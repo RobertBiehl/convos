@@ -85,7 +85,11 @@ def test_search_uses_last_fts_snapshot_when_refresh_is_locked(hooks):
 def test_core_connections_share_process_lock(hooks):
     _,data=hooks; data.mkdir(); db=duckdb.connect(str(data/"convos.db")); cli.init_schema(db); db.close(); env={**os.environ,"CONVOS_PROJECT_ROOT":str(data.parent)}; hold=POPEN([sys.executable,"-c","from ai_convos.cli import get_db; c=get_db(); print('ready',flush=True); input(); c.close()"],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); done=threading.Event()
     try:
-        assert hold.stdout.readline().strip()=="ready"; waiter=threading.Thread(target=lambda:(cli.get_db(True).close(),done.set())); waiter.start(); assert not done.wait(.1); hold.stdin.write("\n"); hold.stdin.flush(); assert done.wait(5); waiter.join()
+        assert hold.stdout.readline().strip()=="ready"; (data/"hook_fts_dirty").touch(); started=time.monotonic()
+        with pytest.raises(ValueError,match="0 seconds"): cli.flush_fts()
+        assert time.monotonic()-started<.5 and (data/"hook_fts_dirty").exists(); started=time.monotonic()
+        with pytest.raises(ValueError,match="0.05 seconds"): cli.get_db(True,wait=.05)
+        assert time.monotonic()-started<.5; waiter=threading.Thread(target=lambda:(cli.get_db(True).close(),done.set())); waiter.start(); assert not done.wait(.1); hold.stdin.write("\n"); hold.stdin.flush(); assert done.wait(5); waiter.join()
     finally: hold.stdin.close(); hold.wait(timeout=5)
 
 def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
