@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 import base64, json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile, duckdb, typer
-from importlib.metadata import entry_points, version; from concurrent.futures import ThreadPoolExecutor, as_completed; from datetime import datetime, timedelta, timezone; from functools import lru_cache; from pathlib import Path; from typing import Optional; from hashlib import pbkdf2_hmac; from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from importlib.metadata import entry_points, version; from concurrent.futures import ThreadPoolExecutor, as_completed; from contextlib import ExitStack; from datetime import datetime, timedelta, timezone; from functools import lru_cache; from pathlib import Path; from typing import Optional; from hashlib import pbkdf2_hmac; from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT = find_root(); DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"; STATE_PATH = DATA_DIR / "sync_state.json"
-HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY, HOOK_FTS_DIRTY, _NOISE = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty", DATA_DIR/"hook_fts_dirty", " AND NOT regexp_matches(content,'^(Base directory for this skill:|# AGENTS\\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))')"
-CHATGPT_BURST, CHATGPT_RATE = 20, 8/15  # conservative policy below the observed ~200-detail failure point
+HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY, HOOK_FTS_DIRTY, _NOISE = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty", DATA_DIR/"hook_fts_dirty", " AND NOT regexp_matches(content,'^(Base directory for this skill:|# AGENTS\\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))')"; CHATGPT_BURST, CHATGPT_RATE = 20, 8/15  # conservative policy below the observed ~200-detail failure point
 
 # ---- db helpers ----
-def open_db(path=None,read_only=False,wait=30):
-    path=Path(path or DB_PATH); path.parent.mkdir(parents=True,exist_ok=True); deadline=time.monotonic()+wait
+def open_db(path=None,read_only=False,wait=30,deadline=None):
+    path=Path(path or DB_PATH); path.parent.mkdir(parents=True,exist_ok=True); deadline=deadline if deadline is not None else time.monotonic()+wait
     if read_only and not path.exists(): return None
     while True:
         try: return duckdb.connect(str(path),read_only=read_only)
@@ -19,14 +18,16 @@ def open_db(path=None,read_only=False,wait=30):
             if time.monotonic()<deadline: time.sleep(.05); continue
             raise ValueError(f"Database stayed locked by another convos process for {wait:g} seconds.") from e
 class _LockedDB:
-    def __init__(self,db,lock): self.db,self.lock=db,lock
+    def __init__(self,db,lock): self.db,self.stack=db,ExitStack(); self.stack.callback(lock.close); self.stack.callback(db.close)
     def __getattr__(self,name): return getattr(self.db,name)
-    def close(self):
-        try: return self.db.close()
-        finally: self.lock.close()
+    def close(self): self.stack.close()
+def _flock(lock,op,deadline,wait):
+    while True:
+        try: return fcntl.flock(lock,op|fcntl.LOCK_NB)
+        except BlockingIOError: time.sleep(min(.05,remaining)) if (remaining:=deadline-time.monotonic())>0 else (_ for _ in ()).throw(ValueError(f"Database stayed locked by another convos process for {wait:g} seconds."))
 def get_db(read_only:bool=False,wait=30):
-    HOOK_DIR.mkdir(parents=True,exist_ok=True); lock=(HOOK_DIR/".db.lock").open("w"); fcntl.flock(lock,fcntl.LOCK_SH if read_only else fcntl.LOCK_EX)
-    try: db=open_db(read_only=read_only,wait=wait)
+    HOOK_DIR.mkdir(parents=True,exist_ok=True); deadline=time.monotonic()+wait; lock=(HOOK_DIR/".db.lock").open("w")
+    try: _flock(lock,fcntl.LOCK_SH if read_only else fcntl.LOCK_EX,deadline,wait); db=open_db(read_only=read_only,wait=wait,deadline=deadline)
     except BaseException: lock.close(); raise
     return _LockedDB(db,lock) if db is not None else (lock.close() or None)
 
@@ -85,8 +86,7 @@ CREATE TABLE IF NOT EXISTS archive_state(singleton BOOLEAN PRIMARY KEY,archive_i
 CREATE TABLE IF NOT EXISTS archive_changes(kind VARCHAR,entity VARCHAR,generation UBIGINT,PRIMARY KEY(kind,entity));
 """
 ARCHIVE_COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
-_MSG_UPDATES=",".join(f"{c}=excluded.{c}" for c in ARCHIVE_COLUMNS["messages"][1:])+",embedding=excluded.embedding"; _MSG_UPS=f"INSERT INTO messages ({','.join(ARCHIVE_COLUMNS['messages'])},embedding) SELECT x.*,m.embedding FROM (VALUES ({','.join('?'*len(ARCHIVE_COLUMNS['messages']))})) x({','.join(ARCHIVE_COLUMNS['messages'])}) LEFT JOIN messages m ON m.id=x.id AND m.content IS NOT DISTINCT FROM x.content ON CONFLICT(id) DO UPDATE SET {_MSG_UPDATES}"
-PROVENANCE_KINDS={"repository.observed","file.observed","file.version","edit.observed","git.checkpoint","checkpoint.link"}
+_MSG_UPDATES=",".join(f"{c}=excluded.{c}" for c in ARCHIVE_COLUMNS["messages"][1:])+",embedding=excluded.embedding"; _MSG_UPS=f"INSERT INTO messages ({','.join(ARCHIVE_COLUMNS['messages'])},embedding) SELECT x.*,m.embedding FROM (VALUES ({','.join('?'*len(ARCHIVE_COLUMNS['messages']))})) x({','.join(ARCHIVE_COLUMNS['messages'])}) LEFT JOIN messages m ON m.id=x.id AND m.content IS NOT DISTINCT FROM x.content ON CONFLICT(id) DO UPDATE SET {_MSG_UPDATES}"; PROVENANCE_KINDS={"repository.observed","file.observed","file.version","edit.observed","git.checkpoint","checkpoint.link"}
 def provenance_digest(v): return hashlib.sha256(v if isinstance(v,bytes) else json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()).hexdigest()
 def _archive_touch(db,rows=()): generation=(db.execute("UPDATE archive_state SET generation=generation+1 WHERE singleton RETURNING generation").fetchone() or [0])[0]; rows and _insert_pages(db,"archive_changes",[(kind,entity,generation) for kind,entity in rows],mode=" OR REPLACE"); return generation
 def archive_changes(db,since): return db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],db.execute("SELECT kind,entity FROM archive_changes WHERE generation>?",(since,)).fetchall()
