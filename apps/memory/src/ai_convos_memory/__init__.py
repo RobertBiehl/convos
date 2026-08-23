@@ -1,5 +1,5 @@
 """Read-only provider adapters plus a deterministic plan/resolve/apply memory ledger."""
-import hashlib, json, os, queue, re, shlex, shutil, site, sqlite3, subprocess, sys, sysconfig, threading, time
+import contextlib, hashlib, json, os, queue, re, shlex, shutil, site, sqlite3, subprocess, sys, sysconfig, threading, time
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -84,6 +84,12 @@ def connect(root=None):
         db.commit()
     if db.execute("SELECT 1 FROM links l JOIN sources s ON s.id=l.source JOIN canonicals c ON c.id=l.canonical WHERE s.scope<>c.scope LIMIT 1").fetchone(): db.close(); raise ValueError("Cross-scope memory link in ledger")
     return db
+@contextlib.contextmanager
+def _transaction(db,commit=True):
+    db.execute("BEGIN IMMEDIATE")
+    try: yield
+    except BaseException: db.rollback(); raise
+    else: db.commit() if commit else db.rollback()
 def _codex_scopes(content): return [_scope(s.strip()) for s in re.split(r"\s+and\s+(?=/)", m.group(1).strip())] if (m := re.search(r"(?m)^applies_to: cwd=([^;\n]+)", content)) else ["global"]
 def _codex():
     root = Path(os.environ.get("CONVOS_CODEX_MEMORY_ROOT", Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"memories")).expanduser(); path = root/"MEMORY.md"
@@ -185,33 +191,31 @@ def remember_data(content, scope=None, canonical=None, evidence=()):
     content, scope = content.strip(), _scope(scope)
     if not content: raise ValueError("memory content cannot be empty")
     proofs, db, now = _archive_evidence(evidence,scope) if evidence else [], connect(), datetime.now(timezone.utc).isoformat()
-    try:
-        db.execute("BEGIN IMMEDIATE"); scope = _bind_scope(db,scope); replacing = canonical is not None; cid = _select_canonical(db,scope,canonical)["id"] if replacing else "mem_" + _hash(scope + "\0" + content)[:16]; row = db.execute("SELECT * FROM canonicals WHERE id=?", (cid,)).fetchone(); origins = db.execute("SELECT s.* FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=? ORDER BY s.id", (cid,)).fetchall()
+    with contextlib.closing(db),_transaction(db):
+        scope = _bind_scope(db,scope); replacing = canonical is not None; cid = _select_canonical(db,scope,canonical)["id"] if replacing else "mem_" + _hash(scope + "\0" + content)[:16]; row = db.execute("SELECT * FROM canonicals WHERE id=?", (cid,)).fetchone(); origins = db.execute("SELECT s.* FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=? ORDER BY s.id", (cid,)).fetchall()
         if replacing and (len(origins) != 1 or origins[0]["provider"] not in ("user","remote")): raise ValueError("only user-owned memories without Codex or Claude origins can be revised directly")
         if row and (row["scope"] != scope or not replacing and row["content"] != content): raise ValueError("canonical id collision")
         locator, digest = f"user/{cid}", _hash(content); sid = origins[0]["id"] if replacing else _hash("\0".join(("user",scope,locator)))[:20]; prior = db.execute("SELECT content FROM sources WHERE id=?", (sid,)).fetchone(); status = "unchanged" if prior and prior["content"] == content else "revised" if replacing else "linked" if row else "created"
         db.execute("INSERT INTO sources VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET hash=excluded.hash,content=excluded.content,active=1,observed_at=excluded.observed_at", (sid,"user",scope,locator,str(_db_path()),digest,content,1,now)); db.execute("INSERT OR IGNORE INTO revisions VALUES (?,?,?,?)", (sid,digest,content,now))
         if not row or row["content"] != content: _canonical(db,cid,scope,content,now)
-        db.execute("INSERT INTO links VALUES (?,?,?) ON CONFLICT(source) DO UPDATE SET canonical=excluded.canonical,applied_hash=excluded.applied_hash", (sid,cid,digest)); [db.execute("INSERT OR IGNORE INTO evidence VALUES (?,?,?,?,?,?,?,?,?)",(cid,digest,*(p[k] for k in ("message","conversation","source","title","role","created_at","content_hash")))) for p in proofs]; db.commit()
-    except BaseException: db.rollback(); db.close(); raise
-    db.close(); return dict(id=cid,scope=scope,hash=digest,source=sid,status=status,evidence=len(proofs))
+        db.execute("INSERT INTO links VALUES (?,?,?) ON CONFLICT(source) DO UPDATE SET canonical=excluded.canonical,applied_hash=excluded.applied_hash", (sid,cid,digest)); [db.execute("INSERT OR IGNORE INTO evidence VALUES (?,?,?,?,?,?,?,?,?)",(cid,digest,*(p[k] for k in ("message","conversation","source","title","role","created_at","content_hash")))) for p in proofs]
+    return dict(id=cid,scope=scope,hash=digest,source=sid,status=status,evidence=len(proofs))
 def forget_data(canonical, scope=None, dry_run=False):
     scope, db = _scope(scope), connect()
-    try:
-        db.execute("BEGIN IMMEDIATE"); row = _select_canonical(db,scope,canonical); canonical = row["id"]; origins = db.execute("SELECT s.id,s.provider,s.locator,s.hash,s.active,l.applied_hash FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=?", (canonical,)).fetchall()
+    with contextlib.closing(db),_transaction(db,not dry_run):
+        row = _select_canonical(db,scope,canonical); canonical = row["id"]; origins = db.execute("SELECT s.id,s.provider,s.locator,s.hash,s.active,l.applied_hash FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=?", (canonical,)).fetchall()
         if not origins or any(r["provider"] not in ("user","remote") or r["provider"]=="user" and (not r["active"] or r["hash"]!=r["applied_hash"]) for r in origins): raise ValueError("only settled user-owned memories without Codex or Claude origins can be forgotten")
         if any((p := Path(r[0])).exists() and (p.is_symlink() or f"canonical:{canonical} " in p.read_text()) for r in db.execute("SELECT target FROM projections")): raise ValueError("canonical is present in a Claude projection; remove or refresh the projection first")
         revisions = db.execute("SELECT COUNT(*) FROM canonical_revisions WHERE canonical=?", (canonical,)).fetchone()[0] + sum(db.execute("SELECT COUNT(*) FROM revisions WHERE source=?", (r["id"],)).fetchone()[0] for r in origins); evidence = db.execute("SELECT COUNT(*) FROM evidence WHERE canonical=?",(canonical,)).fetchone()[0]
-        [db.execute("UPDATE remote_semantics SET owned=1 WHERE entity=?",(r["locator"].split("/",2)[-1],)) for r in origins if r["provider"]=="remote"]; [db.execute("DELETE FROM links WHERE source=?", (r["id"],)) for r in origins]; [db.execute("DELETE FROM revisions WHERE source=?", (r["id"],)) for r in origins]; [db.execute("DELETE FROM sources WHERE id=?", (r["id"],)) for r in origins]; db.execute("DELETE FROM evidence WHERE canonical=?", (canonical,)); db.execute("DELETE FROM canonical_revisions WHERE canonical=?", (canonical,)); db.execute("DELETE FROM canonicals WHERE id=?", (canonical,)); db.rollback() if dry_run else db.commit()
-    except BaseException: db.rollback(); db.close(); raise
-    db.close(); return dict(id=canonical,scope=scope,revisions=revisions,evidence=evidence,status="would_forget" if dry_run else "forgotten")
+        [db.execute("UPDATE remote_semantics SET owned=1 WHERE entity=?",(r["locator"].split("/",2)[-1],)) for r in origins if r["provider"]=="remote"]; [db.execute("DELETE FROM links WHERE source=?", (r["id"],)) for r in origins]; [db.execute("DELETE FROM revisions WHERE source=?", (r["id"],)) for r in origins]; [db.execute("DELETE FROM sources WHERE id=?", (r["id"],)) for r in origins]; db.execute("DELETE FROM evidence WHERE canonical=?", (canonical,)); db.execute("DELETE FROM canonical_revisions WHERE canonical=?", (canonical,)); db.execute("DELETE FROM canonicals WHERE id=?", (canonical,))
+    return dict(id=canonical,scope=scope,revisions=revisions,evidence=evidence,status="would_forget" if dry_run else "forgotten")
 def apply_data(document, dry_run=False):
     if not isinstance(document, dict) or document.get("version") != 1 or isinstance(document.get("version"), bool): raise ValueError("Unsupported memory resolution version; expected 1")
     resolutions = document.get("resolutions")
     if not isinstance(document.get("plan"), str) or not isinstance(resolutions, list) or document.get("scope") is not None and not isinstance(document["scope"], str) or any(not isinstance(d, dict) or not isinstance(d.get("action"), str) or any(k in d and not isinstance(d[k], str) for k in ("canonical","scope","content","hash","source")) or ("sources" in d and (not isinstance(d["sources"], list) or not d["sources"] or not all(isinstance(s, str) for s in d["sources"]))) or (d.get("action") == "revise" and not all(isinstance(d.get(k), str) for k in ("canonical","hash","content"))) or (d.get("action") != "revise" and "source" not in d and "sources" not in d) for d in resolutions): raise ValueError("Malformed memory resolution document")
     scan_store(document.get("scope")); db, now, applied = connect(), datetime.now(timezone.utc).isoformat(), 0
-    try:
-        db.execute("BEGIN IMMEDIATE"); plan = plan_data(True, db, document.get("scope"))
+    with contextlib.closing(db),_transaction(db,not dry_run):
+        plan = plan_data(True, db, document.get("scope"))
         if document["plan"] != plan["plan"]: raise ValueError(f"stale plan {document['plan']}; current plan is {plan['plan']}")
         pending, used = {r["source"]:r for r in plan["pending"]}, set()
         for decision in resolutions:
@@ -251,9 +255,7 @@ def apply_data(document, dry_run=False):
             applied += len(ids)
         remaining = len(plan_data(db=db, scope=document.get("scope"))["pending"])
         preview = [dict(r) for r in db.execute("SELECT id,scope,hash,content FROM canonicals WHERE ? IS NULL OR scope=? ORDER BY id", (document.get("scope"), document.get("scope")))] if dry_run else None
-        db.rollback() if dry_run else db.commit()
-    except BaseException: db.rollback(); db.close(); raise
-    db.close(); return dict(version=1, applied=applied, remaining=remaining, **({"dry_run":True,"canonicals":preview} if dry_run else {}))
+    return dict(version=1, applied=applied, remaining=remaining, **({"dry_run":True,"canonicals":preview} if dry_run else {}))
 def reconcile_data(scope, dry_run=False, refresh=True, retry=True):
     refresh and scan_store(scope); plan = plan_data(True, scope=scope); pending = plan["pending"]; groups = {(r["scope"],r["hash"]):[p for p in pending if (p["scope"],p["hash"]) == (r["scope"],r["hash"]) and p["kind"] == "unlinked"] for r in pending}
     resolutions = [dict(source=r["source"],action="detach") for r in pending if r["kind"] == "missing" and r["replacement"]] + [dict(source=r["source"],action="same",canonical=r["suggested"]) for r in pending if r["kind"] == "exact"] + [dict(sources=[r["source"] for r in rows],action="merge",scope=key[0]) for key,rows in groups.items() if len(rows)>1] + ([dict(source=pending[0]["source"],action="distinct")] if len(pending) == 1 and pending[0]["kind"] == "unlinked" and not plan["canonicals"] else [])
@@ -355,15 +357,13 @@ def remote_accept(root,row,proof,project=True):
     data=row["data"]; parts=row["id"].split(":",2); fields={"canonical","scope","repository","lineage","hash","content","updated_at"}
     if row["kind"]!="memory.canonical" or len(parts)!=3 or parts[0]!="memory" or not all(parts[1:]) or row["state"]=="active" and (set(data)!=fields or row["id"]!=f"memory:{data['scope']}:{data['canonical']}" or not all(isinstance(data[k],str) and data[k] for k in ("canonical","scope","hash","updated_at")) or not isinstance(data["content"],str) or _hash(data["content"])!=data["hash"] or data["repository"] is not None and not isinstance(data["repository"],str) or data["lineage"] is not None and not isinstance(data["lineage"],str) or data["repository"] is None and data["lineage"] is not None) or row["state"]=="deleted" and data is not None: raise ValueError("Malformed remote memory object")
     db=connect(root); author,entity=proof["author_user_id"],row["id"]
-    try:
-        db.execute("BEGIN IMMEDIATE"); old=db.execute("SELECT owned FROM remote_semantics WHERE workspace=? AND author=? AND entity=? AND revision=?",(proof["workspace"],author,entity,proof["revision"])).fetchone(); owned=bool(old and old["owned"]); db.execute("INSERT OR REPLACE INTO remote_semantics VALUES (?,?,?,?,?,?,?,?)",(proof["workspace"],author,entity,proof["revision"],row["state"],json.dumps(row,sort_keys=True,separators=(",",":")),json.dumps(proof,sort_keys=True,separators=(",",":")),int(owned or not project))); values=[dict(row=json.loads(r["body"]),proof=json.loads(r["proof"])) for r in db.execute("SELECT body,proof FROM remote_semantics WHERE workspace=? AND author=? AND entity=?",(proof["workspace"],author,entity))]; ancestors={a for value in values for a in value["proof"]["ancestors"]}; leaves=[value for value in values if value["proof"]["revision"] not in ancestors]; db.execute("DELETE FROM remote_semantics WHERE workspace=? AND author=? AND entity=? AND revision NOT IN (%s)"%",".join("?"*len(leaves)),(proof["workspace"],author,entity,*(v["proof"]["revision"] for v in leaves)))
+    with contextlib.closing(db),_transaction(db):
+        old=db.execute("SELECT owned FROM remote_semantics WHERE workspace=? AND author=? AND entity=? AND revision=?",(proof["workspace"],author,entity,proof["revision"])).fetchone(); owned=bool(old and old["owned"]); db.execute("INSERT OR REPLACE INTO remote_semantics VALUES (?,?,?,?,?,?,?,?)",(proof["workspace"],author,entity,proof["revision"],row["state"],json.dumps(row,sort_keys=True,separators=(",",":")),json.dumps(proof,sort_keys=True,separators=(",",":")),int(owned or not project))); values=[dict(row=json.loads(r["body"]),proof=json.loads(r["proof"])) for r in db.execute("SELECT body,proof FROM remote_semantics WHERE workspace=? AND author=? AND entity=?",(proof["workspace"],author,entity))]; ancestors={a for value in values for a in value["proof"]["ancestors"]}; leaves=[value for value in values if value["proof"]["revision"] not in ancestors]; db.execute("DELETE FROM remote_semantics WHERE workspace=? AND author=? AND entity=? AND revision NOT IN (%s)"%",".join("?"*len(leaves)),(proof["workspace"],author,entity,*(v["proof"]["revision"] for v in leaves)))
         if project and not owned:
             current=(db.execute("SELECT c.hash FROM sources s JOIN links l ON l.source=s.id JOIN canonicals c ON c.id=l.canonical WHERE s.provider='remote' AND s.locator=?",(f"{proof['workspace']}/{author}/{entity}",)).fetchone() or [None])[0]; deleted=next((v for v in leaves if v["row"]["state"]=="deleted"),None); chosen=leaves if len(leaves)==1 else [deleted or next((v for v in leaves if v["row"]["data"]["hash"]!=current),leaves[0])]
             for value in chosen:
                 body,p=value["row"],value["proof"]; payload=body["data"]; _remote_apply(db,root,proof["workspace"],p["author_user_id"],entity,payload,payload["content"],payload["updated_at"],len(leaves)>1) if body["state"]=="active" else _remote_apply(db,root,proof["workspace"],p["author_user_id"],entity,{},None,datetime.now(timezone.utc).isoformat(),len(leaves)>1)
-        db.commit()
-    except BaseException: db.rollback(); db.close(); raise
-    db.close(); return len(leaves)==1
+    return len(leaves)==1
 def remote_token(root):
     db=connect(root); value=db.execute("SELECT value FROM remote_meta WHERE key='ledger_id'").fetchone()[0]; db.close(); return value
 def remote_bridge(): return dict(v=2,objects={"memory.canonical"},records=remote_records,accept=remote_accept,token=remote_token)
@@ -373,8 +373,7 @@ def _skill_source():
     return next((p for r in roots if (p := r/rel).exists()), None)
 def _hook_valid(command, path):
     parts = shlex.split(command); return len(parts) == 4 and parts[0] == f"CONVOS_MEMORY_DB={path}" and Path(parts[1]).is_file() and os.access(parts[1], os.X_OK) and parts[2:] == ["memory", "runtime-hook"]
-def _hook_paths():
-    return [("claude-code",Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude")).expanduser()/"settings.json"),("codex",Path(os.environ.get("CODEX_HOME", Path.home()/".codex")).expanduser()/"hooks.json")]
+def _hook_paths(): return [("claude-code",Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude")).expanduser()/"settings.json"),("codex",Path(os.environ.get("CODEX_HOME", Path.home()/".codex")).expanduser()/"hooks.json")]
 def _hook_data(source, path):
     if path.is_symlink() or path.exists() and not path.is_file(): raise ValueError(f"Managed JSON path must be a regular non-symlink file: {path}")
     data = json.loads(path.read_text()) if path.exists() else {}; hooks = data.setdefault("hooks", {}) if isinstance(data, dict) else None
@@ -429,7 +428,8 @@ def _evidence(db, canonical, digest):
     archive = None
     try:
         from ai_convos import cli
-        archive=cli.get_db(True) or (_ for _ in ()).throw(ValueError()); live={mid:_hash(body) for mid,body in archive.execute("SELECT id,COALESCE(content,'') FROM messages WHERE id IN (SELECT UNNEST(?)) AND json_extract_string(metadata,'$.history_of') IS NULL",[ [r["message"] for r in rows] ]).fetchall()}
+        if not (archive:=cli.get_db(True)): raise ValueError
+        live={mid:_hash(body) for mid,body in archive.execute("SELECT id,COALESCE(content,'') FROM messages WHERE id IN (SELECT UNNEST(?)) AND json_extract_string(metadata,'$.history_of') IS NULL",[ [r["message"] for r in rows] ]).fetchall()}
         return [{**r,"status":"verified" if live.get(r["message"]) == r["content_hash"] else "changed" if r["message"] in live else "missing","read":f"convos read {r['conversation']} --around {r['message']}"} for r in rows]
     except Exception: return [{**r,"status":"unavailable","read":f"convos read {r['conversation']} --around {r['message']}"} for r in rows]
     finally:

@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from ai_convos.cli import required
 
 V = 1
 ROW_FIELDS_V1={"conversations":("source","title","created_at","updated_at","model","project_id","metadata"),"messages":("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"),"tool_calls":("message_id","tool_name","input","output","status","duration_ms","created_at"),"attachments":("message_id","filename","mime_type","size","body_hash","created_at"),"artifacts":("conversation_id","artifact_type","title","content","language","created_at","version"),"file_edits":("message_id","file_path","edit_type","content","created_at","old_content")}
@@ -97,7 +98,7 @@ def verify_event(value, sign_public):
     body = {k:v for k,v in signed.items() if k != "id"}
     if digest(body) != value["id"] or digest(value["payload"]) != value["revision"]: raise ValueError("Invalid event digest")
     return value
-def signer(devices,author): value=devices[author]["sign_public"]; return value if public_id(value)==author else (_ for _ in ()).throw(ValueError("device signing key mismatch"))
+def signer(devices,author): value=devices[author]["sign_public"]; return required(value if public_id(value)==author else None,ValueError("device signing key mismatch"))
 def sign_control(device,body): return {**body,"control_signature":b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body)))}
 
 def seal_event(value, workspace, epoch, key):
@@ -126,14 +127,14 @@ def open_replica(value,key):
 def seal_origin(controls,workspace,epoch,key,uploader,rows=True):
     body={"controls":controls,"rows":rows}; nonce=os.urandom(12); header={"v":1,"kind":"origin.bundle","workspace":workspace,"origin":fingerprint(key,digest(body)),"epoch":epoch,"uploader":uploader,"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,canon(body),canon(header)))}
 def open_origin(value,key):
-    try: header={k:value[k] for k in ("v","kind","workspace","origin","epoch","uploader","nonce")}; body=json.loads(AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header))); return body if set(value)==set(header)|{"ciphertext"} and value["v"]==1 and value["kind"]=="origin.bundle" and set(body)=={"controls","rows"} and isinstance(body["controls"],list) and body["controls"] and isinstance(body["rows"],bool) and value["origin"]==fingerprint(key,digest(body)) else (_ for _ in ()).throw(ValueError)
+    try: header={k:value[k] for k in ("v","kind","workspace","origin","epoch","uploader","nonce")}; body=json.loads(AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header))); return required(body if set(value)==set(header)|{"ciphertext"} and value["v"]==1 and value["kind"]=="origin.bundle" and set(body)=={"controls","rows"} and isinstance(body["controls"],list) and body["controls"] and isinstance(body["rows"],bool) and value["origin"]==fingerprint(key,digest(body)) else None,ValueError())
     except (InvalidTag,KeyError,TypeError,ValueError) as e: raise ValueError("invalid origin bundle") from e
 
 def seal_blob(data,workspace,epoch,key,uploader):
     if len(data)>32*1024**2: raise ValueError("attachment body exceeds 32 MiB")
     nonce=os.urandom(12); body_hash=digest(data); header={"v":1,"kind":"blob.replica","workspace":workspace,"blob":fingerprint(key,body_hash),"epoch":epoch,"uploader":uploader,"size":len(data),"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,data,canon(header)))}
 def open_blob(value,key):
-    try: header={k:value[k] for k in ("v","kind","workspace","blob","epoch","uploader","size","nonce")}; data=AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header)); body_hash=digest(data); return (data,body_hash) if set(value)==set(header)|{"ciphertext"} and value["v"]==1 and value["kind"]=="blob.replica" and 0<=value["size"]<=32*1024**2 and len(data)==value["size"] and value["blob"]==fingerprint(key,body_hash) else (_ for _ in ()).throw(ValueError)
+    try: header={k:value[k] for k in ("v","kind","workspace","blob","epoch","uploader","size","nonce")}; data=AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header)); body_hash=digest(data); return required((data,body_hash) if set(value)==set(header)|{"ciphertext"} and value["v"]==1 and value["kind"]=="blob.replica" and 0<=value["size"]<=32*1024**2 and len(data)==value["size"] and value["blob"]==fingerprint(key,body_hash) else None,ValueError())
     except (InvalidTag,KeyError,TypeError,ValueError) as e: raise ValueError("invalid blob replica") from e
 
 def _wrap_key(shared, context): return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"convos-key-v1:" + context.encode()).derive(shared)

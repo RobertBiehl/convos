@@ -56,7 +56,9 @@ def _private_json(path,data):
     tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.touch(mode=0o600,exist_ok=False); tmp.write_text(json.dumps(data)); durable_replace(tmp,path)
 def _audit(root,workspace,record,findings):
     if not findings: return
-    path=_root(root)/"redact/audit.db"; path.parent.is_symlink() and (_ for _ in ()).throw(ValueError("Redaction audit directory must not be a symlink")); path.parent.mkdir(parents=True,exist_ok=True); os.chmod(path.parent,0o700)
+    path=_root(root)/"redact/audit.db"
+    if path.parent.is_symlink(): raise ValueError("Redaction audit directory must not be a symlink")
+    path.parent.mkdir(parents=True,exist_ok=True); os.chmod(path.parent,0o700)
     if path.is_symlink() or path.exists() and not path.is_file(): raise ValueError("Redaction audit database must be a regular non-symlink file")
     path.touch(mode=0o600,exist_ok=True); os.chmod(path,0o600); db=sqlite3.connect(path); db.executescript(SCHEMA); now=datetime.now(timezone.utc).isoformat()
     for finding in findings:

@@ -1,6 +1,7 @@
 """Tests for repository constraints."""
 
 import ast, re, token, tokenize, tomllib
+from collections import Counter
 from pathlib import Path
 
 TOKEN_WHITELIST = {token.OP, token.NAME, token.NUMBER, token.STRING}
@@ -27,6 +28,16 @@ def test_app_line_budgets():
         loc = _loc(sorted(src.rglob("*.py")))
         limit = {"changegraph": 400, "memory": 650, "remote": 1100, "remote_server": 400}.get(src.parent.name, 200)
         assert loc < limit, f"App {src.parent.name} budget exceeded: {loc} >= {limit}"
+
+
+def test_statement_packing_budget():
+    """Dense expressions are welcome; packing unrelated statements behind separators is not."""
+    root = Path(__file__).resolve().parents[1]
+    paths = sorted([*(root/"src").rglob("*.py"), *(root/"apps").rglob("*.py"), *(root/"scripts").rglob("*.py"), *(root/"evals").rglob("*.py")])
+    separators = [(path, tok.start[0]) for path in paths for tok in tokenize.generate_tokens(path.read_text().splitlines(True).__iter__().__next__) if tok.type == token.OP and tok.string == ";"]
+    packed = {f"{path.relative_to(root)}:{line}":count for (path,line),count in Counter(separators).items()}
+    assert len(separators) < 1875, f"Statement separator budget exceeded: {len(separators)} >= 1875"
+    assert not {where:count for where,count in packed.items() if count > 10}, packed
 
 
 def test_remote_has_two_product_packages():
