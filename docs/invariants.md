@@ -137,6 +137,12 @@ they do not depend on relay or `state.db` history.
 > identifies the current delivery peer. Existing signed fields are not renamed
 > or rewritten to express this distinction.
 
+> A remote logical row is identified by author, semantic kind, and source row.
+> Workspaces authorize delivery of that identity and never participate in its
+> physical archive ID. Equivalent access through another workspace adds a
+> proof; an incomparable revision remains conflicted instead of creating a
+> duplicate row or winning by arrival order.
+
 ## Retained semantic state
 
 > Recovery preserves the newest valid causal revision of mutable semantic
