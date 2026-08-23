@@ -149,7 +149,7 @@ does not change semantic row identity after device recovery.
 
 | Relation | Durable facts |
 |----------|---------------|
-| `row_origins` | Current physical-to-source row attribution and optional proof link |
+| `row_origins` | Author-scoped physical-to-source identity and currently materialized proof |
 | `provenance_origins` | Imported provenance fact attribution and original proof link |
 | `row_proofs` | Bodyless signed revision, content hash, predecessor, state, author, and authorization epoch |
 | `row_signers` | One normalized root key and device certificate per author device |
