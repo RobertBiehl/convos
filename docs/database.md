@@ -143,9 +143,9 @@ schema.
 The `remote` schema is the separate identifier-only exception for remotely
 projected archive rows. Core writes it atomically with each imported row so
 deleting synchronization state cannot change authorship or make a foreign row
-publishable. Imported physical IDs use the verified author user plus workspace,
-table, and exact source row; the signing device remains separate provenance and
-does not change semantic row identity after device recovery.
+publishable. Imported physical IDs use the verified author user, table, and
+exact source row; workspace proofs remain access paths. The signing device is
+separate provenance and does not change semantic row identity after recovery.
 
 | Relation | Durable facts |
 |----------|---------------|
