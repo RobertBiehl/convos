@@ -179,7 +179,7 @@ def test_relay_cannot_fabricate_semantic_replica_or_mutate_memory(tmp_path,monke
     server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); memory_module.remember_data("relay forgery target","global"); sync_once(a,True); ws=workspace(load(b),"Personal")
     def forged(cfg,body,auth=True):
         result=copy.deepcopy(direct(cfg,body,auth))
-        if body["op"]=="replica_pull" and result["replicas"]: result["replicas"][0]["envelope"]["ciphertext"]="A"+result["replicas"][0]["envelope"]["ciphertext"][1:]
+        if body["op"]=="replica_pull" and result["replicas"]: ciphertext=result["replicas"][0]["envelope"]["ciphertext"]; result["replicas"][0]["envelope"]["ciphertext"]=("B" if ciphertext[0]=="A" else "A")+ciphertext[1:]
         return result
     monkeypatch.setattr("ai_convos_remote.request",forged)
     state=connect(b/"remote/state.db")
