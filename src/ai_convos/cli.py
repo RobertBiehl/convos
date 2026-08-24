@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64, contextlib, json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile, duckdb, typer
 from importlib.metadata import entry_points, version; from concurrent.futures import ThreadPoolExecutor, as_completed; from contextlib import ExitStack; from datetime import datetime, timedelta, timezone; from functools import lru_cache; from pathlib import Path; from typing import Optional; from hashlib import pbkdf2_hmac; from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from .migrations import migrate_remote_ids, remote_id_migration_scope
 
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
@@ -97,6 +98,7 @@ CREATE TABLE IF NOT EXISTS archive_changes(kind VARCHAR,entity VARCHAR,generatio
 ARCHIVE_COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
 _MSG_UPDATES=",".join(f"{c}=excluded.{c}" for c in ARCHIVE_COLUMNS["messages"][1:])+",embedding=excluded.embedding"; _MSG_UPS=f"INSERT INTO messages ({','.join(ARCHIVE_COLUMNS['messages'])},embedding) SELECT x.*,m.embedding FROM (VALUES ({','.join('?'*len(ARCHIVE_COLUMNS['messages']))})) x({','.join(ARCHIVE_COLUMNS['messages'])}) LEFT JOIN messages m ON m.id=x.id AND m.content IS NOT DISTINCT FROM x.content ON CONFLICT(id) DO UPDATE SET {_MSG_UPDATES}"; PROVENANCE_KINDS={"repository.observed","file.observed","file.version","edit.observed","git.checkpoint","checkpoint.link"}
 def provenance_digest(v): return hashlib.sha256(v if isinstance(v,bytes) else json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()).hexdigest()
+def remote_id(author,table,source): return provenance_digest(f"{author}:{table}:{source}")[:16] if source is not None else None
 def _archive_touch(db,rows=()): generation=(db.execute("UPDATE archive_state SET generation=generation+1 WHERE singleton RETURNING generation").fetchone() or [0])[0]; rows and _insert_pages(db,"archive_changes",[(kind,entity,generation) for kind,entity in rows],mode=" OR REPLACE"); return generation
 def archive_changes(db,since): return db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],db.execute("SELECT kind,entity FROM archive_changes WHERE generation>?",(since,)).fetchall()
 def archive_state(db):
@@ -211,7 +213,7 @@ def project_workspace_controls(db,controls):
         db.execute("INSERT OR IGNORE INTO remote.workspace_controls VALUES (?,?,?,?,?)",(*key,value["epoch"],proof,raw))
     return len(controls)
 def _logical_archive(row,proof,proof_id,native=False):
-    table,source,columns=row["kind"],row["id"],ARCHIVE_COLUMNS[row["kind"]]; mapped=lambda kind,value:value if native or value is None else provenance_digest(f"{proof['author_user_id']}:{kind}:{value}")[:16]; physical,origin=mapped(table,source),None if native else {"workspace_id":proof["workspace"],"author_user_id":proof["author_user_id"],"author_device_id":proof["author_device_id"],"source_row_id":source,"source_event_id":proof["revision"],"content_key":f"{table}:{source}","observed_at":None,"proof_id":proof_id}; data={"id":source,**row["data"]}; parents=dict({"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}.get(table,()))
+    table,source,columns=row["kind"],row["id"],ARCHIVE_COLUMNS[row["kind"]]; mapped=lambda kind,value:value if native else remote_id(proof["author_user_id"],kind,value); physical,origin=mapped(table,source),None if native else {"workspace_id":proof["workspace"],"author_user_id":proof["author_user_id"],"author_device_id":proof["author_device_id"],"source_row_id":source,"source_event_id":proof["revision"],"content_key":f"{table}:{source}","observed_at":None,"proof_id":proof_id}; data={"id":source,**row["data"]}; parents=dict({"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}.get(table,()))
     values=[physical if c=="id" else mapped(parents[c],data[c]) if c in parents else json.dumps(data[c],sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False) if c in ("metadata","input","output") and data.get(c) is not None else data.get(c) for c in columns]; return table,physical,values,origin,data
 def project_logical_rows(db,items):
     grouped={}; out=[]; delayed=[]
@@ -220,7 +222,7 @@ def project_logical_rows(db,items):
         table,physical,values,origin,data=_logical_archive(row,proof,pid,native); grouped.setdefault(table,[]).append((values,origin)); out.append((table,physical)); table=="attachments" and data["body_hash"] and grouped.setdefault("attachment_bodies",[]).append((physical,data["body_hash"],data["size"]))
     [project_archive_rows(db,table,ARCHIVE_COLUMNS[table],rows) for table,rows in grouped.items() if table!="attachment_bodies"]; grouped.get("attachment_bodies") and _insert_pages(db,"attachment_bodies",grouped["attachment_bodies"],mode=" OR REPLACE"); out += [(item[0]["kind"],project_logical_row(db,*item,touch=False)) for item in delayed]; out and _archive_touch(db,out); return out
 def project_logical_row(db,row,proof,proof_id,native=False,touch=True):
-    table,source=row["kind"],row["id"]; mapped=lambda kind,value:value if native or value is None else provenance_digest(f"{proof['author_user_id']}:{kind}:{value}")[:16]; physical=mapped(table,source); origin=None if native else {"workspace_id":proof["workspace"],"author_user_id":proof["author_user_id"],"author_device_id":proof["author_device_id"],"source_row_id":source,"source_event_id":proof["revision"],"content_key":f"{table}:{source}","observed_at":None,"proof_id":proof_id}
+    table,source=row["kind"],row["id"]; mapped=lambda kind,value:value if native else remote_id(proof["author_user_id"],kind,value); physical=mapped(table,source); origin=None if native else {"workspace_id":proof["workspace"],"author_user_id":proof["author_user_id"],"author_device_id":proof["author_device_id"],"source_row_id":source,"source_event_id":proof["revision"],"content_key":f"{table}:{source}","observed_at":None,"proof_id":proof_id}
     if table in PROVENANCE_KINDS:
         data={"id":source,**row["data"]}; observed=data.pop("observed_at",None); value={"kind":table,"entity":source,"payload":data,"observed_at":observed}; project_provenance(db,value,mapped,False); physical=mapped("file_edits",source) if table=="edit.observed" else provenance_digest({"checkpoint":data["checkpoint"],"edit":mapped("file_edits",data["edit"])}) if table=="checkpoint.link" else source; touch and _archive_touch(db,[(table,physical)])
         if native: db.execute("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",(table,physical))
@@ -257,7 +259,7 @@ def _migration_backup(conn,version=1):
     try: shutil.copyfile(path,tmp); os.chmod(tmp,0o600); check=duckdb.connect(tmp,read_only=True); check.execute("SELECT COUNT(*) FROM conversations").fetchone(); check.close(); durable_replace(tmp,backup); return backup
     except BaseException: Path(tmp).unlink(missing_ok=True); raise
 def init_schema(conn):
-    _migration_backup(conn)
+    tables={r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()}; current=(conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0] if "core_schema" in tables else 0; scope=remote_id_migration_scope(conn,remote_id) if current<2 else set(); _migration_backup(conn); current==1 and scope and _migration_backup(conn,2); had_fts=bool(conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone())
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
         id VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, title VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP,
         model VARCHAR, cwd VARCHAR, git_branch VARCHAR, project_id VARCHAR, metadata JSON)""")
@@ -284,10 +286,15 @@ def init_schema(conn):
     conn.execute(_PROVENANCE_SCHEMA)
     with _transaction(conn):
         cols={r[0] for r in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance' AND table_name='file_edit_files'").fetchall()}; [(conn.execute(f"ALTER TABLE provenance.file_edit_files RENAME COLUMN {old} TO {new}"),cols.add(new)) for old,new in (("before_hash","old_content_hash"),("after_hash","new_content_hash")) if old in cols and new not in cols]
-        conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR; ALTER TABLE remote.row_origins ADD COLUMN IF NOT EXISTS proof_id VARCHAR; ALTER TABLE remote.row_proofs ADD COLUMN IF NOT EXISTS authorization_workspace_id VARCHAR; UPDATE remote.row_proofs SET authorization_workspace_id=workspace_id WHERE authorization_workspace_id IS NULL; DROP TABLE IF EXISTS provenance.assertions; DROP TABLE IF EXISTS provenance.capture_gaps; INSERT OR REPLACE INTO core_schema VALUES (TRUE,1)")
+        conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR; ALTER TABLE remote.row_origins ADD COLUMN IF NOT EXISTS proof_id VARCHAR; ALTER TABLE remote.row_proofs ADD COLUMN IF NOT EXISTS authorization_workspace_id VARCHAR; UPDATE remote.row_proofs SET authorization_workspace_id=workspace_id WHERE authorization_workspace_id IS NULL; DROP TABLE IF EXISTS provenance.assertions; DROP TABLE IF EXISTS provenance.capture_gaps; INSERT INTO core_schema SELECT TRUE,1 WHERE NOT EXISTS (SELECT 1 FROM core_schema WHERE singleton)")
         [index_attachment_body(conn,*r) for r in conn.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL AND id NOT IN (SELECT attachment_id FROM attachment_bodies)").fetchall()]; facts=[(r["kind"],r["entity"]) for r in provenance_records(conn)] if not local_facts else []; facts and conn.executemany("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",facts)
     conn.execute("INSERT INTO archive_state SELECT TRUE,uuid(),0 WHERE NOT EXISTS (SELECT 1 FROM archive_state)")
+    migrated=set()
+    if current<2 and scope:
+        with _transaction(conn): migrated=migrate_remote_ids(conn,ARCHIVE_COLUMNS,provenance_digest,remote_id)
     conn.execute("INSTALL fts; LOAD fts")
+    if "messages" in migrated and had_fts: conn.execute("PRAGMA create_fts_index('messages', 'id', 'content', 'thinking', overwrite=1)")
+    current<2 and conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,2)")
 
 def counts_by_source(conn):
     q = [("conversations", "source", 0), ("messages m JOIN conversations c ON c.id = m.conversation_id", "c.source", 1),
