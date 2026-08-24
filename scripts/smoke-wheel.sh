@@ -19,7 +19,7 @@ import duckdb, huggingface_hub, llama_cpp
 from ai_convos import cli
 
 requirements = metadata("convos").get_all("Requires-Dist") or []
-assert version("convos") == "0.8.1"
+assert version("convos") == "0.9.1"
 assert any(r.startswith("llama-cpp-python") for r in requirements), requirements
 assert any(r.startswith("huggingface-hub") for r in requirements), requirements
 conn = duckdb.connect(str(cli.DB_PATH))
@@ -30,5 +30,5 @@ cli.rebuild_fts_index(conn); conn.close(); cli.embed_text = lambda *args, **kwar
 hits = cli.hybrid_hits("why is semantic recall included?", limit=1)
 assert hits[0]["conversation_id"] == "smoke-conversation", hits
 assert Path(cli.PROJECT_ROOT).exists()
-print("clean wheel: convos 0.8.1, semantic dependencies and hybrid retrieval ready")
+print("clean wheel: convos 0.9.1, semantic dependencies and hybrid retrieval ready")
 PY

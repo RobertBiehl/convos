@@ -28,6 +28,14 @@ def test_incompatible_relay_database_is_rejected_instead_of_mutated(tmp_path):
     with pytest.raises(ValueError,match="incompatible"): connect(path)
 
 
+def test_paged_ledgers_seek_workspace_cursor_indexes(tmp_path):
+    db=connect(tmp_path/"server.db"); tables={"events":"event_workspace_cursor","row_replicas":"replica_workspace_cursor","blob_replicas":"blob_workspace_cursor"}
+    for table,index in tables.items():
+        assert tuple(r[2] for r in db.execute(f"PRAGMA index_info({index})"))==("workspace","cursor")
+        for direction in ("","DESC"):
+            plan=" ".join(str(v) for row in db.execute(f"EXPLAIN QUERY PLAN SELECT cursor FROM {table} WHERE workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace={table}.workspace AND k.epoch={table}.epoch AND k.device=?) ORDER BY cursor {direction} LIMIT 1",("w",1,"d")) for v in row); assert index in plan and "TEMP B-TREE" not in plan
+
+
 def test_personal_workspace_idempotency_and_ciphertext_only(tmp_path):
     db = connect(tmp_path/"server.db"); a = account(db,"alice"); key = bytes(range(32)); ws = "personal-alice"
     create_ws(db,a,ws,key,"personal")

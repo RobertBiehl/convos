@@ -121,6 +121,14 @@ def test_equal_revisions_from_different_authors_project_independently(tmp_path):
     assert bodies[0]["proof"]["revision"]==bodies[1]["proof"]["revision"] and apply_row_replicas(tmp_path/"db",bodies,"w",[control])==[True,True]; db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0]==2; db.close()
 
 
+def test_same_authored_row_has_one_identity_across_workspaces(tmp_path):
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":certificate(root,user,device),"history":True}; control=lambda ws:{"workspace":ws,"revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; row=lambda title:logical_row("conversations",fields,["c","codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]); base=row("base"); proofs={ws:row_proof(device,user,ws,1,base) for ws in ("a","b")}; path=tmp_path/"db"
+    assert apply_row_replicas(path,[{"row":base,"proof":proofs["a"]}],"a",[control("a")])==[True] and apply_row_replicas(path,[{"row":base,"proof":proofs["b"]}],"b",[control("b")])==[True]
+    db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT id,title FROM conversations").fetchall()==[(foreign_id(user,"conversations","c"),"base")] and db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==1 and {r[0] for r in db.execute("SELECT workspace_id FROM remote.row_proofs").fetchall()}=={"a","b"}; db.close()
+    newer=row("newer"); pa=row_proof(device,user,"a",1,newer,proofs["a"]["revision"]); assert apply_row_replicas(path,[{"row":newer,"proof":pa}],"a",[control("a")])==[True]; branch=row("branch"); pb=row_proof(device,user,"b",1,branch,proofs["b"]["revision"]); assert apply_row_replicas(path,[{"row":branch,"proof":pb}],"b",[control("b")])==[False]
+    db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="newer" and db.execute("SELECT COUNT(*) FROM remote.row_conflicts").fetchone()[0]==1; db.close()
+
+
 def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
     class Entry:
         def load(self): return lambda:{"v":2,"objects":{"x"},"records":lambda *_:[],"accept":lambda *_:None}

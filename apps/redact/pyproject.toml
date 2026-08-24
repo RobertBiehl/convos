@@ -1,11 +1,11 @@
 [project]
 name = "convos-redact"
-version = "0.8.2"
+version = "0.9.1"
 description = "Local secret scanning and safe team projection policy for convos"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["convos>=0.8,<0.9", "typer>=0.12.0"]
+dependencies = ["convos>=0.9,<0.10", "typer>=0.12.0"]
 
 [project.urls]
 Documentation = "https://github.com/RobertBiehl/convos/blob/master/docs/redact.md"

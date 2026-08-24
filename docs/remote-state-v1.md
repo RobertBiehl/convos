@@ -141,9 +141,14 @@ Each row proof separates its immutable origin workspace from the workspace and
 epoch that authorized that particular revision. They are initially equal. An
 explicitly re-founded workspace may authorize a later successor without
 rewriting the original namespace or predecessor.
-Imported physical IDs derive from `(workspace, author user, table, source row)`.
-The verified device certificate supplies the user; projection fails when that
-mapping is absent. Content equality is never used to infer row identity.
+Imported physical IDs derive from `(author user, table, source row)`. The
+verified device certificate supplies the user; projection fails when that
+mapping is absent. A workspace authorizes access to that identity through its
+signed row proofs but never creates another identity. `row_origins` retains the
+proof for the currently materialized revision, while every matching workspace
+proof remains available as an access path. Content equality is never used to
+infer row identity, and incomparable cross-workspace revisions stay conflicted
+instead of overwriting the materialized row by arrival order.
 
 Local absolute checkout paths are local-only and are never serialized to a
 remote canonical event. Remote workspace boundaries and device activity remain

@@ -31,9 +31,12 @@ CREATE TABLE IF NOT EXISTS workspace_device_exclusions(workspace TEXT,device TEX
 CREATE TABLE IF NOT EXISTS ledger_cursors(cursor INTEGER PRIMARY KEY AUTOINCREMENT);
 CREATE TABLE IF NOT EXISTS events(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,envelope TEXT,wire_hash TEXT,created REAL,UNIQUE(workspace,event));
 CREATE UNIQUE INDEX IF NOT EXISTS event_author_sequence ON events(workspace,author,seq);
+CREATE INDEX IF NOT EXISTS event_workspace_cursor ON events(workspace,cursor);
 CREATE TABLE IF NOT EXISTS row_replicas(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,replica TEXT,epoch INT,uploader TEXT,envelope TEXT,wire_hash TEXT,created REAL,updated REAL,UNIQUE(workspace,replica,epoch,uploader));
+CREATE INDEX IF NOT EXISTS replica_workspace_cursor ON row_replicas(workspace,cursor);
 CREATE TABLE IF NOT EXISTS replica_usage(workspace TEXT,uploader TEXT,bytes INT NOT NULL,PRIMARY KEY(workspace,uploader));
 CREATE TABLE IF NOT EXISTS blob_replicas(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,blob TEXT,epoch INT,uploader TEXT,size INT,nonce TEXT,ciphertext BLOB,created REAL,updated REAL,UNIQUE(workspace,blob,epoch,uploader));
+CREATE INDEX IF NOT EXISTS blob_workspace_cursor ON blob_replicas(workspace,cursor);
 CREATE TABLE IF NOT EXISTS origin_bundles(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,origin TEXT,epoch INT,uploader TEXT,envelope TEXT,wire_hash TEXT,created REAL,updated REAL,UNIQUE(workspace,origin,epoch,uploader));
 CREATE TABLE IF NOT EXISTS workspace_controls(workspace TEXT,revision INT,state_hash TEXT UNIQUE,state TEXT,PRIMARY KEY(workspace,revision));
 CREATE TABLE IF NOT EXISTS device_proposals(id TEXT PRIMARY KEY,workspace TEXT,base TEXT,target_user TEXT,target_device TEXT,proposal TEXT,not_before REAL,expires REAL,active INT);
@@ -65,6 +68,7 @@ def certify(db,actor,req):
     if body["user"]!=actor["user_id"] or body["device"]!=expected: raise PermissionError("device certificate does not match account")
     db.execute("INSERT OR REPLACE INTO device_certificates VALUES (?,?)",(body["device"]["id"],json.dumps(req["certificate"]))); db.commit(); return {"certified":body["device"]["id"]}
 def rows(db, sql, args=()): return [dict(r) for r in db.execute(sql, args).fetchall()]
+def cursor_bounds(db,table,access,args): return tuple((db.execute(f"SELECT cursor FROM {table} WHERE {access} ORDER BY cursor {direction} LIMIT 1",args).fetchone() or [0])[0] for direction in ("","DESC"))
 def verify_signed(value,sign_public):
     signature=unb64(value["signature"]); body={k:v for k,v in value.items() if k!="signature"}; Ed25519PublicKey.from_public_bytes(unb64(sign_public)).verify(signature,canon(body)); return value
 def verify_record(value):
@@ -315,7 +319,7 @@ def action(db, req, token=None):
     if op == "blob_pull":
         ws=req["workspace"]; m=device_member(db,ws,actor); after,limit=req.get("after",0),req.get("limit",20)
         if not isinstance(after,int) or isinstance(after,bool) or after<0 or not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=20: raise ValueError("blob page is invalid")
-        access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=blob_replicas.workspace AND k.epoch=blob_replicas.epoch AND k.device=?)"; args=(ws,m["history_from"],actor["id"]); bounds=db.execute(f"SELECT MIN(cursor),MAX(cursor) FROM blob_replicas WHERE {access}",args).fetchone(); values=bounded(db.execute(f"SELECT * FROM blob_replicas WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(after,limit)),lambda r:4*((len(r["ciphertext"])+2)//3)+1024); return {"floor":bounds[0] or 0,"tail":bounds[1] or 0,"blobs":[{"cursor":r["cursor"],"envelope":blob_envelope(r)} for r in values]}
+        access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=blob_replicas.workspace AND k.epoch=blob_replicas.epoch AND k.device=?)"; args=(ws,m["history_from"],actor["id"]); floor,tail=cursor_bounds(db,"blob_replicas",access,args); values=bounded(db.execute(f"SELECT * FROM blob_replicas WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(after,limit)),lambda r:4*((len(r["ciphertext"])+2)//3)+1024); return {"floor":floor,"tail":tail,"blobs":[{"cursor":r["cursor"],"envelope":blob_envelope(r)} for r in values]}
     if op == "origin_upload": return immediate(db,lambda:store_origin(db,actor,req["envelope"]))
     if op == "origin_pull":
         ws=req["workspace"]; m=device_member(db,ws,actor); values=rows(db,"SELECT cursor,envelope FROM origin_bundles WHERE workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=origin_bundles.workspace AND k.epoch=origin_bundles.epoch AND k.device=?) ORDER BY cursor",(ws,m["history_from"],actor["id"])); return {"origins":[{"cursor":r["cursor"],"envelope":json.loads(r["envelope"])} for r in values]}
@@ -326,12 +330,12 @@ def action(db, req, token=None):
     if op == "replica_pull":
         ws=req["workspace"]; m=device_member(db,ws,actor); after,limit=req.get("after",0),req.get("limit",500)
         if not isinstance(after,int) or isinstance(after,bool) or after<0 or not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=500: raise ValueError("replica page is invalid")
-        access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=row_replicas.workspace AND k.epoch=row_replicas.epoch AND k.device=?)"; args=(ws,m["history_from"],actor["id"]); bounds=db.execute(f"SELECT MIN(cursor),MAX(cursor) FROM row_replicas WHERE {access}",args).fetchone(); values=bounded(db.execute(f"SELECT cursor,envelope FROM row_replicas WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(after,limit)),lambda r:len(r["envelope"])); return {"floor":bounds[0] or 0,"tail":bounds[1] or 0,"replicas":[{"cursor":r["cursor"],"envelope":json.loads(r["envelope"])} for r in values]}
+        access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=row_replicas.workspace AND k.epoch=row_replicas.epoch AND k.device=?)"; args=(ws,m["history_from"],actor["id"]); floor,tail=cursor_bounds(db,"row_replicas",access,args); values=bounded(db.execute(f"SELECT cursor,envelope FROM row_replicas WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(after,limit)),lambda r:len(r["envelope"])); return {"floor":floor,"tail":tail,"replicas":[{"cursor":r["cursor"],"envelope":json.loads(r["envelope"])} for r in values]}
     if op == "pull":
         ws=req["workspace"]; m=device_member(db,ws,actor); limit=req.get("limit",500)
         if not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=500: raise ValueError("pull limit must be 1 to 500")
         access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?)"; args=(ws,m["history_from"],actor["id"])
-        bounds=db.execute(f"SELECT MIN(cursor),MAX(cursor) FROM events x WHERE {access}",args).fetchone(); floor,tail=(bounds[0] or 0),(bounds[1] or 0); out=rows(db,f"SELECT cursor,event,envelope,LENGTH(envelope) size FROM events x WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(req.get("after",0),limit))
+        floor,tail=cursor_bounds(db,"events x",access,args); out=rows(db,f"SELECT cursor,event,envelope,LENGTH(envelope) size FROM events x WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(req.get("after",0),limit))
         return {"floor":floor,"tail":tail,"events":[{"cursor":r["cursor"],**({"lazy":True,"event":r["event"],"size":r["size"]} if r["size"]>65536 else {"envelope":json.loads(r["envelope"])})} for r in out]}
     if op == "fetch":
         m=device_member(db,req["workspace"],actor); row=db.execute("SELECT cursor,envelope FROM events WHERE workspace=? AND event=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=events.workspace AND k.epoch=events.epoch AND k.device=?)",(req["workspace"],req["event"],m["history_from"],actor["id"])).fetchone()

@@ -38,6 +38,10 @@ includes all pull, verification, causal resolution, and projection work. Both
 recovery paths therefore pass the fixed 500 verified/projected
 objects-per-second gate without subtracting setup or validation work.
 
+Current benchmark output also reports an isolated full replica-page walk over
+the production-shaped encrypted relay rows. This separates relay cursor paging
+and envelope decoding from client decryption, verification, and projection.
+
 | Storage | Bytes | Relative to 4,102,565,888-byte source |
 |---|---:|---:|
 | Automatic migration backup | 0 | Current schema; no migration |
