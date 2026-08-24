@@ -1,5 +1,18 @@
+_BATCH,_MEMORY=50_000,512*2**20
+
+
 def _bad(db,sql,message):
     if db.execute(sql).fetchone(): raise ValueError(message)
+
+
+def _bytes(value):
+    number,unit=value.split()
+    return float(number)*{"B":1,"bytes":1,"KiB":2**10,"MiB":2**20,"GiB":2**30,"TiB":2**40}[unit]
+
+
+def _batches(db,kind):
+    maximum=db.execute("SELECT max(batch) FROM _convos_origins WHERE table_name=?",[kind]).fetchone()[0]
+    return range((maximum if maximum is not None else -1)+1)
 
 
 def remote_id_migration_scope(db,remote_id=None):
@@ -25,30 +38,34 @@ def _relation(db,name,id_column,kind):
     db.execute(f"CREATE OR REPLACE TEMP TABLE {target} AS SELECT x.* REPLACE (COALESCE(o.new_id,x.{id_column}) AS {id_column}) FROM {name} x LEFT JOIN _convos_origins o ON o.table_name='{kind}' AND o.physical_row_id=x.{id_column} QUALIFY row_number() OVER (PARTITION BY COALESCE(o.new_id,x.{id_column}){partition} ORDER BY COALESCE((SELECT winner FROM _convos_rows w WHERE w.kind='{kind}' AND w.old_id=x.{id_column}),FALSE) DESC)=1")
 
 
-def migrate_remote_ids(db,archive_columns):
+def _migrate_remote_ids(db,archive_columns):
     _bad(db,"SELECT 1 FROM remote.row_origins WHERE author_user_id IS NULL OR source_row_id IS NULL","remote origin identity is incomplete")
     db.execute("DROP TABLE IF EXISTS _convos_heads; DROP TABLE IF EXISTS _convos_origins; DROP TABLE IF EXISTS _convos_rows")
     db.execute("""CREATE TEMP TABLE _convos_heads AS WITH leaves AS (
       SELECT DISTINCT p.row_kind kind,p.author_user_id author,p.source_row_id source_id,p.revision,p.state
       FROM remote.row_proofs p WHERE NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE (c.row_kind,c.author_user_id,c.source_row_id)=(p.row_kind,p.author_user_id,p.source_row_id) AND c.previous_revision=p.revision))
       SELECT kind,author,source_id,count(*) leaf_count,min(revision) leaf_revision,min(state) leaf_state FROM leaves GROUP BY kind,author,source_id""")
-    db.execute("""CREATE TEMP TABLE _convos_origins AS WITH base AS (
+    db.execute(f"""CREATE TEMP TABLE _convos_origins AS WITH base AS (
       SELECT o.*,substr(sha256(to_json(o.author_user_id||':'||o.table_name||':'||o.source_row_id)),1,16) new_id,p.revision proof_revision,p.content_hash proof_content_hash,h.leaf_count,h.leaf_revision,h.leaf_state
       FROM remote.row_origins o LEFT JOIN remote.row_proofs p ON p.id=o.proof_id LEFT JOIN _convos_heads h ON (h.kind,h.author,h.source_id)=(o.table_name,o.author_user_id,o.source_row_id))
-      SELECT *,row_number() OVER (PARTITION BY table_name,author_user_id,source_row_id ORDER BY CASE WHEN leaf_count=1 AND proof_revision=leaf_revision THEN 0 ELSE 1 END,CASE WHEN physical_row_id=new_id THEN 0 ELSE 1 END,physical_row_id) origin_rank FROM base""")
+      ,ranked AS (SELECT *,row_number() OVER (PARTITION BY table_name,author_user_id,source_row_id ORDER BY CASE WHEN leaf_count=1 AND proof_revision=leaf_revision THEN 0 ELSE 1 END,CASE WHEN physical_row_id=new_id THEN 0 ELSE 1 END,physical_row_id) origin_rank FROM base)
+      SELECT *,floor((dense_rank() OVER (PARTITION BY table_name ORDER BY author_user_id,source_row_id)-1)/{_BATCH})::UINTEGER batch FROM ranked""")
     _bad(db,"SELECT 1 FROM (SELECT table_name,new_id,count(DISTINCT struct_pack(author_user_id,source_row_id)) n FROM _convos_origins GROUP BY table_name,new_id HAVING n>1)","remote physical ID collision")
-    db.execute("CREATE TEMP TABLE _convos_rows(kind VARCHAR,old_id VARCHAR,new_id VARCHAR,winner BOOLEAN)")
+    db.execute("CREATE TEMP TABLE _convos_rows(kind VARCHAR,old_id VARCHAR,new_id VARCHAR,winner BOOLEAN,batch UINTEGER)")
     for table in archive_columns:
         _bad(db,f"SELECT 1 FROM _convos_origins o JOIN {table} x ON x.id=o.new_id LEFT JOIN _convos_origins owned ON owned.table_name='{table}' AND owned.physical_row_id=x.id WHERE o.table_name='{table}' AND owned.physical_row_id IS NULL",f"remote {table} ID collides with a local row")
         _bad(db,f"""WITH live AS (SELECT o.* FROM _convos_origins o JOIN {table} x ON x.id=o.physical_row_id WHERE o.table_name='{table}') SELECT 1 FROM live GROUP BY table_name,author_user_id,source_row_id,leaf_count,leaf_revision,leaf_state HAVING count(*)>1 AND (COALESCE(leaf_count,0)<>1 OR count(*) FILTER (proof_revision=leaf_revision)=0) AND (count(proof_content_hash)<>count(*) OR count(DISTINCT proof_content_hash)<>1)""",f"remote {table} has irreconcilable pre-v2 identities")
         _bad(db,f"""SELECT 1 FROM _convos_origins o JOIN _convos_heads h ON (h.kind,h.author,h.source_id)=(o.table_name,o.author_user_id,o.source_row_id) LEFT JOIN {table} x ON x.id=o.physical_row_id WHERE o.table_name='{table}' AND h.leaf_count=1 AND h.leaf_state='active' GROUP BY o.table_name,o.author_user_id,o.source_row_id HAVING count(x.id)=0""",f"remote {table} current body is unavailable")
-        db.execute(f"""INSERT INTO _convos_rows WITH ranked AS (SELECT o.table_name kind,o.physical_row_id old_id,o.new_id,o.leaf_count,o.leaf_state,row_number() OVER (PARTITION BY o.table_name,o.author_user_id,o.source_row_id ORDER BY CASE WHEN o.leaf_count=1 AND o.proof_revision=o.leaf_revision THEN 0 ELSE 1 END,CASE WHEN o.physical_row_id=o.new_id THEN 0 ELSE 1 END,o.physical_row_id) rn FROM _convos_origins o JOIN {table} x ON x.id=o.physical_row_id WHERE o.table_name='{table}') SELECT kind,old_id,new_id,NOT COALESCE(leaf_count=1 AND leaf_state='deleted',FALSE) AND rn=1 FROM ranked""")
+        db.execute(f"""INSERT INTO _convos_rows WITH ranked AS (SELECT o.table_name kind,o.physical_row_id old_id,o.new_id,o.leaf_count,o.leaf_state,o.batch,row_number() OVER (PARTITION BY o.table_name,o.author_user_id,o.source_row_id ORDER BY CASE WHEN o.leaf_count=1 AND o.proof_revision=o.leaf_revision THEN 0 ELSE 1 END,CASE WHEN o.physical_row_id=o.new_id THEN 0 ELSE 1 END,o.physical_row_id) rn FROM _convos_origins o JOIN {table} x ON x.id=o.physical_row_id WHERE o.table_name='{table}') SELECT kind,old_id,new_id,NOT COALESCE(leaf_count=1 AND leaf_state='deleted',FALSE) AND rn=1,batch FROM ranked""")
     changed={r[0] for r in db.execute("SELECT DISTINCT table_name FROM _convos_origins WHERE physical_row_id<>new_id").fetchall()}
     has_fts=bool(db.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone())
     direct=has_fts and "messages" in changed and not fts_needs_rebuild(db)
     rebuild=has_fts and "messages" in changed and not direct
     if direct:
-        db.execute("DELETE FROM fts_main_messages.terms USING fts_main_messages.docs d,_convos_rows r WHERE terms.docid=d.docid AND r.kind='messages' AND r.old_id=d.name AND NOT r.winner; DELETE FROM fts_main_messages.docs USING _convos_rows r WHERE r.kind='messages' AND r.old_id=docs.name AND NOT r.winner; UPDATE fts_main_messages.docs SET name=r.new_id FROM _convos_rows r WHERE r.kind='messages' AND r.winner AND docs.name=r.old_id")
+        for batch in _batches(db,"messages"):
+            db.execute("DELETE FROM fts_main_messages.terms USING fts_main_messages.docs d,_convos_rows r WHERE terms.docid=d.docid AND r.kind='messages' AND r.batch=? AND r.old_id=d.name AND NOT r.winner",[batch])
+            db.execute("DELETE FROM fts_main_messages.docs USING _convos_rows r WHERE r.kind='messages' AND r.batch=? AND r.old_id=docs.name AND NOT r.winner",[batch])
+            db.execute("UPDATE fts_main_messages.docs SET name=r.new_id FROM _convos_rows r WHERE r.kind='messages' AND r.batch=? AND r.winner AND docs.name=r.old_id",[batch])
         if db.execute("SELECT 1 FROM _convos_rows WHERE kind='messages' AND NOT winner").fetchone(): db.execute("UPDATE fts_main_messages.dict d SET df=COALESCE(x.df,0) FROM (SELECT d.termid,count(DISTINCT t.docid) df FROM fts_main_messages.dict d LEFT JOIN fts_main_messages.terms t ON t.termid=d.termid GROUP BY d.termid) x WHERE x.termid=d.termid; UPDATE fts_main_messages.stats SET num_docs=(SELECT count(*) FROM fts_main_messages.docs),avgdl=COALESCE((SELECT avg(len) FROM fts_main_messages.docs),0)")
     db.execute("""CREATE TEMP TABLE _convos_origin_keep AS WITH ranked AS (SELECT o.*,row_number() OVER (PARTITION BY o.table_name,o.author_user_id,o.source_row_id ORDER BY CASE WHEN r.winner THEN 0 ELSE 1 END,o.origin_rank) rn FROM _convos_origins o LEFT JOIN _convos_rows r ON r.kind=o.table_name AND r.old_id=o.physical_row_id) SELECT table_name,new_id physical_row_id,workspace_id,author_user_id,author_device_id,source_row_id,source_event_id,content_key,observed_at,proof_id FROM ranked WHERE rn=1""")
     _relation(db,"attachment_bodies","attachment_id","attachments")
@@ -60,9 +77,13 @@ def migrate_remote_ids(db,archive_columns):
     db.execute("CREATE TEMP TABLE _convos_entity_map AS SELECT DISTINCT table_name kind,physical_row_id old_id,new_id FROM _convos_origins UNION SELECT DISTINCT p.kind,p.physical_entity,n.physical_entity FROM remote.provenance_origins p JOIN _convos_provenance n USING(kind,workspace_id,author_user_id,source_entity); CREATE TEMP TABLE _convos_changes AS SELECT c.kind,COALESCE(m.new_id,c.entity) entity,max(c.generation) generation FROM archive_changes c LEFT JOIN _convos_entity_map m ON (m.kind,m.old_id)=(c.kind,c.entity) GROUP BY c.kind,COALESCE(m.new_id,c.entity)")
     fks={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
     for table,parents in fks.items():
-        for column,parent in parents: db.execute(f"UPDATE {table} x SET {column}=o.new_id FROM _convos_origins o WHERE o.table_name='{parent}' AND x.{column}=o.physical_row_id AND o.physical_row_id<>o.new_id")
-    db.execute("""UPDATE messages w SET embedding=l.embedding FROM _convos_rows rw,_convos_rows rl,messages l,_convos_origins ow,_convos_origins ol WHERE rw.kind='messages' AND rw.winner AND rl.kind='messages' AND NOT rl.winner AND rw.new_id=rl.new_id AND w.id=rw.old_id AND l.id=rl.old_id AND w.embedding IS NULL AND l.embedding IS NOT NULL AND ow.table_name='messages' AND ow.physical_row_id=rw.old_id AND ol.table_name='messages' AND ol.physical_row_id=rl.old_id AND ow.proof_content_hash=ol.proof_content_hash""")
-    for table in archive_columns: db.execute(f"DELETE FROM {table} USING _convos_rows r WHERE r.kind='{table}' AND NOT r.winner AND id=r.old_id; UPDATE {table} SET id=r.new_id FROM _convos_rows r WHERE r.kind='{table}' AND r.winner AND id=r.old_id AND r.old_id<>r.new_id")
+        for column,parent in parents:
+            for batch in _batches(db,parent): db.execute(f"UPDATE {table} x SET {column}=o.new_id FROM _convos_origins o WHERE o.table_name='{parent}' AND o.batch=? AND x.{column}=o.physical_row_id AND o.physical_row_id<>o.new_id",[batch])
+    for batch in _batches(db,"messages"): db.execute("""UPDATE messages w SET embedding=l.embedding FROM _convos_rows rw,_convos_rows rl,messages l,_convos_origins ow,_convos_origins ol WHERE rw.kind='messages' AND rw.batch=? AND rw.winner AND rl.kind='messages' AND NOT rl.winner AND rw.new_id=rl.new_id AND w.id=rw.old_id AND l.id=rl.old_id AND w.embedding IS NULL AND l.embedding IS NOT NULL AND ow.table_name='messages' AND ow.physical_row_id=rw.old_id AND ol.table_name='messages' AND ol.physical_row_id=rl.old_id AND ow.proof_content_hash=ol.proof_content_hash""",[batch])
+    for table in archive_columns:
+        for batch in _batches(db,table):
+            db.execute(f"DELETE FROM {table} USING _convos_rows r WHERE r.kind='{table}' AND r.batch=? AND NOT r.winner AND id=r.old_id",[batch])
+            db.execute(f"UPDATE {table} SET id=r.new_id FROM _convos_rows r WHERE r.kind='{table}' AND r.batch=? AND r.winner AND id=r.old_id AND r.old_id<>r.new_id",[batch])
     for name in ("attachment_bodies","provenance.file_edit_files","provenance.checkpoint_edits"):
         target=f"_convos_{name.replace('.','_')}"
         db.execute(f"DELETE FROM {name}; INSERT INTO {name} SELECT * FROM {target}")
@@ -70,3 +91,17 @@ def migrate_remote_ids(db,archive_columns):
     generation=db.execute("UPDATE archive_state SET generation=generation+1 WHERE singleton RETURNING generation").fetchone()[0]
     db.execute("DELETE FROM archive_changes; INSERT INTO archive_changes SELECT * FROM _convos_changes; INSERT OR REPLACE INTO archive_changes SELECT DISTINCT kind,new_id,? FROM _convos_entity_map WHERE old_id<>new_id",[generation])
     return changed,rebuild
+
+
+def migrate_remote_ids(db,archive_columns):
+    limit=db.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    db.execute("RESET memory_limit")
+    default=db.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    custom=limit!=default
+    if custom: db.execute("SET memory_limit=?",[limit])
+    capped=_bytes(limit)>_MEMORY
+    try:
+        if capped: db.execute("SET memory_limit=?",[f"{_MEMORY}B"])
+        return _migrate_remote_ids(db,archive_columns)
+    finally:
+        db.execute("SET memory_limit=?",[limit]) if custom else db.execute("RESET memory_limit")
