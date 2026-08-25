@@ -3,7 +3,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from ai_convos.cli import capture_provenance, init_schema, project_attachment_body, project_row_proof, provenance_digest
+from ai_convos.cli import ARCHIVE_COLUMNS, capture_provenance, init_schema, project_attachment_body, project_row_proof, provenance_digest
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish, sharing_routes
 from ai_convos_remote.projection import apply_row_replicas, attest_rows, blob_replicas, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, row_replicas, scan, sequence, sharing
@@ -147,15 +147,23 @@ def test_event_support_is_exact_and_unknowns_fail_closed(monkeypatch):
 
 
 def test_member_sharing_preference_is_root_signed_and_defaults_on(tmp_path):
-    state=connect(tmp_path/"state.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); state.executemany("INSERT INTO policies VALUES (?,?,?,?)",[("w",user,"repository","mine"),("w","teammate","repository","theirs"),("w","teammate","path","opaque")]); assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":None,"effective_auto_contribute":True,"match":["cwd","edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:opaque":"/bound"})==(["mine","theirs"],["/bound"],["cwd","edit"])
+    state=connect(tmp_path/"state.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); state.executemany("INSERT INTO policies VALUES (?,?,?,?)",[("w",user,"repository","mine"),("w","teammate","repository","theirs"),("w","teammate","path","opaque")]); state.execute("INSERT INTO meta VALUES ('core_generation:w','7')"); assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":None,"effective_auto_contribute":True,"match":["cwd","edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:opaque":"/bound"})==(["mine","theirs"],["/bound"],["cwd","edit"])
     row={"v":1,"kind":"sharing.preference","id":f"sharing:w:{user}","state":"active","data":{"auto_contribute":False,"match":["edit"]}}; proof=semantic_proof(root,user,device["id"],"w",1,row); value=event(device,1,"workspace.preference",row["id"],{"row":row,"proof":proof}); project(tmp_path/"core.db",state,value,"w",authors={device["id"]:user},local_user=user)
-    assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":False,"effective_auto_contribute":False,"match":["edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:opaque":"/bound"})==(["mine"],["/bound"],["edit"])
+    assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":False,"effective_auto_contribute":False,"match":["edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:opaque":"/bound"})==(["mine"],["/bound"],["edit"]) and not state.execute("SELECT 1 FROM meta WHERE key='core_generation:w'").fetchone()
+
+
+def test_incoming_policy_invalidates_cached_team_scope(tmp_path):
+    state=connect(tmp_path/"state.db"); state.execute("INSERT INTO meta VALUES ('core_generation:w','7')"); device=identity("device"); value=event(device,1,"workspace.policy","policy:path:grant",{"kind":"path","value":"grant"}); project(tmp_path/"core.db",state,value,"w",authors={device["id"]:"member"}); assert not state.execute("SELECT 1 FROM meta WHERE key='core_generation:w'").fetchone()
 
 
 def test_team_match_modes_are_independent_and_empty_is_passive(tmp_path):
     repo,core=source(tmp_path); core.execute("INSERT INTO conversations VALUES ('cwd','codex','cwd only','2026-01-02','2026-01-02','m',?,NULL,NULL,'{}')",[str(repo)]); core.execute("INSERT INTO messages VALUES ('cwd-m','cwd','user','inspect',NULL,'2026-01-02','m','{}',NULL,NULL)"); state=connect(tmp_path/"state.db"); rid=next(r["payload"]["id"] for r in scan(core,state) if r["kind"]=="repository.observed")
     selected=lambda mode:{r["payload"]["row"][0] for r in scan(core,state,"team",[rid],[],match=mode) if r["kind"]=="conversation.record"}
     assert selected(["cwd"])=={"c","cwd"} and selected(["edit"])=={"c"} and selected([])==set()
+
+
+def test_durable_row_proof_keeps_admitted_conversation_after_state_rebuild(tmp_path):
+    repo,core=source(tmp_path); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); row=logical_row("conversations",ARCHIVE_COLUMNS["conversations"],list(core.execute("SELECT * FROM conversations WHERE id='c'").fetchone())); proof=row_proof(device,user,"w",1,row); project_row_proof(core,proof,root["sign_public"],certificate(root,user,device)); state=connect(tmp_path/"fresh-state.db"); scope=set(); records=scan(core,state,"team",[],[],None,"w",scope,match=[]); assert "c" in scope and any(r["kind"]=="conversation.record" and r["payload"]["row"][0]=="c" for r in records)
 
 
 def test_team_scope_includes_prompt_turn_and_linked_repo_only(tmp_path):

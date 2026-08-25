@@ -104,6 +104,10 @@ encrypted outbox file. Plaintext event JSON, acknowledged envelopes,
 attachment chunk bodies in SQLite, raw provenance JSON, prompts, and other
 derived content are forbidden.
 
+Current root-signed member preferences are re-delivered after every workspace
+epoch change. Future-only members and recovered devices therefore receive
+current sharing behavior without receiving earlier conversation history.
+
 ### Relay
 
 The relay stores opaque delivery envelopes and encrypted blobs for availability
