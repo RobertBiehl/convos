@@ -32,7 +32,7 @@ def test_old_state_inspection_is_read_only_and_cutover_preserves_exact_backup(tm
     with pytest.raises(ValueError,match="rebuild required"): connect(path)
     assert (path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in tmp_path.iterdir()})==before
     report=cutover_state(path); backup=Path(report["backup"]); old=__import__("sqlite3").connect(backup/"state.db"); assert old.execute("SELECT value FROM legacy_payload").fetchone()[0]=="only in old state"; old.close()
-    state=connect(path); assert state.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()[0]=="3" and json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["backup"]==str(backup); state.close(); assert inspect_state(path)["status"]=="current" and os.stat(backup).st_mode&0o777==0o700 and os.stat(backup/"state.db").st_mode&0o777==0o600
+    state=connect(path); assert state.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()[0]=="4" and json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["backup"]==str(backup); state.close(); assert inspect_state(path)["status"]=="current" and os.stat(backup).st_mode&0o777==0o700 and os.stat(backup/"state.db").st_mode&0o777==0o600
 
 
 def test_cutover_recovers_corrupt_regular_state_but_refuses_symlink(tmp_path):
@@ -148,9 +148,9 @@ def test_event_support_is_exact_and_unknowns_fail_closed(monkeypatch):
 
 
 def test_member_sharing_preference_is_root_signed_and_defaults_on(tmp_path):
-    state=connect(tmp_path/"state.db"); core=duckdb.connect(); init_schema(core); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); state.executemany("INSERT INTO policies VALUES (?,?,?,?,?)",[("w",user,"repository","mine",None),("w","teammate","repository","theirs",None),("w","teammate","path","opaque",None)]); state.execute("INSERT INTO meta VALUES ('core_generation:w','7')"); assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":None,"effective_auto_contribute":True,"match":["cwd","edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:opaque":"/bound"},core)==(["mine","theirs"],["/bound"],["cwd","edit"])
+    state=connect(tmp_path/"state.db"); core=duckdb.connect(); init_schema(core); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); state.executemany("INSERT INTO policies VALUES (?,?,?,?,?)",[("w",user,"repository","mine",None),("w","teammate","repository","theirs",None),("w",user,"path","opaque",None)]); state.execute("INSERT INTO meta VALUES ('core_generation:w','7')"); assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":None,"effective_auto_contribute":True,"match":["cwd","edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:path:opaque":"/bound"},core)==(["mine","theirs"],["/bound"],["cwd","edit"])
     row={"v":1,"kind":"sharing.preference","id":f"sharing:w:{user}","state":"active","data":{"auto_contribute":False,"match":["edit"]}}; proof=semantic_proof(root,user,device["id"],"w",1,row); value=event(device,1,"workspace.preference",row["id"],{"row":row,"proof":proof}); project(tmp_path/"core.db",state,value,"w",authors={device["id"]:user},local_user=user)
-    assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":False,"effective_auto_contribute":False,"match":["edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:opaque":"/bound"},core)==(["mine"],["/bound"],["edit"]) and not state.execute("SELECT 1 FROM meta WHERE key='core_generation:w'").fetchone()
+    assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":False,"effective_auto_contribute":False,"match":["edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:path:opaque":"/bound"},core)==(["mine"],["/bound"],["edit"]) and not state.execute("SELECT 1 FROM meta WHERE key='core_generation:w'").fetchone()
 
 
 def test_incoming_policy_invalidates_cached_team_scope(tmp_path):
@@ -158,18 +158,28 @@ def test_incoming_policy_invalidates_cached_team_scope(tmp_path):
 
 
 def test_repository_grant_token_uses_evidence_and_bound_checkout_can_go_dormant(tmp_path):
-    root,core=source(tmp_path); state=connect(tmp_path/"state.db"); user="member"; repo=repository(root,core); evidence={k:repo[k] for k in ("lineage","remotes")}; state.execute("INSERT INTO policies VALUES (?,?,?,?,?)",("w",user,"repository","grant",json.dumps(evidence))); bindings={"w:grant":str(root)}
+    root,core=source(tmp_path); state=connect(tmp_path/"state.db"); user="member"; repo=repository(root,core); evidence={k:repo[k] for k in ("lineage","remotes")}; state.execute("INSERT INTO policies VALUES (?,?,?,?,?)",("w",user,"repository","grant",json.dumps(evidence))); bindings={"w:repository:grant":{"path":str(root),"repository":repo["id"],"checkout":repo["checkout"]}}
     assert sharing_routes(state,"w",user,bindings,core)[0]==[repo["id"]]; git(root,"remote","add","origin","git@github.com:acme/renamed.git"); assert sharing_routes(state,"w",user,bindings,core)[0]==[repo["id"]]
     __import__("shutil").rmtree(root/".git"); core.close(); capture_provenance(tmp_path/"source.db"); core=duckdb.connect(str(tmp_path/"source.db")); assert sharing_routes(state,"w",user,bindings,core)[0]==[]
 
 
 def test_path_grant_promotes_only_when_its_exact_root_becomes_git(tmp_path,monkeypatch):
-    root=tmp_path/"repo"; root.mkdir(); core=duckdb.connect(); init_schema(core); state=connect(tmp_path/"state.db"); state.execute("INSERT INTO policies VALUES ('w','member','path','path-grant',NULL)"); cfg={"user":"member","bindings":{"w:path-grant":str(root)},"promotions":{}}; events=[]; saved=[]
-    def emit(cfg,state,ws,record,root=None): p=record["payload"]; events.append(record); state.execute("INSERT INTO policies VALUES (?,?,?,?,?)",(ws,cfg["user"],p["kind"],p["value"],json.dumps(p["evidence"])))
+    root=tmp_path/"repo"; root.mkdir(); core=duckdb.connect(); init_schema(core); state=connect(tmp_path/"state.db"); state.execute("INSERT INTO policies VALUES ('w','member','path','path-grant',NULL)"); signer=identity("member"); cfg={"user":public_id(signer["sign_public"]),"root":signer,"device":identity("device"),"workspaces":{"w":{"epoch":1}},"bindings":{"w:path:path-grant":str(root)},"promotions":{}}; state.execute("UPDATE policies SET owner=?",(cfg["user"],)); events=[]; saved=[]
+    def emit(cfg,state,ws,record,root=None): p=record["payload"]; events.append(record); state.execute("INSERT INTO policies VALUES (?,?,?,?,?)",(ws,cfg["user"],"repository",p["row"]["data"]["value"],json.dumps(p["row"]["data"]["evidence"])))
     monkeypatch.setattr(remote_client,"publish",emit); monkeypatch.setattr(remote_client,"save",lambda *args:saved.append(1))
     assert not promote_paths(cfg,state,core); git(root,"init","-q"); git(root,"config","user.email","a@b.c"); git(root,"config","user.name","A"); (root/"a.py").write_text("new\n"); git(root,"add","."); git(root,"commit","-qm","init")
-    assert promote_paths(cfg,state,core) and not promote_paths(cfg,state,core) and len(events)==len(saved)==1 and events[0]["payload_v"]==2 and events[0]["payload"]["value"]==cfg["promotions"]["w:path-grant"] and cfg["bindings"][f"w:{events[0]['payload']['value']}"]==str(root)
-    state.execute("INSERT INTO policies VALUES ('w','member','path','second-path',NULL)"); cfg["bindings"]["w:second-path"]=str(root); assert promote_paths(cfg,state,core) and len(events)==1 and len(saved)==2 and cfg["promotions"]["w:second-path"]==events[0]["payload"]["value"]
+    assert promote_paths(cfg,state,core) and not promote_paths(cfg,state,core) and len(events)==len(saved)==1 and events[0]["payload_v"]==2 and events[0]["payload"]["row"]["data"]["value"]==cfg["promotions"]["w:path:path-grant"] and cfg["bindings"][f"w:repository:{events[0]['payload']['row']['data']['value']}"]["path"]==str(root)
+    state.execute("INSERT INTO policies VALUES ('w',?,'path','second-path',NULL)",(cfg["user"],)); cfg["bindings"]["w:path:second-path"]=str(root); assert promote_paths(cfg,state,core) and len(events)==1 and len(saved)==2 and cfg["promotions"]["w:path:second-path"]==events[0]["payload"]["row"]["data"]["value"]
+
+
+def test_grant_binding_kind_and_owner_prevent_repository_to_path_downgrade(tmp_path):
+    root,core=source(tmp_path); state=connect(tmp_path/"state.db"); state.executemany("INSERT INTO policies VALUES (?,?,?,?,?)",[("w","member","repository","shared",None),("w","attacker","path","shared",None)]); repos,roots,_=sharing_routes(state,"w","member",{"w:repository:shared":str(root)},core); assert repos==["shared"] and roots==[]
+
+
+def test_repository_policy_evidence_is_root_signed_and_immutable(tmp_path):
+    state=connect(tmp_path/"state.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); row=lambda lineage:{"v":1,"kind":"repository.policy","id":"repository:w:grant","state":"active","data":{"value":"grant","evidence":{"lineage":lineage,"remotes":[]}}}; wrap=lambda value,seq:event(device,seq,"workspace.policy","policy:repository:grant",{"row":value,"proof":semantic_proof(root,user,device["id"],"w",1,value)},payload_v=2); authors={device["id"]:user}; first=wrap(row("a"),1); assert project(tmp_path/"core.db",state,first,"w",authors=authors) and project(tmp_path/"core.db",state,first,"w",authors=authors)
+    with pytest.raises(ValueError,match="evidence conflict"): project(tmp_path/"core.db",state,wrap(row("b"),2),"w",authors=authors)
+    assert json.loads(state.execute("SELECT evidence FROM policies").fetchone()[0])["lineage"]=="a"
 
 
 def test_team_match_modes_are_independent_and_empty_is_passive(tmp_path):

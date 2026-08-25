@@ -27,7 +27,7 @@ def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_pat
     observed=next(r for r in records if r["kind"]=="repository.observed"); head=db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]; project(db,{**observed,"payload":{k:v for k,v in observed["payload"].items() if k!="head"},"observed_at":None}); assert db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]==head
     row=query(db,"conversation_changes","c")[0]; assert row["repositories"]==2 and row["files"]==2 and row["prompt"]=="make the cross-repo change" and row["changeset_id"]=="m"
     assert len(query(db,"changeset_files","m"))==2 and query(db,"current_activity",str(a))[0]["repository"]==repository(a)["id"]
-    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","repository_aliases","conversation_scopes","files","file_versions","file_edit_files","git_checkpoints","checkpoint_edits","local_facts"}
+    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","repository_aliases","conversation_scopes","files","file_versions","file_edit_scopes","file_edit_files","git_checkpoints","checkpoint_edits","local_facts"}
     columns={r[0] for r in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance'").fetchall()}; assert not columns&{"prompt","content","payload","workspace","author"}
 
 
@@ -37,7 +37,7 @@ def test_core_schema_upgrade_adds_canonical_schemas_without_rewriting_archive(tm
 
 
 def test_existing_core_is_checkpointed_once_before_automatic_migration(tmp_path):
-    path=tmp_path/"legacy.db"; db=duckdb.connect(str(path)); db.execute("CREATE TABLE conversations(id VARCHAR,title VARCHAR)"); db.execute("INSERT INTO conversations VALUES ('keep','preserved')"); db.close(); db=duckdb.connect(str(path)); init_schema(db); db.close(); backup=path.with_name("legacy.db.pre-v1.bak"); check=duckdb.connect(str(backup),read_only=True); assert check.execute("SELECT * FROM conversations").fetchall()==[("keep","preserved")]; check.close(); stamp=backup.stat().st_mtime_ns; db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==2; db.close(); assert backup.stat().st_mtime_ns==stamp and backup.stat().st_mode&0o777==0o600
+    path=tmp_path/"legacy.db"; db=duckdb.connect(str(path)); db.execute("CREATE TABLE conversations(id VARCHAR,title VARCHAR)"); db.execute("INSERT INTO conversations VALUES ('keep','preserved')"); db.close(); db=duckdb.connect(str(path)); init_schema(db); db.close(); backup=path.with_name("legacy.db.pre-v1.bak"); check=duckdb.connect(str(backup),read_only=True); assert check.execute("SELECT * FROM conversations").fetchall()==[("keep","preserved")]; check.close(); stamp=backup.stat().st_mtime_ns; db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==3; db.close(); assert backup.stat().st_mtime_ns==stamp and backup.stat().st_mode&0o777==0o600
 
 
 def test_stale_fixed_migration_backup_is_preserved_not_reused(tmp_path):
@@ -45,7 +45,7 @@ def test_stale_fixed_migration_backup_is_preserved_not_reused(tmp_path):
 
 
 def test_v2_unaffected_archive_skips_backup_and_rewrite(tmp_path):
-    path=tmp_path/"ready.db"; db=graph(path); user="author"; row_id=remote_id(user,"conversations","c"); db.execute("INSERT INTO conversations VALUES (?,'codex','ready',NULL,NULL,NULL,NULL,NULL,NULL,'{}')",[row_id]); db.execute("INSERT INTO remote.row_origins VALUES ('conversations',?,'w',?,'d','c','e','conversations:c',NULL,NULL)",[row_id,user]); before=archive_state(db)[1]; db.execute("UPDATE core_schema SET version=1"); db.close(); db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT id FROM conversations").fetchone()[0]==row_id and archive_state(db)[1]==before and db.execute("SELECT version FROM core_schema").fetchone()[0]==2; db.close(); assert not path.with_name("ready.db.pre-v2.bak").exists()
+    path=tmp_path/"ready.db"; db=graph(path); user="author"; row_id=remote_id(user,"conversations","c"); db.execute("INSERT INTO conversations VALUES (?,'codex','ready',NULL,NULL,NULL,NULL,NULL,NULL,'{}')",[row_id]); db.execute("INSERT INTO remote.row_origins VALUES ('conversations',?,'w',?,'d','c','e','conversations:c',NULL,NULL)",[row_id,user]); before=archive_state(db)[1]; db.execute("UPDATE core_schema SET version=1"); db.close(); db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT id FROM conversations").fetchone()[0]==row_id and archive_state(db)[1]==before and db.execute("SELECT version FROM core_schema").fetchone()[0]==3; db.close(); assert not path.with_name("ready.db.pre-v2.bak").exists()
 
 
 def test_v2_migration_caps_memory_restores_setting_and_honors_lower_limit():
@@ -73,14 +73,14 @@ def test_v2_resumes_durable_archive_change_cutover(tmp_path,monkeypatch):
     path=tmp_path/"resume-changes.db"; db=graph(path); user="author"; old=digest(f"workspace:{user}:conversations:c")[:16]; new=remote_id(user,"conversations","c"); db.execute("INSERT INTO conversations VALUES (?,'codex','x',NULL,NULL,NULL,NULL,NULL,NULL,'{}')",[old]); db.execute("INSERT INTO remote.row_origins VALUES ('conversations',?,'workspace',?,'device','c','event','key',NULL,NULL)",[old,user]); db.execute("INSERT OR REPLACE INTO archive_changes VALUES ('conversations',?,1)",[old]); db.execute("UPDATE core_schema SET version=1"); db.close(); real=migrations_module.migrate_remote_changes; monkeypatch.setattr(migrations_module,"migrate_remote_changes",lambda *_:(_ for _ in ()).throw(RuntimeError("cutover interrupted"))); db=duckdb.connect(str(path))
     with pytest.raises(RuntimeError,match="cutover interrupted"): init_schema(db)
     assert db.execute("SELECT version FROM core_schema").fetchone()[0]==1 and db.execute("SELECT state FROM core_migrations").fetchone()[0]=="changes" and db.execute("SELECT id FROM conversations").fetchone()[0]==new and db.execute("SELECT 1 FROM core_remote_id_map").fetchone()
-    monkeypatch.setattr(migrations_module,"migrate_remote_changes",real); init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==2 and db.execute("SELECT entity FROM archive_changes WHERE kind='conversations'").fetchone()[0]==new and not db.execute("SELECT 1 FROM information_schema.tables WHERE table_name='core_remote_id_map'").fetchone(); db.close()
+    monkeypatch.setattr(migrations_module,"migrate_remote_changes",real); init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==3 and db.execute("SELECT entity FROM archive_changes WHERE kind='conversations'").fetchone()[0]==new and not db.execute("SELECT 1 FROM information_schema.tables WHERE table_name='core_remote_id_map'").fetchone(); db.close()
 
 
 def test_v2_resumes_durable_batched_data_cutover(tmp_path,monkeypatch):
     path=tmp_path/"resume-data.db"; db=graph(path); user="author"; old=digest(f"workspace:{user}:conversations:c")[:16]; new=remote_id(user,"conversations","c"); db.execute("INSERT INTO conversations VALUES (?,'codex','x',NULL,NULL,NULL,NULL,NULL,NULL,'{}')",[old]); db.execute("INSERT INTO remote.row_origins VALUES ('conversations',?,'workspace',?,'device','c','event','key',NULL,NULL)",[old,user]); db.execute("UPDATE core_schema SET version=1"); db.close(); real=migrations_module.migrate_remote_data; monkeypatch.setattr(migrations_module,"migrate_remote_data",lambda *_:(_ for _ in ()).throw(RuntimeError("data cutover interrupted"))); db=duckdb.connect(str(path))
     with pytest.raises(RuntimeError,match="data cutover interrupted"): init_schema(db)
     assert db.execute("SELECT state FROM core_migrations WHERE name='remote_ids'").fetchone()[0]=="data" and db.execute("SELECT id FROM conversations").fetchone()[0]==old and db.execute("SELECT 1 FROM core_remote_id_rows").fetchone(); db.close(); monkeypatch.setattr(migrations_module,"migrate_remote_data",real); db=duckdb.connect(str(path)); init_schema(db)
-    assert db.execute("SELECT version FROM core_schema").fetchone()[0]==2 and db.execute("SELECT id FROM conversations").fetchone()[0]==new and not db.execute("SELECT 1 FROM information_schema.tables WHERE table_name LIKE 'core_remote_%'").fetchone(); db.close()
+    assert db.execute("SELECT version FROM core_schema").fetchone()[0]==3 and db.execute("SELECT id FROM conversations").fetchone()[0]==new and not db.execute("SELECT 1 FROM information_schema.tables WHERE table_name LIKE 'core_remote_%'").fetchone(); db.close()
 
 
 def test_v2_migrates_workspace_scoped_rows_and_unblocks_provenance_replay(tmp_path,monkeypatch):
@@ -89,7 +89,7 @@ def test_v2_migrates_workspace_scoped_rows_and_unblocks_provenance_replay(tmp_pa
         row=logical_row(table,ARCHIVE_COLUMNS[table],values); proof=row_proof(device,user,workspace,1,row); pids[table]=pid=project_row_proof(db,proof,root["sign_public"],cert); physical=values.copy(); physical[0]=old(table,values[0]); physical[1]=old("conversations" if table=="messages" else "messages",values[1]) if table!="conversations" else physical[1]; origin={"workspace_id":workspace,"author_user_id":user,"author_device_id":device["id"],"source_row_id":values[0],"source_event_id":proof["revision"],"content_key":f"{table}:{values[0]}","observed_at":None,"proof_id":pid}; project_archive_row(db,table,ARCHIVE_COLUMNS[table],physical,origin)
     db.execute("INSERT INTO provenance.files VALUES ('f',NULL,'x.py','external')"); event={"kind":"edit.observed","entity":"e","payload":{"id":"e","turn":"m","file":"f","repository":None,"old_content_hash":"old","new_content_hash":"new","evidence":"captured_exact"},"observed_at":None}; mapper=lambda table,value:remote_id(user,table,value); legacy=lambda table,value:old(table,value); assert project(db,event,legacy); old_link=digest({"checkpoint":"cp","edit":old("file_edits","e")}); db.execute("INSERT INTO provenance.checkpoint_edits VALUES ('cp',?,'full_content_match')",[old("file_edits","e")]); db.execute("INSERT INTO remote.provenance_origins VALUES ('edit.observed',?,?,?,?,?)",(old("file_edits","e"),workspace,user,"e",pids["file_edits"])); db.execute("INSERT INTO remote.provenance_origins VALUES ('checkpoint.link',?,?,?,?,?)",(old_link,workspace,user,digest({"checkpoint":"cp","edit":"e"}),None))
     with pytest.raises(ValueError,match="edit/turn mismatch"): project(db,event,mapper)
-    db.execute("UPDATE core_schema SET version=1"); rebuild_fts_index(db); docid=db.execute("SELECT docid FROM fts_main_messages.docs WHERE name=?",[old("messages","m")]).fetchone()[0]; before=archive_state(db)[1]; db.close(); monkeypatch.setattr(core_module,"rebuild_fts_index",lambda _:(_ for _ in ()).throw(AssertionError("FTS rebuild was unnecessary"))); db=duckdb.connect(str(path)); init_schema(db); assert path.with_name("archive.db.pre-v2.bak").is_file() and db.execute("SELECT version FROM core_schema").fetchone()[0]==2 and db.execute("SELECT id FROM conversations").fetchone()[0]==remote_id(user,"conversations","c") and db.execute("SELECT id,conversation_id FROM messages").fetchone()==(remote_id(user,"messages","m"),remote_id(user,"conversations","c")) and db.execute("SELECT id,message_id FROM file_edits").fetchone()==(remote_id(user,"file_edits","e"),remote_id(user,"messages","m")) and archive_state(db)[1]>before
+    db.execute("UPDATE core_schema SET version=1"); rebuild_fts_index(db); docid=db.execute("SELECT docid FROM fts_main_messages.docs WHERE name=?",[old("messages","m")]).fetchone()[0]; before=archive_state(db)[1]; db.close(); monkeypatch.setattr(core_module,"rebuild_fts_index",lambda _:(_ for _ in ()).throw(AssertionError("FTS rebuild was unnecessary"))); db=duckdb.connect(str(path)); init_schema(db); assert path.with_name("archive.db.pre-v2.bak").is_file() and db.execute("SELECT version FROM core_schema").fetchone()[0]==3 and db.execute("SELECT id FROM conversations").fetchone()[0]==remote_id(user,"conversations","c") and db.execute("SELECT id,conversation_id FROM messages").fetchone()==(remote_id(user,"messages","m"),remote_id(user,"conversations","c")) and db.execute("SELECT id,message_id FROM file_edits").fetchone()==(remote_id(user,"file_edits","e"),remote_id(user,"messages","m")) and archive_state(db)[1]>before
     new_edit=remote_id(user,"file_edits","e"); new_link=digest({"checkpoint":"cp","edit":new_edit}); assert project(db,event,mapper) and db.execute("SELECT file_edit_id FROM provenance.file_edit_files").fetchone()[0]==new_edit and db.execute("SELECT file_edit_id FROM provenance.checkpoint_edits").fetchone()[0]==new_edit and {r[0] for r in db.execute("SELECT physical_entity FROM remote.provenance_origins").fetchall()}=={new_edit,new_link} and db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==3 and db.execute("SELECT docid FROM fts_main_messages.docs WHERE name=?",[remote_id(user,"messages","m")]).fetchone()[0]==docid and db.execute("SELECT fts_main_messages.match_bm25(?, 'findable')",[remote_id(user,"messages","m")]).fetchone()[0] is not None; db.close()
 
 
@@ -100,7 +100,7 @@ def test_v2_resumes_required_fts_rebuild_after_data_commit(tmp_path,monkeypatch)
     db.execute("DELETE FROM core_migrations")  # simulate interruption under the migration build that lacked a durable FTS marker
     with pytest.raises(RuntimeError,match="interrupted"): init_schema(db)
     assert db.execute("SELECT state FROM core_migrations WHERE name='remote_ids'").fetchone()[0]=="fts"
-    monkeypatch.setattr(core_module,"rebuild_fts_index",real); init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==2 and not db.execute("SELECT 1 FROM core_migrations").fetchone() and db.execute("SELECT fts_main_messages.match_bm25(?, 'findable')",[remote_id(user,"messages","m")]).fetchone()[0] is not None; db.close()
+    monkeypatch.setattr(core_module,"rebuild_fts_index",real); init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==3 and not db.execute("SELECT 1 FROM core_migrations").fetchone() and db.execute("SELECT fts_main_messages.match_bm25(?, 'findable')",[remote_id(user,"messages","m")]).fetchone()[0] is not None; db.close()
 
 
 def test_v2_mixed_archive_keeps_unique_latest_author_scoped_revision(tmp_path):
@@ -197,9 +197,19 @@ def test_bound_checkout_survives_remote_changes_and_move_without_binding_fork(tm
     fork=tmp_path/"fork"; subprocess.run(("git","clone","-q",str(moved),str(fork)),check=True); git(fork,"remote","set-url","origin","git@example.com:other/fork.git"); assert repository(fork,db)["id"]!=stable
 
 
+def test_replaced_checkout_at_same_path_gets_new_identity_and_prunes_stale_metadata(tmp_path):
+    root=repo(tmp_path/"checkout"); git(root,"remote","add","origin","https://example.com/acme/original.git"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); capture(path); db=duckdb.connect(str(path)); stable=repository(root,db)["id"]; db.close(); __import__("shutil").rmtree(root/".git"); capture(path); db=duckdb.connect(str(path)); assert not db.execute("SELECT 1 FROM provenance.repository_checkouts WHERE root=?",[str(root)]).fetchone(); db.close(); git(root,"init","-q"); git(root,"config","user.email","a@b.c"); git(root,"config","user.name","A"); git(root,"add","."); git(root,"commit","-qm","replacement"); git(root,"remote","add","origin","https://example.com/other/replacement.git"); db=duckdb.connect(str(path)); assert repository(root,db)["id"]!=stable
+
+
 def test_ssh_and_https_remote_evidence_normalize_identically(tmp_path):
-    a,b=repo(tmp_path/"a"),repo(tmp_path/"b"); git(a,"remote","add","origin","git@github.com:acme/project.git"); git(b,"remote","add","origin","https://github.com/acme/project.git")
+    a=repo(tmp_path/"a"); b=tmp_path/"b"; subprocess.run(("git","clone","-q",str(a),str(b)),check=True); git(a,"remote","add","origin","git@github.com:acme/project.git"); git(b,"remote","set-url","origin","https://github.com/acme/project.git")
     assert repository(a)["id"]==repository(b)["id"] and repository(a)["remotes"]==repository(b)["remotes"]==["https://github.com/acme/project"]
+
+
+def test_same_remote_does_not_collapse_unrelated_histories_and_ports_are_distinct(tmp_path):
+    a,b=repo(tmp_path/"a","a",content="a\n"),repo(tmp_path/"b","b",content="b\n"); git(a,"remote","add","origin","ssh://git@example.com:2222/acme/project.git"); git(b,"remote","add","origin","ssh://git@example.com:2222/acme/project.git")
+    assert repository(a)["id"]!=repository(b)["id"] and repository(a)["remotes"]==["https://example.com:2222/acme/project"]
+    git(b,"remote","set-url","origin","ssh://git@example.com:22/acme/project.git"); assert repository(b,refresh=True)["remotes"]==["https://example.com/acme/project"]
 
 
 def test_conversation_scope_is_captured_once_across_git_init_and_removal(tmp_path):
@@ -209,9 +219,24 @@ def test_conversation_scope_is_captured_once_across_git_init_and_removal(tmp_pat
     assert [(r[0],r[1] is not None) for r in db.execute("SELECT conversation,repository FROM provenance.conversation_scopes ORDER BY conversation").fetchall()]==[("after",False),("before",False),("during",True)]
 
 
+def test_v3_migration_and_ingest_snapshot_never_reclassify_after_git_init(tmp_path):
+    legacy=tmp_path/"legacy"; legacy.mkdir(); path=tmp_path/"legacy.db"; db=graph(path); db.execute("INSERT INTO conversations VALUES ('old','codex','old',NULL,NULL,NULL,?,NULL,NULL,'{}')",[str(legacy)]); db.execute("UPDATE core_schema SET version=2"); db.close(); git(legacy,"init","-q"); db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT cwd,repository FROM provenance.conversation_scopes WHERE conversation='old'").fetchone()==(None,None); db.close(); capture(path); assert not duckdb.connect(str(path),read_only=True).execute("SELECT 1 FROM provenance.repositories").fetchone()
+    plain=tmp_path/"plain"; plain.mkdir(); fresh=tmp_path/"fresh.db"; db=graph(fresh); conv=dict(id="new",source="codex",title="new",created_at=None,updated_at=None,model=None,cwd=str(plain),git_branch=None,project_id=None,metadata="{}"); result=core_module.ParseResult(convs=[conv]); result.scopes=core_module.snapshot_scopes([("new",str(plain))]); core_module.upsert(db,result); db.close(); git(plain,"init","-q"); capture(fresh); assert duckdb.connect(str(fresh),read_only=True).execute("SELECT cwd,repository FROM provenance.conversation_scopes WHERE conversation='new'").fetchone()==(str(plain),None)
+
+
+def test_conversation_scope_freezes_resolved_symlink_target(tmp_path):
+    a,b=tmp_path/"a",tmp_path/"b"; a.mkdir(); b.mkdir(); link=tmp_path/"current"; link.symlink_to(a); scopes=core_module.snapshot_scopes([("c",str(link))]); link.unlink(); link.symlink_to(b); assert scopes[0][1]==str(a) and scopes[0][1]!=str(link.resolve())
+
+
 def test_semantic_capture_ids_are_existing_archive_identities(tmp_path):
     root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); records=capture(path); one=lambda kind:next(r["payload"]["id"] for r in records if r["kind"]==kind)
     assert one("edit.observed")=="e0" and one("file.observed")==digest({"repository":repository(root)["id"],"path":"x.py"})
+
+
+def test_file_edit_scope_is_unique_frozen_and_revisits_parent_conversation(tmp_path):
+    root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); known=core_module.repository_state(db); frozen=core_module.snapshot_edit_scopes([{"id":"e0","path":str(root/"x.py"),"cwd":str(root)}],known); db.execute("INSERT INTO provenance.file_edit_scopes VALUES (?,?,?,?,?,?)",frozen[0]); generation=archive_state(db)[1]; db.close(); __import__("shutil").rmtree(root/".git"); records=capture(path,edit_ids=["e0"]); edit=next(r for r in records if r["kind"]=="edit.observed"); db=duckdb.connect(str(path)); assert edit["payload"]["repository"]==frozen[0][2] and db.execute("SELECT COUNT(*) FROM provenance.file_edit_files WHERE file_edit_id='e0'").fetchone()[0]==1 and ("conversations","c") in archive_changes(db,generation)[1]; db.close()
+    assert not [r for r in capture(path,edit_ids=["e0"]) if r["kind"]=="edit.observed"]; db=duckdb.connect(str(path)); conflict={**edit,"payload":{**edit["payload"],"file":"other"}}
+    with pytest.raises(ValueError,match="scope conflict"): project(db,conflict)
 
 
 def test_provenance_git_observation_does_not_hold_duckdb_lock(tmp_path,monkeypatch):

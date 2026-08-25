@@ -208,14 +208,17 @@ Repository lifecycle is passive and conservative:
 - removing `.git` makes the repository binding dormant instead of turning it
   into a recursive path share;
 - when an exactly linked non-Git directory later becomes a Git repository, its
-  local path grant stays active and a portable repository grant is published
-  for future conversations; earlier conversations are not reclassified;
+  local path grant stays active; after the first commit establishes immutable
+  lineage, one portable repository grant is published for future conversations;
+  earlier conversations are not reclassified;
 - overlapping path/repository grants still select a conversation only once in
   one workspace. A nested repository is classified by Git's deepest enclosing
   root.
 
-Starting-directory classification is captured once with the conversation, and
-edit classification uses the repository recorded with that edit. Later
+Starting-directory and edit classification freeze the resolved path and Git
+checkout marker during ingestion. Delayed Git enrichment is accepted only when
+that marker still matches; pre-upgrade scope without a trustworthy snapshot is
+treated as unknown. Later
 filesystem changes therefore cannot retroactively move an old conversation in
 or out of scope. Ordinary directories remain path-bound, so moving one requires
 an explicit new link.
