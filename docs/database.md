@@ -129,6 +129,8 @@ product is strictly read-only.
 |----------|-----------------|
 | `repositories` | Repository identity, lineage, roots, remotes, and last observed head |
 | `repository_checkouts` | Local-only checkout path, branch, and head |
+| `repository_aliases` | Local exact Git evidence used to reattach a repository without making remotes its identity |
+| `conversation_scopes` | Capture-time conversation cwd, repository, and enclosing root |
 | `files` | Repository-relative or opaque external file identity |
 | `file_versions` | Observed full-content hashes |
 | `file_edit_files` | Edit-to-file edges plus hashes of captured old/new edit material and evidence quality |

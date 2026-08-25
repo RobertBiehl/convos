@@ -8,7 +8,7 @@ import typer
 from ai_convos_redact import protect_all
 _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import PROJECT_ROOT, archive_changes as core_archive_changes, archive_state as core_archive_state, drain_hooks, durable_replace, init_schema, install_hooks, open_db, project_attachment_body, project_workspace_controls, required
+from ai_convos.cli import PROJECT_ROOT, archive_changes as core_archive_changes, archive_state as core_archive_state, drain_hooks, durable_replace, init_schema, install_hooks, open_db, project_attachment_body, project_workspace_controls, repository as core_repository, repository_evidence, required
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
@@ -192,10 +192,29 @@ def settle_sharing(cfg,state,ready,root=None):
             value={k:sharing(state,ws,cfg["user"])[k] for k in ("auto_contribute","match")}; changed|=cfg.setdefault("sharing",{}).get(ws)!=value; cfg["sharing"][ws]=value
         elif (value:=cfg.get("sharing",{}).get(ws)): configure_sharing(cfg,state,ws,value["auto_contribute"],value["match"],root)
     if changed: update_recovery(cfg,root)
-def sharing_routes(state,ws,user,bindings):
+def sharing_routes(state,ws,user,bindings,core):
     pref=sharing(state,ws,user)
-    policies=state.execute("SELECT owner,kind,value FROM policies WHERE workspace=?",(ws,)).fetchall()
-    return [p[2] for p in policies if p[1]=="repository" and (p[0]==user or pref["effective_auto_contribute"])],[bindings[f"{ws}:{p[2]}"] for p in policies if p[1]=="path" and f"{ws}:{p[2]}" in bindings],pref["match"]
+    policies=state.execute("SELECT owner,kind,value,evidence FROM policies WHERE workspace=?",(ws,)).fetchall(); active=[p for p in policies if p[1]=="repository" and (p[0]==user or pref["effective_auto_contribute"])]
+    def resolve(p):
+        if not p[3]: return p[2]
+        if (path:=bindings.get(f"{ws}:{p[2]}")) and (repo:=core_repository(path,core)): return repo["id"]
+        if path and Path(path).exists(): return None
+        rows=core.execute("SELECT DISTINCT repository FROM provenance.repository_aliases WHERE evidence=?",(repository_evidence(json.loads(p[3])),)).fetchall()
+        return rows[0][0] if len(rows)==1 else None
+    return sorted({repo for p in active if (repo:=resolve(p))}),[bindings[f"{ws}:{p[2]}"] for p in policies if p[1]=="path" and f"{ws}:{p[2]}" in bindings],pref["match"]
+def promote_paths(cfg,state,core,root=None):
+    changed=False
+    for ws,value in state.execute("SELECT workspace,value FROM policies WHERE owner=? AND kind='path'",(cfg["user"],)).fetchall():
+        path=cfg.get("bindings",{}).get(f"{ws}:{value}"); repo=core_repository(path,core,True) if path else None
+        if not repo or Path(repo["root"])!=Path(path).resolve(): continue
+        promotions,key=cfg.setdefault("promotions",{}),f"{ws}:{value}"
+        created=key not in promotions
+        grants=[r[0] for r in state.execute("SELECT value FROM policies WHERE workspace=? AND owner=? AND kind='repository'",(ws,cfg["user"])).fetchall()]; grant=promotions.setdefault(key,next((g for g in grants if cfg.get("bindings",{}).get(f"{ws}:{g}")==str(Path(path).resolve())),None) or digest(os.urandom(32))[:32]); binding=f"{ws}:{grant}"
+        changed|=created or cfg.setdefault("bindings",{}).get(binding)!=str(Path(path).resolve())
+        cfg["bindings"][binding]=str(Path(path).resolve()); evidence={k:repo[k] for k in ("lineage","remotes")}
+        if grant not in grants: publish(cfg,state,ws,{"kind":"workspace.policy","entity":f"policy:repository:{grant}","payload":{"kind":"repository","value":grant,"evidence":evidence},"payload_v":2},root)
+    if changed: save(cfg,root)
+    return changed
 def membership_event(cfg,ws,epoch,members,root=None):
     state=connect(paths(root)[2]); publish(cfg,state,ws,{"kind":"workspace.membership","entity":f"membership:{epoch}","payload":{"epoch":epoch,"members":members}},root); upload(cfg,state,root); state.close()
 def control_event(cfg,ws,action,target,root=None):
@@ -396,9 +415,9 @@ def sync_once(root=None,force=False):
             scans=[(ws,meta,state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()) for ws,meta in cfg["workspaces"].items() if path.is_file() and ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]]
             scans=[(ws,meta,prior) for ws,meta,prior in scans if prior is None or int(prior[0])!=generation or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()]
             if scans:
-                core=open_db(path,True); batches=[]
+                core=open_db(path,True); promote_paths(cfg,state,core,root); batches=[]
                 for ws,meta,prior in scans:
-                    repos,roots,match=sharing_routes(state,ws,cfg["user"],cfg.get("bindings",{}))
+                    repos,roots,match=sharing_routes(state,ws,cfg["user"],cfg.get("bindings",{}),core)
                     changes=None if prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone() else set(core_archive_changes(core,int(prior[0]))[1])
                     scope=set()
                     records=scan(core,state,meta["kind"],repos,roots,changes,ws,scope,match=match,user=cfg["user"])
@@ -522,12 +541,10 @@ def approve_history_cmd(space:str,device_id:str,reject:bool=typer.Option(False,"
 @remote.command("link")
 @locked
 def link_cmd(path:Path,space:str):
-    from ai_convos.cli import repository
-    ws=workspace(cfg:=load(),space); state=connect(paths()[2]); resolved=path.resolve(); repo=repository(resolved)
-    kind,value=("repository",repo["id"]) if repo else ("path",digest(os.urandom(32))[:32])
-    state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,?)",(ws,cfg["user"],kind,value)); state.execute("DELETE FROM meta WHERE key LIKE 'core_generation:%'"); state.commit()
-    if kind=="path": cfg.setdefault("bindings",{})[f"{ws}:{value}"]=str(resolved)
-    save(cfg); publish(cfg,state,ws,{"kind":"workspace.policy","entity":f"policy:{kind}:{value}","payload":{"kind":kind,"value":value}}); upload(cfg,state)
+    ws=workspace(cfg:=load(),space); state=connect(paths()[2]); resolved=path.resolve(); core=open_db(core_path(),True); repo=core_repository(resolved,core) if core else core_repository(resolved); core and core.close(); kind="repository" if repo else "path"; existing=[p for p in state.execute("SELECT value,evidence FROM policies WHERE workspace=? AND owner=? AND kind=?",(ws,cfg["user"],kind)).fetchall() if cfg.get("bindings",{}).get(f"{ws}:{p[0]}")==str(resolved)]; value=existing[0][0] if existing else digest(os.urandom(32))[:32]
+    evidence=json.loads(existing[0][1]) if existing and existing[0][1] else {k:repo[k] for k in ("lineage","remotes")} if repo else None; payload={"kind":kind,"value":value,**({"evidence":evidence} if repo else {})}; version=2 if repo else 1
+    state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,?,?)",(ws,cfg["user"],kind,value,json.dumps(evidence) if evidence else None)); state.execute("DELETE FROM meta WHERE key LIKE 'core_generation:%'"); state.commit(); cfg.setdefault("bindings",{})[f"{ws}:{value}"]=str(resolved)
+    save(cfg); publish(cfg,state,ws,{"kind":"workspace.policy","entity":f"policy:{kind}:{value}","payload":payload,"payload_v":version}); upload(cfg,state)
     typer.echo(f"{kind} {value} -> {cfg['workspaces'][ws]['name']}")
 @remote.command("config")
 @locked

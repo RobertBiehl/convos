@@ -3,6 +3,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+import ai_convos.cli as core_module
 import ai_convos_memory as memory_module
 import ai_convos_remote as remote_client
 import ai_convos_remote.projection as projection_module
@@ -50,6 +51,11 @@ def test_remote_scan_is_read_only_and_does_not_self_trigger(tmp_path,monkeypatch
     path=root/"data/convos.db"; path.parent.mkdir(); db=duckdb.connect(str(path)); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','provenance','2026-01-01','2026-01-01',NULL,?,NULL,NULL,'{}')",[str(repo)]); db.execute("INSERT INTO messages VALUES ('m','c','assistant','done',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.execute("INSERT INTO file_edits VALUES ('e','m',?,'write','one\n','2026-01-01',NULL)",[str(repo/"a.py")]); db.close(); capture_provenance(path); sync_once(root,True)
     state=connect(root/"remote/state.db"); ws=workspace(load(root),"Personal"); generation=int(state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()[0]); state.close(); db=duckdb.connect(str(path),read_only=True); observed=db.execute("SELECT observed_at FROM provenance.repositories").fetchone()[0]; assert generation==archive_state(db)[1]; db.close(); count=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     sync_once(root); db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT observed_at FROM provenance.repositories").fetchone()[0]==observed; db.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count
+
+
+def test_link_uses_stable_grant_token_and_immutable_git_evidence(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); create(cfg,"Team","team",root); repo=root/"repo"; repo.mkdir(); subprocess.run(("git","-C",str(repo),"init","-q"),check=True); subprocess.run(("git","-C",str(repo),"remote","add","origin","git@github.com:acme/project.git"),check=True); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(root)); remote_client.link_cmd(repo,"Team"); state=connect(root/"remote/state.db"); first=state.execute("SELECT value,evidence FROM policies WHERE kind='repository'").fetchone(); events=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; subprocess.run(("git","-C",str(repo),"remote","set-url","origin","https://github.com/other/fork.git"),check=True); remote_client.link_cmd(repo,"Team"); second=state.execute("SELECT value,evidence FROM policies WHERE kind='repository'").fetchone()
+    assert first==second and first[0]!=core_module.repository(repo)["id"] and json.loads(first[1])["remotes"]==["https://github.com/acme/project"] and state.execute("SELECT COUNT(*) FROM policies WHERE kind='repository'").fetchone()[0]==1 and server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==events
 
 
 def test_incremental_sync_reads_only_core_marked_rows(tmp_path,monkeypatch):
@@ -336,7 +342,7 @@ def test_attachment_bytes_are_redacted_lazy_and_reassembled(tmp_path,monkeypatch
 
 def test_deleted_state_rebaselines_before_publishing_existing_archive(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); replicate_conversation(a,ws,"remote","remote"); sync_once(b,True); core=duckdb.connect(str(b/"data/convos.db"),read_only=True); restored=core.execute("SELECT id,title FROM conversations").fetchall(); origins=core.execute("SELECT * FROM remote.row_origins").fetchall(); core.close(); assert restored==[("remote","remote")] and not origins
-    before=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; replicas_before=server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]; state_path=b/"remote/state.db"; [Path(str(state_path)+suffix).unlink(missing_ok=True) for suffix in ("-wal","-shm")]; state_path.unlink(); legacy=sqlite3.connect(state_path); legacy.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); legacy.execute("CREATE TABLE legacy_payload(value TEXT)"); legacy.execute("INSERT INTO meta VALUES ('state_schema','3')"); legacy.execute("INSERT INTO legacy_payload VALUES ('preserve me')"); legacy.commit(); legacy.close(); db=duckdb.connect(str(b/"data/convos.db")); db.execute("INSERT INTO conversations VALUES ('local','codex','new local','2026-01-02','2026-01-02',NULL,NULL,NULL,NULL,'{}')"); db.close()
+    before=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; replicas_before=server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]; state_path=b/"remote/state.db"; [Path(str(state_path)+suffix).unlink(missing_ok=True) for suffix in ("-wal","-shm")]; state_path.unlink(); legacy=sqlite3.connect(state_path); legacy.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); legacy.execute("CREATE TABLE legacy_payload(value TEXT)"); legacy.execute("INSERT INTO meta VALUES ('state_schema','2')"); legacy.execute("INSERT INTO legacy_payload VALUES ('preserve me')"); legacy.commit(); legacy.close(); db=duckdb.connect(str(b/"data/convos.db")); db.execute("INSERT INTO conversations VALUES ('local','codex','new local','2026-01-02','2026-01-02',NULL,NULL,NULL,NULL,'{}')"); db.close()
     def offline(cfg,body,auth=True):
         if body["op"] in ("pull","replica_pull"): raise ConnectionError("relay unavailable")
         return direct(cfg,body,auth)
@@ -372,7 +378,7 @@ def test_ready_rejects_history_missing_before_signed_checkpoint(tmp_path,monkeyp
 
 
 def test_doctor_reports_legacy_state_without_modifying_it(tmp_path,monkeypatch):
-    root=tmp_path/"client"; remote=root/"remote"; remote.mkdir(parents=True); (remote/"config.json").write_text(json.dumps({"url":"http://server","user":"user","device":{"id":"device"},"workspaces":{},"keys":{}})); path=remote/"state.db"; db=sqlite3.connect(path); db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); db.execute("INSERT INTO meta VALUES ('state_schema','3')"); db.commit(); db.close(); before=(path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in remote.iterdir()}); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(root)); monkeypatch.setattr("ai_convos_remote.health",lambda cfg:{"ok":True})
+    root=tmp_path/"client"; remote=root/"remote"; remote.mkdir(parents=True); (remote/"config.json").write_text(json.dumps({"url":"http://server","user":"user","device":{"id":"device"},"workspaces":{},"keys":{}})); path=remote/"state.db"; db=sqlite3.connect(path); db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); db.execute("INSERT INTO meta VALUES ('state_schema','2')"); db.commit(); db.close(); before=(path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in remote.iterdir()}); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(root)); monkeypatch.setattr("ai_convos_remote.health",lambda cfg:{"ok":True})
     assert "state=incompatible" in doctor_status() and "backup+rebaseline" in doctor_status()
     assert (path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in remote.iterdir()})==before
 

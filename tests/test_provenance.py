@@ -27,7 +27,7 @@ def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_pat
     observed=next(r for r in records if r["kind"]=="repository.observed"); head=db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]; project(db,{**observed,"payload":{k:v for k,v in observed["payload"].items() if k!="head"},"observed_at":None}); assert db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]==head
     row=query(db,"conversation_changes","c")[0]; assert row["repositories"]==2 and row["files"]==2 and row["prompt"]=="make the cross-repo change" and row["changeset_id"]=="m"
     assert len(query(db,"changeset_files","m"))==2 and query(db,"current_activity",str(a))[0]["repository"]==repository(a)["id"]
-    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","files","file_versions","file_edit_files","git_checkpoints","checkpoint_edits","local_facts"}
+    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","repository_aliases","conversation_scopes","files","file_versions","file_edit_files","git_checkpoints","checkpoint_edits","local_facts"}
     columns={r[0] for r in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance'").fetchall()}; assert not columns&{"prompt","content","payload","workspace","author"}
 
 
@@ -189,6 +189,24 @@ def test_repository_identity_distinguishes_fork_but_preserves_lineage_and_unborn
     a,b,c=repository(source),repository(clone),repository(fork); assert a["id"]==b["id"]!=c["id"] and a["lineage"]==b["lineage"]==c["lineage"]
     empty=tmp_path/"empty"; empty.mkdir(); git(empty,"init","-q"); (empty/"new.py").write_text("new\n"); observed=repository(empty); assert observed["head"]=="" and observed["lineage"] is None
     path=tmp_path/"empty-core.db"; db=core(path,empty,[(empty/"new.py","write","new\n",None)]); db.close(); records=capture(path); assert any(r["kind"]=="git.checkpoint" and r["payload"]["head"]=="" for r in records)
+
+
+def test_bound_checkout_survives_remote_changes_and_move_without_binding_fork(tmp_path):
+    root=repo(tmp_path/"source"); git(root,"remote","add","origin","https://example.com/acme/project.git"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); capture(path); db=duckdb.connect(str(path)); stable=repository(root,db)["id"]; git(root,"remote","set-url","origin","git@example.com:other/fork.git"); assert repository(root,db)["id"]==stable
+    moved=tmp_path/"moved"; __import__("shutil").move(root,moved); assert repository(moved,db)["id"]==stable
+    fork=tmp_path/"fork"; subprocess.run(("git","clone","-q",str(moved),str(fork)),check=True); git(fork,"remote","set-url","origin","git@example.com:other/fork.git"); assert repository(fork,db)["id"]!=stable
+
+
+def test_ssh_and_https_remote_evidence_normalize_identically(tmp_path):
+    a,b=repo(tmp_path/"a"),repo(tmp_path/"b"); git(a,"remote","add","origin","git@github.com:acme/project.git"); git(b,"remote","add","origin","https://github.com/acme/project.git")
+    assert repository(a)["id"]==repository(b)["id"] and repository(a)["remotes"]==repository(b)["remotes"]==["https://github.com/acme/project"]
+
+
+def test_conversation_scope_is_captured_once_across_git_init_and_removal(tmp_path):
+    root=tmp_path/"project"; root.mkdir(); path=tmp_path/"core.db"; db=duckdb.connect(str(path)); init_schema(db)
+    def conversation(cid): db.execute("INSERT INTO conversations VALUES (?,'codex',?,'2026-01-01','2026-01-01',NULL,?,NULL,NULL,'{}')",[cid,cid,str(root)])
+    conversation("before"); db.close(); capture(path); git(root,"init","-q"); git(root,"config","user.email","a@b.c"); git(root,"config","user.name","A"); (root/"x.py").write_text("x\n"); git(root,"add","."); git(root,"commit","-qm","init"); db=duckdb.connect(str(path)); conversation("during"); db.close(); capture(path); __import__("shutil").rmtree(root/".git"); db=duckdb.connect(str(path)); conversation("after"); db.close(); capture(path); db=duckdb.connect(str(path))
+    assert [(r[0],r[1] is not None) for r in db.execute("SELECT conversation,repository FROM provenance.conversation_scopes ORDER BY conversation").fetchall()]==[("after",False),("before",False),("during",True)]
 
 
 def test_semantic_capture_ids_are_existing_archive_identities(tmp_path):

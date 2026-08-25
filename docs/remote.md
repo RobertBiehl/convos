@@ -179,10 +179,11 @@ the invitation to the intended root key even if the relay directory is later
 compromised. Before wrapping any workspace or history key, clients verify each
 device's user-root-signed certificate and its signing and encryption keys.
 
-Linking a Git checkout publishes its stable repository identity; core resolves
-every known clone and worktree for that identity. A linked non-Git path uses an
-opaque policy token whose absolute root remains a machine-local `config.json`
-binding. Team repository links auto-contribute for every member by default;
+Linking a Git checkout publishes a stable opaque grant plus normalized Git
+evidence; the grant is not a remote URL or a repository row ID. Core resolves
+known clones and worktrees from exact checkout or evidence matches. A linked
+non-Git path uses the same opaque grant model while its absolute root remains a
+machine-local `config.json` binding. Team repository links auto-contribute for every member by default;
 each member can disable links created by teammates with
 `--no-auto-contribute`, restore the team default with `--inherit`, or keep the
 default explicitly with `--auto-contribute`. A member's own explicit links
@@ -196,6 +197,28 @@ member's authorized devices. The client applies them passively during sync;
 there is no hook prompt or review queue. When either enabled signal matches,
 the complete conversation is routed once to that workspace. Repository policy
 never silently slices turns or creates partial conversation history.
+
+Repository lifecycle is passive and conservative:
+
+- adding, removing, renaming, or changing a remote does not disable an already
+  bound checkout; SSH and HTTPS forms of the same host/path normalize equally;
+- moving the same checkout reattaches through its local checkout identity, while
+  a new checkout must match the grant's original Git evidence exactly;
+- a new fork or unrelated remote is not silently merged into an existing grant;
+- removing `.git` makes the repository binding dormant instead of turning it
+  into a recursive path share;
+- when an exactly linked non-Git directory later becomes a Git repository, its
+  local path grant stays active and a portable repository grant is published
+  for future conversations; earlier conversations are not reclassified;
+- overlapping path/repository grants still select a conversation only once in
+  one workspace. A nested repository is classified by Git's deepest enclosing
+  root.
+
+Starting-directory classification is captured once with the conversation, and
+edit classification uses the repository recorded with that edit. Later
+filesystem changes therefore cannot retroactively move an old conversation in
+or out of scope. Ordinary directories remain path-bound, so moving one requires
+an explicit new link.
 
 The client requires `convos-redact` and runs it inside the team `publish`
 boundary before event signing and encryption. High-confidence credential spans

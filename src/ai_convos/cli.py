@@ -77,6 +77,8 @@ _PROVENANCE_SCHEMA = """
 CREATE SCHEMA IF NOT EXISTS provenance;
 CREATE TABLE IF NOT EXISTS provenance.repositories(id VARCHAR PRIMARY KEY,lineage VARCHAR,roots JSON,remotes JSON,last_head VARCHAR,observed_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS provenance.repository_checkouts(id VARCHAR PRIMARY KEY,repository VARCHAR,root VARCHAR UNIQUE,branch VARCHAR,head VARCHAR);
+CREATE TABLE IF NOT EXISTS provenance.repository_aliases(repository VARCHAR,evidence VARCHAR,PRIMARY KEY(repository,evidence));
+CREATE TABLE IF NOT EXISTS provenance.conversation_scopes(conversation VARCHAR PRIMARY KEY,cwd VARCHAR,repository VARCHAR,root VARCHAR,observed_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS provenance.files(id VARCHAR PRIMARY KEY,repository VARCHAR,path VARCHAR,kind VARCHAR);
 CREATE TABLE IF NOT EXISTS provenance.file_versions(id VARCHAR PRIMARY KEY,file_id VARCHAR,content_hash VARCHAR,observed_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS provenance.file_edit_files(file_edit_id VARCHAR,file_id VARCHAR,old_content_hash VARCHAR,new_content_hash VARCHAR,evidence VARCHAR,PRIMARY KEY(file_edit_id,file_id));
@@ -107,35 +109,32 @@ def archive_state(db):
 def _git_run(root,*args): return subprocess.run(("git","-C",str(root),*args),capture_output=True,check=True).stdout
 def _git_maybe(root,*args):
     try: return _git_run(root,*args)
-    except subprocess.CalledProcessError: return b""
+    except (subprocess.CalledProcessError,FileNotFoundError): return b""
 @lru_cache(maxsize=4096)
-def _git_root(path):
-    probe=path if path.is_dir() else path.parent
-    try: return Path(_git_run(probe,"rev-parse","--show-toplevel").decode().strip()).resolve()
-    except (subprocess.CalledProcessError,FileNotFoundError): return None
-def _git_remotes(root): return sorted({url.replace("git@github.com:","https://github.com/").removesuffix(".git") for line in _git_run(root,"remote","-v").decode(errors="replace").splitlines() if "\t" in line and not (url:=line.split("\t",1)[1].rsplit(" ",1)[0]).startswith(("/","file:"))})
+def _git_root(path): return Path(value.decode().strip()).resolve() if (value:=_git_maybe(probe if (probe:=Path(path)).is_dir() else probe.parent,"rev-parse","--show-toplevel")) else None
+def _remote(url): return (f"https://{p.hostname.lower()}/{p.path.strip('/').removesuffix('.git')}" if p.hostname and p.path else None) if (p:=__import__("urllib.parse").parse.urlparse(re.sub(r"^(?:[^/@]+@)?([^:/]+):",r"ssh://\1/",url) if "://" not in url else url)) else None
+def _git_remotes(root): return sorted({remote for line in _git_run(root,"remote","-v").decode(errors="replace").splitlines() if "\t" in line and not (url:=line.split("\t",1)[1].rsplit(" ",1)[0]).startswith(("/","file:")) and (remote:=_remote(url))})
+def repository_evidence(value): return provenance_digest({"lineage":value["lineage"],"remotes":value["remotes"]})
+def _checkout(root): return provenance_digest(f"{stat.st_dev}:{stat.st_ino}" if (stat:=next((p.stat() for p in [Path(root)/'.git'] if p.exists()),None)) else str(root))[:32]
 @lru_cache(maxsize=256)
-def _repository(root):
-    root=Path(root); roots=sorted(_git_maybe(root,"rev-list","--max-parents=0","HEAD").decode().split()); remotes=_git_remotes(root); lineage=provenance_digest({"git_roots":roots}) if roots else None
-    return dict(id=provenance_digest({"remotes":remotes}) if remotes else lineage or provenance_digest({"local":str(root)}),lineage=lineage,root=str(root),roots=roots,remotes=remotes,checkout=provenance_digest(str(root))[:32])
-def repository(path):
-    root=_git_root(Path(path))
-    return {**_repository(str(root)),"head":_git_maybe(root,"rev-parse","--verify","HEAD").decode().strip(),"branch":_git_maybe(root,"symbolic-ref","--short","HEAD").decode().strip()} if root else None
-def _observe_checkout(db,repo): db.execute("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET repository=excluded.repository,root=excluded.root,branch=excluded.branch,head=excluded.head",(repo["checkout"],repo["id"],repo["root"],repo["branch"],repo["head"]))
-def _provenance_where(path,cwd,cache):
-    p=Path(path); p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve(); root=_git_root(p); repo=cache.get(str(root)) if root else None
-    if root and not repo: repo=repository(root); cache[repo["root"]]=repo
+def _repository(root): return (lambda root,roots,remotes,lineage:dict(id=provenance_digest({"remotes":remotes}) if remotes else lineage or provenance_digest({"local":str(root)}),lineage=lineage,root=str(root),roots=roots,remotes=remotes,checkout=_checkout(root)))(root:=Path(root),roots:=sorted(_git_maybe(root,"rev-list","--max-parents=0","HEAD").decode().split()),remotes:=_git_remotes(root),provenance_digest({"git_roots":roots}) if roots else None)
+def repository_state(db): return {"roots":dict(db.execute("SELECT root,repository FROM provenance.repository_checkouts").fetchall()),"checkouts":dict(db.execute("SELECT id,repository FROM provenance.repository_checkouts").fetchall()),"aliases":dict(db.execute("SELECT evidence,CASE WHEN COUNT(DISTINCT repository)=1 THEN MIN(repository) END FROM provenance.repository_aliases GROUP BY evidence").fetchall())}
+def _refresh_repository(): (_git_root.cache_clear(),_repository.cache_clear())
+def repository(path,known=None,refresh=False): return (lambda value,state,evidence,resolved:{**value,"id":resolved or value["id"],"alias":None if resolved else evidence})(value:={**_repository(str(root)),"head":_git_maybe(root,"rev-parse","--verify","HEAD").decode().strip(),"branch":_git_maybe(root,"symbolic-ref","--short","HEAD").decode().strip()},state:=repository_state(known) if known is not None and hasattr(known,"execute") else known or {"roots":{},"checkouts":{},"aliases":{}},evidence:=repository_evidence(value),state["checkouts"].get(value["checkout"]) or state["roots"].get(value["root"]) or state["aliases"].get(evidence)) if (not refresh or _refresh_repository() is None) and (root:=_git_root(Path(path))) else None
+def _observe_checkout(db,repo):
+    db.execute("DELETE FROM provenance.repository_checkouts WHERE root=? AND id<>?",(repo["root"],repo["checkout"]))
+    db.execute("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET repository=excluded.repository,root=excluded.root,branch=excluded.branch,head=excluded.head",(repo["checkout"],repo["id"],repo["root"],repo["branch"],repo["head"])) and repo["alias"] and db.execute("INSERT OR IGNORE INTO provenance.repository_aliases VALUES (?,?)",(repo["id"],repo["alias"]))
+def _provenance_where(path,cwd,cache,known=None):
+    p=Path(path); p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve(); repo=cache.get(str(root)) or cache.setdefault(str(root),repository(root,known)) if (root:=_git_root(p)) else None
     return (repo,p.relative_to(repo["root"]).as_posix(),"repository") if repo else (None,f"external/{provenance_digest(str(p))[:24]}/{p.name}","external")
-def _checkpoint(repo,source):
-    paths=sorted({x[3:].split(" -> ")[-1] for x in _git_run(repo["root"],"status","--porcelain=v1","-z").decode(errors="replace").split("\0") if len(x)>3}); state=provenance_digest((_git_maybe(repo["root"],"diff","--binary","HEAD")+_git_maybe(repo["root"],"diff","--binary","--cached","HEAD")) if repo["head"] else _git_run(repo["root"],"status","--porcelain=v1","-z"))
-    return dict(id=provenance_digest({"repository":repo["id"],"head":repo["head"],"state":state}),repository=repo["id"],head=repo["head"],state_hash=state,paths=paths,capture_source=source)
+def _checkpoint(repo,source): return (lambda paths,state:dict(id=provenance_digest({"repository":repo["id"],"head":repo["head"],"state":state}),repository=repo["id"],head=repo["head"],state_hash=state,paths=paths,capture_source=source))(sorted({x[3:].split(" -> ")[-1] for x in _git_run(repo["root"],"status","--porcelain=v1","-z").decode(errors="replace").split("\0") if len(x)>3}),provenance_digest((_git_maybe(repo["root"],"diff","--binary","HEAD")+_git_maybe(repo["root"],"diff","--binary","--cached","HEAD")) if repo["head"] else _git_run(repo["root"],"status","--porcelain=v1","-z")))
 def _provenance_record(kind,entity,payload,observed_at): return dict(kind=kind,entity=entity,payload=payload,observed_at=observed_at)
 def _provenance_edits(core,edit_ids=None):
     ids=sorted(set(edit_ids or ())) if edit_ids is not None else None; selected="" if ids is None else " AND ("+(f"fe.id IN ({','.join('?'*len(ids))}) OR " if ids else "")+"NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_edit_id=fe.id))"; sql="""SELECT fe.id,fe.file_path,fe.edit_type,fe.content,fe.old_content,CAST(fe.created_at AS VARCHAR),m.id,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='file_edits' AND o.physical_row_id=fe.id)"""+selected+" ORDER BY fe.created_at,fe.id"; return [dict(zip(("id","path","type","content","old","ts","turn","conversation","cwd"),r)) for r in core.execute(sql,ids or ()).fetchall()]
-def _observe_provenance(edits,source="sync"):
-    _git_root.cache_clear(); _repository.cache_clear(); captured=datetime.now(timezone.utc).isoformat().replace("+00:00","Z"); records,repos,versions,cache,fulls=[],{},{},{},{}
+def _observe_provenance(edits,source="sync",known=None,conversations=()):
+    _git_root.cache_clear(); _repository.cache_clear(); captured=datetime.now(timezone.utc).isoformat().replace("+00:00","Z"); records,repos,versions,cache,fulls,scopes=[],{},{},{},{},[]
     for e in edits:
-        repo,path,kind=_provenance_where(e["path"],e["cwd"],cache); rid=repo["id"] if repo else None; fid=provenance_digest({"repository":rid,"path":path})
+        repo,path,kind=_provenance_where(e["path"],e["cwd"],cache,known); rid=repo["id"] if repo else None; fid=provenance_digest({"repository":rid,"path":path})
         if repo and rid not in repos: repos[rid]=repo; records.append(_provenance_record("repository.observed",rid,{k:repo[k] for k in ("id","lineage","roots","remotes","head")},captured))
         target=Path(repo["root"],path) if repo else None; key=str(target) if target else None
         if key not in fulls: fulls[key]=provenance_digest(target.read_bytes()) if target and target.is_file() else None
@@ -147,8 +146,11 @@ def _observe_provenance(edits,source="sync"):
         for (r,fid),(edit,after,full,path) in versions.items():
             if r==rid: vid=provenance_digest({"file":fid,"content":full}); records.append(_provenance_record("file.version",vid,{"id":vid,"file":fid,"content_hash":full},captured))
             if r==rid and path not in cp["paths"] and after==full: records.append(_provenance_record("checkpoint.link",provenance_digest({"checkpoint":cp["id"],"edit":edit}),{"checkpoint":cp["id"],"edit":edit,"evidence":"full_content_match"},captured))
-    return records,repos
-def observe_provenance(core): return _observe_provenance(_provenance_edits(core))[0]
+    for conversation,cwd in conversations:
+        repo=repository(cwd,known); rid=repo["id"] if repo else None; scopes.append((conversation,cwd,rid,repo["root"] if repo else None,captured))
+        if repo and rid not in repos: repos[rid]=repo; records.append(_provenance_record("repository.observed",rid,{k:repo[k] for k in ("id","lineage","roots","remotes","head")},captured))
+    return records,repos,scopes
+def observe_provenance(core): return _observe_provenance(_provenance_edits(core),known=repository_state(core))[0]
 def provenance_records(db,only=None):
     out=[]; ids=lambda kind:[entity for k,entity in only or () if k==kind]; rows=lambda kind,sql,column="id":[] if only is not None and not ids(kind) else db.execute(sql+(f" WHERE {column} IN (SELECT UNNEST(?))" if only is not None else ""),[ids(kind)] if only is not None else []).fetchall()
     for r in rows("repository.observed","SELECT id,lineage,CAST(roots AS VARCHAR),CAST(remotes AS VARCHAR),last_head,observed_at FROM provenance.repositories"): out.append(_provenance_record("repository.observed",r[0],dict(id=r[0],lineage=r[1],roots=json.loads(r[2]),remotes=json.loads(r[3]),head=r[4]),r[5]))
@@ -184,10 +186,10 @@ def project_provenance(db,value,map_id=lambda table,value:value,touch=True):
     return True
 def capture_provenance(path=None,edit_ids=None,source="sync"):
     connect=lambda read_only=False: open_db(path,read_only) if path else get_db(read_only); core=connect(True)
-    try: edits=_provenance_edits(core,edit_ids)
+    try: edits=_provenance_edits(core,edit_ids); known=repository_state(core); conversations=core.execute("SELECT c.id,c.cwd FROM conversations c WHERE c.cwd IS NOT NULL AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) AND NOT EXISTS (SELECT 1 FROM provenance.conversation_scopes s WHERE s.conversation=c.id)").fetchall()
     finally: core.close()
-    records,repos=_observe_provenance(edits,source); core=connect()
-    with contextlib.closing(core),_transaction(core): [_observe_checkout(core,r) for r in repos.values()]; [project_provenance(core,r) for r in records]; records and core.executemany("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",[(r["kind"],r["entity"]) for r in records])
+    records,repos,scopes=_observe_provenance(edits,source,known,conversations); core=connect()
+    with contextlib.closing(core),_transaction(core): [_observe_checkout(core,r) for r in repos.values()]; [project_provenance(core,r) for r in records]; records and core.executemany("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",[(r["kind"],r["entity"]) for r in records]); scopes and core.executemany("INSERT OR IGNORE INTO provenance.conversation_scopes VALUES (?,?,?,?,?)",scopes); scopes and _archive_touch(core,[("conversations",r[0]) for r in scopes])
     return records
 def project_archive_row(db,table,columns,values,origin=None,touch=True):
     if table not in ARCHIVE_COLUMNS or columns!=ARCHIVE_COLUMNS[table] or len(values)!=len(columns): raise ValueError("record schema/entity mismatch")
