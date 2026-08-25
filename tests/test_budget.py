@@ -13,12 +13,12 @@ def _loc(paths):
 
 
 def test_line_budget():
-    """Keep the cohesive archive-writing core under its explicit 1200-line budget."""
+    """Keep the cohesive archive-writing core, including durable migrations, under its explicit 1300-line budget."""
     root = Path(__file__).resolve().parents[1]
     paths = sorted((root / "src" / "ai_convos").glob("*.py"))
     assert paths, "No source files found"
     loc = _loc(paths)
-    assert loc < 1200, f"Code line budget exceeded: {loc} >= 1200"
+    assert loc < 1300, f"Code line budget exceeded: {loc} >= 1300"
 
 
 def test_app_line_budgets():

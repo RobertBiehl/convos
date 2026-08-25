@@ -20,11 +20,16 @@ Compatibility
 -------------
 
 There is no backward compatibility unless explicitly requested or covered by tests.
+Released signed logical-row encodings are the exception: retained relay replicas
+must remain ingestible for their documented lifetime. Physical-ID recipe changes
+require both a backed-up local migration and receive-path coverage proving old
+logical replicas project to the current physical identity; workspace IDs are
+authorization evidence and must never be inferred as wire-level row identity.
 
 Line Budget
 -----------
 
-Stay below the explicit 1200-line core budget (tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). The increase from 1000 keeps canonical provenance capture and every DuckDB writer in the cohesive core instead of hiding them behind an optional product. Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible.
+Stay below the explicit 1300-line core budget (tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). The increase from 1200 keeps durable schema migrations in the cohesive core instead of hiding archive mutation behind an optional product. Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible.
 
 Package boundaries must represent user-installable products, not internal
 modules or a way to evade line budgets. A cohesive product may declare one

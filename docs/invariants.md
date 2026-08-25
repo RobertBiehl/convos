@@ -37,6 +37,14 @@ questions do not become invariants by implication.
 > validates a private `<database>.pre-vN.bak`. A failed upgrade must leave a
 > usable original or recovery copy.
 
+> A physical archive migration and relay compatibility are two halves of one
+> upgrade. Retained signed logical encodings remain readable at ingestion;
+> physical-ID changes repair already projected rows without changing relay
+> ciphertext, logical row IDs, proofs, or signatures. Workspace identity is
+> authorization evidence, never a serialized physical-ID recipe.
+> Core migrations cap DuckDB at 1.5 GiB without raising a lower user limit and
+> restore the connection setting only after the active transaction has ended.
+
 > Rebuildable remote state may be discarded and recreated. During the current
 > pre-establishment phase, Relay and `state.db` require no compatibility
 > migration; protocol migrations may be introduced later when real deployments

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from ai_convos.cli import capture_provenance, init_schema, project_attachment_body, project_row_proof
+from ai_convos.cli import capture_provenance, init_schema, project_attachment_body, project_row_proof, provenance_digest
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish
 from ai_convos_remote.projection import apply_row_replicas, attest_rows, blob_replicas, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, row_replicas, scan, sequence
@@ -127,6 +127,11 @@ def test_same_authored_row_has_one_identity_across_workspaces(tmp_path):
     db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT id,title FROM conversations").fetchall()==[(foreign_id(user,"conversations","c"),"base")] and db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==1 and {r[0] for r in db.execute("SELECT workspace_id FROM remote.row_proofs").fetchall()}=={"a","b"}; db.close()
     newer=row("newer"); pa=row_proof(device,user,"a",1,newer,proofs["a"]["revision"]); assert apply_row_replicas(path,[{"row":newer,"proof":pa}],"a",[control("a")])==[True]; branch=row("branch"); pb=row_proof(device,user,"b",1,branch,proofs["b"]["revision"]); assert apply_row_replicas(path,[{"row":branch,"proof":pb}],"b",[control("b")])==[False]
     db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="newer" and db.execute("SELECT COUNT(*) FROM remote.row_conflicts").fetchone()[0]==1; db.close()
+
+
+def test_legacy_physical_archive_migrates_then_accepts_unchanged_v1_relay_replica(tmp_path):
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":certificate(root,user,device),"history":True}; control=lambda ws:{"workspace":ws,"revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; row=logical_row("conversations",fields,["c","codex","legacy","2026-01-01","2026-01-01",None,None,None,None,"{}"]); proofs={ws:row_proof(device,user,ws,1,row) for ws in ("old-workspace","relay-workspace")}; path=tmp_path/"db"; db=duckdb.connect(str(path)); init_schema(db); pid=project_row_proof(db,proofs["old-workspace"],root["sign_public"],entry["certificate"]); old=provenance_digest(f"old-workspace:{user}:conversations:c")[:16]; db.execute("INSERT INTO conversations VALUES (?,'codex','legacy','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')",[old]); db.execute("INSERT INTO remote.row_origins VALUES ('conversations',?,'old-workspace',?,'device','c',?,'conversations:c',NULL,?)",[old,user,proofs["old-workspace"]["revision"],pid]); db.execute("UPDATE core_schema SET version=1"); db.close(); db=duckdb.connect(str(path)); init_schema(db); db.close()
+    assert apply_row_replicas(path,[{"row":row,"proof":proofs["relay-workspace"]}],"relay-workspace",[control("relay-workspace")])==[True]; db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT id,title FROM conversations").fetchall()==[(foreign_id(user,"conversations","c"),"legacy")] and {r[0] for r in db.execute("SELECT workspace_id FROM remote.row_proofs").fetchall()}=={"old-workspace","relay-workspace"}; db.close()
 
 
 def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
