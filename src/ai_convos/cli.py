@@ -300,10 +300,10 @@ def init_schema(conn):
         if current<2 and (scope or migration and (migration.startswith("data") or migration=="changes")):
             with _transaction(conn):
                 result=migrate_remote_data(conn,ARCHIVE_COLUMNS,migration=="data_direct") if migration and migration.startswith("data") else migrate_remote_changes(conn) if migration=="changes" else migrate_remote_ids(conn,ARCHIVE_COLUMNS)
-                rebuild=fts_needs_rebuild(conn) if migration else result[1]; conn.execute("INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids',?)",["fts" if rebuild else "done"]); rebuild or conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,2); DELETE FROM core_migrations WHERE name='remote_ids'")
+                conn.execute(f"INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids','{'fts' if (rebuild:=fts_needs_rebuild(conn) if migration else result[1]) else 'done'}'); INSERT OR REPLACE INTO core_schema SELECT TRUE,2 WHERE {not rebuild}; DELETE FROM core_migrations WHERE name='remote_ids' AND {not rebuild}")
             pending,current=rebuild,current if rebuild else 2
         else: pending=bool(conn.execute("SELECT 1 FROM core_migrations WHERE name='remote_ids' AND state='fts'").fetchone())
-        if current<2 and not scope and not pending and fts_needs_rebuild(conn): conn.execute("INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids','fts')"); pending=True
+        if current<2 and not scope and not pending and fts_needs_rebuild(conn): pending=bool(conn.execute("INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids','fts')"))
         conn.execute("INSTALL fts; LOAD fts")
         if pending:
             rebuild_fts_index(conn)

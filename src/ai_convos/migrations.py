@@ -12,7 +12,7 @@ def _bytes(value): return float(value.split()[0])*{"B":1,"bytes":1,"KiB":2**10,"
 
 @contextmanager
 def migration_memory(db):
-    if _bytes(limit:=db.execute("SELECT current_setting('memory_limit')").fetchone()[0])<=_MEMORY: yield; return
+    if _bytes(limit:=db.execute("SELECT current_setting('memory_limit')").fetchone()[0])<=_MEMORY: return (yield)
     db.execute("SET memory_limit=?",[f"{_MEMORY}B"])
     try: yield
     except BaseException:
