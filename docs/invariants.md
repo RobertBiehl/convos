@@ -42,6 +42,8 @@ questions do not become invariants by implication.
 > physical-ID changes repair already projected rows without changing relay
 > ciphertext, logical row IDs, proofs, or signatures. Workspace identity is
 > authorization evidence, never a serialized physical-ID recipe.
+> Core migrations cap DuckDB at 1.5 GiB without raising a lower user limit and
+> restore the connection setting only after the active transaction has ended.
 
 > Rebuildable remote state may be discarded and recreated. During the current
 > pre-establishment phase, Relay and `state.db` require no compatibility

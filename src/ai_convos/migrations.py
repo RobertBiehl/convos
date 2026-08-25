@@ -1,8 +1,24 @@
-_BATCH=50_000
+from contextlib import contextmanager,suppress
+
+_BATCH,_MEMORY=50_000,1536*2**20
 
 
 def _bad(db,sql,message):
     if db.execute(sql).fetchone(): raise ValueError(message)
+
+
+def _bytes(value): return float(value.split()[0])*{"B":1,"bytes":1,"KiB":2**10,"MiB":2**20,"GiB":2**30,"TiB":2**40}[value.split()[1]]
+
+
+@contextmanager
+def migration_memory(db):
+    if _bytes(limit:=db.execute("SELECT current_setting('memory_limit')").fetchone()[0])<=_MEMORY: yield; return
+    db.execute("SET memory_limit=?",[f"{_MEMORY}B"])
+    try: yield
+    except BaseException:
+        with suppress(BaseException): db.execute("SET memory_limit=?",[limit])
+        raise
+    else: db.execute("SET memory_limit=?",[limit])
 
 
 def _batches(db,kind,table="_convos_origins",column="table_name"): return range((maximum if (maximum:=db.execute(f"SELECT max(batch) FROM {table} WHERE {column}=?",[kind]).fetchone()[0]) is not None else -1)+1)
@@ -19,8 +35,7 @@ def remote_id_migration_scope(db,remote_id=None):
 
 
 def _fts_direct(db):
-    expected,actual={"dict":(("termid","BIGINT"),("term","VARCHAR"),("df","BIGINT")),"docs":(("docid","BIGINT"),("name","VARCHAR"),("len","BIGINT")),"fields":(("fieldid","BIGINT"),("field","VARCHAR")),"stats":(("num_docs","BIGINT"),("avgdl","DOUBLE")),"stopwords":(("sw","VARCHAR"),),"terms":(("docid","BIGINT"),("fieldid","BIGINT"),("termid","BIGINT"))},{}
-    [actual.setdefault(t,[]).append((c,k)) for t,c,k in db.execute("SELECT table_name,column_name,data_type FROM information_schema.columns WHERE table_schema='fts_main_messages' ORDER BY table_name,ordinal_position").fetchall()]
+    expected,actual={"dict":(("termid","BIGINT"),("term","VARCHAR"),("df","BIGINT")),"docs":(("docid","BIGINT"),("name","VARCHAR"),("len","BIGINT")),"fields":(("fieldid","BIGINT"),("field","VARCHAR")),"stats":(("num_docs","BIGINT"),("avgdl","DOUBLE")),"stopwords":(("sw","VARCHAR"),),"terms":(("docid","BIGINT"),("fieldid","BIGINT"),("termid","BIGINT"))},(lambda rows:{t:tuple((c,k) for x,c,k in rows if x==t) for t in {x for x,_,_ in rows}})(db.execute("SELECT table_name,column_name,data_type FROM information_schema.columns WHERE table_schema='fts_main_messages' ORDER BY table_name,ordinal_position").fetchall())
     return {k:tuple(v) for k,v in actual.items()}==expected and not db.execute("SELECT 1 FROM (SELECT m.id,count(d.docid) n FROM messages m LEFT JOIN fts_main_messages.docs d ON d.name=m.id GROUP BY m.id HAVING n<>1 UNION ALL SELECT d.name,count(m.id) FROM fts_main_messages.docs d LEFT JOIN messages m ON m.id=d.name GROUP BY d.name HAVING count(m.id)<>1) LIMIT 1").fetchone()
 
 
@@ -55,8 +70,7 @@ def migrate_remote_ids(db,archive_columns):
     changed,has_fts={r[0] for r in db.execute("SELECT DISTINCT table_name FROM _convos_origins WHERE physical_row_id<>new_id").fetchall()},bool(db.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone())
     direct,rebuild=(direct:=has_fts and "messages" in changed and not fts_needs_rebuild(db)),has_fts and "messages" in changed and not direct
     db.execute("CREATE OR REPLACE TABLE core_remote_origin_keep AS SELECT table_name,new_id physical_row_id,workspace_id,author_user_id,author_device_id,source_row_id,source_event_id,content_key,observed_at,proof_id,0::UINTEGER batch FROM _convos_origins WHERE FALSE")
-    for table in archive_columns:
-        for batch in _batches(db,table): db.execute(f"""INSERT INTO core_remote_origin_keep WITH ranked AS (SELECT o.*,row_number() OVER (PARTITION BY o.table_name,o.author_user_id,o.source_row_id ORDER BY CASE WHEN r.winner THEN 0 ELSE 1 END,o.origin_rank) rn FROM _convos_origins o LEFT JOIN core_remote_id_rows r ON r.kind=o.table_name AND r.old_id=o.physical_row_id WHERE o.table_name='{table}' AND o.batch={batch}) SELECT table_name,new_id,workspace_id,author_user_id,author_device_id,source_row_id,source_event_id,content_key,observed_at,proof_id,{batch} FROM ranked WHERE rn=1; COMMIT; BEGIN""")
+    for table,batch in ((table,batch) for table in archive_columns for batch in _batches(db,table)): db.execute(f"""INSERT INTO core_remote_origin_keep WITH ranked AS (SELECT o.*,row_number() OVER (PARTITION BY o.table_name,o.author_user_id,o.source_row_id ORDER BY CASE WHEN r.winner THEN 0 ELSE 1 END,o.origin_rank) rn FROM _convos_origins o LEFT JOIN core_remote_id_rows r ON r.kind=o.table_name AND r.old_id=o.physical_row_id WHERE o.table_name='{table}' AND o.batch={batch}) SELECT table_name,new_id,workspace_id,author_user_id,author_device_id,source_row_id,source_event_id,content_key,observed_at,proof_id,{batch} FROM ranked WHERE rn=1; COMMIT; BEGIN""")
     [_relation(db,*relation) for relation in (("attachment_bodies","attachment_id","attachments"),("provenance.file_edit_files","file_edit_id","file_edits"),("provenance.checkpoint_edits","file_edit_id","file_edits"))]
     db.execute("CREATE TEMP TABLE _convos_links AS SELECT sha256(json_object('checkpoint',checkpoint_id,'edit',file_edit_id)) old_id,sha256(json_object('checkpoint',checkpoint_id,'edit',COALESCE(o.new_id,file_edit_id))) new_id FROM provenance.checkpoint_edits c LEFT JOIN _convos_origins o ON o.table_name='file_edits' AND o.physical_row_id=c.file_edit_id")
     _bad(db,"SELECT 1 FROM remote.provenance_origins p LEFT JOIN _convos_links l ON l.old_id=p.physical_entity WHERE p.kind='checkpoint.link' AND l.old_id IS NULL","remote checkpoint link body is unavailable")
@@ -72,19 +86,15 @@ def migrate_remote_data(db,archive_columns,direct=False):
         for batch in _batches(db,"messages","core_remote_id_rows","kind"): db.execute(f"DELETE FROM fts_main_messages.terms USING fts_main_messages.docs d,core_remote_id_rows r WHERE terms.docid=d.docid AND r.kind='messages' AND r.batch={batch} AND r.old_id=d.name AND NOT r.winner; DELETE FROM fts_main_messages.docs USING core_remote_id_rows r WHERE r.kind='messages' AND r.batch={batch} AND r.old_id=docs.name AND NOT r.winner; UPDATE fts_main_messages.docs SET name=r.new_id FROM core_remote_id_rows r WHERE r.kind='messages' AND r.batch={batch} AND r.winner AND docs.name=r.old_id; COMMIT; BEGIN")
         if db.execute("SELECT 1 FROM core_remote_id_rows WHERE kind='messages' AND NOT winner").fetchone(): db.execute("UPDATE fts_main_messages.dict d SET df=COALESCE(x.df,0) FROM (SELECT d.termid,count(DISTINCT t.docid) df FROM fts_main_messages.dict d LEFT JOIN fts_main_messages.terms t ON t.termid=d.termid GROUP BY d.termid) x WHERE x.termid=d.termid; UPDATE fts_main_messages.stats SET num_docs=(SELECT count(*) FROM fts_main_messages.docs),avgdl=COALESCE((SELECT avg(len) FROM fts_main_messages.docs),0); COMMIT; BEGIN")
     fks={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
-    for table,parents in fks.items():
-        for column,parent in parents:
-            for batch in _batches(db,parent,"core_remote_id_map","kind"): db.execute(f"UPDATE {table} x SET {column}=o.new_id FROM core_remote_id_map o WHERE o.kind='{parent}' AND o.batch={batch} AND x.{column}=o.old_id AND o.old_id<>o.new_id; COMMIT; BEGIN")
+    for table,column,parent,batch in ((table,column,parent,batch) for table,parents in fks.items() for column,parent in parents for batch in _batches(db,parent,"core_remote_id_map","kind")): db.execute(f"UPDATE {table} x SET {column}=o.new_id FROM core_remote_id_map o WHERE o.kind='{parent}' AND o.batch={batch} AND x.{column}=o.old_id AND o.old_id<>o.new_id; COMMIT; BEGIN")
     if db.execute("SELECT 1 FROM core_remote_id_rows WHERE kind='messages' AND NOT winner").fetchone():
         for batch in _batches(db,"messages","core_remote_id_rows","kind"): db.execute(f"""UPDATE messages w SET embedding=l.embedding FROM core_remote_id_rows rw,core_remote_id_rows rl,messages l WHERE rw.kind='messages' AND rw.batch={batch} AND rw.winner AND rl.kind='messages' AND NOT rl.winner AND rw.new_id=rl.new_id AND w.id=rw.old_id AND l.id=rl.old_id AND w.embedding IS NULL AND l.embedding IS NOT NULL AND rw.content_hash=rl.content_hash; COMMIT; BEGIN""")
-    for table in archive_columns:
-        for batch in _batches(db,table,"core_remote_id_rows","kind"): db.execute(f"DELETE FROM {table} USING core_remote_id_rows r WHERE r.kind='{table}' AND r.batch={batch} AND NOT r.winner AND id=r.old_id; UPDATE {table} SET id=r.new_id FROM core_remote_id_rows r WHERE r.kind='{table}' AND r.batch={batch} AND r.winner AND id=r.old_id AND r.old_id<>r.new_id; COMMIT; BEGIN")
+    for table,batch in ((table,batch) for table in archive_columns for batch in _batches(db,table,"core_remote_id_rows","kind")): db.execute(f"DELETE FROM {table} USING core_remote_id_rows r WHERE r.kind='{table}' AND r.batch={batch} AND NOT r.winner AND id=r.old_id; UPDATE {table} SET id=r.new_id FROM core_remote_id_rows r WHERE r.kind='{table}' AND r.batch={batch} AND r.winner AND id=r.old_id AND r.old_id<>r.new_id; COMMIT; BEGIN")
     for name,target in (("attachment_bodies","core_remote_attachment_bodies"),("provenance.file_edit_files","core_remote_provenance_file_edit_files"),("provenance.checkpoint_edits","core_remote_provenance_checkpoint_edits")):
         db.execute(f"DELETE FROM {name}; COMMIT; BEGIN")
         for batch in range(db.execute(f"SELECT coalesce(max(_batch),-1)+1 FROM {target}").fetchone()[0]): db.execute(f"INSERT INTO {name} SELECT * EXCLUDE(_batch) FROM {target} WHERE _batch={batch}; COMMIT; BEGIN")
     db.execute("DELETE FROM remote.row_origins; COMMIT; BEGIN")
-    for table in archive_columns:
-        for batch in _batches(db,table,"core_remote_origin_keep"): db.execute(f"INSERT INTO remote.row_origins SELECT * EXCLUDE(batch) FROM core_remote_origin_keep WHERE table_name='{table}' AND batch={batch}; COMMIT; BEGIN")
+    for table,batch in ((table,batch) for table in archive_columns for batch in _batches(db,table,"core_remote_origin_keep")): db.execute(f"INSERT INTO remote.row_origins SELECT * EXCLUDE(batch) FROM core_remote_origin_keep WHERE table_name='{table}' AND batch={batch}; COMMIT; BEGIN")
     db.execute("DELETE FROM remote.provenance_origins; COMMIT; BEGIN")
     for batch in range(db.execute("SELECT coalesce(max(batch),-1)+1 FROM core_remote_provenance").fetchone()[0]): db.execute(f"INSERT INTO remote.provenance_origins SELECT * EXCLUDE(batch) FROM core_remote_provenance WHERE batch={batch}; COMMIT; BEGIN")
     db.execute("DROP TABLE core_remote_id_rows; DROP TABLE core_remote_origin_keep; DROP TABLE core_remote_attachment_bodies; DROP TABLE core_remote_provenance_file_edit_files; DROP TABLE core_remote_provenance_checkpoint_edits; DROP TABLE core_remote_provenance; INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids','changes'); COMMIT; BEGIN")

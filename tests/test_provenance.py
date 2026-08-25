@@ -48,15 +48,25 @@ def test_v2_unaffected_archive_skips_backup_and_rewrite(tmp_path):
     path=tmp_path/"ready.db"; db=graph(path); user="author"; row_id=remote_id(user,"conversations","c"); db.execute("INSERT INTO conversations VALUES (?,'codex','ready',NULL,NULL,NULL,NULL,NULL,NULL,'{}')",[row_id]); db.execute("INSERT INTO remote.row_origins VALUES ('conversations',?,'w',?,'d','c','e','conversations:c',NULL,NULL)",[row_id,user]); before=archive_state(db)[1]; db.execute("UPDATE core_schema SET version=1"); db.close(); db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT id FROM conversations").fetchone()[0]==row_id and archive_state(db)[1]==before and db.execute("SELECT version FROM core_schema").fetchone()[0]==2; db.close(); assert not path.with_name("ready.db.pre-v2.bak").exists()
 
 
-def test_v2_migration_does_not_override_resources_or_mask_failures(monkeypatch):
-    db=duckdb.connect(); db.execute("SET memory_limit='256MiB'"); setting=db.execute("SELECT current_setting('memory_limit')").fetchone()[0]; seen=[]; monkeypatch.setattr(migrations_module,"_bad",lambda db,*_:seen.append(db.execute("SELECT current_setting('memory_limit')").fetchone()[0]) or (_ for _ in ()).throw(RuntimeError("original failure")))
-    with pytest.raises(RuntimeError,match="original failure"): migrations_module.migrate_remote_ids(db,{})
-    assert seen==[setting] and db.execute("SELECT current_setting('memory_limit')").fetchone()[0]==setting
+def test_v2_migration_caps_memory_restores_setting_and_honors_lower_limit():
+    db=duckdb.connect(); db.execute("SET memory_limit='3GiB'"); original=db.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    with migrations_module.migration_memory(db): assert migrations_module._bytes(db.execute("SELECT current_setting('memory_limit')").fetchone()[0])<=migrations_module._MEMORY
+    assert db.execute("SELECT current_setting('memory_limit')").fetchone()[0]==original; db.execute("SET memory_limit='256MiB'"); lower=db.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    with migrations_module.migration_memory(db): assert db.execute("SELECT current_setting('memory_limit')").fetchone()[0]==lower
+    assert db.execute("SELECT current_setting('memory_limit')").fetchone()[0]==lower
+
+
+def test_v2_migration_restores_after_transaction_failure_without_masking():
+    db=duckdb.connect(); db.execute("SET memory_limit='3GiB'"); original=db.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    with pytest.raises(RuntimeError,match="original failure"):
+        with migrations_module.migration_memory(db):
+            with core_module._transaction(db): raise RuntimeError("original failure")
+    assert db.execute("SELECT current_setting('memory_limit')").fetchone()[0]==original
 
 
 def test_v2_migration_batches_physical_id_mutations(tmp_path,monkeypatch):
-    path=tmp_path/"batches.db"; db=graph(path); user="author"; old=lambda source:digest(f"workspace:{user}:conversations:{source}")[:16]; db.executemany("INSERT INTO conversations VALUES (?,'codex',?,NULL,NULL,NULL,NULL,NULL,NULL,'{}')",[(old(source),source) for source in ("a","b")]); db.executemany("INSERT INTO remote.row_origins VALUES ('conversations',?,'workspace',?,'device',?,'event','key',NULL,NULL)",[(old(source),user,source) for source in ("a","b")]); db.execute("UPDATE core_schema SET version=1"); db.close(); monkeypatch.setattr(migrations_module,"_BATCH",1); db=duckdb.connect(str(path)); init_schema(db)
-    assert db.execute("SELECT id,title FROM conversations ORDER BY title").fetchall()==[(remote_id(user,"conversations",source),source) for source in ("a","b")]; db.close()
+    path=tmp_path/"batches.db"; db=graph(path); user="author"; old=lambda source:digest(f"workspace:{user}:conversations:{source}")[:16]; db.executemany("INSERT INTO conversations VALUES (?,'codex',?,NULL,NULL,NULL,NULL,NULL,NULL,'{}')",[(old(source),source) for source in ("a","b")]); db.executemany("INSERT INTO remote.row_origins VALUES ('conversations',?,'workspace',?,'device',?,'event','key',NULL,NULL)",[(old(source),user,source) for source in ("a","b")]); db.execute("UPDATE core_schema SET version=1"); db.close(); real=migrations_module._bad; seen=[]; monkeypatch.setattr(migrations_module,"_BATCH",1); monkeypatch.setattr(migrations_module,"_bad",lambda db,*args:seen.append(db.execute("SELECT current_setting('memory_limit')").fetchone()[0]) or real(db,*args)); db=duckdb.connect(str(path)); db.execute("SET memory_limit='3GiB'"); original=db.execute("SELECT current_setting('memory_limit')").fetchone()[0]; init_schema(db)
+    assert seen and max(map(migrations_module._bytes,seen))<=migrations_module._MEMORY and db.execute("SELECT current_setting('memory_limit')").fetchone()[0]==original and db.execute("SELECT id,title FROM conversations ORDER BY title").fetchall()==[(remote_id(user,"conversations",source),source) for source in ("a","b")]; db.close()
 
 
 def test_v2_resumes_durable_archive_change_cutover(tmp_path,monkeypatch):

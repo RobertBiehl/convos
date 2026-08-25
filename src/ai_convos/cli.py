@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import base64, contextlib, json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile, duckdb, typer
 from importlib.metadata import entry_points, version; from concurrent.futures import ThreadPoolExecutor, as_completed; from contextlib import ExitStack; from datetime import datetime, timedelta, timezone; from functools import lru_cache; from pathlib import Path; from typing import Optional; from hashlib import pbkdf2_hmac; from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remote_data, migrate_remote_ids, remote_id_migration_scope
+from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remote_data, migrate_remote_ids, migration_memory, remote_id_migration_scope
 
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
@@ -296,24 +296,19 @@ def init_schema(conn):
         [index_attachment_body(conn,*r) for r in conn.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL AND id NOT IN (SELECT attachment_id FROM attachment_bodies)").fetchall()]; facts=[(r["kind"],r["entity"]) for r in provenance_records(conn)] if not local_facts else []; facts and conn.executemany("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",facts)
     conn.execute("INSERT INTO archive_state SELECT TRUE,uuid(),0 WHERE NOT EXISTS (SELECT 1 FROM archive_state)")
     migration=(conn.execute("SELECT state FROM core_migrations WHERE name='remote_ids'").fetchone() or [None])[0]
-    if current<2 and (migration and migration.startswith("data") or migration=="changes"):
-        with _transaction(conn):
-            migrate_remote_data(conn,ARCHIVE_COLUMNS,migration=="data_direct") if migration.startswith("data") else migrate_remote_changes(conn)
-            pending=fts_needs_rebuild(conn)
-            conn.execute("INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids',?)",["fts" if pending else "done"])
-            pending or conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,2); DELETE FROM core_migrations WHERE name='remote_ids'")
-        current=2 if not pending else current
-    pending=bool(conn.execute("SELECT 1 FROM core_migrations WHERE name='remote_ids' AND state='fts'").fetchone())
-    if current<2 and scope:
-        with _transaction(conn):
-            migrated,rebuild=migrate_remote_ids(conn,ARCHIVE_COLUMNS); conn.execute("INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids',?)",["fts" if rebuild else "done"]); rebuild or conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,2); DELETE FROM core_migrations WHERE name='remote_ids'")
-        pending=rebuild
-    if current<2 and not scope and not pending and fts_needs_rebuild(conn): conn.execute("INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids','fts')"); pending=True
-    conn.execute("INSTALL fts; LOAD fts")
-    if pending:
-        rebuild_fts_index(conn)
-        with _transaction(conn): conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,2); DELETE FROM core_migrations WHERE name='remote_ids'")
-    elif current<2 and not scope: conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,2)")
+    with migration_memory(conn) if current<2 else contextlib.nullcontext():
+        if current<2 and (scope or migration and (migration.startswith("data") or migration=="changes")):
+            with _transaction(conn):
+                result=migrate_remote_data(conn,ARCHIVE_COLUMNS,migration=="data_direct") if migration and migration.startswith("data") else migrate_remote_changes(conn) if migration=="changes" else migrate_remote_ids(conn,ARCHIVE_COLUMNS)
+                rebuild=fts_needs_rebuild(conn) if migration else result[1]; conn.execute("INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids',?)",["fts" if rebuild else "done"]); rebuild or conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,2); DELETE FROM core_migrations WHERE name='remote_ids'")
+            pending,current=rebuild,current if rebuild else 2
+        else: pending=bool(conn.execute("SELECT 1 FROM core_migrations WHERE name='remote_ids' AND state='fts'").fetchone())
+        if current<2 and not scope and not pending and fts_needs_rebuild(conn): conn.execute("INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids','fts')"); pending=True
+        conn.execute("INSTALL fts; LOAD fts")
+        if pending:
+            rebuild_fts_index(conn)
+            with _transaction(conn): conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,2); DELETE FROM core_migrations WHERE name='remote_ids'")
+        elif current<2 and not scope: conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,2)")
 
 def counts_by_source(conn):
     q = [("conversations", "source", 0), ("messages m JOIN conversations c ON c.id = m.conversation_id", "c.source", 1),
