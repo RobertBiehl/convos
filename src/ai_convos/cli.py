@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import base64, contextlib, json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile, duckdb, typer
 from importlib.metadata import entry_points, version; from concurrent.futures import ThreadPoolExecutor, as_completed; from contextlib import ExitStack; from datetime import datetime, timedelta, timezone; from functools import lru_cache; from pathlib import Path; from typing import Optional; from hashlib import pbkdf2_hmac; from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from .migrations import fts_needs_rebuild, migrate_remote_ids, remote_id_migration_scope
+from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remote_data, migrate_remote_ids, remote_id_migration_scope
 
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
@@ -265,7 +265,7 @@ def _migration_backup(conn,version=1):
     try: _backup_copy(path,tmp); os.chmod(tmp,0o600); check=duckdb.connect(tmp,read_only=True); check.execute("SELECT COUNT(*) FROM conversations").fetchone(); check.close(); durable_replace(tmp,backup); return backup
     except BaseException: Path(tmp).unlink(missing_ok=True); raise
 def init_schema(conn):
-    tables={r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()}; current=(conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0] if "core_schema" in tables else 0; scope=remote_id_migration_scope(conn,remote_id) if current<2 else set(); _migration_backup(conn); current==1 and scope and _migration_backup(conn,2)
+    tables={r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()}; current=(conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0] if "core_schema" in tables else 0; scope=remote_id_migration_scope(conn,remote_id) if current<2 else set(); _migration_backup(conn); current==1 and scope and ("core_migrations" not in tables or not conn.execute("SELECT 1 FROM core_migrations WHERE name='remote_ids'").fetchone()) and _migration_backup(conn,2)
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
         id VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, title VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP,
         model VARCHAR, cwd VARCHAR, git_branch VARCHAR, project_id VARCHAR, metadata JSON)""")
@@ -295,6 +295,14 @@ def init_schema(conn):
         conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR; ALTER TABLE remote.row_origins ADD COLUMN IF NOT EXISTS proof_id VARCHAR; ALTER TABLE remote.row_proofs ADD COLUMN IF NOT EXISTS authorization_workspace_id VARCHAR; UPDATE remote.row_proofs SET authorization_workspace_id=workspace_id WHERE authorization_workspace_id IS NULL; DROP TABLE IF EXISTS provenance.assertions; DROP TABLE IF EXISTS provenance.capture_gaps; INSERT INTO core_schema SELECT TRUE,1 WHERE NOT EXISTS (SELECT 1 FROM core_schema WHERE singleton)")
         [index_attachment_body(conn,*r) for r in conn.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL AND id NOT IN (SELECT attachment_id FROM attachment_bodies)").fetchall()]; facts=[(r["kind"],r["entity"]) for r in provenance_records(conn)] if not local_facts else []; facts and conn.executemany("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",facts)
     conn.execute("INSERT INTO archive_state SELECT TRUE,uuid(),0 WHERE NOT EXISTS (SELECT 1 FROM archive_state)")
+    migration=(conn.execute("SELECT state FROM core_migrations WHERE name='remote_ids'").fetchone() or [None])[0]
+    if current<2 and (migration and migration.startswith("data") or migration=="changes"):
+        with _transaction(conn):
+            migrate_remote_data(conn,ARCHIVE_COLUMNS,migration=="data_direct") if migration.startswith("data") else migrate_remote_changes(conn)
+            pending=fts_needs_rebuild(conn)
+            conn.execute("INSERT OR REPLACE INTO core_migrations VALUES ('remote_ids',?)",["fts" if pending else "done"])
+            pending or conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,2); DELETE FROM core_migrations WHERE name='remote_ids'")
+        current=2 if not pending else current
     pending=bool(conn.execute("SELECT 1 FROM core_migrations WHERE name='remote_ids' AND state='fts'").fetchone())
     if current<2 and scope:
         with _transaction(conn):
