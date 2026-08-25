@@ -5,9 +5,9 @@ import duckdb
 import pytest
 from ai_convos.cli import capture_provenance, init_schema, project_attachment_body, project_row_proof, provenance_digest
 import ai_convos_remote.projection as projection_module
-from ai_convos_remote import publish
-from ai_convos_remote.projection import apply_row_replicas, attest_rows, blob_replicas, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, row_replicas, scan, sequence
-from ai_convos_remote.protocol import b64, certificate, digest, event, identity, logical_row, open_blob, open_replica, public, public_id, row_proof
+from ai_convos_remote import publish, sharing_routes
+from ai_convos_remote.projection import apply_row_replicas, attest_rows, blob_replicas, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, row_replicas, scan, sequence, sharing
+from ai_convos_remote.protocol import b64, certificate, digest, event, identity, logical_row, open_blob, open_replica, public, public_id, row_proof, semantic_proof
 
 
 def git(path,*args): return subprocess.run(("git","-C",str(path),*args),check=True,capture_output=True).stdout.decode().strip()
@@ -31,7 +31,7 @@ def test_old_state_inspection_is_read_only_and_cutover_preserves_exact_backup(tm
     with pytest.raises(ValueError,match="rebuild required"): connect(path)
     assert (path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in tmp_path.iterdir()})==before
     report=cutover_state(path); backup=Path(report["backup"]); old=__import__("sqlite3").connect(backup/"state.db"); assert old.execute("SELECT value FROM legacy_payload").fetchone()[0]=="only in old state"; old.close()
-    state=connect(path); assert state.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()[0]=="1" and json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["backup"]==str(backup); state.close(); assert inspect_state(path)["status"]=="current" and os.stat(backup).st_mode&0o777==0o700 and os.stat(backup/"state.db").st_mode&0o777==0o600
+    state=connect(path); assert state.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()[0]=="2" and json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["backup"]==str(backup); state.close(); assert inspect_state(path)["status"]=="current" and os.stat(backup).st_mode&0o777==0o700 and os.stat(backup/"state.db").st_mode&0o777==0o600
 
 
 def test_cutover_recovers_corrupt_regular_state_but_refuses_symlink(tmp_path):
@@ -143,7 +143,19 @@ def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
 
 
 def test_event_support_is_exact_and_unknowns_fail_closed(monkeypatch):
-    monkeypatch.setattr(projection_module,"bridges",lambda:[]); classify=lambda kind,version:event_support({"kind":kind,"payload_v":version}); assert classify("workspace.policy",1)=="supported" and classify("conversation.record",1)==classify("conversation.record",2)==classify("future.opaque",1)==classify("memory.canonical",1)=="required"
+    monkeypatch.setattr(projection_module,"bridges",lambda:[]); classify=lambda kind,version:event_support({"kind":kind,"payload_v":version}); assert classify("workspace.policy",1)==classify("workspace.preference",1)=="supported" and classify("conversation.record",1)==classify("conversation.record",2)==classify("future.opaque",1)==classify("memory.canonical",1)=="required"
+
+
+def test_member_sharing_preference_is_root_signed_and_defaults_on(tmp_path):
+    state=connect(tmp_path/"state.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); state.executemany("INSERT INTO policies VALUES (?,?,?,?)",[("w",user,"repository","mine"),("w","teammate","repository","theirs"),("w","teammate","path","opaque")]); assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":None,"effective_auto_contribute":True,"match":["cwd","edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:opaque":"/bound"})==(["mine","theirs"],["/bound"],["cwd","edit"])
+    row={"v":1,"kind":"sharing.preference","id":f"sharing:w:{user}","state":"active","data":{"auto_contribute":False,"match":["edit"]}}; proof=semantic_proof(root,user,device["id"],"w",1,row); value=event(device,1,"workspace.preference",row["id"],{"row":row,"proof":proof}); project(tmp_path/"core.db",state,value,"w",authors={device["id"]:user},local_user=user)
+    assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":False,"effective_auto_contribute":False,"match":["edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:opaque":"/bound"})==(["mine"],["/bound"],["edit"])
+
+
+def test_team_match_modes_are_independent_and_empty_is_passive(tmp_path):
+    repo,core=source(tmp_path); core.execute("INSERT INTO conversations VALUES ('cwd','codex','cwd only','2026-01-02','2026-01-02','m',?,NULL,NULL,'{}')",[str(repo)]); core.execute("INSERT INTO messages VALUES ('cwd-m','cwd','user','inspect',NULL,'2026-01-02','m','{}',NULL,NULL)"); state=connect(tmp_path/"state.db"); rid=next(r["payload"]["id"] for r in scan(core,state) if r["kind"]=="repository.observed")
+    selected=lambda mode:{r["payload"]["row"][0] for r in scan(core,state,"team",[rid],[],match=mode) if r["kind"]=="conversation.record"}
+    assert selected(["cwd"])=={"c","cwd"} and selected(["edit"])=={"c"} and selected([])==set()
 
 
 def test_team_scope_includes_prompt_turn_and_linked_repo_only(tmp_path):

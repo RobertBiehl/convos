@@ -53,7 +53,7 @@ def test_remote_scan_is_read_only_and_does_not_self_trigger(tmp_path,monkeypatch
 
 
 def test_incremental_sync_reads_only_core_marked_rows(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); path=root/"data/convos.db"; write_archive(path,"one"); sync_once(root,True); before=server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]; seen=[]; real=remote_client.scan; monkeypatch.setattr(remote_client,"scan",lambda *args:seen.append(args[-3]) or real(*args)); write_archive(path,"two"); sync_once(root)
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); path=root/"data/convos.db"; write_archive(path,"one"); sync_once(root,True); before=server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]; seen=[]; real=remote_client.scan; monkeypatch.setattr(remote_client,"scan",lambda *args,**kwargs:seen.append(args[-3]) or real(*args,**kwargs)); write_archive(path,"two"); sync_once(root)
     assert seen==[{("conversations","c")}] and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==before+1
 
 

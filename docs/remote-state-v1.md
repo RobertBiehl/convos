@@ -95,7 +95,8 @@ Long-lived `state.db` rows contain only:
   retained only in event receipts and DuckDB origin attribution;
 - exact `(workspace, author, sequence) -> event_id` sequence identity;
 - compact parent data only for unresolved out-of-order gaps;
-- lazy/deferred event manifests, policies, retries, and last failure;
+- lazy/deferred event manifests, policy owners, root-signed member contribution
+  preferences, retries, and last failure;
 - content-free acknowledged event and row-replica receipts.
 
 The only content-bearing remote working state permitted is an unacknowledged

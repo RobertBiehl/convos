@@ -10,9 +10,9 @@ _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, archive_changes as core_archive_changes, archive_state as core_archive_state, drain_hooks, durable_replace, init_schema, install_hooks, open_db, project_attachment_body, project_workspace_controls, required
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, stored_controls, verify_history
+from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
-                       recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, sign_control, signer, unb64, verify_certificate)
+                       recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate)
 from .service import edit_hooks, enable
 
 remote=typer.Typer(help="End-to-end encrypted personal and team synchronization")
@@ -169,6 +169,16 @@ def publish(cfg,state,ws,record,root=None,defer=False,heads=None):
     if not defer: state.commit()
     if heads is not None: heads[record["entity"]]=revision
     project(core_path(root),state,value,ws,cfg["device"]["id"],root=root,authors={cfg["device"]["id"]:cfg["user"]}); return value["id"]
+def configure_sharing(cfg,state,ws,auto_contribute,match,root=None):
+    row={"v":1,"kind":"sharing.preference","id":f"sharing:{ws}:{cfg['user']}","state":"active","data":{"auto_contribute":auto_contribute,"match":match}}
+    proof=semantic_proof(cfg["root"],cfg["user"],cfg["device"]["id"],ws,cfg["workspaces"][ws]["epoch"],row,sharing(state,ws,cfg["user"])["proofs"] or None)
+    publish(cfg,state,ws,{"kind":"workspace.preference","entity":row["id"],"payload":{"row":row,"proof":proof}},root)
+    upload(cfg,state,root)
+    return sharing(state,ws,cfg["user"])
+def sharing_routes(state,ws,user,bindings):
+    pref=sharing(state,ws,user)
+    policies=state.execute("SELECT owner,kind,value FROM policies WHERE workspace=?",(ws,)).fetchall()
+    return [p[2] for p in policies if p[1]=="repository" and (p[0]==user or pref["effective_auto_contribute"])],[bindings[f"{ws}:{p[2]}"] for p in policies if p[1]=="path" and f"{ws}:{p[2]}" in bindings],pref["match"]
 def membership_event(cfg,ws,epoch,members,root=None):
     state=connect(paths(root)[2]); publish(cfg,state,ws,{"kind":"workspace.membership","entity":f"membership:{epoch}","payload":{"epoch":epoch,"members":members}},root); upload(cfg,state,root); state.close()
 def control_event(cfg,ws,action,target,root=None):
@@ -371,7 +381,12 @@ def sync_once(root=None,force=False):
             if scans:
                 core=open_db(path,True); batches=[]
                 for ws,meta,prior in scans:
-                    pol=state.execute("SELECT kind,value FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[cfg.get("bindings",{}).get(f"{ws}:{p[1]}") for p in pol if p[0]=="path" and cfg.get("bindings",{}).get(f"{ws}:{p[1]}")]; changes=None if prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone() else set(core_archive_changes(core,int(prior[0]))[1]); scope=set(); records=scan(core,state,meta["kind"],repos,roots,changes,ws,scope); records=protect_all(records,root,ws) if meta["kind"]=="team" else records; batches.append((ws,records,scope,prior is None))
+                    repos,roots,match=sharing_routes(state,ws,cfg["user"],cfg.get("bindings",{}))
+                    changes=None if prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone() else set(core_archive_changes(core,int(prior[0]))[1])
+                    scope=set()
+                    records=scan(core,state,meta["kind"],repos,roots,changes,ws,scope,match=match)
+                    records=protect_all(records,root,ws) if meta["kind"]=="team" else records
+                    batches.append((ws,records,scope,prior is None))
                 core.close()
                 for ws,records,scope,initial in batches:
                     bindings={r[0]:r[1] for r in state.execute("SELECT origin,epoch FROM origin_bindings WHERE workspace=?",(ws,)).fetchall()}; origins=set(bindings); repair=initial or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()); attest_rows(path,cfg,ws,records,origins)
@@ -491,8 +506,24 @@ def approve_history_cmd(space:str,device_id:str,reject:bool=typer.Option(False,"
 @locked
 def link_cmd(path:Path,space:str):
     from ai_convos.cli import repository
-    cfg=load(); ws=workspace(cfg,space); state=connect(paths()[2]); resolved=path.resolve(); repo=repository(resolved); kind,value=("repository",repo["id"]) if repo else ("path",digest(os.urandom(32))[:32]); state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?)",(ws,kind,value)); state.execute("DELETE FROM meta WHERE key LIKE 'core_generation:%'"); state.commit(); kind=="path" and cfg.setdefault("bindings",{}).update({f"{ws}:{value}":str(resolved)}); save(cfg)
-    publish(cfg,state,ws,{"kind":"workspace.policy","entity":f"policy:{kind}:{value}","payload":{"kind":kind,"value":value}}); upload(cfg,state); typer.echo(f"{kind} {value} -> {cfg['workspaces'][ws]['name']}")
+    ws=workspace(cfg:=load(),space); state=connect(paths()[2]); resolved=path.resolve(); repo=repository(resolved)
+    kind,value=("repository",repo["id"]) if repo else ("path",digest(os.urandom(32))[:32])
+    state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,?)",(ws,cfg["user"],kind,value)); state.execute("DELETE FROM meta WHERE key LIKE 'core_generation:%'"); state.commit()
+    if kind=="path": cfg.setdefault("bindings",{})[f"{ws}:{value}"]=str(resolved)
+    save(cfg); publish(cfg,state,ws,{"kind":"workspace.policy","entity":f"policy:{kind}:{value}","payload":{"kind":kind,"value":value}}); upload(cfg,state)
+    typer.echo(f"{kind} {value} -> {cfg['workspaces'][ws]['name']}")
+@remote.command("config")
+@locked
+def config_cmd(space:str,auto_contribute:Optional[bool]=typer.Option(None,"--auto-contribute/--no-auto-contribute"),inherit:bool=typer.Option(False,"--inherit"),match:Optional[str]=typer.Option(None,"--match",help="cwd,edit; cwd; edit; or none")):
+    ws=workspace(cfg:=load(),space)
+    if cfg["workspaces"][ws]["kind"]!="team": raise typer.BadParameter("sharing policy applies only to team workspaces","space")
+    state=connect(paths()[2]); current=sharing(state,ws,cfg["user"])
+    requested=[] if match=="none" else [m.strip() for m in match.split(",") if m.strip()] if match is not None else current["match"]
+    if match is not None and (len(requested)!=len(set(requested)) or not set(requested)<={"cwd","edit"}): raise typer.BadParameter("must be cwd,edit; cwd; edit; or none","--match")
+    if inherit and auto_contribute is not None: raise typer.BadParameter("cannot combine with auto-contribute override","--inherit")
+    result=configure_sharing(cfg,state,ws,None if inherit else auto_contribute if auto_contribute is not None else current["auto_contribute"],[m for m in ("cwd","edit") if m in requested]) if inherit or auto_contribute is not None or match is not None else current
+    state.close()
+    typer.echo(json.dumps({k:result[k] for k in ("auto_contribute","effective_auto_contribute","match","conflict")}))
 @remote.command("sync")
 def sync_cmd(): result=sync_once(force=True); typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else ""))
 @remote.command("fetch")
