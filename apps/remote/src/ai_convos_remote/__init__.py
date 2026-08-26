@@ -177,12 +177,13 @@ def configure_sharing(cfg,state,ws,auto_contribute,match,root=None):
     publish(cfg,state,ws,{"kind":"workspace.preference","entity":row["id"],"payload":{"row":row,"proof":proof}},root)
     upload(cfg,state,root); cfg.setdefault("sharing",{})[ws]={"auto_contribute":auto_contribute,"match":match}; update_recovery(cfg,root)
     return sharing(state,ws,cfg["user"])
-def retained_preferences(state,ws):
+def retained_preferences(state,ws,epoch=None):
     rows=((user,proof,*state.execute("SELECT auto_contribute,match FROM sharing_preferences WHERE workspace=? AND user=? AND revision=?",(ws,user,proof["revision"])).fetchone()) for user, in state.execute("SELECT DISTINCT user FROM sharing_preferences WHERE workspace=?",(ws,)).fetchall() for proof in sharing(state,ws,user)["proofs"])
-    return [{"kind":"workspace.preference","entity":(entity:=f"sharing:{ws}:{user}"),"payload":{"row":{"v":1,"kind":"sharing.preference","id":entity,"state":"active","data":{"auto_contribute":None if auto is None else bool(auto),"match":json.loads(match)}},"proof":proof}} for user,proof,auto,match in rows]
-def retain_preferences(cfg,ws,root=None):
+    records=[{"kind":"workspace.preference","entity":(entity:=f"sharing:{ws}:{user}"),"payload":{"row":{"v":1,"kind":"sharing.preference","id":entity,"state":"active","data":{"auto_contribute":None if auto is None else bool(auto),"match":json.loads(match)}},"proof":proof}} for user,proof,auto,match in rows]
+    return [r for r in records if epoch is None or not state.execute("SELECT 1 FROM outbox WHERE workspace=? AND entity=? AND revision=? AND epoch=? UNION SELECT 1 FROM receipts WHERE workspace=? AND entity=? AND revision=? AND epoch=?",(ws,r["entity"],digest(r["payload"]),epoch,ws,r["entity"],digest(r["payload"]),epoch)).fetchone()]
+def retain_preferences(cfg,ws,root=None,state=None):
     if cfg["workspaces"][ws]["kind"]!="team": return 0
-    state=connect(paths(root)[2]); records=retained_preferences(state,ws); [publish(cfg,state,ws,r,root,force=True) for r in records]; upload(cfg,state,root,{ws}); state.close(); return len(records)
+    owned=state is None; state=state or connect(paths(root)[2]); records=retained_preferences(state,ws,cfg["workspaces"][ws]["epoch"]); [publish(cfg,state,ws,r,root,force=True) for r in records]; records and upload(cfg,state,root,{ws}); owned and state.close(); return len(records)
 def settle_sharing(cfg,state,ready,root=None):
     changed=False
     for ws in ready&set(cfg["workspaces"]):
@@ -389,7 +390,7 @@ def sync_once(root=None,force=False):
             if force:
                 for ws in ready: state.execute("INSERT OR REPLACE INTO meta VALUES (?,'1')",(f"replica_repair:{ws}",))
             state.commit(); upload(cfg,state,root,ready); prepare_archive(cfg,state,root); baseline=archive_info(root); bound={r[0] for r in state.execute("SELECT DISTINCT workspace FROM origin_bindings").fetchall()}
-            pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; settle_sharing(cfg,state,ready,root); path=core_path(root); active={w["id"] for w in cfg["server_state"]["workspaces"]}; generation=archive_info(root)[1] if path.is_file() else 0
+            pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; settle_sharing(cfg,state,ready,root); [retain_preferences(cfg,ws,root,state) for ws in ready&set(cfg["workspaces"])]; path=core_path(root); active={w["id"] for w in cfg["server_state"]["workspaces"]}; generation=archive_info(root)[1] if path.is_file() else 0
             if baseline and baseline[2]==0:
                 for ws in ready&active-bound: state.execute("INSERT OR IGNORE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation)))
             scans=[(ws,meta,state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()) for ws,meta in cfg["workspaces"].items() if path.is_file() and ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]]
@@ -400,7 +401,7 @@ def sync_once(root=None,force=False):
                     repos,roots,match=sharing_routes(state,ws,cfg["user"],cfg.get("bindings",{}))
                     changes=None if prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone() else set(core_archive_changes(core,int(prior[0]))[1])
                     scope=set()
-                    records=scan(core,state,meta["kind"],repos,roots,changes,ws,scope,match=match)
+                    records=scan(core,state,meta["kind"],repos,roots,changes,ws,scope,match=match,user=cfg["user"])
                     records=protect_all(records,root,ws) if meta["kind"]=="team" else records
                     batches.append((ws,records,scope,prior is None))
                 core.close()

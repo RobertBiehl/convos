@@ -144,7 +144,9 @@ they do not depend on relay or `state.db` history.
 > disabling their own explicit links. Captured starting-directory and edit
 > matching are independent member controls, both enabled by default. Local-path
 > bindings remain device-local and never activate merely because another member
-> published an opaque path token.
+> published an opaque path token. Durable conversation admission is keyed by
+> `(author_user_id, row_kind, source_row_id)`; another member's proof cannot
+> admit a same-ID local row.
 
 > `author_user_id` identifies the user under whose identity the immutable event
 > or object proof was originally signed. Message role and provider source

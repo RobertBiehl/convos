@@ -162,8 +162,9 @@ def test_team_match_modes_are_independent_and_empty_is_passive(tmp_path):
     assert selected(["cwd"])=={"c","cwd"} and selected(["edit"])=={"c"} and selected([])==set()
 
 
-def test_durable_row_proof_keeps_admitted_conversation_after_state_rebuild(tmp_path):
-    repo,core=source(tmp_path); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); row=logical_row("conversations",ARCHIVE_COLUMNS["conversations"],list(core.execute("SELECT * FROM conversations WHERE id='c'").fetchone())); proof=row_proof(device,user,"w",1,row); project_row_proof(core,proof,root["sign_public"],certificate(root,user,device)); state=connect(tmp_path/"fresh-state.db"); scope=set(); records=scan(core,state,"team",[],[],None,"w",scope,match=[]); assert "c" in scope and any(r["kind"]=="conversation.record" and r["payload"]["row"][0]=="c" for r in records)
+def test_durable_row_proof_keeps_only_its_authors_admitted_conversation_after_state_rebuild(tmp_path):
+    repo,core=source(tmp_path); alice_root,alice_device=identity("alice-root"),identity("alice-device"); bob_root,bob_device=identity("bob-root"),identity("bob-device"); alice,bob=public_id(alice_root["sign_public"]),public_id(bob_root["sign_public"]); row=logical_row("conversations",ARCHIVE_COLUMNS["conversations"],list(core.execute("SELECT * FROM conversations WHERE id='c'").fetchone())); project_row_proof(core,row_proof(bob_device,bob,"w",1,row),bob_root["sign_public"],certificate(bob_root,bob,bob_device)); state=connect(tmp_path/"fresh-state.db"); scope=set(); assert not scan(core,state,"team",[],[],None,"w",scope,match=[],user=alice) and not scope
+    project_row_proof(core,row_proof(alice_device,alice,"w",1,row),alice_root["sign_public"],certificate(alice_root,alice,alice_device)); records=scan(core,state,"team",[],[],None,"w",scope,match=[],user=alice); assert "c" in scope and any(r["kind"]=="conversation.record" and r["payload"]["row"][0]=="c" for r in records)
 
 
 def test_team_scope_includes_prompt_turn_and_linked_repo_only(tmp_path):

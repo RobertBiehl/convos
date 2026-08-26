@@ -105,8 +105,9 @@ attachment chunk bodies in SQLite, raw provenance JSON, prompts, and other
 derived content are forbidden.
 
 Current root-signed member preferences are re-delivered after every workspace
-epoch change. Future-only members and recovered devices therefore receive
-current sharing behavior without receiving earlier conversation history.
+epoch change and reconciled idempotently on later syncs. Future-only members
+and recovered devices therefore receive current sharing behavior without
+receiving earlier conversation history, even after an interrupted rotation.
 
 ### Relay
 
