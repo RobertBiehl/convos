@@ -282,6 +282,22 @@ they do not depend on relay or `state.db` history.
 > the same repository and file identities. Files outside a resolved repository
 > receive opaque identities; equal-looking local paths are not assumed equal.
 
+> A repository sharing grant has its own stable opaque identity. Git lineage and
+> normalized remotes are matching evidence, not the grant identity. An exact
+> local checkout binding survives mutable remote metadata; an unbound checkout
+> must match the original evidence, and an ambiguous or unrelated fork does not
+> inherit the grant. Replacing a checkout in place does not transfer its binding;
+> legacy identities with conflicting live evidence are quarantined.
+
+> Conversation starting scope and edit repository scope are capture-time facts.
+> Later `git init`, remote changes, moves, nesting, or `.git` removal do not
+> retroactively reclassify old conversations. A removed repository binding is
+> dormant, not an implicit recursive path policy.
+
+> Archive ingestion commits before Git enrichment. A delayed enrichment may
+> retry only while the captured checkout marker still identifies the same
+> filesystem object; otherwise the pending scope resolves to unknown/external.
+
 > Core has no generic identity-assertion relation. Explicit moves remain typed
 > captured operations; likely renames or equivalence remain read-only hints.
 > A new canonical relationship requires a concrete product use case and a

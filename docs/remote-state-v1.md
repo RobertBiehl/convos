@@ -61,10 +61,11 @@ with the content transaction.
 ### Device config
 
 `config.json` owns device keys, workspace keys, pinned signed controls,
-machine-local non-Git path bindings, and the last archive ID/generation that
-completed an entire sync. Repository policies use core's stable repository ID;
-its one-to-many checkout map resolves clones and worktrees without a remote path
-binding. The archive proof is
+machine-local path/repository grant bindings and promotion identities, and the
+last archive ID/generation that completed an entire sync. Repository grants use
+opaque stable tokens with immutable matching evidence; mutable remotes are not
+grant identities. Core's checkout and evidence maps resolve local repositories
+without publishing absolute paths. The archive proof is
 kept here, rather than only in rebuildable `state.db`, so deleting `state.db`
 cannot erase rollback detection. A content-free copy in `state.db` provides a
 second safety anchor against a stale config write. Neither copy contains archive
@@ -95,8 +96,8 @@ Long-lived `state.db` rows contain only:
   retained only in event receipts and DuckDB origin attribution;
 - exact `(workspace, author, sequence) -> event_id` sequence identity;
 - compact parent data only for unresolved out-of-order gaps;
-- lazy/deferred event manifests, policy owners, root-signed member contribution
-  preferences, retries, and last failure;
+- lazy/deferred event manifests, policy owners, root-signed repository-policy
+  proofs and member contribution preferences, retries, and last failure;
 - content-free acknowledged event and row-replica receipts.
 
 The only content-bearing remote working state permitted is an unacknowledged
@@ -104,10 +105,11 @@ encrypted outbox file. Plaintext event JSON, acknowledged envelopes,
 attachment chunk bodies in SQLite, raw provenance JSON, prompts, and other
 derived content are forbidden.
 
-Current root-signed member preferences are re-delivered after every workspace
-epoch change and reconciled idempotently on later syncs. Future-only members
-and recovered devices therefore receive current sharing behavior without
-receiving earlier conversation history, even after an interrupted rotation.
+Current root-signed repository policies and member preferences are re-delivered
+after every workspace epoch change and reconciled idempotently on later syncs.
+Future-only members and recovered devices therefore receive current routing
+controls without receiving earlier conversation history, even after an
+interrupted rotation.
 
 ### Relay
 
