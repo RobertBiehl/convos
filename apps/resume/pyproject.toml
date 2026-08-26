@@ -1,6 +1,6 @@
 [project]
 name = "convos-resume"
-version = "0.10.0"
+version = "0.10.1"
 description = "Deterministic project handoff and session replay from exact conversation evidence"
 readme = "README.md"
 license = "MIT"

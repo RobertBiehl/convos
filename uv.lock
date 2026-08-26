@@ -116,7 +116,7 @@ wheels = [
 
 [[package]]
 name = "convos"
-version = "0.10.0"
+version = "0.10.1"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -164,7 +164,7 @@ provides-extras = ["redact", "dev"]
 
 [[package]]
 name = "convos-changegraph"
-version = "0.10.0"
+version = "0.10.1"
 source = { editable = "apps/changegraph" }
 dependencies = [
     { name = "convos" },
@@ -181,7 +181,7 @@ requires-dist = [
 
 [[package]]
 name = "convos-explore"
-version = "0.10.0"
+version = "0.10.1"
 source = { editable = "apps/explore" }
 dependencies = [
     { name = "convos" },
@@ -196,7 +196,7 @@ requires-dist = [
 
 [[package]]
 name = "convos-memory"
-version = "0.10.0"
+version = "0.10.1"
 source = { editable = "apps/memory" }
 dependencies = [
     { name = "convos" },
@@ -211,7 +211,7 @@ requires-dist = [
 
 [[package]]
 name = "convos-redact"
-version = "0.10.0"
+version = "0.10.1"
 source = { editable = "apps/redact" }
 dependencies = [
     { name = "convos" },
@@ -226,7 +226,7 @@ requires-dist = [
 
 [[package]]
 name = "convos-remote"
-version = "0.10.0"
+version = "0.10.1"
 source = { editable = "apps/remote" }
 dependencies = [
     { name = "convos" },
@@ -245,7 +245,7 @@ requires-dist = [
 
 [[package]]
 name = "convos-remote-server"
-version = "0.10.0"
+version = "0.10.1"
 source = { editable = "apps/remote_server" }
 dependencies = [
     { name = "cryptography" },
@@ -256,7 +256,7 @@ requires-dist = [{ name = "cryptography", specifier = ">=42.0.0" }]
 
 [[package]]
 name = "convos-resume"
-version = "0.10.0"
+version = "0.10.1"
 source = { editable = "apps/resume" }
 dependencies = [
     { name = "convos" },
