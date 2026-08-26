@@ -169,6 +169,9 @@ convos remote setup https://convos.example.com alice --device laptop
 convos remote workspace backend
 convos remote invite backend ALICE_USER_ID
 convos remote link ~/src/backend backend
+
+# Per-member contribution policy (defaults shown)
+convos remote config backend --auto-contribute --match cwd,edit
 ```
 
 Name lookup is a convenience for a trusted relay. An out-of-band user ID binds
@@ -179,9 +182,20 @@ device's user-root-signed certificate and its signing and encryption keys.
 Linking a Git checkout publishes its stable repository identity; core resolves
 every known clone and worktree for that identity. A linked non-Git path uses an
 opaque policy token whose absolute root remains a machine-local `config.json`
-binding. Once a conversation's working directory or any edit matches a policy,
-the complete conversation is routed to that workspace. Repository policy never
-silently slices turns or creates partial conversation history.
+binding. Team repository links auto-contribute for every member by default;
+each member can disable links created by teammates with
+`--no-auto-contribute`, restore the team default with `--inherit`, or keep the
+default explicitly with `--auto-contribute`. A member's own explicit links
+remain active either way. Non-Git path links never auto-bind on another device.
+
+Conversation matching defaults to both the captured starting directory (`cwd`)
+and captured file edits (`edit`). `--match cwd`, `--match edit`, or
+`--match none` narrows or disables future automatic contribution. The settings
+are root-signed, encrypted in the team workspace, and shared across that
+member's authorized devices. The client applies them passively during sync;
+there is no hook prompt or review queue. When either enabled signal matches,
+the complete conversation is routed once to that workspace. Repository policy
+never silently slices turns or creates partial conversation history.
 
 The client requires `convos-redact` and runs it inside the team `publish`
 boundary before event signing and encryption. High-confidence credential spans

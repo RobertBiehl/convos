@@ -9,7 +9,7 @@ from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVEN
 from .control import verify_state
 from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
-STATE_VERSION="1"
+STATE_VERSION="2"
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -25,15 +25,16 @@ CREATE TABLE IF NOT EXISTS blob_outbox(workspace TEXT,blob TEXT,epoch INT,upload
 CREATE TABLE IF NOT EXISTS blob_receipts(workspace TEXT,blob TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,blob,epoch)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS origin_bindings(workspace TEXT,origin TEXT,bundle TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,origin)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS control_dependencies(workspace TEXT,origin TEXT,bundle TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,origin)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS policies(workspace TEXT,kind TEXT,value TEXT,PRIMARY KEY(workspace,kind,value)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS policies(workspace TEXT,owner TEXT,kind TEXT,value TEXT,PRIMARY KEY(workspace,owner,kind,value)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS sharing_preferences(workspace TEXT,user TEXT,revision TEXT,auto_contribute INT,match TEXT,proof TEXT,PRIMARY KEY(workspace,user,revision)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS team_scopes(workspace TEXT,conversation TEXT,PRIMARY KEY(workspace,conversation)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID;
 """
-STATE_TABLES={"outbox","receipts","publication_heads","cursors","lazy_events","deferred_events","event_sequences","sequence_gaps","replica_receipts","blob_outbox","blob_receipts","origin_bindings","control_dependencies","policies","team_scopes","sync_states","meta"}
+STATE_TABLES={"outbox","receipts","publication_heads","cursors","lazy_events","deferred_events","event_sequences","sequence_gaps","replica_receipts","blob_outbox","blob_receipts","origin_bindings","control_dependencies","policies","sharing_preferences","team_scopes","sync_states","meta"}
 STATE_FORBIDDEN={"published","event_log","history_material","history_outbox","history_queue","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries","sharing_boundaries"}
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
-CORE_EVENTS={(kind,1) for kind in {"workspace.policy","workspace.membership","workspace.device"}}; SIGNED=set(TABLES)|PROVENANCE
+CORE_EVENTS={(kind,1) for kind in {"workspace.policy","workspace.preference","workspace.membership","workspace.device"}}; SIGNED=set(TABLES)|PROVENANCE
 FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 
 def _connect(path,journal="WAL"):
@@ -156,11 +157,21 @@ def _records(core,state,blobs=True,changes=None):
 def signed_row(record): return logical_row(p["table"],identity=p["id"],state="deleted") if (p:=record["payload"]).get("state")=="deleted" else logical_row(p["table"],p["columns"],p["row"])
 def _under(path,cwd,roots):
     p=Path(path); p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve(); return any(p.is_relative_to(root) for root in roots)
-def _team_scope(core,provenance,repositories,roots,candidates=None):
+def sharing(state,workspace,user):
+    rows=state.execute("SELECT revision,auto_contribute,match,proof FROM sharing_preferences WHERE workspace=? AND user=?",(workspace,user)).fetchall()
+    proofs=[json.loads(r[3]) for r in rows]
+    ancestors={a for p in proofs for a in p["ancestors"]}
+    leaves=[(r,p) for r,p in zip(rows,proofs) if r[0] not in ancestors]
+    values=[dict(auto_contribute=None if r[1] is None else bool(r[1]),match=json.loads(r[2])) for r,p in leaves] or [dict(auto_contribute=None,match=["cwd","edit"])]
+    autos=[v["auto_contribute"] for v in values]
+    match=[m for m in ("cwd","edit") if all(m in v["match"] for v in values)]
+    configured=False if False in autos else True if autos and all(v is True for v in autos) else None
+    return dict(auto_contribute=configured,effective_auto_contribute=configured is not False,match=match,proofs=[p for r,p in leaves],conflict=len(leaves)>1)
+def _team_scope(core,provenance,repositories,roots,candidates=None,match=("cwd","edit")):
     roots=[Path(p).expanduser().resolve() for p in roots]; checkouts=[Path(r[0]).expanduser().resolve() for r in core.execute("SELECT root FROM provenance.repository_checkouts WHERE repository IN (SELECT UNNEST(?))",[list(repositories)]).fetchall()] if repositories else []; allowed=roots+checkouts; edit_repos={r["payload"]["id"]:r["payload"]["repository"] for r in provenance if r["kind"]=="edit.observed"}; where=" WHERE c.id IN (SELECT UNNEST(?))" if candidates is not None else ""; args=[list(candidates)] if candidates is not None else []; rows=core.execute("SELECT fe.id,fe.file_path,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id"+where,args).fetchall(); cwd_rows=core.execute("SELECT id,cwd FROM conversations WHERE cwd IS NOT NULL"+(" AND id IN (SELECT UNNEST(?))" if candidates is not None else ""),args).fetchall()
-    return {cid for eid,path,cid,cwd in rows if edit_repos.get(eid) in repositories or _under(path,cwd,roots)}|{cid for cid,cwd in cwd_rows if allowed and _under(cwd,None,allowed)}
-def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,workspace=None,new_scope=None):
-    selected=changes; local={tuple(r) for r in core.execute("SELECT kind,entity FROM provenance.local_facts"+(" WHERE entity IN (SELECT UNNEST(?))" if selected is not None else ""),[[r[1] for r in selected]] if selected is not None else []).fetchall()}; all_provenance=[clean(r) for r in provenance_records(core,selected) if (r["kind"],r["entity"]) in local]; prior={r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()} if kind=="team" and workspace and changes is not None else set(); changed={table:{entity for name,entity in changes or () if name==table} for table in TABLES.values()}; candidates=changed["conversations"]|{r[0] for r in core.execute("SELECT conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(changed["messages"])]).fetchall()}|{r[0] for r in core.execute("SELECT m.conversation_id FROM messages m JOIN (SELECT message_id FROM tool_calls WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM attachments WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM file_edits WHERE id IN (SELECT UNNEST(?))) x ON x.message_id=m.id",[list(changed["tool_calls"]),list(changed["attachments"]),list(changed["file_edits"])]).fetchall()}|{r[0] for r in core.execute("SELECT conversation_id FROM artifacts WHERE id IN (SELECT UNNEST(?))",[list(changed["artifacts"])]).fetchall()} if changes is not None else None; convs=(prior|_team_scope(core,all_provenance,set(repositories),roots,candidates)) if kind=="team" else set()
+    return ({cid for eid,path,cid,cwd in rows if edit_repos.get(eid) in repositories or _under(path,cwd,roots)} if "edit" in match else set())|({cid for cid,cwd in cwd_rows if allowed and _under(cwd,None,allowed)} if "cwd" in match else set())
+def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,workspace=None,new_scope=None,match=("cwd","edit"),user=None):
+    selected=changes; local={tuple(r) for r in core.execute("SELECT kind,entity FROM provenance.local_facts"+(" WHERE entity IN (SELECT UNNEST(?))" if selected is not None else ""),[[r[1] for r in selected]] if selected is not None else []).fetchall()}; all_provenance=[clean(r) for r in provenance_records(core,selected) if (r["kind"],r["entity"]) in local]; prior={r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()} if kind=="team" and workspace and changes is not None else set(); admitted={r[0] for r in core.execute("SELECT source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=? AND author_user_id=? AND row_kind='conversations' AND state='active'",(workspace,user)).fetchall()} if kind=="team" and workspace and user else set(); changed={table:{entity for name,entity in changes or () if name==table} for table in TABLES.values()}; candidates=changed["conversations"]|{r[0] for r in core.execute("SELECT conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(changed["messages"])]).fetchall()}|{r[0] for r in core.execute("SELECT m.conversation_id FROM messages m JOIN (SELECT message_id FROM tool_calls WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM attachments WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM file_edits WHERE id IN (SELECT UNNEST(?))) x ON x.message_id=m.id",[list(changed["tool_calls"]),list(changed["attachments"]),list(changed["file_edits"])]).fetchall()}|{r[0] for r in core.execute("SELECT conversation_id FROM artifacts WHERE id IN (SELECT UNNEST(?))",[list(changed["artifacts"])]).fetchall()} if changes is not None else None; convs=(admitted|prior|_team_scope(core,all_provenance,set(repositories),roots,candidates,match)) if kind=="team" else set()
     if changes is not None and workspace and (new:=convs-{r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()}):
         local={tuple(r) for r in core.execute("SELECT kind,entity FROM provenance.local_facts").fetchall()}; all_provenance=[clean(r) for r in provenance_records(core) if (r["kind"],r["entity"]) in local]; msgs={r[0] for r in core.execute("SELECT id FROM messages WHERE conversation_id IN (SELECT UNNEST(?))",[list(new)]).fetchall()}; changes=set(changes)|{("conversations",x) for x in new}|{("messages",x) for x in msgs}|{(table,r[0]) for table in ("tool_calls","attachments","file_edits") for r in core.execute(f"SELECT id FROM {table} WHERE message_id IN (SELECT UNNEST(?))",[list(msgs)]).fetchall()}|{("artifacts",r[0]) for r in core.execute("SELECT id FROM artifacts WHERE conversation_id IN (SELECT UNNEST(?))",[list(new)]).fetchall()}|local
     if workspace and new_scope is not None: new_scope.update(convs)
@@ -311,7 +322,22 @@ def verify_history(state,workspace,controls,start):
 def project(db_path,state,value,workspace,local_device=None,db=None,root=None,batch=False,authors=None,recover=None,local_user=None):
     if event_support(value)!="supported": return False
     if value["kind"]=="workspace.policy":
-        p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?)",(workspace,p["kind"],p["value"])); batch or state.commit(); return True
+        p=value["payload"]
+        state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,?)",(workspace,author_user(value,authors),p["kind"],p["value"]))
+        state.execute("DELETE FROM meta WHERE key=?",(f"core_generation:{workspace}",))
+        batch or state.commit()
+        return True
+    if value["kind"]=="workspace.preference":
+        p=value["payload"]
+        row,proof=p["row"],p["proof"]
+        user=proof["author_user_id"]
+        verify_semantic_proof(proof,row,user)
+        data,match=row["data"],row["data"]["match"]
+        if set(p)!={"row","proof"} or value["entity"]!=row["id"] or set(row)!={"v","kind","id","state","data"} or row["v"]!=1 or row["kind"]!="sharing.preference" or row["id"]!=f"sharing:{workspace}:{user}" or row["state"]!="active" or set(data)!={"auto_contribute","match"} or data["auto_contribute"] is not None and not isinstance(data["auto_contribute"],bool) or not isinstance(match,list) or match!=[m for m in ("cwd","edit") if m in match] or proof["workspace"]!=workspace or (authors or {}).get(proof["author_device_id"])!=user: raise ValueError("invalid sharing preference")
+        state.execute("INSERT OR REPLACE INTO sharing_preferences VALUES (?,?,?,?,?,?)",(workspace,user,proof["revision"],data["auto_contribute"],json.dumps(match),json.dumps(proof)))
+        state.execute("DELETE FROM meta WHERE key=?",(f"core_generation:{workspace}",))
+        batch or state.commit()
+        return True
     if value["kind"] not in PROVENANCE: return False
     user=author_user(value,authors); owned=bool(recover and user==local_user); native=owned and recover=="native"
     if owned and recover=="adopt": return True

@@ -7,10 +7,10 @@ import ai_convos_memory as memory_module
 import ai_convos_remote as remote_client
 import ai_convos_remote.projection as projection_module
 from ai_convos.cli import ARCHIVE_COLUMNS, archive_state, capture_provenance, index_attachment_body, init_schema, project_archive_row, project_logical_row
-from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, bind_origin, connect, control_body, create, doctor_status, fetch_lazy, grant_all, key, load, pull, pull_origins, publish, refresh, rehome_client, remove_device,
+from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, bind_origin, configure_sharing, connect, control_body, create, doctor_status, fetch_lazy, grant_all, key, load, pull, pull_origins, publish, refresh, rehome_client, remove_device,
                               request_device, request_history, rescue_bindings, setup_client, sync_once, upload, workspace)
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
-from ai_convos_remote.projection import inspect_state, scan
+from ai_convos_remote.projection import inspect_state, scan, sharing
 from ai_convos_remote.protocol import certificate, event, identity, logical_row, open_blob, open_origin, open_replica, seal_blob, seal_event, seal_key, seal_origin, seal_replica, sign_control, unb64
 from ai_convos_remote_server import action, connect as server_connect
 
@@ -53,7 +53,7 @@ def test_remote_scan_is_read_only_and_does_not_self_trigger(tmp_path,monkeypatch
 
 
 def test_incremental_sync_reads_only_core_marked_rows(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); path=root/"data/convos.db"; write_archive(path,"one"); sync_once(root,True); before=server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]; seen=[]; real=remote_client.scan; monkeypatch.setattr(remote_client,"scan",lambda *args:seen.append(args[-3]) or real(*args)); write_archive(path,"two"); sync_once(root)
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); path=root/"data/convos.db"; write_archive(path,"one"); sync_once(root,True); before=server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]; seen=[]; real=remote_client.scan; monkeypatch.setattr(remote_client,"scan",lambda *args,**kwargs:seen.append(args[-3]) or real(*args,**kwargs)); write_archive(path,"two"); sync_once(root)
     assert seen==[{("conversations","c")}] and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==before+1
 
 
@@ -287,6 +287,15 @@ def test_team_future_only_complete_history_and_removal(tmp_path,monkeypatch):
     with pytest.raises(ValueError,match="outside"): action(server,sign_control(alice["device"],future),alice["token"])
     assert grant_all(alice,team,"bob",a)>=2; bob=load(b); pull(bob,sb,b); assert any(name.endswith(":1") for name in load(b)["keys"])
     add_member(alice,team,"bob",True,root=a); bob=load(b); pull(bob,sb,b); assert team not in {w["id"] for w in load(b)["server_state"]["workspaces"]} and f"{team}:3" not in load(b)["keys"]
+
+
+def test_future_only_recovered_device_reasserts_explicit_sharing_preference(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,_=setup_client("http://server","alice",root=a); bob,recovery=setup_client("http://server","bob","laptop",root=b); team=create(alice,"Team","team",a); add_member(alice,team,"bob",root=a); bob=load(b); refresh(bob,b); state=connect(b/"remote/state.db"); configure_sharing(bob,state,team,False,["edit"],b); state.close(); desktop,_=setup_client("http://server","bob","desktop",recovery,root=c); request_device(desktop,team,c,0); approve_device(load(b),team,desktop["device"]["id"],root=b); sync_once(c); state=connect(c/"remote/state.db"); assert sharing(state,team,desktop["user"])["auto_contribute"] is False and sharing(state,team,desktop["user"])["match"]==["edit"] and load(c)["sharing"][team]=={"auto_contribute":False,"match":["edit"]}
+
+
+def test_epoch_preference_retention_resumes_after_rotation_crash(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,_=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); state=connect(a/"remote/state.db"); configure_sharing(alice,state,team,False,["edit"],a); state.close(); real=remote_client.retain_preferences; monkeypatch.setattr(remote_client,"retain_preferences",lambda *args,**kwargs:0); add_member(load(a),team,"bob",root=a); monkeypatch.setattr(remote_client,"retain_preferences",real); before=server.execute("SELECT COUNT(*) FROM events WHERE workspace=? AND epoch=2",(team,)).fetchone()[0]; sync_once(a); after=server.execute("SELECT COUNT(*) FROM events WHERE workspace=? AND epoch=2",(team,)).fetchone()[0]; sync_once(a); assert after==before+1 and server.execute("SELECT COUNT(*) FROM events WHERE workspace=? AND epoch=2",(team,)).fetchone()[0]==after
+
 
 def test_path_bindings_are_rescued_to_config_before_state_cutover(tmp_path):
     path=tmp_path/"state.db"; db=sqlite3.connect(path); db.execute("CREATE TABLE policies(workspace TEXT,kind TEXT,value TEXT,local_root TEXT)"); db.execute("INSERT INTO policies VALUES ('w','path','token','/local/worktree'),('w','repository','repo','/ignored')"); db.commit(); db.close(); cfg={"bindings":{}}
