@@ -1,6 +1,6 @@
 [project]
 name = "convos-remote"
-version = "0.10.0"
+version = "0.10.1"
 description = "Encrypted personal and team synchronization client for convos"
 readme = "README.md"
 license = "MIT"

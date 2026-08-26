@@ -1,6 +1,6 @@
 [project]
 name = "convos-explore"
-version = "0.10.0"
+version = "0.10.1"
 description = "Local semantic navigation across conversations in convos"
 readme = "README.md"
 license = "MIT"
