@@ -204,6 +204,7 @@ Repository lifecycle is passive and conservative:
   bound checkout; SSH and HTTPS forms of the same host/path normalize equally;
 - moving the same checkout reattaches through its local checkout identity, while
   a new checkout must match the grant's original Git evidence exactly;
+- replacing a checkout at the same path does not inherit the old local binding;
 - a new fork or unrelated remote is not silently merged into an existing grant;
 - removing `.git` makes the repository binding dormant instead of turning it
   into a recursive path share;
@@ -222,6 +223,11 @@ treated as unknown. Later
 filesystem changes therefore cannot retroactively move an old conversation in
 or out of scope. Ordinary directories remain path-bound, so moving one requires
 an explicit new link.
+
+During the state-v1 cutover, released untyped local path bindings are rewritten
+to typed path bindings. A locally owned proofless repository policy is reissued
+with immutable evidence only when one unambiguous live repository match exists;
+foreign, missing, or ambiguous proofless policies remain dormant.
 
 The client requires `convos-redact` and runs it inside the team `publish`
 boundary before event signing and encryption. High-confidence credential spans

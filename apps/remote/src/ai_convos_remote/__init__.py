@@ -31,13 +31,19 @@ def save(cfg,root=None):
     base,path,_=paths(root); base.mkdir(parents=True,exist_ok=True); os.chmod(base,0o700); tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_text(json.dumps(cfg)); os.chmod(tmp,0o600); durable_replace(tmp,path)
 def rescue_bindings(cfg,state_path,root=None):
     db=sqlite3.connect(Path(state_path).resolve().as_uri()+"?mode=ro",uri=True)
-    try: columns={r[1] for r in db.execute("PRAGMA table_info(policies)").fetchall()}; rows=db.execute("SELECT workspace,value,local_root FROM policies WHERE kind='path' AND local_root IS NOT NULL").fetchall() if "local_root" in columns else []
+    try: rows=db.execute(f"SELECT workspace,value,{('local_root' if 'local_root' in columns else 'NULL')} FROM policies WHERE kind='path'").fetchall() if {"workspace","kind","value"}<=(columns:={r[1] for r in db.execute("PRAGMA table_info(policies)").fetchall()}) else []
     finally: db.close()
-    for ws,value,path in rows:
+    changed=0
+    for ws,value,stored in rows:
+        old,new,path=(old:=f"{ws}:{value}"),policy_binding(ws,"path",value),stored or cfg.get("bindings",{}).get(old)
+        if path is None: continue
         if not isinstance(path,str) or not Path(path).is_absolute(): raise ValueError("legacy path binding is invalid")
-        cfg.setdefault("bindings",{})[f"{ws}:path:{value}"]=path
-    if rows: save(cfg,root)
-    return len(rows)
+        if (current:=cfg.setdefault("bindings",{}).get(new)) is not None and binding_path(current)!=path: raise ValueError("legacy path binding conflicts")
+        cfg["bindings"][new]=path
+        cfg["bindings"].pop(old,None)
+        changed+=1
+    if changed: save(cfg,root)
+    return changed
 def encrypted_file(root,event,value):
     path=paths(root)[0]/"outbox"/f"{event}.json"; path.parent.mkdir(parents=True,exist_ok=True)
     if path.parent.is_symlink() or path.is_symlink(): raise ValueError("encrypted outbox path must not be a symlink")
@@ -204,7 +210,7 @@ def sharing_routes(state,ws,user,bindings,core):
     pref=sharing(state,ws,user); known=core_repository_state(core) if hasattr(core,"execute") else core
     policies=state.execute("SELECT owner,kind,value,evidence FROM policies WHERE workspace=?",(ws,)).fetchall(); active=[p for p in policies if p[1]=="repository" and (p[0]==user or pref["effective_auto_contribute"])]
     def resolve(p):
-        if not p[3]: return p[2]
+        if not p[3]: return None
         binding=bindings.get(policy_binding(ws,p[1],p[2])) if p[0]==user else None; path=binding_path(binding) if binding else None
         expected=binding["repository"] if isinstance(binding,dict) else known["aliases"].get(repository_evidence(json.loads(p[3])))
         if path and (repo:=core_repository(path,known,True)) and repo["id"]==expected: return expected
@@ -212,18 +218,31 @@ def sharing_routes(state,ws,user,bindings,core):
             if rid==expected and (repo:=core_repository(known.get("checkout_roots",{}).get(checkout),known,True)) and (repo["id"],repo["checkout"])==(expected,checkout): return expected
         return None
     return sorted({repo for p in active if (repo:=resolve(p))}),[binding_path(bindings[key]) for p in policies if p[0]==user and p[1]=="path" and (key:=policy_binding(ws,p[1],p[2])) in bindings],pref["match"]
+def upgrade_repository_policies(cfg,state,core,root=None):
+    changed=False
+    for ws,owner,value in state.execute("SELECT workspace,owner,value FROM policies WHERE kind='repository' AND evidence IS NULL").fetchall():
+        if owner!=cfg["user"] or ws not in cfg["workspaces"] or cfg["workspaces"][ws]["kind"]!="team": continue
+        repos={repository_evidence({k:repo[k] for k in ("lineage","remotes")}):(path,repo) for checkout,rid in core["checkouts"].items() if rid==value and (path:=core["checkout_roots"].get(checkout)) and (repo:=core_repository(path,core,True)) and repo["id"]==rid and repo["lineage"]}
+        if len(repos)!=1: continue
+        path,repo=next(iter(repos.values())); binding={"path":path,"repository":repo["id"],"checkout":repo["checkout"]}; key=policy_binding(ws,"repository",value)
+        if (old:=cfg.setdefault("bindings",{}).get(key)) and old!=binding: continue
+        cfg["bindings"][key]=binding; save(cfg,root); publish(cfg,state,ws,repository_policy(cfg,state,ws,value,{k:repo[k] for k in ("lineage","remotes")}),root); changed=True
+    return changed
 def promote_paths(cfg,state,core,root=None):
     changed=False
     for ws,value in state.execute("SELECT workspace,value FROM policies WHERE owner=? AND kind='path'",(cfg["user"],)).fetchall():
         binding=cfg.get("bindings",{}).get(policy_binding(ws,"path",value)); path=binding_path(binding) if binding else None; repo=core_repository(path,core,True) if path else None
         if not repo or not repo["lineage"] or Path(repo["root"])!=Path(path).resolve(): continue
-        promotions,key=cfg.setdefault("promotions",{}),policy_binding(ws,"path",value)
-        created=key not in promotions
+        promotions,key=cfg.setdefault("promotions",{}),policy_binding(ws,"path",value); promotion=promotions.get(key)
+        if promotion and (set(promotion)!={"grant","path","repository","checkout","evidence"} or promotion["path"]!=str(Path(path).resolve()) or promotion["checkout"]!=repo["checkout"] or promotion["evidence"]["lineage"]!=repo["lineage"]): continue
         grants=[r[0] for r in state.execute("SELECT value FROM policies WHERE workspace=? AND owner=? AND kind='repository'",(ws,cfg["user"])).fetchall()]
-        grant=promotions.setdefault(key,next((g for g in grants if binding_path(cfg.get("bindings",{}).get(policy_binding(ws,"repository",g),{}))==str(Path(path).resolve())),None) or digest(os.urandom(32))[:32]); grant_binding=policy_binding(ws,"repository",grant); bound={"path":str(Path(path).resolve()),"repository":repo["id"],"checkout":repo["checkout"]}
-        dirty=created or cfg.setdefault("bindings",{}).get(grant_binding)!=bound; changed|=dirty
-        cfg["bindings"][grant_binding]=bound; evidence={k:repo[k] for k in ("lineage","remotes")}; dirty and save(cfg,root)
-        if grant not in grants: publish(cfg,state,ws,repository_policy(cfg,state,ws,grant,evidence),root)
+        dirty=False
+        if not promotion: promotion={"grant":digest(os.urandom(32))[:32],"path":str(Path(path).resolve()),"repository":repo["id"],"checkout":repo["checkout"],"evidence":{k:repo[k] for k in ("lineage","remotes")}}; promotions[key]=promotion; dirty=True
+        grant,bound=promotion["grant"],{k:promotion[k] for k in ("path","repository","checkout")}; grant_binding=policy_binding(ws,"repository",grant)
+        if (old:=cfg.setdefault("bindings",{}).get(grant_binding)) and old!=bound: continue
+        if not old: cfg["bindings"][grant_binding]=bound; dirty=True
+        if dirty: save(cfg,root); changed=True
+        if grant not in grants: publish(cfg,state,ws,repository_policy(cfg,state,ws,grant,promotion["evidence"]),root)
     return changed
 def membership_event(cfg,ws,epoch,members,root=None):
     state=connect(paths(root)[2]); publish(cfg,state,ws,{"kind":"workspace.membership","entity":f"membership:{epoch}","payload":{"epoch":epoch,"members":members}},root); upload(cfg,state,root); state.close()
@@ -419,7 +438,10 @@ def sync_once(root=None,force=False):
             if force:
                 for ws in ready: state.execute("INSERT OR REPLACE INTO meta VALUES (?,'1')",(f"replica_repair:{ws}",))
             state.commit(); upload(cfg,state,root,ready); prepare_archive(cfg,state,root); baseline=archive_info(root); bound={r[0] for r in state.execute("SELECT DISTINCT workspace FROM origin_bindings").fetchall()}
-            pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; settle_sharing(cfg,state,ready,root); path=core_path(root); active={w["id"] for w in cfg["server_state"]["workspaces"]}; generation=archive_info(root)[1] if path.is_file() else 0; core=open_db(path,True) if path.is_file() else None; known=core_repository_state(core) if core else {"roots":{},"checkouts":{},"aliases":{}}; core and core.close(); promote_paths(cfg,state,known,root); [retain_sharing(cfg,ws,root,state) for ws in ready&set(cfg["workspaces"])]
+            pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; settle_sharing(cfg,state,ready,root)
+            path,active,generation=(path:=core_path(root)),{w["id"] for w in cfg["server_state"]["workspaces"]},archive_info(root)[1] if path.is_file() else 0
+            known=core_repository_state(core) if (core:=open_db(path,True) if path.is_file() else None) else {"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}}
+            (core and core.close(),promote_paths(cfg,state,known,root),upgrade_repository_policies(cfg,state,known,root),[retain_sharing(cfg,ws,root,state) for ws in ready&set(cfg["workspaces"])])
             if baseline and baseline[2]==0:
                 for ws in ready&active-bound: state.execute("INSERT OR IGNORE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation)))
             scans=[(ws,meta,state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()) for ws,meta in cfg["workspaces"].items() if path.is_file() and ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]]

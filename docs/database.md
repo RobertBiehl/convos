@@ -133,7 +133,7 @@ product is strictly read-only.
 | `conversation_scopes` | Capture-time resolved cwd, repository, root, and checkout marker |
 | `files` | Repository-relative or opaque external file identity |
 | `file_versions` | Observed full-content hashes |
-| `file_edit_scopes` | Immutable capture-time path, repository, root, and checkout marker for each local edit |
+| `file_edit_scopes` | Immutable capture-time repository-relative path, resolved filesystem route, root, and checkout marker for each local edit |
 | `file_edit_files` | Edit-to-file edges plus hashes of captured old/new edit material and evidence quality |
 | `git_checkpoints` | Git head plus capture-time working-tree hash, changed paths, and capture source |
 | `checkpoint_edits` | Checkpoint-to-`file_edits.id` evidence |

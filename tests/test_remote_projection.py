@@ -3,6 +3,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+import ai_convos.cli as core_module
 from ai_convos.cli import ARCHIVE_COLUMNS, capture_provenance, init_schema, project_attachment_body, project_row_proof, provenance_digest, repository
 import ai_convos_remote as remote_client
 import ai_convos_remote.projection as projection_module
@@ -148,9 +149,9 @@ def test_event_support_is_exact_and_unknowns_fail_closed(monkeypatch):
 
 
 def test_member_sharing_preference_is_root_signed_and_defaults_on(tmp_path):
-    state=connect(tmp_path/"state.db"); core=duckdb.connect(); init_schema(core); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); state.executemany("INSERT INTO policies VALUES (?,?,?,?,?)",[("w",user,"repository","mine",None),("w","teammate","repository","theirs",None),("w",user,"path","opaque",None)]); state.execute("INSERT INTO meta VALUES ('core_generation:w','7')"); assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":None,"effective_auto_contribute":True,"match":["cwd","edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:path:opaque":"/bound"},core)==(["mine","theirs"],["/bound"],["cwd","edit"])
+    repo_root,core=source(tmp_path); state=connect(tmp_path/"state.db"); repo=repository(repo_root,core); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); evidence={k:repo[k] for k in ("lineage","remotes")}; state.executemany("INSERT INTO policies VALUES (?,?,?,?,?)",[("w","teammate","repository","theirs",json.dumps(evidence)),("w",user,"path","opaque",None)]); state.execute("INSERT INTO meta VALUES ('core_generation:w','7')"); assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":None,"effective_auto_contribute":True,"match":["cwd","edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:path:opaque":"/bound"},core)==([repo["id"]],["/bound"],["cwd","edit"])
     row={"v":1,"kind":"sharing.preference","id":f"sharing:w:{user}","state":"active","data":{"auto_contribute":False,"match":["edit"]}}; proof=semantic_proof(root,user,device["id"],"w",1,row); value=event(device,1,"workspace.preference",row["id"],{"row":row,"proof":proof}); project(tmp_path/"core.db",state,value,"w",authors={device["id"]:user},local_user=user)
-    assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":False,"effective_auto_contribute":False,"match":["edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:path:opaque":"/bound"},core)==(["mine"],["/bound"],["edit"]) and not state.execute("SELECT 1 FROM meta WHERE key='core_generation:w'").fetchone()
+    assert sharing(state,"w",user)|{"proofs":[]}=={"auto_contribute":False,"effective_auto_contribute":False,"match":["edit"],"proofs":[],"conflict":False} and sharing_routes(state,"w",user,{"w:path:opaque":"/bound"},core)==([],["/bound"],["edit"]) and not state.execute("SELECT 1 FROM meta WHERE key='core_generation:w'").fetchone()
 
 
 def test_incoming_policy_invalidates_cached_team_scope(tmp_path):
@@ -168,12 +169,20 @@ def test_path_grant_promotes_only_when_its_exact_root_becomes_git(tmp_path,monke
     def emit(cfg,state,ws,record,root=None): p=record["payload"]; events.append(record); state.execute("INSERT INTO policies VALUES (?,?,?,?,?)",(ws,cfg["user"],"repository",p["row"]["data"]["value"],json.dumps(p["row"]["data"]["evidence"])))
     monkeypatch.setattr(remote_client,"publish",emit); monkeypatch.setattr(remote_client,"save",lambda *args:saved.append(1))
     assert not promote_paths(cfg,state,core); git(root,"init","-q"); git(root,"config","user.email","a@b.c"); git(root,"config","user.name","A"); (root/"a.py").write_text("new\n"); git(root,"add","."); git(root,"commit","-qm","init")
-    assert promote_paths(cfg,state,core) and not promote_paths(cfg,state,core) and len(events)==len(saved)==1 and events[0]["payload_v"]==2 and events[0]["payload"]["row"]["data"]["value"]==cfg["promotions"]["w:path:path-grant"] and cfg["bindings"][f"w:repository:{events[0]['payload']['row']['data']['value']}"]["path"]==str(root)
-    state.execute("INSERT INTO policies VALUES ('w',?,'path','second-path',NULL)",(cfg["user"],)); cfg["bindings"]["w:path:second-path"]=str(root); assert promote_paths(cfg,state,core) and len(events)==1 and len(saved)==2 and cfg["promotions"]["w:path:second-path"]==events[0]["payload"]["row"]["data"]["value"]
+    assert promote_paths(cfg,state,core) and not promote_paths(cfg,state,core) and len(events)==len(saved)==1 and events[0]["payload_v"]==2 and events[0]["payload"]["row"]["data"]["value"]==cfg["promotions"]["w:path:path-grant"]["grant"] and cfg["bindings"][f"w:repository:{events[0]['payload']['row']['data']['value']}"]["path"]==str(root)
+    state.execute("INSERT INTO policies VALUES ('w',?,'path','second-path',NULL)",(cfg["user"],)); cfg["bindings"]["w:path:second-path"]=str(root); assert promote_paths(cfg,state,core) and len(events)==len(saved)==2 and cfg["promotions"]["w:path:second-path"]["grant"]!=events[0]["payload"]["row"]["data"]["value"]
+
+
+def test_path_promotion_never_retargets_after_in_place_checkout_replacement(tmp_path,monkeypatch):
+    root=tmp_path/"repo"; root.mkdir(); git(root,"init","-q"); git(root,"config","user.email","a@b.c"); git(root,"config","user.name","A"); (root/"a").write_text("one"); git(root,"add","."); git(root,"commit","-qm","one"); core=duckdb.connect(); init_schema(core); state=connect(tmp_path/"state.db"); signer=identity("member"); cfg={"user":public_id(signer["sign_public"]),"root":signer,"device":identity("device"),"workspaces":{"w":{"epoch":1}},"bindings":{"w:path:path-grant":str(root)},"promotions":{}}; state.execute("INSERT INTO policies VALUES ('w',?,'path','path-grant',NULL)",(cfg["user"],)); events=[]
+    def emit(cfg,state,ws,record,root=None): events.append(record); state.execute("INSERT INTO policies VALUES (?,?,?,?,?)",(ws,cfg["user"],"repository",record["payload"]["row"]["data"]["value"],json.dumps(record["payload"]["row"]["data"]["evidence"])))
+    monkeypatch.setattr(remote_client,"publish",emit); monkeypatch.setattr(remote_client,"save",lambda *args:None); assert promote_paths(cfg,state,core); frozen=json.loads(json.dumps(cfg["promotions"]))
+    for child in (root/".git").iterdir(): __import__("shutil").rmtree(child) if child.is_dir() else child.unlink()
+    git(root,"init","-q"); git(root,"config","user.email","a@b.c"); git(root,"config","user.name","A"); (root/"a").write_text("two"); git(root,"add","."); git(root,"commit","-qm","two"); assert not promote_paths(cfg,state,core) and cfg["promotions"]==frozen and len(events)==1
 
 
 def test_grant_binding_kind_and_owner_prevent_repository_to_path_downgrade(tmp_path):
-    root,core=source(tmp_path); state=connect(tmp_path/"state.db"); state.executemany("INSERT INTO policies VALUES (?,?,?,?,?)",[("w","member","repository","shared",None),("w","attacker","path","shared",None)]); repos,roots,_=sharing_routes(state,"w","member",{"w:repository:shared":str(root)},core); assert repos==["shared"] and roots==[]
+    root,core=source(tmp_path); state=connect(tmp_path/"state.db"); repo=repository(root,core); evidence={k:repo[k] for k in ("lineage","remotes")}; state.executemany("INSERT INTO policies VALUES (?,?,?,?,?)",[("w","member","repository","shared",json.dumps(evidence)),("w","attacker","path","shared",None)]); repos,roots,_=sharing_routes(state,"w","member",{"w:repository:shared":{"path":str(root),"repository":repo["id"],"checkout":repo["checkout"]}},core); assert repos==[repo["id"]] and roots==[]
 
 
 def test_repository_policy_evidence_is_root_signed_and_immutable(tmp_path):
@@ -223,6 +232,10 @@ def test_team_policy_routes_complete_cross_repo_conversation(tmp_path):
 def test_path_policy_match_routes_complete_conversation(tmp_path):
     allowed,private=tmp_path/"project",tmp_path/"project-private"; allowed.mkdir(); private.mkdir(); (allowed/"a.py").write_text("a"); (private/"b.py").write_text("b"); core=duckdb.connect(str(tmp_path/"core.db")); init_schema(core); core.execute("INSERT INTO conversations VALUES ('c','codex','paths','2026-01-01','2026-01-01','m',?,NULL,NULL,'{}')",[str(tmp_path)]); core.execute("INSERT INTO messages VALUES ('m','c','assistant','done',NULL,'2026-01-01','m','{}',NULL,NULL)"); core.execute("INSERT INTO file_edits VALUES ('a','m',?,'write','a','2026-01-01',NULL),('b','m',?,'write','b','2026-01-01',NULL)",[str(allowed/'a.py'),str(private/'b.py')]); state=connect(tmp_path/"state.db")
     core.close(); capture_provenance(tmp_path/"core.db"); core=duckdb.connect(str(tmp_path/"core.db")); records=scan(core,state,"team",[],[str(allowed)]); assert sum(r["kind"]=="file_edit.record" for r in records)==2 and not any(r["kind"]=="turn.boundary" for r in records) and str(private) not in json.dumps(records)
+
+
+def test_edit_policy_uses_captured_resolved_route_after_symlink_retarget(tmp_path):
+    a,b=tmp_path/"a",tmp_path/"b"; a.mkdir(); b.mkdir(); link=tmp_path/"current"; link.symlink_to(a); path=tmp_path/"core.db"; core=duckdb.connect(str(path)); init_schema(core); result=core_module.ParseResult(convs=[dict(id="c",source="codex",title="route",created_at=None,updated_at=None,model=None,cwd=str(tmp_path),git_branch=None,project_id=None,metadata="{}")],msgs=[dict(id="m",conversation_id="c",role="assistant",content="done",thinking=None,created_at=None,model=None,metadata="{}",parent_id=None)],edits=[dict(id="e",message_id="m",file_path=str(link/"x.py"),edit_type="write",content="x",created_at=None,old_content=None)]); core_module.upsert(core,result); core.close(); link.unlink(); link.symlink_to(b); capture_provenance(path); core=duckdb.connect(str(path)); state=connect(tmp_path/"state.db"); selected=lambda root:{r["payload"]["row"][0] for r in scan(core,state,"team",[],[str(root)],match=["edit"]) if r["kind"]=="conversation.record"}; assert selected(a)=={"c"} and selected(b)==set()
 
 
 def test_per_workspace_device_chain_accepts_reorder_and_rejects_replay_or_bad_parent(tmp_path):
