@@ -285,13 +285,13 @@ def reconcile_replicas(cfg,state,root,ws,envelopes):
         if not isinstance(present,dict) or not set(present)<=set(ids) or any(not isinstance(v,int) or isinstance(v,bool) or v<1 for v in present.values()): raise ValueError("relay replica inventory mismatch")
         missing=[env for env in page if env["replica"] not in present]; uploaded=request(cfg,{"op":"replica_upload_many","envelopes":missing})["replicas"] if missing else []
         if len(uploaded)!=len(missing) or any(not isinstance(r.get("cursor"),int) or isinstance(r["cursor"],bool) or r["cursor"]<1 for r in uploaded): raise ValueError("relay replica acknowledgement mismatch")
-        cursors={**present,**{env["replica"]:ack["cursor"] for env,ack in zip(missing,uploaded)}}; [state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",(ws,env["replica"],env["epoch"],cursors[env["replica"]])) for env in page]; state.commit()
+        cursors={**present,**{env["replica"]:ack["cursor"] for env,ack in zip(missing,uploaded)}}; state.executemany("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",[(ws,env["replica"],env["epoch"],cursors[env["replica"]]) for env in page]); state.commit()
 def replica_inventory(cfg,state,ws,candidates):
     found={}
     for rows in (candidates[i:i+500] for i in range(0,len(candidates),500)):
         present=request(cfg,{"op":"replica_reconcile","workspace":ws,"replicas":(page:=[r[0] for r in rows])})["present"]
         if not isinstance(present,dict) or not set(present)<=set(page) or any(not isinstance(v,int) or isinstance(v,bool) or v<1 for v in present.values()): raise ValueError("relay replica inventory mismatch")
-        found.update(present); [state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",(ws,replica,epoch,present[replica])) if replica in present else state.execute("DELETE FROM replica_receipts WHERE workspace=? AND replica=? AND epoch=?",(ws,replica,epoch)) for replica,epoch in rows]
+        found.update(present); available=[(ws,replica,epoch,present[replica]) for replica,epoch in rows if replica in present]; missing=[(ws,replica,epoch) for replica,epoch in rows if replica not in present]; available and state.executemany("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",available); missing and state.executemany("DELETE FROM replica_receipts WHERE workspace=? AND replica=? AND epoch=?",missing)
     state.commit(); return set(found)
 def reconcile_blobs(cfg,state,root,ws,envelopes):
     for page in (envelopes[i:i+500] for i in range(0,len(envelopes),500)):
@@ -328,14 +328,19 @@ def pull_origins(cfg,state,root,ws):
         state.commit(); core.execute("COMMIT"); return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
     except BaseException: core.execute("ROLLBACK"); state.rollback(); raise
     finally: core.close()
+def local_replica_ids(path,cfg,workspace,epochs):
+    if not path.is_file(): return set()
+    fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); core=open_db(path,True); cursor=core.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs"); found=set()
+    while rows:=cursor.fetchmany(5000): found.update((fingerprint(key(cfg,workspace,epoch),digest({"v":1,"kind":"row.proof",**dict(zip(fields,row))})),epoch) for row in rows for epoch in epochs)
+    core.close(); return found
 def pull_row_replicas(cfg,state,root,ws,recover=None,origins=()):
-    sid,stamp=ws["id"],bridge_stamp(root); saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]; reset=saved!=stamp; after=0 if reset else int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0]); cursor,total=after,0; dependencies={r[0] for r in state.execute("SELECT origin FROM control_dependencies WHERE workspace=?",(sid,)).fetchall()}; controls=ws["controls"]+stored_controls(core_path(root),set(origins)|dependencies); known=set() if reset else {(r[0],r[1]) for r in state.execute("SELECT replica,epoch FROM replica_receipts WHERE workspace=?",(sid,)).fetchall()}; valid=set(known); invalid={}; checked=recover is None or not known
+    sid,stamp=ws["id"],bridge_stamp(root); saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]; reset=saved!=stamp; after=0 if reset else int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0]); cursor,total=after,0; dependencies={r[0] for r in state.execute("SELECT origin FROM control_dependencies WHERE workspace=?",(sid,)).fetchall()}; controls=ws["controls"]+stored_controls(core_path(root),set(origins)|dependencies); known=set() if reset else {(r[0],r[1]) for r in state.execute("SELECT replica,epoch FROM replica_receipts WHERE workspace=?",(sid,)).fetchall()}; valid=set(known); invalid={}; checked=not reset and (recover is None or not known)
     while True:
         result=request(cfg,{"op":"replica_pull","workspace":sid,"after":cursor,"limit":500}); floor,tail=result["floor"],result["tail"]
         if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail: raise ValueError("relay replica cursor window is invalid")
         if cursor>tail: cursor=after=0; known=set(); valid=set(); invalid={}; state.execute("DELETE FROM meta WHERE key=?",(f"replica_cursor:{sid}",)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_repair:{sid}","1")); state.commit(); continue
         if not checked and result["replicas"]:
-            fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); core=open_db(core_path(root),True); proofs=[{"v":1,"kind":"row.proof",**dict(zip(fields,r))} for r in core.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs").fetchall()]; core.close(); epochs={r[1] for r in known}; known&={(fingerprint(key(cfg,sid,epoch),digest(proof)),epoch) for proof in proofs for epoch in epochs}; valid=set(known); checked=True
+            epochs={r[1] for r in known} or {r["epoch"] for r in ws["keys"]}; local=local_replica_ids(core_path(root),cfg,sid,epochs); known=known&local if known else local; valid=set(known); checked=True
         opened=[]; received=[]
         for item in result["replicas"]:
             env=item["envelope"]
@@ -347,9 +352,7 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=()):
                 else: opened.append((item,body)); valid.add(identity); invalid.pop(identity,None)
         accepted=apply_row_replicas(core_path(root),[body for item,body in opened],sid,controls,recover,cfg["user"],root=root); accepted_keys={(item["envelope"]["replica"],item["envelope"]["epoch"]) for (item,body),ok in zip(opened,accepted) if body["proof"]["kind"]=="row.proof" or ok}
         known|=accepted_keys
-        for item in received:
-            env=item["envelope"]
-            if (env["replica"],env["epoch"]) in known|accepted_keys: state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",(sid,env["replica"],env["epoch"],item["cursor"]))
+        receipts=[(sid,item["envelope"]["replica"],item["envelope"]["epoch"],item["cursor"]) for item in received if (item["envelope"]["replica"],item["envelope"]["epoch"]) in known|accepted_keys]; receipts and state.executemany("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",receipts)
         after=min(invalid.values())-1 if invalid else cursor; total+=len(received); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"replica_cursor:{sid}",str(after),f"replica_projection:{sid}",stamp)); state.commit()
         if cursor>=tail:
             if invalid: raise ValueError(f"invalid row replica: no valid delivery copy for {len(invalid)} object(s)")

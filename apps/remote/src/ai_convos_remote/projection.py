@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, index_attachment_body, init_schema, open_db, project_logical_rows, project_provenance, project_row_proofs, project_workspace_controls, provenance_records, required, set_attachment_path
 from .control import verify_state
+from .migrations import migrate_state
 from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
 STATE_VERSION="4"
@@ -76,7 +77,9 @@ def cutover_state(path):
             if file_hash(source)!=saved[source.name]["sha256"]: raise ValueError("remote state backup verification failed")
         report={"from":info["version"] or "legacy","to":int(STATE_VERSION),"backup":str(target),"files":saved}; manifest=stage/"manifest.json"; manifest.write_text(json.dumps(report,sort_keys=True,indent=2)); os.chmod(manifest,0o600); [_fsync(p) for p in [*(stage/p.name for p in files),manifest]]; _fsync(stage)
         new=_connect(fresh,"DELETE")
-        try: new.execute("INSERT INTO meta VALUES ('state_schema',?),('state_cutover',?)",(STATE_VERSION,json.dumps(report,sort_keys=True))); new.commit(); valid=new.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
+        try:
+            migrate=migrate_state(path,new,info["version"])
+            new.execute("INSERT INTO meta VALUES ('state_schema',?),('state_cutover',?)",(STATE_VERSION,json.dumps({**report,"preserved":migrate},sort_keys=True))); new.commit(); valid=new.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
         finally: new.close()
         if not valid: raise ValueError("fresh remote state validation failed")
         os.replace(stage,target); _fsync(backups); [p.unlink(missing_ok=True) for p in (Path(str(path)+"-wal"),Path(str(path)+"-shm"))]; os.replace(fresh,path); os.chmod(path,0o600); _fsync(path); _fsync(path.parent); return report
@@ -206,7 +209,7 @@ def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,worksp
     provenance=[r for r in all_provenance if changes is None or (r["kind"],r["entity"]) in changes]; records=_records(core,graph,kind=="personal",changes)
     edit_paths={r["payload"]["id"]:r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed"}; file_paths={r["payload"]["id"]:r["payload"]["path"] for r in provenance if r["kind"]=="file.observed"}
     for r in records:
-        if r["kind"]=="file_edit.record" and r["payload"].get("state")!="deleted" and (fid:=edit_paths.get(r["payload"]["row"][0])): r["payload"]["row"][2]=file_paths[fid]
+        if r["kind"]=="file_edit.record" and r["payload"].get("state")!="deleted" and (fid:=edit_paths.get(r["payload"]["row"][0])): r["payload"]["row"][2]=file_paths.get(fid)
     if kind=="personal": return records+provenance
     keep=[]; parents={r["payload"]["row"][1] for r in records if r["payload"]["table"] in ("tool_calls","attachments","file_edits") and r["payload"].get("state")!="deleted"}; msg_convs=dict(core.execute("SELECT id,conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(parents)]).fetchall()) if parents else {}; edits={r[0] for r in core.execute("SELECT fe.id FROM file_edits fe JOIN messages m ON m.id=fe.message_id WHERE m.conversation_id IN (SELECT UNNEST(?))",[list(convs)]).fetchall()}; shared=set(core.execute("SELECT row_kind,source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=?",(workspace,)).fetchall()) if workspace else set()
     for r in records:

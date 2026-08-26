@@ -36,6 +36,11 @@ def test_old_state_inspection_is_read_only_and_cutover_preserves_exact_backup(tm
     state=connect(path); assert state.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()[0]=="4" and json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["backup"]==str(backup); state.close(); assert inspect_state(path)["status"]=="current" and os.stat(backup).st_mode&0o777==0o700 and os.stat(backup/"state.db").st_mode&0o777==0o600
 
 
+def test_known_state_upgrade_preserves_replica_anchors_and_replays_policy_events(tmp_path):
+    path=tmp_path/"state.db"; state=connect(path); state.executescript("INSERT INTO replica_receipts VALUES ('w','r',1,7); INSERT INTO blob_receipts VALUES ('w','b',1,8); INSERT INTO receipts VALUES ('w','event',9,'device',1,1,'workspace.policy',1,'policy','revision',NULL); INSERT INTO publication_heads VALUES ('w','user','policy','revision','event'); INSERT INTO cursors VALUES ('w',9); INSERT INTO sync_states VALUES ('w','ready',9,1,NULL); INSERT INTO meta VALUES ('replica_cursor:w','7'),('blob_cursor:w','8'),('replica_projection:w','stamp'),('boundary:w','boundary'),('core_generation:w','99'); DROP TABLE policy_proofs; DROP TABLE sharing_preferences; DROP TABLE policies; CREATE TABLE policies(workspace TEXT,kind TEXT,value TEXT,PRIMARY KEY(workspace,kind,value)) WITHOUT ROWID; UPDATE meta SET value='1' WHERE key='state_schema';"); state.commit(); state.close(); report=cutover_state(path); state=connect(path)
+    assert json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["preserved"] and tuple(state.execute("SELECT replica,cursor FROM replica_receipts").fetchone())==("r",7) and tuple(state.execute("SELECT blob,cursor FROM blob_receipts").fetchone())==("b",8) and state.execute("SELECT cursor FROM receipts").fetchone()[0]==9 and state.execute("SELECT lifecycle FROM sync_states").fetchone()[0]=="ready" and state.execute("SELECT value FROM meta WHERE key='replica_cursor:w'").fetchone()[0]=="7" and not state.execute("SELECT 1 FROM cursors").fetchone() and not state.execute("SELECT 1 FROM policies").fetchone() and not state.execute("SELECT 1 FROM meta WHERE key='core_generation:w'").fetchone(); state.close(); assert Path(report["backup"]).is_dir()
+
+
 def test_cutover_recovers_corrupt_regular_state_but_refuses_symlink(tmp_path):
     path=tmp_path/"state.db"; path.write_bytes(b"corrupt but preserved"); report=cutover_state(path); assert (Path(report["backup"])/"state.db").read_bytes()==b"corrupt but preserved" and inspect_state(path)["status"]=="current"
     target=tmp_path/"target.db"; target.write_bytes(b"do not touch"); link=tmp_path/"link.db"; link.symlink_to(target)
@@ -205,6 +210,10 @@ def test_durable_row_proof_keeps_only_its_authors_admitted_conversation_after_st
 def test_team_scope_includes_prompt_turn_and_linked_repo_only(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); personal=scan(core,state); rid=next(r["payload"]["id"] for r in personal if r["kind"]=="repository.observed"); team=scan(core,state,"team",[rid],[])
     kinds=[r["kind"] for r in team]; assert kinds.count("conversation.record")==1 and kinds.count("message.record")==2 and "file_edit.record" in kinds and "edit.observed" in kinds and "changeset.observed" not in kinds
+
+
+def test_scan_redacts_edit_path_when_local_file_fact_is_missing(tmp_path):
+    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); fid=core.execute("SELECT file_id FROM provenance.file_edit_files").fetchone()[0]; core.execute("DELETE FROM provenance.local_facts WHERE kind='file.observed' AND entity=?",[fid]); records=scan(core,state); edit=next(r for r in records if r["kind"]=="file_edit.record"); assert edit["payload"]["row"][2] is None and str(repo) not in json.dumps(records); core.close(); state.close()
 
 
 def test_team_incremental_uses_changed_rows_after_scope_seed(tmp_path):
