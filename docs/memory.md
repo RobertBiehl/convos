@@ -130,7 +130,7 @@ uv tool install --reinstall "git+https://github.com/RobertBiehl/convos.git" \
   --with "convos-memory @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/memory"
 ```
 
-Memory 0.9 supports `convos>=0.9,<0.10`. The package metadata enforces
+Memory 0.10 supports `convos>=0.10,<0.11`. The package metadata enforces
 that contract, so an independently installed memory wheel cannot silently pair
 with an unsupported core CLI.
 `init` installs both agent skill copies, core capture hooks, and both agents'

@@ -56,7 +56,7 @@ def test_explore_distribution_and_registration():
     import tomllib
     from pathlib import Path
     project=tomllib.loads((Path(__file__).parents[1]/"apps/explore/pyproject.toml").read_text())["project"]; app=typer.Typer(); register(app)
-    assert project["readme"]=="README.md" and project["dependencies"][0]=="convos>=0.9,<0.10" and project["entry-points"]["convos.commands"]=={"explore":"ai_convos_explore:register"} and {c.name or c.callback.__name__ for c in app.registered_commands}=={"related","trail"}
+    assert project["readme"]=="README.md" and project["dependencies"][0]=="convos>=0.10,<0.11" and project["entry-points"]["convos.commands"]=={"explore":"ai_convos_explore:register"} and {c.name or c.callback.__name__ for c in app.registered_commands}=={"related","trail"}
 def test_explore_import_does_not_reenter_core_plugin_discovery():
     result=subprocess.run([sys.executable,"-c","import sys,ai_convos_explore; assert 'ai_convos.cli' not in sys.modules"],text=True,capture_output=True)
     assert result.returncode==0 and result.stderr==""
