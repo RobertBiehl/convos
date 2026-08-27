@@ -44,6 +44,14 @@ def test_drain_releases_inbox_lock_before_parsing(hooks, monkeypatch):
         result=subprocess.run([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)",str(data/"hook_inbox/.lock")]); assert result.returncode==0; return parse(*args)
     monkeypatch.setattr(cli,"hook_result",unlocked); assert cli.drain_hooks()==1
 
+def test_concurrent_sync_exits_immediately_and_explicitly(hooks,capsys):
+    _,data=hooks; data.mkdir(); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/".sync.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+    try:
+        assert hold.stdout.readline().strip()=="ready"; started=time.monotonic()
+        with pytest.raises(cli.typer.Exit): cli.sync(False,300,False,False,False,False,True)
+        assert time.monotonic()-started<1 and "Sync already running; no work was started" in capsys.readouterr().out
+    finally: hold.stdin.write("\n"); hold.stdin.flush(); hold.wait(timeout=5)
+
 def test_retrieval_drains_idempotently_and_preserves_truncated_rewritten_history(hooks):
     sessions, data = hooks; path = sessions/"s.jsonl"; runner = CliRunner(); transcript(path); enqueue(path)
     assert json.loads(runner.invoke(cli.app, ["search", "remember alpha", "-f", "json"]).output)[0]["source"] == "codex"

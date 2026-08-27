@@ -132,9 +132,7 @@ def _repository(root): return (lambda root,roots,remotes,lineage:dict(id=provena
 def repository_state(db): return {"roots":dict(db.execute("SELECT root,repository FROM provenance.repository_checkouts").fetchall()),"checkouts":dict(db.execute("SELECT id,repository FROM provenance.repository_checkouts").fetchall()),"checkout_roots":dict(db.execute("SELECT id,root FROM provenance.repository_checkouts").fetchall()),"lineages":dict(db.execute("SELECT id,lineage FROM provenance.repositories").fetchall()),"aliases":dict(db.execute("SELECT evidence,CASE WHEN COUNT(DISTINCT repository)=1 THEN MIN(repository) END FROM provenance.repository_aliases GROUP BY evidence").fetchall())}
 def _refresh_repository(): (_git_root.cache_clear(),_repository.cache_clear())
 def repository(path,known=None,refresh=True): return (lambda value,state,evidence,bound,resolved:{**value,"id":resolved or value["id"],"alias":None if resolved or not evidence else evidence})(value:={**_repository(str(root)),"head":_git_maybe(root,"rev-parse","--verify","HEAD").decode().strip(),"branch":_git_maybe(root,"symbolic-ref","--short","HEAD").decode().strip()},state:=repository_state(known) if known is not None and hasattr(known,"execute") else known or {"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}},evidence:=repository_evidence(value),bound:=state["checkouts"].get(value["checkout"]),bound if value["lineage"] and state["lineages"].get(bound)==value["lineage"] else evidence and state["aliases"].get(evidence)) if (not refresh or _refresh_repository() is None) and (root:=_git_root(Path(path))) else None
-def _cached_repository(cache,root,known):
-    key=str(root)
-    return cache[key] if key in cache else cache.setdefault(key,repository(root,known,False))
+def _cached_repository(cache,root,known): return cache[key] if (key:=str(root)) in cache else cache.setdefault(key,repository(root,known,False))
 def _observe_checkout(db,repo):
     db.execute("DELETE FROM provenance.repository_checkouts WHERE root=? AND id<>?",(repo["root"],repo["checkout"]))
     db.execute("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET repository=excluded.repository,root=excluded.root,branch=excluded.branch,head=excluded.head",(repo["checkout"],repo["id"],repo["root"],repo["branch"],repo["head"])) and repo["alias"] and db.execute("INSERT OR IGNORE INTO provenance.repository_aliases VALUES (?,?)",(repo["id"],repo["alias"]))
@@ -185,10 +183,8 @@ def _provenance_edits(core,edit_ids=None):
     sql="""SELECT fe.id,fe.file_path,fe.edit_type,fe.content,fe.old_content,CAST(fe.created_at AS VARCHAR),m.id,m.conversation_id,c.cwd,s.path,s.repository,s.root,s.checkout,s.route,CAST(s.observed_at AS VARCHAR) FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id LEFT JOIN provenance.file_edit_scopes s ON s.file_edit_id=fe.id WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='file_edits' AND o.physical_row_id=fe.id)"""+selected+" ORDER BY fe.created_at,fe.id"
     return [dict(zip(("id","path","type","content","old","ts","turn","conversation","cwd","scope_path","repository","root","checkout","route","scope_at"),r)) for r in core.execute(sql,ids or ()).fetchall()]
 def _observe_provenance(edits,source="sync",known=None,conversations=(),cache=None):
-    if cache is None:
-        _refresh_repository()
-        cache={}
-    captured=datetime.now(timezone.utc).isoformat().replace("+00:00","Z"); records,repos,versions,fulls,scopes=[],{},{},{},[]
+    cache={} if cache is None and _refresh_repository() is None else cache
+    captured,records,repos,versions,fulls,scopes=datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),[],{},{},{},[]
     for e in edits:
         rid,path=e["repository"],e["scope_path"]
         repo=_cached_repository(cache,e["root"],known) if e["root"] else None
@@ -1323,6 +1319,10 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional
         with output.open("w", newline="") as f: w = csv.writer(f); w.writerow([d[0] for d in cur.description]); w.writerows(cur.fetchall())
     conn.close(); typer.echo(f"Exported to {output}")
 
+def _sync_leader():
+    try: fcntl.flock(lock:=(DATA_DIR/".sync.lock").open("w"),fcntl.LOCK_EX|fcntl.LOCK_NB); return lock
+    except BlockingIOError: lock.close(); typer.echo("Sync already running; no work was started"); raise typer.Exit()
+
 @app.command()
 def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch all sources and reconcile all provenance"), verbose: bool = typer.Option(False, "-v", "--verbose"), local_only: bool = typer.Option(False, "--local-only", help="Import local agent sessions and configured exports without contacting web sources.")):
     if sys.argv[1:2] == ["sync"]: signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -1399,7 +1399,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         return dict(name=f"import:{path}", label=f"import:{path}", func=lambda p=path: parse_source(p), state=("imports", str(path), {"mtime": mtime}))
     def do_sync():
         nonlocal state, dirty, local, web, imports
-        sync_lock = (DATA_DIR/".sync.lock").open("w"); fcntl.flock(sync_lock, fcntl.LOCK_EX); state = load_state(); local, web, imports = state.setdefault("local", {}), state.setdefault("web", {}), state.setdefault("imports", {}); chatgpt_ok.clear(); chatgpt_frontiers.clear()
+        sync_lock=_sync_leader(); state=load_state()
+        local,web,imports=state.setdefault("local",{}),state.setdefault("web",{}),state.setdefault("imports",{}); chatgpt_ok.clear(); chatgpt_frontiers.clear()
         t0 = time.perf_counter(); dirty, total, changed, jobs, newc, updc, provenance_edits, provenance_conversations = False, [0]*5, set(), [], 0, 0, set(), set()
         def checkpoint(r):
             ids = {m["id"] for m in r.msgs}
