@@ -29,6 +29,9 @@ def test_hook_is_nonblocking_coalesced_and_private(hooks, monkeypatch):
     queued = list((data/"hook_inbox").glob("*.json")); assert len(queued) == 1
     raw = queued[0].read_text(); assert "remember alpha" not in raw and "secret" not in raw and set(json.loads(raw)) == {"source", "path", "mtime", "size"} and all(args[-1]=="--no-block" for args in launched)
 
+def test_explicit_drain_is_nonblocking_unless_requested(hooks,monkeypatch):
+    calls=[]; monkeypatch.setattr(cli,"drain_hooks",lambda **kwargs:calls.append(kwargs)); runner=CliRunner(); assert runner.invoke(cli.app,["drain-hooks"]).exit_code==runner.invoke(cli.app,["drain-hooks","--block"]).exit_code==0 and calls==[{"block":False},{"block":True}]
+
 def test_incidental_drain_and_manual_sync_do_not_wait_for_worker(hooks, monkeypatch):
     _,data=hooks; (data/"hook_inbox").mkdir(parents=True); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/"hook_inbox/.drain.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); monkeypatch.setattr(cli,"capture_provenance",lambda *a,**k:[])
     try:

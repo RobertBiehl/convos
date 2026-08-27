@@ -1158,7 +1158,7 @@ def capture(source: str):
     except Exception as e: log_parse_error(f"{source} hook", e)
 
 @app.command("drain-hooks", hidden=True)
-def drain_hooks_cmd(block:bool=typer.Option(True,"--block/--no-block",hidden=True)): drain_hooks(block=block)
+def drain_hooks_cmd(block:bool=typer.Option(False,"--block/--no-block",hidden=True)): drain_hooks(block=block)
 
 @app.command()
 def init():
