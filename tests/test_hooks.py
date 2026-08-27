@@ -23,11 +23,26 @@ def enqueue(path,command="capture"):
     assert r.exit_code == 0
 
 def test_hook_is_nonblocking_coalesced_and_private(hooks, monkeypatch):
-    sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path)
+    sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); launched=[]; monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(args))
     monkeypatch.setattr(cli, "get_db", lambda *a, **k: (_ for _ in ()).throw(AssertionError("hook touched db")))
     enqueue(path); enqueue(path,"hook")
     queued = list((data/"hook_inbox").glob("*.json")); assert len(queued) == 1
-    raw = queued[0].read_text(); assert "remember alpha" not in raw and "secret" not in raw and set(json.loads(raw)) == {"source", "path", "mtime", "size"}
+    raw = queued[0].read_text(); assert "remember alpha" not in raw and "secret" not in raw and set(json.loads(raw)) == {"source", "path", "mtime", "size"} and all(args[-1]=="--no-block" for args in launched)
+
+def test_incidental_drain_and_manual_sync_do_not_wait_for_worker(hooks, monkeypatch):
+    _,data=hooks; (data/"hook_inbox").mkdir(parents=True); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/"hook_inbox/.drain.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); monkeypatch.setattr(cli,"capture_provenance",lambda *a,**k:[])
+    try:
+        assert hold.stdout.readline().strip()=="ready"; started=time.monotonic(); assert cli.drain_hooks()==0; cli.sync(False,300,False,False,False,False,True); assert time.monotonic()-started<1
+        done=threading.Event(); waiter=threading.Thread(target=lambda:(cli.drain_hooks(block=True),done.set())); waiter.start(); assert not done.wait(.1); hold.stdin.write("\n"); hold.stdin.flush(); assert done.wait(5); waiter.join()
+    finally:
+        if hold.poll() is None: hold.stdin.write("\n"); hold.stdin.flush()
+        hold.wait(timeout=5)
+
+def test_drain_releases_inbox_lock_before_parsing(hooks, monkeypatch):
+    sessions,data=hooks; path=sessions/"s.jsonl"; transcript(path); enqueue(path); parse=cli.hook_result
+    def unlocked(*args):
+        result=subprocess.run([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)",str(data/"hook_inbox/.lock")]); assert result.returncode==0; return parse(*args)
+    monkeypatch.setattr(cli,"hook_result",unlocked); assert cli.drain_hooks()==1
 
 def test_retrieval_drains_idempotently_and_preserves_truncated_rewritten_history(hooks):
     sessions, data = hooks; path = sessions/"s.jsonl"; runner = CliRunner(); transcript(path); enqueue(path)
@@ -100,6 +115,11 @@ def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
     try: cli.sync(False, 300, False, False, False, False); assert signal.getsignal(signal.SIGINT) == old
     finally: signal.signal(signal.SIGINT, old)
     assert (data/"hook_fts_dirty").exists() and json.loads((data/"hook_embeddings_dirty").read_text()) == ["sync-m"]
+
+def test_sync_targets_provenance_but_full_reconciles_all(hooks, monkeypatch):
+    _,data=hooks; monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); calls=[]; monkeypatch.setattr(cli,"capture_provenance",lambda *a,**k:calls.append((a,k)) or [])
+    cli.sync(False,300,False,False,False,False,True); cli.sync(False,300,False,False,True,False,True)
+    assert calls==[((),{"edit_ids":set(),"conversation_ids":set()}),((),{})]
 
 def test_local_only_sync_imports_configured_agent_roots_without_web(hooks, tmp_path, monkeypatch):
     sessions, data = hooks; transcript(sessions/"local.jsonl", "offline codex history"); (sessions/"gone.jsonl").symlink_to(tmp_path/"missing-codex.jsonl"); claude=tmp_path/"claude"; project=claude/"projects"/"-repo"; project.mkdir(parents=True); (project/"local.jsonl").write_text("\n".join([json.dumps({"type":"system","timestamp":"2026-01-01T00:00:00Z","cwd":"/repo"}),json.dumps({"type":"human","timestamp":"2026-01-01T00:00:01Z","message":{"content":"offline claude history"}})])); (project/"gone.jsonl").symlink_to(tmp_path/"missing-claude.jsonl"); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); blocked = lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("local-only sync touched web"))

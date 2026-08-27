@@ -180,6 +180,12 @@ def test_provenance_failure_rolls_back_only_enrichment(tmp_path,monkeypatch):
     assert db.execute("SELECT COUNT(*) FROM file_edits").fetchone()[0]==1 and db.execute("SELECT COUNT(*) FROM provenance.repositories").fetchone()[0]==0 and db.execute("SELECT COUNT(*) FROM provenance.repository_checkouts").fetchone()[0]==0 and archive_state(db)[1]==generation
 
 
+def test_targeted_capture_is_bounded_by_touched_repository_not_archive_files(tmp_path,monkeypatch):
+    root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); capture(path); (root/"target.py").write_text("two\n"); db=duckdb.connect(str(path)); rid=db.execute("SELECT id FROM provenance.repositories").fetchone()[0]; db.executemany("INSERT INTO provenance.files VALUES (?,?,?,'repository')",[(f"unrelated-{i}",rid,f"unrelated-{i}.py") for i in range(100)]); db.execute("INSERT INTO conversations VALUES ('target-c','codex','target','2026-01-02','2026-01-02',NULL,?,NULL,NULL,'{}')",[str(root)]); db.execute("INSERT INTO messages VALUES ('target-m','target-c','assistant','done',NULL,'2026-01-02',NULL,'{}',NULL,NULL); INSERT INTO file_edits VALUES ('target-e','target-m',?,'write','two\n','2026-01-02',NULL)",[str(root/"target.py")]); db.close(); real,calls=core_module._git_run,[]
+    monkeypatch.setattr(core_module,"_git_run",lambda root,*args:calls.append((str(root),args)) or real(root,*args)); records=capture(path,edit_ids=["target-e"],conversation_ids=["target-c"])
+    assert any(r["kind"]=="edit.observed" and r["entity"]=="target-e" for r in records) and len(calls)<20
+
+
 def test_checkpoint_diff_uses_local_git_evidence(tmp_path):
     root=repo(tmp_path/"repo",content="one\n"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); first=capture(path); cp1=next(r["payload"]["id"] for r in first if r["kind"]=="git.checkpoint"); (root/"x.py").write_text("two\n"); git(root,"add","x.py"); git(root,"commit","-qm","second"); second=capture(path); cp2=next(r["payload"]["id"] for r in second if r["kind"]=="git.checkpoint"); db=duckdb.connect(str(path))
     result=query(db,"checkpoint_diff",f"{cp1}..{cp2}")[0]; assert result["head_before"]!=result["head_after"] and result["changed"]==["M\tx.py"]
