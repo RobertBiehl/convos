@@ -17,6 +17,10 @@ metadata and never invents facts a source did not record.
 - Local bindings may retain a legacy filename-derived alias and the later exact
   provider ID for one conversation; `(source, session_id)` remains unique and can
   never name two conversations.
+- Cross-device equivalence is represented only by the
+  [author-scoped signed provider-session alias](provider-session-aliases.md).
+  Exact provider evidence may add a logical conversation row ID to that alias;
+  local bindings, content similarity, cwd, and repository evidence cannot.
 - `metadata.parent_session_id` is present only when the provider explicitly names a
   parent session.
 - `metadata.session_kind` is the normalized `main` or `subagent` classification.

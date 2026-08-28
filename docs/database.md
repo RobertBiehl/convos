@@ -48,6 +48,9 @@ conversation metadata and is not a replicated archive row. The unique
 already-published opaque conversation ID; imported relay rows remain author-scoped
 through `remote.row_origins` instead.
 
+Cross-device identity is not stored here; it uses the root-signed
+[provider-session alias](provider-session-aliases.md), keyed by author.
+
 | Column | Type | Description |
 |--------|------|-------------|
 | source | VARCHAR PK | Provider/integration namespace |

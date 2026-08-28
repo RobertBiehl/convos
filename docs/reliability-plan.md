@@ -19,7 +19,8 @@ gate below are acceptance criteria, not additional tasks.
 | In review in stacked PR #96 | Install backed-up local native-session bindings without rewriting released physical IDs; preserve safe filename-to-native aliases, make a batch converge or fail before mutation, preserve foreign signed rows, structurally quarantine startup stubs, and keep migration commit independent of FTS rebuild. |
 | In review in stacked PR #97 | Make ordinary imports complete and bounded: stream relevant Codex records, retain current ChatGPT content forms, recheck incomplete and tool-ended web sessions, checkpoint chunks, and keep parse failures visible. |
 | In review in stacked PR #98 | Add explicit provider turn ordering so timestamp ties cannot hide the terminal message from bounded `read`, export, replay, resume, or last-role logic, and selectively refetch affected ChatGPT conversations. |
-| Pending | Design signed author-scoped provider-session aliases/tombstones that reconcile pre-existing local duplicates and converge two devices of one author while preserving equal native IDs from different authors. |
+| In review in stacked PR #99 | Freeze the signed author-scoped provider-session alias and tombstone design: exact-evidence membership, deterministic multi-ancestor convergence, author separation, retained v1 row identities, backed-up migration, and fail-before-mutation reconciliation. |
+| Pending | Implement the core alias ledger and backed-up reconciliation, then prove pre-existing and cross-device duplicate convergence with retained v1 replicas. |
 | Pending | Harden remote synchronization: fix duplicate-root proof-chain convergence, add observable exponential backoff, narrow local mutation locks, cover interruption recovery, and prove retained signed logical replicas remain ingestible. |
 | Pending | Build and qualify the Titan multi-user testbed with a fresh synthetic lane and a persistent upgrade canary before declaring a stable release. |
 
