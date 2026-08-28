@@ -7,44 +7,39 @@ correctness: every source input must be accounted for, migrations must preserve
 meaning, incremental work must be bounded by changed data, and released clients
 and relay replicas must remain interoperable for their documented lifetime.
 
-## Production findings
+## Work items
 
-The 2026-08-28 two-user deployment report is tracked as eleven concrete issues:
+Only concrete deliverables receive task status here. The requirements and release
+gate below are acceptance criteria, not additional tasks.
 
-| Finding | Work | Status |
-| --- | --- | --- |
-| 1 | v3 migration omitted `local_facts` | fixed in 0.10.1; retain regression coverage |
-| 2 | Projection failed on legacy rows | fixed in 0.10.1; retain regression coverage |
-| 3 | State rebaseline used excessive time and memory | fixed in 0.10.1; retain release benchmark |
-| 4 | Attestation failed on duplicate-root proof chains | pending upstream fix and regression |
-| 5 | Remote watch swallowed repeated failures without backoff | pending |
-| 6 | Remote synchronization held coarse locks around unrelated work | pending |
-| 7 | Commands blocked behind a running hook drain | current priority |
-| 8 | One hook event performed archive-sized work | current priority |
-| 9 | Imported cwd, Git, model, tool, and edit evidence was incomplete | pending canonical importer work |
-| 10 | Provider transcripts could be imported more than once | pending identity migration |
-| 11 | Promptless startup stubs became conversations | pending admission and cleanup migration |
+| Status | Task |
+| --- | --- |
+| Done in current PR | Restore capture and manual-sync availability: use short inbox critical sections, make competing drains and syncs nonblocking, bound ordinary provenance work to touched conversations, edits, and repositories, preserve full reconciliation behind `sync --full`, and add concurrency and archive-size regressions. |
+| Pending | Freeze the cross-provider conversation contract and audit real Codex and Claude imports. Define transcript and session identity, main-versus-subagent relationships, authorship, cwd, Git observations, model evidence, tool calls, attachments, edits, and provider-only metadata without deriving unavailable facts. |
+| Pending | Ship one backed-up, resumable, bounded-memory identity and ingestion migration. Dedupe within author and provider transcript identity, never by root session alone and never across relay authors. Re-read surviving raw inputs only after canonical identity is installed, clean promptless startup stubs, and prove interruption recovery. |
+| Pending | Harden remote synchronization: fix duplicate-root proof-chain convergence, add observable exponential backoff, narrow local mutation locks, cover interruption recovery, and prove old signed logical replicas project to current physical identity. |
+| Pending | Build and qualify the Titan multi-user testbed with a fresh synthetic lane and a persistent upgrade canary before declaring a stable release. |
 
-## Work order
+## Production evidence register
 
-1. Restore capture and manual-sync availability. Incidental drains must never wait
-   behind another drain, and one changed transcript must do work proportional to
-   that transcript. Add lock, progress, archive-size, and retry regressions.
-2. Freeze the cross-provider identity and data contract before backfill. Preserve
-   exact transcript, owning session, explicit parent, author, cwd, Git observation,
-   model, tool invocation, attachment, and edit evidence without deriving facts the
-   providers did not supply.
-3. Ship one backed-up, resumable, bounded-memory identity and ingestion migration.
-   Dedupe within author and provider transcript identity, never by root session alone
-   and never across relay authors. Re-read surviving raw files only after canonical
-   identity is installed.
-4. Harden remote synchronization: proof-chain convergence, observable exponential
-   backoff, narrow local mutation locks, interruption recovery, and mixed-version
-   receive-path coverage.
-5. Qualify a release candidate in the Titan multi-user testbed before declaring a
-   stable release.
+The 2026-08-28 two-user deployment report established these findings. This is an
+evidence register; remediation is represented by the work items above.
 
-## Permanent quality gates
+| Finding | Current outcome |
+| --- | --- |
+| v3 migration omitted `local_facts` | Fixed in 0.10.1; regression retained. |
+| Projection failed on legacy rows | Fixed in 0.10.1; regression retained. |
+| State rebaseline used excessive time and memory | Fixed in 0.10.1; release benchmark retained. |
+| Attestation failed on duplicate-root proof chains | Open; remote-hardening task. |
+| Remote watch swallowed repeated failures without backoff | Open; remote-hardening task. |
+| Remote synchronization held coarse locks around unrelated work | Open; remote-hardening task. |
+| Commands blocked behind a running hook drain | Fixed in current PR. |
+| One hook event performed archive-sized work | Fixed in current PR. |
+| Imported cwd, Git, model, tool, and edit evidence was incomplete | Open; provider-contract task. |
+| Provider transcripts could be imported more than once | Open; identity-migration task. |
+| Promptless startup stubs became conversations | Open; identity-migration task. |
+
+## Acceptance criteria
 
 ### Input accountability
 
@@ -64,7 +59,7 @@ The 2026-08-28 two-user deployment report is tracked as eleven concrete issues:
   released on-disk version still in use.
 - Validation covers conversations, messages, tools, attachments, edits, embeddings,
   provenance, remote origins, signed proofs, FTS, and change tracking.
-- Interrupted migration plus resume must produce the same semantic result as an
+- Interrupted migration plus resume produces the same semantic result as an
   uninterrupted migration under the 1.5 GiB memory ceiling.
 
 ### Incremental performance and concurrency
@@ -73,8 +68,6 @@ The 2026-08-28 two-user deployment report is tracked as eleven concrete issues:
   repositories, not total archive or provenance size.
 - Read-only commands and manual sync do not wait for an already running incidental
   hook drain.
-- Tests measure forward progress and phase timing; CPU utilization alone is never
-  treated as evidence of useful progress.
 - No-op sync, one-event capture, relay paging, and migration have recorded budgets
   that fail on regression.
 
