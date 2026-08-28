@@ -6,7 +6,7 @@ from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remot
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT = find_root(); DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"; STATE_PATH = DATA_DIR / "sync_state.json"
-HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY, HOOK_FTS_DIRTY, _NOISE = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty", DATA_DIR/"hook_fts_dirty", " AND NOT regexp_matches(content,'^(Base directory for this skill:|# AGENTS\\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))')"; CHATGPT_BURST, CHATGPT_RATE = 20, 8/15  # conservative policy below the observed ~200-detail failure point
+HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty"," AND NOT regexp_matches(content,'^(Base directory for this skill:|# AGENTS\\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))')",8,10,20,8/15  # conservative policy below the observed ~200-detail failure point
 
 # ---- db helpers ----
 def open_db(path=None,read_only=False,wait=30,deadline=None):
@@ -953,13 +953,9 @@ def parse_codex_session(jsonl: Path) -> dict | None:
         "msgs": msgs, "tools": tools, "attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")], "edits": edits}
 
 def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult:
-    sessions_dir = codex_dir / "sessions"
-    if not sessions_dir.exists(): return ParseResult()
-    sessions = [s for jsonl in (files or sessions_dir.rglob("*.jsonl"))
-                if (s := safe_parse(f"codex session {jsonl}", parse_codex_session, jsonl))]
-    return ParseResult(
-        convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
-        tools=[t for s in sessions for t in s["tools"]], attachs=[a for s in sessions for a in s["attachs"]], edits=[e for s in sessions for e in s["edits"]])
+    if not (sessions_dir := codex_dir / "sessions").exists(): return ParseResult()
+    sessions = [s for jsonl in (files or sessions_dir.rglob("*.jsonl")) if (s := safe_parse(f"codex session {jsonl}", parse_codex_session, jsonl))]
+    return ParseResult(convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]], tools=[t for s in sessions for t in s["tools"]], attachs=[a for s in sessions for a in s["attachs"]], edits=[e for s in sessions for e in s["edits"]])
 
 _CONV_UPS = "INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source,title=excluded.title,created_at=CASE WHEN conversations.created_at IS NULL OR excluded.created_at < conversations.created_at THEN excluded.created_at ELSE conversations.created_at END,updated_at=CASE WHEN conversations.updated_at IS NULL OR excluded.updated_at > conversations.updated_at THEN excluded.updated_at ELSE conversations.updated_at END,model=COALESCE(excluded.model,conversations.model),cwd=COALESCE(excluded.cwd,conversations.cwd),git_branch=COALESCE(excluded.git_branch,conversations.git_branch),project_id=COALESCE(excluded.project_id,conversations.project_id),metadata=excluded.metadata"
 
@@ -1005,8 +1001,8 @@ def enqueue_hook(source, payload):
     st, key = path.stat(), gen_id("hook", f"{source}:{path}"); atomic_json(HOOK_DIR/f"{key}.json", dict(source=source, path=str(path), mtime=st.st_mtime_ns, size=st.st_size))
     subprocess.Popen([sys.executable, "-m", "ai_convos", "drain-hooks", "--no-block"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 def retry_hook(work, force=False):
-    q = work.with_suffix(".json"); target = q if q.exists() else work
-    if force: e = json.loads(target.read_text()); atomic_json(target, {**e, "retry":True})
+    q,target=(q:=work.with_suffix(".json")),q if q.exists() else work
+    if force: atomic_json(target,{**json.loads(target.read_text()),"retry":True})
     work.unlink(missing_ok=True) if q.exists() else os.replace(work, q)
 def merge_embed_dirty(ids):
     old = set(json.loads(HOOK_EMBED_DIRTY.read_text())) if HOOK_EMBED_DIRTY.exists() else set(); atomic_json(HOOK_EMBED_DIRTY, sorted(old | set(ids)))
@@ -1014,7 +1010,7 @@ def mark_dirty(ids):
     if not ids: return
     with (HOOK_DIR/".lock").open("w") as lock: fcntl.flock(lock, fcntl.LOCK_EX); HOOK_FTS_DIRTY.touch(); merge_embed_dirty(ids)
 def drain_hooks(embed=False, local_only=False,block=False):
-    HOOK_DIR.mkdir(parents=True, exist_ok=True); done,claims = [],[]
+    HOOK_DIR.mkdir(parents=True, exist_ok=True); done,claims,failed,started = [],[],0,time.monotonic()
     with (HOOK_DIR/".drain.lock").open("w") as drain:
         try: fcntl.flock(drain,fcntl.LOCK_EX|(0 if block else fcntl.LOCK_NB))
         except BlockingIOError: return 0
@@ -1022,8 +1018,9 @@ def drain_hooks(embed=False, local_only=False,block=False):
             fcntl.flock(lock,fcntl.LOCK_EX); state=json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}
             for w in HOOK_DIR.glob("*.work"):
                 e=json.loads(w.read_text()); done.append((w,w.stem,e["snap"],set(e["changed"]))) if "changed" in e else retry_hook(w,True)
-            for q in HOOK_DIR.glob("*.json"): work=q.with_suffix(".work"); os.replace(q,work); claims.append(work)
-        for work in claims:
+            for q in sorted(HOOK_DIR.glob("*.json"),key=lambda p:(p.stat().st_mtime_ns,p.name))[:HOOK_DRAIN_EVENTS]: work=q.with_suffix(".work"); os.replace(q,work); claims.append(work)
+        for n,work in enumerate(claims):
+            if n and time.monotonic()-started>=HOOK_DRAIN_SECONDS: break
             try:
                 e,path,key,st,snap=(e:=json.loads(work.read_text())),(path:=Path(e["path"])),work.stem,(st:=path.stat()),[st.st_mtime_ns,st.st_size]
                 if state.get(key)==snap: work.unlink(); continue
@@ -1038,12 +1035,15 @@ def drain_hooks(embed=False, local_only=False,block=False):
             except FileNotFoundError: work.unlink(missing_ok=True)
             except Exception as error:
                 with (HOOK_DIR/".lock").open("w") as lock: fcntl.flock(lock,fcntl.LOCK_EX); retry_hook(work)
+                failed+=1
                 log_parse_error(f"hook inbox {work}",error)
         if done:
             with (HOOK_DIR/".lock").open("w") as lock:
                 fcntl.flock(lock,fcntl.LOCK_EX); dirty=set().union(*(d for _,_,_,d in done)); HOOK_FTS_DIRTY.touch() if dirty else None; dirty and merge_embed_dirty(dirty)
                 for _,key,snap,_ in done: state[key]=snap
                 atomic_json(HOOK_STATE,state); [work.unlink(missing_ok=True) for work,_,_,_ in done]
+    atomic_json(HOOK_PROGRESS,dict(completed_at=time.time_ns(),processed=len(done),failed=failed,pending=len(pending:=[*HOOK_DIR.glob("*.json"),*HOOK_DIR.glob("*.work")]),oldest=min((p.stat().st_mtime_ns for p in pending),default=None)))
+    if pending and len(pending)>failed: subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
     if embed:
         try: embed_hook_pending(local_only=local_only)
         except Exception as e: log_parse_error("hook embeddings", e)
@@ -1232,9 +1232,9 @@ def embed_cmd(batch: int = typer.Option(32, "-b")):
 @app.command()
 def doctor(verbose: bool = typer.Option(False, "-v")):
     typer.echo(f"convos: {version('convos')}")
-    pending = len(list(HOOK_DIR.glob("*.json"))) + len(list(HOOK_DIR.glob("*.work"))); state = json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}; last = max((v[0] for v in state.values()), default=0)
+    pending = len(list(HOOK_DIR.glob("*.json"))) + len(list(HOOK_DIR.glob("*.work"))); state = json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}; progress=json.loads(HOOK_PROGRESS.read_text()) if HOOK_PROGRESS.exists() else {}; last = max((v[0] for v in state.values()), default=0); age=max(0,time.time_ns()-(progress.get("oldest") or time.time_ns()))/1e9 if pending else 0
     dirty = len(json.loads(HOOK_EMBED_DIRTY.read_text())) if HOOK_EMBED_DIRTY.exists() else 0; claims = len(list(DATA_DIR.glob(f".{HOOK_EMBED_DIRTY.name}.*")))
-    typer.echo(f"ingest: pending={pending}, embedding_ids={dirty}, embedding_claims={claims}, last={datetime.fromtimestamp(last/1e9).isoformat(timespec='seconds') if last else 'never'}")
+    typer.echo(f"ingest: pending={pending}, embedding_ids={dirty}, embedding_claims={claims}, last={datetime.fromtimestamp(last/1e9).isoformat(timespec='seconds') if last else 'never'}, oldest={age:.0f}s, last_batch={progress.get('processed',0)} ok/{progress.get('failed',0)} failed")
     if DB_PATH.exists():
         try:
             conn = get_db(read_only=True); cols = set(conn.execute("SELECT table_name,column_name FROM information_schema.columns").fetchall()); required = {"conversations":("id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"), "messages":("id","conversation_id","role","content","thinking","created_at","model","metadata","embedding","parent_id"), "tool_calls":("id","message_id","tool_name","input","output","status","duration_ms","created_at"), "attachments":("id","message_id","filename","mime_type","size","path","url","created_at"), "artifacts":("id","conversation_id","artifact_type","title","content","language","created_at","version"), "file_edits":("id","message_id","file_path","edit_type","content","created_at","old_content")}; missing = [f"{t}.{c}" for t, cs in required.items() for c in cs if (t,c) not in cols]

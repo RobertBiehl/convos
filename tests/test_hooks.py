@@ -8,7 +8,7 @@ POPEN=subprocess.Popen
 @pytest.fixture
 def hooks(tmp_path, monkeypatch):
     data, codex = tmp_path/"data", tmp_path/".codex"; sessions = codex/"sessions"; sessions.mkdir(parents=True)
-    for k, v in (("DATA_DIR", data), ("DB_PATH", data/"convos.db"), ("HOOK_DIR", data/"hook_inbox"), ("HOOK_STATE", data/"hook_state.json"), ("HOOK_EMBED_DIRTY", data/"hook_embeddings_dirty"), ("HOOK_FTS_DIRTY", data/"hook_fts_dirty")): monkeypatch.setattr(cli, k, v)
+    for k, v in (("DATA_DIR", data), ("DB_PATH", data/"convos.db"), ("HOOK_DIR", data/"hook_inbox"), ("HOOK_STATE", data/"hook_state.json"), ("HOOK_PROGRESS", data/"hook_progress.json"), ("HOOK_EMBED_DIRTY", data/"hook_embeddings_dirty"), ("HOOK_FTS_DIRTY", data/"hook_fts_dirty")): monkeypatch.setattr(cli, k, v)
     monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: None if a[0][1:4] == ["-m", "ai_convos", "drain-hooks"] else POPEN(*a, **k))
     return sessions, data
 
@@ -46,6 +46,22 @@ def test_drain_releases_inbox_lock_before_parsing(hooks, monkeypatch):
     def unlocked(*args):
         result=subprocess.run([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)",str(data/"hook_inbox/.lock")]); assert result.returncode==0; return parse(*args)
     monkeypatch.setattr(cli,"hook_result",unlocked); assert cli.drain_hooks()==1
+
+def test_drain_bounds_batch_records_progress_and_hands_off(hooks,monkeypatch):
+    sessions,data=hooks; launched=[]; monkeypatch.setattr(cli,"HOOK_DRAIN_EVENTS",2); monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(args))
+    for i in range(5): transcript(path:=sessions/f"{i}.jsonl",f"event {i}"); enqueue(path)
+    launched.clear(); assert cli.drain_hooks()==2 and len(list((data/"hook_inbox").glob("*.json")))==3 and len(launched)==1
+    progress=json.loads((data/"hook_progress.json").read_text()); assert (progress["processed"],progress["failed"],progress["pending"],bool(progress["oldest"]))==(2,0,3,True)
+
+def test_drain_stops_between_events_at_time_budget(hooks,monkeypatch):
+    sessions,data=hooks; launched=[]; monkeypatch.setattr(cli,"HOOK_DRAIN_SECONDS",-1); monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(args))
+    for i in range(3): transcript(path:=sessions/f"timed-{i}.jsonl",f"timed {i}"); enqueue(path)
+    launched.clear(); assert cli.drain_hooks()==1 and len([*list((data/"hook_inbox").glob("*.json")),*list((data/"hook_inbox").glob("*.work"))])==2 and len(launched)==1
+    monkeypatch.setattr(cli,"HOOK_DRAIN_SECONDS",10); assert cli.drain_hooks()==2 and not [*list((data/"hook_inbox").glob("*.json")),*list((data/"hook_inbox").glob("*.work"))]
+
+def test_failed_only_drain_does_not_respawn_tight_loop(hooks,monkeypatch):
+    sessions,data=hooks; path=sessions/"bad.jsonl"; transcript(path); enqueue(path); launched=[]; monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(args)); monkeypatch.setattr(cli,"hook_result",lambda *_:(_ for _ in ()).throw(ValueError("bad transcript")))
+    assert cli.drain_hooks()==0 and not launched and json.loads((data/"hook_progress.json").read_text())["failed"]==1
 
 def test_concurrent_sync_exits_immediately_and_explicitly(hooks,capsys):
     _,data=hooks; data.mkdir(); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/".sync.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)

@@ -14,7 +14,7 @@ gate below are acceptance criteria, not additional tasks.
 
 | Status | Task |
 | --- | --- |
-| Done in current PR | Restore capture and manual-sync availability: use short inbox critical sections, make competing drains and syncs nonblocking, bound ordinary provenance work to touched conversations, edits, and repositories, preserve full reconciliation behind `sync --full`, and add concurrency and archive-size regressions. |
+| Done in current PR | Restore capture and manual-sync availability: use short inbox critical sections, make competing drains and syncs nonblocking, cap each drain worker by event count and elapsed time with visible progress and safe handoff, bound ordinary provenance work to touched conversations, edits, and repositories, preserve full reconciliation behind `sync --full`, and add concurrency and archive-size regressions. |
 | Pending | Freeze the cross-provider conversation contract and audit real Codex and Claude imports. Define transcript and session identity, main-versus-subagent relationships, authorship, cwd, Git observations, model evidence, tool calls, attachments, edits, and provider-only metadata without deriving unavailable facts. |
 | Pending | Ship one backed-up, resumable, bounded-memory identity and ingestion migration. Dedupe within author and provider transcript identity, never by root session alone and never across relay authors. Re-read surviving raw inputs only after canonical identity is installed, clean promptless startup stubs, and prove interruption recovery. |
 | Pending | Harden remote synchronization: fix duplicate-root proof-chain convergence, add observable exponential backoff, narrow local mutation locks, cover interruption recovery, and prove old signed logical replicas project to current physical identity. |
@@ -35,6 +35,7 @@ evidence register; remediation is represented by the work items above.
 | Remote synchronization held coarse locks around unrelated work | Open; remote-hardening task. |
 | Commands blocked behind a running hook drain | Fixed in current PR. |
 | One hook event performed archive-sized work | Fixed in current PR. |
+| One winning hook drain claimed the entire backlog | Fixed in current PR; bounded workers hand remaining backlog to a successor. |
 | Imported cwd, Git, model, tool, and edit evidence was incomplete | Open; provider-contract task. |
 | Provider transcripts could be imported more than once | Open; identity-migration task. |
 | Promptless startup stubs became conversations | Open; identity-migration task. |
@@ -66,6 +67,8 @@ evidence register; remediation is represented by the work items above.
 
 - Hook capture cost is bounded by the changed transcript, touched rows, and touched
   repositories, not total archive or provenance size.
+- Each worker has an event cap and a between-event time cap; pending age and the
+  previous batch outcome are visible in `doctor`, and failed-only queues do not spin.
 - Read-only commands and manual sync do not wait for an already running incidental
   hook drain.
 - No-op sync, one-event capture, relay paging, and migration have recorded budgets
