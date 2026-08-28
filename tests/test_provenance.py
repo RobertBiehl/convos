@@ -67,10 +67,9 @@ def test_v4_does_not_mutate_foreign_signed_recovery_or_stub_rows(tmp_path):
     assert db.execute("SELECT count(*) FROM remote.row_origins").fetchone()[0]==2 and db.execute("SELECT count(*) FROM remote.row_proofs").fetchone()[0]==2; db.close()
 
 
-def test_v4_identity_conflict_fails_before_mutation_with_backup(tmp_path):
+def test_v4_identity_conflict_is_retained_and_bound_deterministically_with_backup(tmp_path):
     path=tmp_path/"conflict.db"; db=graph(path); db.execute("DROP TABLE provider_sessions; INSERT INTO conversations VALUES ('a','codex','a',NULL,NULL,NULL,NULL,NULL,NULL,'{\"session_id\":\"same\"}'),('b','codex','b',NULL,NULL,NULL,NULL,NULL,NULL,'{\"session_id\":\"same\"}'); UPDATE core_schema SET version=3"); db.close(); db=duckdb.connect(str(path))
-    with pytest.raises(ValueError,match="provider session identity conflicts"): init_schema(db)
-    assert db.execute("SELECT version FROM core_schema").fetchone()[0]==3 and db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==2 and not db.execute("SELECT 1 FROM information_schema.tables WHERE table_name='provider_sessions'").fetchone(); db.close(); assert path.with_name("conflict.db.pre-v4.bak").is_file()
+    init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==5 and db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==2 and db.execute("SELECT source,session_id,conversation_id FROM provider_sessions").fetchall()==[("codex","same","a")]; db.close(); assert path.with_name("conflict.db.pre-v4.bak").is_file()
 
 
 def test_v4_interruption_rolls_back_and_retry_matches_clean_migration(tmp_path,monkeypatch):

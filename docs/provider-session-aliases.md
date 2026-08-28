@@ -3,7 +3,9 @@
 Status: accepted design for the 0.11 schema epoch, 2026-08-28
 
 Implementation status: the additive proof ledger and personal-workspace bridge are
-in stacked PR #100; backed-up row reconciliation remains a dependent task.
+in stacked PR #100. PR #101 admits pre-existing duplicate groups non-destructively
+and binds future parsing to their minimum local ID; signed row reconciliation remains
+a dependent task.
 
 ## Outcome
 
