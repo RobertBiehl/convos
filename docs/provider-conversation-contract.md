@@ -14,6 +14,9 @@ metadata and never invents facts a source did not record.
   not logical identity.
 - `metadata.session_id` is the exact provider-native session identity. For a Claude
   Code subagent this is its `agentId`; the root `sessionId` becomes its parent.
+- Local bindings may retain a legacy filename-derived alias and the later exact
+  provider ID for one conversation; `(source, session_id)` remains unique and can
+  never name two conversations.
 - `metadata.parent_session_id` is present only when the provider explicitly names a
   parent session.
 - `metadata.session_kind` is the normalized `main` or `subagent` classification.

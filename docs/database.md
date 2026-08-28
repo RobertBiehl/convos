@@ -42,7 +42,7 @@ Primary record for each conversation session.
 
 ### provider_sessions
 
-Local native-identity binding installed by schema v4. It is derived from owned
+Local native-identity binding installed by schema v5. It is derived from owned
 conversation metadata and is not a replicated archive row. The unique
 `(source, session_id)` key maps a moved or copied provider transcript back to its
 already-published opaque conversation ID; imported relay rows remain author-scoped
@@ -52,7 +52,7 @@ through `remote.row_origins` instead.
 |--------|------|-------------|
 | source | VARCHAR PK | Provider/integration namespace |
 | session_id | VARCHAR PK | Exact provider-native session or subagent ID |
-| conversation_id | VARCHAR UNIQUE | Stable local `conversations.id` |
+| conversation_id | VARCHAR | Stable local `conversations.id`; multiple exact or legacy provider aliases may name the same local conversation |
 
 ### messages
 
