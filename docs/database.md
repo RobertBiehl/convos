@@ -29,7 +29,7 @@ Primary record for each conversation session.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| id | VARCHAR PK | Deterministic hash of `source:original_id` |
+| id | VARCHAR PK | Opaque stable physical identity |
 | source | VARCHAR | `chatgpt`, `claude`, `claude-code`, `codex` |
 | title | VARCHAR | Conversation title or derived name |
 | created_at | TIMESTAMP | First message timestamp |
@@ -39,6 +39,20 @@ Primary record for each conversation session.
 | git_branch | VARCHAR | Git branch (CLI tools only) |
 | project_id | VARCHAR | Project/gizmo ID if applicable |
 | metadata | JSON | Stable normalized session fields plus documented provider extensions; see the [provider conversation contract](provider-conversation-contract.md) |
+
+### provider_sessions
+
+Local native-identity binding installed by schema v4. It is derived from owned
+conversation metadata and is not a replicated archive row. The unique
+`(source, session_id)` key maps a moved or copied provider transcript back to its
+already-published opaque conversation ID; imported relay rows remain author-scoped
+through `remote.row_origins` instead.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| source | VARCHAR PK | Provider/integration namespace |
+| session_id | VARCHAR PK | Exact provider-native session or subagent ID |
+| conversation_id | VARCHAR UNIQUE | Stable local `conversations.id` |
 
 ### messages
 

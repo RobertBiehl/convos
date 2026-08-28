@@ -37,8 +37,8 @@ evidence register; remediation is represented by the work items above.
 | One hook event performed archive-sized work | Fixed in current PR. |
 | One winning hook drain claimed the entire backlog | Fixed in current PR; bounded workers hand remaining backlog to a successor. |
 | Imported cwd, Git, model, tool, and edit evidence was incomplete | Fixed in stacked PR #95; parser and live-sample regressions retained. |
-| Provider transcripts could be imported more than once | Open; identity-migration task. |
-| Promptless startup stubs became conversations | Open; identity-migration task. |
+| Provider transcripts could be imported more than once | Native identity binding and conflict detection in stacked identity PR; pre-existing conflict reconciliation remains open. |
+| Promptless startup stubs became conversations | Fixed in stacked identity PR; exact startup-only cleanup and admission regressions retained. |
 
 ## Acceptance criteria
 
