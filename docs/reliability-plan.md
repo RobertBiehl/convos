@@ -25,7 +25,7 @@ gate below are acceptance criteria, not additional tasks.
 | In review in stacked PR #102 | Implement backed-up alias reconciliation and prove pre-existing and cross-device duplicate row successors/tombstones converge with retained v1 replicas. |
 | In review in stacked PR #103 | Add an auditable file-edit evidence ledger, reclassify surviving provider transcripts, retain raw uncertain history, and exclude anything except confirmed edits from exact provenance and team sharing. |
 | In review in stacked PR #104 | Harden remote synchronization: converge duplicate-root proof chains without hiding true forks, add observable exponential backoff, separate nonblocking sync and control-mutation leases, cover interruption recovery, and prove retained signed logical replicas remain ingestible. |
-| Pending | Build and qualify the Titan multi-user testbed with a fresh synthetic lane and a persistent upgrade canary before declaring a stable release. |
+| In progress | Build and qualify the isolated Titan multi-user testbed with a destructive fresh synthetic lane and a persistent upgrade canary before declaring a stable release. |
 
 ## Production evidence register
 
@@ -49,6 +49,8 @@ evidence register; remediation is represented by the work items above.
 | Provider transcripts could be imported more than once | Same-batch and later moved-local inputs are covered in stacked PR #96; pre-existing and cross-device reconciliation remains open. |
 | Promptless startup stubs became conversations | Exact wrapper-only candidates are retained and marked in stacked PR #96; ownership-safe cleanup remains open. |
 | Completed ChatGPT verdict was absent from bounded `read` | Fixed in stacked PR #98 with canonical provider order and selective repair of affected ChatGPT conversations. |
+| A clean Ubuntu 24.04 install of core plus remote required an undocumented native compiler toolchain for `llama-cpp-python` | Open stable-release blocker found by the Titan testbed; choose and verify the supported installation contract. |
+| A confirmed local edit received through a signed replica is projected as `legacy_unverified` | Open data-semantics finding from the Titan testbed; the signed wire format does not currently preserve the sender's confirmation evidence. |
 
 ## Acceptance criteria
 
