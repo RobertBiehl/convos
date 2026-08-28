@@ -202,15 +202,15 @@ def test_personal_sync_automatically_bridges_encrypted_memory_between_devices(tm
 
 
 def test_lost_semantic_replica_response_retries_without_resurrecting_forgotten_memory(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a=tmp_path/"a"; setup_client("http://server","alice",root=a); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("replica retry secret","global"); sync_once(a,True); memory_module.forget_data(created["id"],"global"); before=server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]; lost=[False]
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a=tmp_path/"a"; setup_client("http://server","alice",root=a); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("replica retry secret","global"); sync_once(a,True); memory_module.forget_data(created["id"],"global"); before=server.execute("SELECT COUNT(*) FROM semantic_replicas").fetchone()[0]; lost=[False]
     def request_lost(cfg,body,auth=True):
         result=direct(cfg,body,auth)
         if body["op"]=="replica_upload_many" and not lost[0]: lost[0]=True; raise ConnectionError("replica response lost")
         return result
     monkeypatch.setattr("ai_convos_remote.request",request_lost)
     with pytest.raises(ConnectionError,match="response lost"): sync_once(a,True)
-    assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==before+1
-    monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(a,True); assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==before+1; db=sqlite3.connect(a/"memory/state.db"); assert db.execute("SELECT state FROM remote_semantics").fetchall()==[("deleted",)]; db.close()
+    assert server.execute("SELECT COUNT(*) FROM semantic_replicas").fetchone()[0]==before+1
+    monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(a,True); assert server.execute("SELECT COUNT(*) FROM semantic_replicas").fetchone()[0]==before+1; db=sqlite3.connect(a/"memory/state.db"); assert db.execute("SELECT state FROM remote_semantics").fetchall()==[("deleted",)]; db.close()
 
 
 def test_same_device_rebuilds_lost_memory_ledger_and_can_revise_and_forget(tmp_path,monkeypatch):
@@ -233,7 +233,7 @@ def test_relay_cannot_fabricate_semantic_replica_or_mutate_memory(tmp_path,monke
 
 
 def test_later_uploader_copy_heals_poisoned_replica_across_pages(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); memory_module.remember_data("healed delivery copy","global"); sync_once(a,True); cfg=load(b); ws=workspace(cfg,"Personal"); poison_cursor,raw=server.execute("SELECT cursor,envelope FROM row_replicas ORDER BY cursor").fetchone(); original=json.loads(raw); body=open_replica(original,key(cfg,ws,original["epoch"])); repaired=seal_replica(body["row"],body["proof"],ws,original["epoch"],key(cfg,ws,original["epoch"]),cfg["device"]["id"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; server.execute("UPDATE row_replicas SET envelope=?",(json.dumps(original),)); server.commit()
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); memory_module.remember_data("healed delivery copy","global"); sync_once(a,True); cfg=load(b); ws=workspace(cfg,"Personal"); poison_cursor,raw=server.execute("SELECT cursor,envelope FROM semantic_replicas ORDER BY cursor").fetchone(); original=json.loads(raw); body=open_replica(original,key(cfg,ws,original["epoch"])); repaired=seal_replica(body["row"],body["proof"],ws,original["epoch"],key(cfg,ws,original["epoch"]),cfg["device"]["id"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; server.execute("UPDATE semantic_replicas SET envelope=?",(json.dumps(original),)); server.commit()
     def paged(cfg,request_,auth=True): return direct(cfg,request_|({"limit":1} if request_["op"]=="replica_pull" else {}),auth)
     monkeypatch.setattr("ai_convos_remote.request",paged); state=connect(b/"remote/state.db")
     with pytest.raises(ValueError,match="no valid delivery copy"): pull(cfg,state,b)

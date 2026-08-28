@@ -81,7 +81,7 @@ def test_edits_for_attributes_prompt(tmp_path):
     assert edits[0]["type"] == "write"
 
 def test_exact_views_exclude_unconfirmed_edits(tmp_path):
-    conn=duckdb.connect(str(tmp_path/"t.db")); init_schema(conn); conn.execute("INSERT INTO file_edits VALUES ('ok','gone','/f.py','write','ok','2024-01-01',NULL),('bad','gone','/f.py','write','bad','2024-01-02',NULL),('maybe','gone','/f.py','write','maybe','2024-01-03',NULL),('old','gone','/f.py','write','old','2024-01-04',NULL); INSERT INTO provenance.file_edit_evidence VALUES ('ok','confirmed','provider_success',NULL),('bad','invalid','provider_failure',NULL),('maybe','unknown','nonterminal_result',NULL),('old','legacy_unverified','source_unavailable',NULL)")
+    conn=duckdb.connect(str(tmp_path/"t.db")); init_schema(conn); conn.execute("INSERT INTO file_edits VALUES ('ok','gone','/f.py','write','ok','2024-01-01',NULL),('bad','gone','/f.py','write','bad','2024-01-02',NULL),('maybe','gone','/f.py','write','maybe','2024-01-03',NULL),('old','gone','/f.py','write','old','2024-01-04',NULL); INSERT INTO provenance.file_edit_evidence VALUES ('ok','confirmed','provider_success',NULL),('bad','invalid','provider_failure',NULL),('maybe','unknown','nonterminal_result',NULL),('old','unverified','source_unavailable',NULL)")
     assert [e["content"] for e in edits_for(conn,"/f.py")]==["ok"]
 
 

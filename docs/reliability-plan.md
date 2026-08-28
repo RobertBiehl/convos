@@ -49,8 +49,8 @@ evidence register; remediation is represented by the work items above.
 | Provider transcripts could be imported more than once | Fixed in PR #105 through exact native bindings and signed cross-device alias reconciliation; every physical row remains retained. |
 | Promptless startup stubs became conversations | Exact wrapper-only candidates are retained and marked in PR #105; ownership-safe cleanup remains open. |
 | Completed ChatGPT verdict was absent from bounded `read` | Fixed in PR #105 with canonical provider order and selective repair of affected ChatGPT conversations. |
-| A clean Ubuntu 24.04 install of core plus remote required an undocumented native compiler toolchain for `llama-cpp-python` | Open stable-release blocker found by the Titan testbed; choose and verify the supported installation contract. |
-| A confirmed local edit received through a signed replica is projected as `legacy_unverified` | Open data-semantics finding from the Titan testbed; the signed wire format does not currently preserve the sender's confirmation evidence. |
+| A clean Ubuntu 24.04 install of core plus remote required an undocumented native compiler toolchain for `llama-cpp-python` | Fixed in PR #105; base install and remote sync are compiler-free, while semantic retrieval is the explicit `semantic` extra. |
+| A confirmed local edit lost its evidence classification through a signed replica | Fixed in PR #105 without changing signed-v1 rows; an authorized root-signed evidence object binds the classification to exact edit/tool revisions, and old rows remain `unverified` until that evidence arrives. |
 
 ## Acceptance criteria
 

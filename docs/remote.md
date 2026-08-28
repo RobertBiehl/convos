@@ -146,8 +146,11 @@ The relay sees ciphertext and envelope metadata, not memory text or absolute
 checkout paths. Preserve the recovery key and continue taking private
 `convos memory backup` snapshots: the remote synchronizes canonical state, not
 native Codex/Claude files, hooks, or the complete device-local ledger.
-Each canonical is one signed object and one encrypted row replica, subject to
-the relay's 48 MiB row-replica ceiling.
+Each canonical is one signed object and one encrypted semantic replica, subject
+to the relay's 48 MiB replica ceiling. Semantic replicas use a separate opaque
+relay table: released clients request only logical-row replicas, while clients
+that advertise the current pull path receive both. This keeps mixed-version
+team sync compatible when new signed semantic object kinds are introduced.
 
 Forgetting a user-owned canonical publishes a root-signed bodyless descendant
 containing the complete known ancestry. Recipients accept it only after proof

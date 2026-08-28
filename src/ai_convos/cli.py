@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS provenance.files(id VARCHAR PRIMARY KEY,repository VA
 CREATE TABLE IF NOT EXISTS provenance.file_versions(id VARCHAR PRIMARY KEY,file_id VARCHAR,content_hash VARCHAR,observed_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS provenance.file_edit_scopes(file_edit_id VARCHAR PRIMARY KEY,path VARCHAR,repository VARCHAR,root VARCHAR,checkout VARCHAR,observed_at TIMESTAMP,route VARCHAR);
 CREATE TABLE IF NOT EXISTS provenance.file_edit_files(file_edit_id VARCHAR PRIMARY KEY,file_id VARCHAR,old_content_hash VARCHAR,new_content_hash VARCHAR,evidence VARCHAR);
-CREATE TABLE IF NOT EXISTS provenance.file_edit_evidence(file_edit_id VARCHAR PRIMARY KEY,status VARCHAR NOT NULL CHECK(status IN ('confirmed','invalid','unknown','legacy_unverified')),reason VARCHAR NOT NULL,tool_call_id VARCHAR);
+CREATE TABLE IF NOT EXISTS provenance.file_edit_evidence(file_edit_id VARCHAR PRIMARY KEY,status VARCHAR NOT NULL CHECK(status IN ('confirmed','invalid','unknown','unverified')),reason VARCHAR NOT NULL,tool_call_id VARCHAR);
 CREATE TABLE IF NOT EXISTS provenance.git_checkpoints(id VARCHAR PRIMARY KEY,repository VARCHAR,head VARCHAR,state_hash VARCHAR,paths JSON,observed_at TIMESTAMP,capture_source VARCHAR);
 CREATE TABLE IF NOT EXISTS provenance.checkpoint_edits(checkpoint_id VARCHAR,file_edit_id VARCHAR,evidence VARCHAR,PRIMARY KEY(checkpoint_id,file_edit_id));
 CREATE TABLE IF NOT EXISTS provenance.local_facts(kind VARCHAR,entity VARCHAR,PRIMARY KEY(kind,entity));
@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS remote.workspace_controls(workspace_id VARCHAR,revisi
 CREATE TABLE IF NOT EXISTS remote.row_proofs(id VARCHAR PRIMARY KEY,workspace_id VARCHAR,authorization_workspace_id VARCHAR,row_kind VARCHAR,source_row_id VARCHAR,encoding_v USMALLINT,content_hash VARCHAR,revision VARCHAR,previous_revision VARCHAR,state VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,authorization_epoch UINTEGER,signature VARCHAR);
 CREATE TABLE IF NOT EXISTS remote.row_conflicts(proof_id VARCHAR PRIMARY KEY,body JSON);
 CREATE TABLE IF NOT EXISTS remote.provider_session_aliases(workspace_id VARCHAR,author_user_id VARCHAR,object_id VARCHAR,revision VARCHAR,source VARCHAR,session_id VARCHAR,members JSON,canonical_source_row_id VARCHAR,proof JSON,PRIMARY KEY(author_user_id,object_id,revision));
+CREATE TABLE IF NOT EXISTS remote.file_edit_evidence_proofs(workspace_id VARCHAR,author_user_id VARCHAR,object_id VARCHAR,revision VARCHAR,source_edit_id VARCHAR,edit_revision VARCHAR,status VARCHAR,reason VARCHAR,source_tool_call_id VARCHAR,tool_revision VARCHAR,proof JSON,PRIMARY KEY(workspace_id,author_user_id,object_id,revision));
 CREATE TABLE IF NOT EXISTS remote.provenance_origins(kind VARCHAR,physical_entity VARCHAR,workspace_id VARCHAR,author_user_id VARCHAR,source_entity VARCHAR,proof_id VARCHAR,PRIMARY KEY(kind,physical_entity,workspace_id,author_user_id));
 CREATE TABLE IF NOT EXISTS attachment_bodies(attachment_id VARCHAR PRIMARY KEY,content_hash VARCHAR NOT NULL,size UINTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS core_schema(singleton BOOLEAN PRIMARY KEY,version USMALLINT NOT NULL);
@@ -152,23 +153,15 @@ def capture_repository(path,db_path=None):
     return repo
 def _resolved(path,cwd=None): return str((Path(cwd)/p if not (p:=Path(path)).is_absolute() and cwd else p).expanduser().resolve())
 def pending_scopes(conversations):
-    captured=datetime.now(timezone.utc)
-    return [(conversation,resolved,None,root,f"pending:{checkout}" if checkout else None,captured) for conversation,cwd in conversations for resolved in [_resolved(cwd) if cwd else None] for root,checkout in [_git_marker(resolved) if resolved else (None,None)]]
+    return [(conversation,resolved,None,root,f"pending:{checkout}" if checkout else None,captured) for captured in [datetime.now(timezone.utc)] for conversation,cwd in conversations for resolved in [_resolved(cwd) if cwd else None] for root,checkout in [_git_marker(resolved) if resolved else (None,None)]]
 def snapshot_scopes(conversations,known=None):
     _refresh_repository()
-    captured=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-    out=[]
-    for conversation,cwd in conversations:
-        resolved=str(Path(cwd).expanduser().resolve()) if cwd else None
-        repo=repository(resolved,known,False) if resolved else None
-        out.append((conversation,resolved,repo["id"] if repo else None,repo["root"] if repo else None,repo["checkout"] if repo else None,captured))
-    return out
+    return [(conversation,resolved,repo["id"] if repo else None,repo["root"] if repo else None,repo["checkout"] if repo else None,captured) for captured in [datetime.now(timezone.utc).isoformat().replace("+00:00","Z")] for conversation,cwd in conversations for resolved in [str(Path(cwd).expanduser().resolve()) if cwd else None] for repo in [repository(resolved,known,False) if resolved else None]]
 def _provenance_where(path,cwd,cache,known=None,frozen=False):
     p=Path(path) if frozen else Path(_resolved(path,cwd)); repo=_cached_repository(cache,root,known) if (root:=_git_root(p)) else None
     return (repo,p.relative_to(repo["root"]).as_posix(),"repository") if repo else (None,f"external/{provenance_digest(str(p))[:24]}/{p.name}","external")
 def pending_edit_scopes(edits):
-    captured=datetime.now(timezone.utc)
-    return [(e["id"],f"external/{provenance_digest(route)[:24]}/{Path(route).name}",None,root,f"pending:{checkout}" if checkout else None,route,captured) for e in edits for route in [_resolved(e["path"],e["cwd"])] for root,checkout in [_git_marker(route)]]
+    return [(e["id"],f"external/{provenance_digest(route)[:24]}/{Path(route).name}",None,root,f"pending:{checkout}" if checkout else None,route,captured) for captured in [datetime.now(timezone.utc)] for e in edits for route in [_resolved(e["path"],e["cwd"])] for root,checkout in [_git_marker(route)]]
 def snapshot_edit_scopes(edits,known=None):
     _refresh_repository()
     captured=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
@@ -301,11 +294,12 @@ def project_archive_row(db,table,columns,values,origin=None,touch=True):
     required=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at")
     if origin and set(origin) not in (set(required),set(required)|{"proof_id"}): raise ValueError("record origin schema mismatch")
     updates=_MSG_UPDATES if table=="messages" else ",".join(f"{c}=excluded.{c}" for c in columns[1:]); db.execute(_MSG_UPS,values) if table=="messages" else db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?'*len(columns))}) ON CONFLICT(id) DO UPDATE SET {updates}",values)
-    if table=="file_edits": db.execute("INSERT OR IGNORE INTO provenance.file_edit_evidence VALUES (?,'legacy_unverified','signed_replica',NULL)",(values[0],))
+    if table=="file_edits": db.execute("INSERT OR IGNORE INTO provenance.file_edit_evidence VALUES (?,'unverified','signed_replica_missing_evidence',NULL)",(values[0],))
     if origin: db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,values[0],*(origin[k] for k in required),origin.get("proof_id")))
+    table in ("file_edits","tool_calls") and _apply_signed_edit_evidence(db)
     touch and _archive_touch(db,[(table,values[0])])
 def _insert_pages(db,target,rows,columns=None,conflict="",mode="",embedding=False): schema={r[0]:r[1] for r in db.execute(f"DESCRIBE {target}").fetchall()}; columns=columns or list(schema); shape=json.dumps([{c:schema[c] for c in columns}]); norm=lambda c,v:json.loads(v) if schema[c]=="JSON" and isinstance(v,str) else v; extra=",embedding" if embedding else ""; source="SELECT x.*,m.embedding FROM UNNEST(from_json(?,?)) t(x) LEFT JOIN messages m ON m.id=x.id AND m.content IS NOT DISTINCT FROM x.content" if embedding else "SELECT x.* FROM UNNEST(from_json(?,?)) t(x)"; [db.execute(f"INSERT{mode} INTO {target} ({','.join(columns)}{extra}) {source}{conflict}",(json.dumps([{c:norm(c,v) for c,v in zip(columns,row)} for row in page],default=str,ensure_ascii=True,allow_nan=False),shape)) for page in (rows[i:i+500] for i in range(0,len(rows),500))]
-def project_archive_rows(db,table,columns,rows): fields=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at"); values=[r[0] for r in rows]; origins=[(table,v[0],*(o[k] for k in fields),o.get("proof_id")) for v,o in rows if o]; updates=_MSG_UPDATES if table=="messages" else ','.join(f"{c}=excluded.{c}" for c in columns[1:]); required(table in ARCHIVE_COLUMNS and columns==ARCHIVE_COLUMNS[table] and not any(len(v)!=len(columns) or o and set(o) not in (set(fields),set(fields)|{"proof_id"}) for v,o in rows),ValueError("record schema/entity mismatch")); _insert_pages(db,table,values,columns,f" ON CONFLICT(id) DO UPDATE SET {updates}",embedding=table=="messages"); table=="file_edits" and _insert_pages(db,"provenance.file_edit_evidence",[(v[0],"legacy_unverified","signed_replica",None) for v in values],mode=" OR IGNORE"); origins and _insert_pages(db,"remote.row_origins",origins,mode=" OR REPLACE")
+def project_archive_rows(db,table,columns,rows): fields=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at"); values=[r[0] for r in rows]; origins=[(table,v[0],*(o[k] for k in fields),o.get("proof_id")) for v,o in rows if o]; updates=_MSG_UPDATES if table=="messages" else ','.join(f"{c}=excluded.{c}" for c in columns[1:]); required(table in ARCHIVE_COLUMNS and columns==ARCHIVE_COLUMNS[table] and not any(len(v)!=len(columns) or o and set(o) not in (set(fields),set(fields)|{"proof_id"}) for v,o in rows),ValueError("record schema/entity mismatch")); _insert_pages(db,table,values,columns,f" ON CONFLICT(id) DO UPDATE SET {updates}",embedding=table=="messages"); table=="file_edits" and _insert_pages(db,"provenance.file_edit_evidence",[(v[0],"unverified","signed_replica_missing_evidence",None) for v in values],mode=" OR IGNORE"); origins and _insert_pages(db,"remote.row_origins",origins,mode=" OR REPLACE"); table in ("file_edits","tool_calls") and _apply_signed_edit_evidence(db)
 def project_row_proofs(db,proofs,root_public,certificate):
     if not proofs: return []
     fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); expected={"v","kind",*fields}; signer=(proofs[0]["author_user_id"],proofs[0]["author_device_id"]); packed=json.dumps(certificate,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)
@@ -315,6 +309,13 @@ def project_row_proofs(db,proofs,root_public,certificate):
     db.execute("INSERT OR IGNORE INTO remote.row_signers VALUES (?,?,?,?)",(*signer,root_public,packed)); ids=[provenance_digest(proof) for proof in proofs]; rows=[(pid,*(proof[k] for k in fields)) for pid,proof in zip(ids,proofs)]; _insert_pages(db,"remote.row_proofs",rows,("id",*columns),mode=" OR IGNORE"); return ids
 def project_row_proof(db,proof,root_public,certificate): return project_row_proofs(db,[proof],root_public,certificate)[0]
 def project_provider_alias(db,record): fields=("workspace_id","author_user_id","object_id","revision","source","session_id","members","canonical_source_row_id","proof"); required(set(record)==set(fields) and isinstance(p:=record["proof"],dict) and (p.get("workspace"),p.get("author_user_id"),p.get("object_id"),p.get("revision"))==tuple(record[k] for k in fields[:4]) and record["object_id"]=="provider-session:"+provenance_digest([record["source"],record["session_id"]]) and isinstance(record["members"],list) and record["members"] and all(isinstance(x,str) and x for x in record["members"]) and record["members"]==sorted(set(record["members"])) and record["canonical_source_row_id"]==record["members"][0],ValueError("provider alias storage schema mismatch")); _insert_pages(db,"remote.provider_session_aliases",[tuple(record[f] for f in fields)],fields,mode=" OR IGNORE")
+def _apply_signed_edit_evidence(db,local_user=None):
+    db.execute("""CREATE OR REPLACE TEMP TABLE core_signed_edit_evidence AS WITH leaves AS (SELECT p.*,count(*) OVER (PARTITION BY workspace_id,author_user_id,object_id) n FROM remote.file_edit_evidence_proofs p WHERE NOT EXISTS (SELECT 1 FROM remote.file_edit_evidence_proofs c WHERE (c.workspace_id,c.author_user_id,c.object_id)=(p.workspace_id,p.author_user_id,p.object_id) AND json_extract_string(c.proof,'$.previous_revision')=p.revision)) SELECT DISTINCT fe.id file_edit_id,CASE WHEN s.n>1 THEN 'unverified' ELSE s.status END status,CASE WHEN s.n>1 THEN 'signed_evidence_conflict' ELSE s.reason END reason,CASE WHEN s.n>1 THEN NULL ELSE tc.id END tool_call_id FROM leaves s JOIN remote.row_proofs ep ON (ep.workspace_id,ep.author_user_id,ep.row_kind,ep.source_row_id,ep.revision)=(s.workspace_id,s.author_user_id,'file_edits',s.source_edit_id,s.edit_revision) LEFT JOIN remote.row_origins eo ON eo.table_name='file_edits' AND eo.proof_id=ep.id JOIN file_edits fe ON fe.id=COALESCE(eo.physical_row_id,CASE WHEN s.author_user_id=? THEN s.source_edit_id END) LEFT JOIN remote.row_proofs tp ON (tp.workspace_id,tp.author_user_id,tp.row_kind,tp.source_row_id,tp.revision)=(s.workspace_id,s.author_user_id,'tool_calls',s.source_tool_call_id,s.tool_revision) LEFT JOIN remote.row_origins tor ON tor.table_name='tool_calls' AND tor.proof_id=tp.id LEFT JOIN tool_calls tc ON tc.id=COALESCE(tor.physical_row_id,CASE WHEN s.author_user_id=? THEN s.source_tool_call_id END) WHERE s.source_tool_call_id IS NULL OR tc.id IS NOT NULL""",(local_user,local_user)); touched=db.execute("SELECT x.file_edit_id FROM core_signed_edit_evidence x LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=x.file_edit_id WHERE (v.status,v.reason,v.tool_call_id) IS DISTINCT FROM (x.status,x.reason,x.tool_call_id)").fetchall()
+    touched and db.execute("INSERT OR REPLACE INTO provenance.file_edit_evidence SELECT * FROM core_signed_edit_evidence") and _archive_touch(db,[("file_edits",r[0]) for r in touched])
+def project_file_edit_evidence(db,record,local_user=None):
+    fields=("workspace_id","author_user_id","object_id","revision","source_edit_id","edit_revision","status","reason","source_tool_call_id","tool_revision","proof"); p=record.get("proof") if isinstance(record,dict) else None
+    required(set(record)==set(fields) and isinstance(p,dict) and (p.get("workspace"),p.get("author_user_id"),p.get("object_id"),p.get("revision"))==tuple(record[k] for k in fields[:4]) and record["object_id"]=="file-edit-evidence:"+provenance_digest(record["source_edit_id"]) and record["status"] in {"confirmed","invalid","unknown","unverified"} and isinstance(record["reason"],str) and record["reason"] and isinstance(record["edit_revision"],str) and len(record["edit_revision"])==64 and ((record["source_tool_call_id"] is None and record["tool_revision"] is None) or all(isinstance(record[k],str) and record[k] for k in ("source_tool_call_id","tool_revision"))),ValueError("file edit evidence storage schema mismatch"))
+    _insert_pages(db,"remote.file_edit_evidence_proofs",[tuple(record[f] for f in fields)],fields,mode=" OR IGNORE"); _apply_signed_edit_evidence(db,local_user)
 def project_provider_bindings(db,source,session,conversation,members): required(db.execute("SELECT 1 FROM conversations WHERE id=?",(conversation,)).fetchone() and all(isinstance(v,str) and v for v in (source,session,conversation,*members)),ValueError("provider binding target unavailable")); members and db.execute("UPDATE provider_sessions SET conversation_id=? WHERE conversation_id IN (SELECT UNNEST(?))",(conversation,members)); db.execute("INSERT OR REPLACE INTO provider_sessions VALUES (?,?,?)",(source,session,conversation))
 def project_workspace_controls(db,controls):
     for value in controls:
@@ -392,6 +393,7 @@ def init_schema(conn):
     current==2 and _migration_backup(conn,3)
     current in (3,4) and _migration_backup(conn,current+1)
     current==5 and _migration_backup(conn,6)
+    current==6 and _migration_backup(conn,7)
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
         id VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, title VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP,
         model VARCHAR, cwd VARCHAR, git_branch VARCHAR, project_id VARCHAR, metadata JSON)""")
@@ -460,9 +462,12 @@ def init_schema(conn):
     if conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone()[0]<6:
         legacy=conn.execute("SELECT id FROM file_edits fe WHERE NOT EXISTS (SELECT 1 FROM provenance.file_edit_evidence v WHERE v.file_edit_id=fe.id)").fetchall()
         with _transaction(conn):
-            legacy and conn.executemany("INSERT INTO provenance.file_edit_evidence VALUES (?,'legacy_unverified','source_unavailable',NULL)",legacy)
+            legacy and conn.executemany("INSERT INTO provenance.file_edit_evidence VALUES (?,'unverified','source_unavailable',NULL)",legacy)
             legacy and _archive_touch(conn,[("file_edits",r[0]) for r in legacy])
             conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,6)")
+    if conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone()[0]<7:
+        with _transaction(conn):
+            conn.execute("CREATE TABLE provenance.file_edit_evidence_v7(file_edit_id VARCHAR PRIMARY KEY,status VARCHAR NOT NULL CHECK(status IN ('confirmed','invalid','unknown','unverified')),reason VARCHAR NOT NULL,tool_call_id VARCHAR); INSERT INTO provenance.file_edit_evidence_v7 SELECT file_edit_id,CASE status WHEN 'legacy_unverified' THEN 'unverified' ELSE status END,reason,tool_call_id FROM provenance.file_edit_evidence; DROP TABLE provenance.file_edit_evidence; ALTER TABLE provenance.file_edit_evidence_v7 RENAME TO file_edit_evidence; INSERT OR REPLACE INTO core_schema VALUES (TRUE,7)")
     with _transaction(conn):
         conn.execute("""CREATE OR REPLACE TEMP TABLE core_legacy_conflicts AS SELECT x.file_edit_id edit,x.file_id old_id,f.path,sha256(json_object('path',f.path,'repository',NULL)) new_id,EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='edit.observed' AND l.entity=x.file_edit_id) is_local FROM provenance.file_edit_files x JOIN provenance.files f ON f.id=x.file_id WHERE x.evidence='legacy_scope_conflict' AND (x.file_id<>sha256(json_object('path',f.path,'repository',NULL)) OR EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='edit.observed' AND l.entity=x.file_edit_id) AND NOT EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='file.observed' AND l.entity=sha256(json_object('path',f.path,'repository',NULL)))); INSERT OR IGNORE INTO provenance.files SELECT new_id,NULL,path,'external' FROM core_legacy_conflicts; UPDATE provenance.file_edit_files x SET file_id=c.new_id FROM core_legacy_conflicts c WHERE x.file_edit_id=c.edit; INSERT OR IGNORE INTO provenance.local_facts SELECT 'file.observed',new_id FROM core_legacy_conflicts WHERE is_local; DELETE FROM provenance.local_facts l USING core_legacy_conflicts c WHERE l.kind='file.observed' AND l.entity=c.old_id AND c.old_id<>c.new_id; DELETE FROM provenance.files f USING core_legacy_conflicts c WHERE f.id=c.old_id AND c.old_id<>c.new_id AND NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_id=f.id) AND NOT EXISTS (SELECT 1 FROM provenance.file_versions v WHERE v.file_id=f.id) AND NOT EXISTS (SELECT 1 FROM remote.provenance_origins o WHERE o.kind='file.observed' AND o.physical_entity=f.id); UPDATE archive_state SET generation=generation+1 WHERE singleton AND EXISTS(SELECT 1 FROM core_legacy_conflicts WHERE is_local); INSERT OR REPLACE INTO archive_changes SELECT kind,entity,generation FROM archive_state,(SELECT 'file_edits' kind,edit entity FROM core_legacy_conflicts WHERE is_local UNION ALL SELECT 'edit.observed',edit FROM core_legacy_conflicts WHERE is_local UNION ALL SELECT 'file.observed',new_id FROM core_legacy_conflicts WHERE is_local) WHERE singleton; DROP TABLE core_legacy_conflicts""")
 
@@ -659,13 +664,7 @@ class ParseResult:
     provenance_conversations: set = field(default_factory=set)
 
     def __iadd__(self,other):
-        self.convs += other.convs
-        self.msgs += other.msgs
-        self.tools += other.tools
-        self.attachs += other.attachs
-        self.artifacts += other.artifacts
-        self.edits += other.edits
-        self.edit_evidence += other.edit_evidence
+        for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence"): getattr(self,name).extend(getattr(other,name))
         return self
 
 def log_parse_error(context: str, err: Exception): typer.echo(f"  parse error ({context}): {type(err).__name__}: {err}", err=True)
@@ -1022,7 +1021,7 @@ def upsert(conn, r: ParseResult):
     evidence_row=lambda v:(v["file_edit_id"],v["status"],v["reason"],v["tool_call_id"])
     evidence={v[0]:v for v in conn.execute("SELECT * FROM provenance.file_edit_evidence WHERE file_edit_id IN (SELECT UNNEST(?))",[[v["file_edit_id"] for v in r.edit_evidence]+[e["id"] for e in r.edits]]).fetchall()} if r.edit_evidence or r.edits else {}
     classified={v["file_edit_id"] for v in r.edit_evidence}; incoming=[*r.edit_evidence,*(dict(file_edit_id=e["id"],status="unknown",reason="unclassified_input",tool_call_id=None) for e in r.edits if e["id"] not in classified)]
-    required(all(set(v)=={"file_edit_id","status","reason","tool_call_id"} and v["status"] in {"confirmed","invalid","unknown","legacy_unverified"} and v["file_edit_id"] and v["reason"] for v in incoming),ValueError("invalid file edit evidence"))
+    required(all(set(v)=={"file_edit_id","status","reason","tool_call_id"} and v["status"] in {"confirmed","invalid","unknown","unverified"} and v["file_edit_id"] and v["reason"] for v in incoming),ValueError("invalid file edit evidence"))
     tool_ids={v["tool_call_id"] for v in incoming if v["tool_call_id"]}; required(not tool_ids or conn.execute("SELECT COUNT(*) FROM tool_calls WHERE id IN (SELECT UNNEST(?))",[list(tool_ids)]).fetchone()[0]==len(tool_ids),ValueError("file edit evidence tool call unavailable"))
     incoming and conn.executemany("INSERT OR REPLACE INTO provenance.file_edit_evidence VALUES (?,?,?,?)",list(map(evidence_row,incoming)))
     evidence_changed={v["file_edit_id"] for v in incoming if evidence.get(v["file_edit_id"])!=evidence_row(v) and conn.execute("SELECT 1 FROM file_edits WHERE id=?",[v["file_edit_id"]]).fetchone()}
@@ -1111,11 +1110,17 @@ def flush_fts():
     return True
 
 _MODEL, _MCFG, _LLAMA_LOG = None, dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), None
-def embedding_model_path(local_only=False): from huggingface_hub import hf_hub_download; return hf_hub_download(_MCFG["repo_id"],_MCFG["filename"],revision=_MCFG["revision"],local_files_only=local_only)
+_SEMANTIC_INSTALL="Semantic retrieval is not installed. Install `convos[semantic]`, then run `convos embed`; literal `convos search` needs no extra."
+def embedding_model_path(local_only=False):
+    try: from huggingface_hub import hf_hub_download
+    except ImportError as e: raise ValueError(_SEMANTIC_INSTALL) from e
+    return hf_hub_download(_MCFG["repo_id"],_MCFG["filename"],revision=_MCFG["revision"],local_files_only=local_only)
 def _llama(local_only=False):
     global _MODEL, _LLAMA_LOG
     if _MODEL is None:
-        from llama_cpp import Llama; import llama_cpp.llama_cpp as lc, warnings; warnings.filterwarnings("ignore", message="The `local_dir_use_symlinks` argument is deprecated.*", category=UserWarning)
+        try: from llama_cpp import Llama; import llama_cpp.llama_cpp as lc
+        except ImportError as e: raise ValueError(_SEMANTIC_INSTALL) from e
+        import warnings; warnings.filterwarnings("ignore", message="The `local_dir_use_symlinks` argument is deprecated.*", category=UserWarning)
         if _LLAMA_LOG is None: _LLAMA_LOG = lc.llama_log_callback(lambda *_: None); lc.llama_log_set(_LLAMA_LOG, None)
         cfg = _MCFG.copy(); nseq = cfg.pop("n_seq_max", 0); [cfg.pop(k) for k in ("repo_id","filename","revision")]
         if nseq:
@@ -1281,7 +1286,7 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
         try:
             conn = get_db(read_only=True); cols = set(conn.execute("SELECT table_name,column_name FROM information_schema.columns").fetchall()); required = {"conversations":("id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"), "messages":("id","conversation_id","role","content","thinking","created_at","model","metadata","embedding","parent_id"), "tool_calls":("id","message_id","tool_name","input","output","status","duration_ms","created_at"), "attachments":("id","message_id","filename","mime_type","size","path","url","created_at"), "artifacts":("id","conversation_id","artifact_type","title","content","language","created_at","version"), "file_edits":("id","message_id","file_path","edit_type","content","created_at","old_content"), "file_edit_evidence":("file_edit_id","status","reason","tool_call_id")}; missing = [f"{t}.{c}" for t, cs in required.items() for c in cs if (t,c) not in cols]
             convs, msgs, unembedded, latest = conn.execute(f"SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM messages WHERE embedding IS NULL AND COALESCE(content,'')!=''{_NOISE}),(SELECT MAX(updated_at) FROM conversations)").fetchone() if not missing else (0,0,0,None); fts = bool(conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()); evidence=dict(conn.execute("SELECT status,COUNT(*) FROM provenance.file_edit_evidence GROUP BY status").fetchall()) if not missing else {}; conn.close()
-            typer.echo(f"archive: {convs} convs, {msgs} msgs, {unembedded} unembedded, {DB_PATH.stat().st_size/1024**3:.1f} GB, latest={latest or 'never'}, schema={'ready' if not missing else 'missing:' + ','.join(missing)}, fts={'yes' if fts else 'no'}, edit_evidence="+",".join(f"{k}:{evidence.get(k,0)}" for k in ("confirmed","unknown","invalid","legacy_unverified")))
+            typer.echo(f"archive: {convs} convs, {msgs} msgs, {unembedded} unembedded, {DB_PATH.stat().st_size/1024**3:.1f} GB, latest={latest or 'never'}, schema={'ready' if not missing else 'missing:' + ','.join(missing)}, fts={'yes' if fts else 'no'}, edit_evidence="+",".join(f"{k}:{evidence.get(k,0)}" for k in ("confirmed","unknown","invalid","unverified")))
             if missing or not fts: typer.echo("repair: convos init")
             elif unembedded: typer.echo("repair: convos embed")
         except Exception as e: typer.echo(f"archive: unavailable ({e})")
@@ -1352,7 +1357,7 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional
             tcs = [dict(tool=t[0], input=json.loads(t[1]), output=json.loads(t[2]), status=t[3])
                   for t in conn.execute("SELECT tool_name, input, output, status FROM tool_calls tc JOIN messages m ON tc.message_id = m.id WHERE m.conversation_id = ?", [r[0]]).fetchall()]
             edits = [dict(file=e[0], type=e[1], content=e[2], evidence_status=e[3], evidence_reason=e[4], tool_call_id=e[5])
-                    for e in conn.execute("SELECT fe.file_path,fe.edit_type,fe.content,COALESCE(v.status,'legacy_unverified'),COALESCE(v.reason,'source_unavailable'),v.tool_call_id FROM file_edits fe JOIN messages m ON fe.message_id=m.id LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id WHERE m.conversation_id=? ORDER BY fe.created_at NULLS FIRST,fe.id",[r[0]]).fetchall()]
+                    for e in conn.execute("SELECT fe.file_path,fe.edit_type,fe.content,COALESCE(v.status,'unverified'),COALESCE(v.reason,'source_unavailable'),v.tool_call_id FROM file_edits fe JOIN messages m ON fe.message_id=m.id LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id WHERE m.conversation_id=? ORDER BY fe.created_at NULLS FIRST,fe.id",[r[0]]).fetchall()]
             result.append(dict(id=r[0], source=r[1], title=r[2], created_at=str(r[3]) if r[3] else None, updated_at=str(r[4]) if r[4] else None,
                               model=r[5], cwd=r[6], git_branch=r[7], project_id=r[8], messages=msgs, tool_calls=tcs, file_edits=edits))
         output.write_text(json.dumps(result, indent=2))

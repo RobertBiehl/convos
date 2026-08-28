@@ -34,7 +34,7 @@ normalized origin evidence identifies clones and worktrees, root commits provide
 a fallback lineage anchor, and differing fork origins remain isolated.
 When both optional clients are installed, an entry-point adapter maps current
 canonical memory revisions onto user-root-signed semantic objects carried by
-ordinary encrypted personal-workspace row replicas. Incoming objects remain
+the encrypted semantic-replica channel. Incoming objects remain
 normal revisioned sources in the memory ledger, so deterministic one-sided
 advances converge while concurrent semantic changes use the existing
 plan/resolve/apply path. Team workspaces never receive memory objects.
@@ -147,8 +147,9 @@ remain outside core.
 Literal `search` is conversation-first as well: BM25 ranks messages, then only
 the strongest matching message from each conversation consumes a result slot.
 
-The package depends on `llama-cpp-python` + `huggingface-hub`. The GGUF model is
-downloaded on first call and cached by huggingface-hub.
+The `semantic` extra supplies `llama-cpp-python` + `huggingface-hub`; the base
+archive and literal retrieval do not require a native compiler. The GGUF model
+is downloaded on first semantic call and cached by huggingface-hub.
 
 ## Data Flow
 

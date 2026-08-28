@@ -47,13 +47,15 @@ bounded reads provide exact evidence instead of generated recollections.
 Install from PyPI with uv, initialize local capture, and prepare semantic recall:
 
 ```bash
-uv tool install convos
+uv tool install 'convos[semantic]'
 convos init
 convos embed
 convos doctor
 ```
 
-`pipx install convos` is also supported.
+Use `uv tool install convos` (or `pipx install convos`) for a compiler-free
+literal-search archive. Add the `semantic` extra when `convos query` and
+`convos embed` are wanted.
 
 Upgrade later with:
 
@@ -62,8 +64,8 @@ uv tool upgrade convos
 convos install-skills
 ```
 
-The first install may compile `llama-cpp-python` locally and take about a
-minute on macOS; later reinstalls reuse the built package.
+The semantic extra may compile `llama-cpp-python` locally; the base archive,
+literal search, capture, and remote sync have no native compiler requirement.
 
 `convos init` creates the archive, installs the bundled Codex + Claude Code
 skill and capture hooks, imports existing local Codex and Claude Code sessions,

@@ -410,7 +410,7 @@ def verified_replica(body,workspace,controls,user):
     row,proof,lineage=body["row"],body["proof"],body.get("lineage")
     if proof.get("kind")=="semantic.proof":
         if lineage: raise ValueError("semantic proof has row lineage")
-        verify_semantic_proof(proof,row,user); return row,proof,None,[]
+        verify_semantic_proof(proof,row,proof["author_user_id"]); authorized=[device for control in controls if (control["workspace"],control["epoch"])==(proof["workspace"],proof["authorization_epoch"]) for device in [control["devices"].get(proof["author_device_id"])] if device and (device["user"],device["root_public"])==(proof["author_user_id"],proof["root_public"])]; required(authorized,ValueError("semantic proof authorization unavailable")); return row,proof,None,[]
     signer_=proof_signer(proof,workspace,controls); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); verified=[]
     if lineage is not None:
         if not isinstance(lineage,list) or len(lineage)!=len({p.get("revision") for p in lineage}): raise ValueError("invalid row proof lineage")

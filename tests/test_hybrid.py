@@ -143,6 +143,10 @@ def test_embedding_model_path_is_revision_pinned_and_can_be_local_only(monkeypat
     assert cli.embedding_model_path(True)=="/model.gguf"
     assert calls==[((cli._MCFG["repo_id"],cli._MCFG["filename"]),{"revision":cli._MCFG["revision"],"local_files_only":True})]
 
+def test_missing_semantic_extra_has_actionable_error(monkeypatch):
+    real=__import__; monkeypatch.setattr("builtins.__import__",lambda name,*args,**kwargs:(_ for _ in ()).throw(ImportError(name)) if name=="huggingface_hub" else real(name,*args,**kwargs))
+    with pytest.raises(ValueError,match=r"convos\[semantic\].*convos embed"): cli.embedding_model_path(True)
+
 
 def test_query_no_embeddings_returns_friendly_error(tmp_path, monkeypatch):
     """When no rows have embeddings, query_cmd prints a guidance message and exits cleanly."""

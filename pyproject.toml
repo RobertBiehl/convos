@@ -9,8 +9,6 @@ dependencies = [
     "duckdb>=1.2.0",
     "typer>=0.12.0",
     "cryptography>=42.0.0",
-    "llama-cpp-python>=0.3.0",
-    "huggingface-hub>=0.20.0",
 ]
 
 [project.urls]
@@ -19,6 +17,7 @@ Issues = "https://github.com/RobertBiehl/convos/issues"
 Repository = "https://github.com/RobertBiehl/convos"
 
 [project.optional-dependencies]
+semantic = ["llama-cpp-python>=0.3.0", "huggingface-hub>=0.20.0"]
 redact = ["convos-redact>=0.10,<0.11"]
 dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "convos-changegraph", "convos-explore", "convos-memory", "convos-redact", "convos-resume", "convos-remote", "convos-remote-server"]
 

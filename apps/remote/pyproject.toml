@@ -19,6 +19,7 @@ remote = "ai_convos_remote:doctor_status"
 
 [project.entry-points."convos.remote"]
 provider-aliases = "ai_convos_remote:provider_alias_bridge"
+edit-evidence = "ai_convos_remote:edit_evidence_bridge"
 
 [build-system]
 requires = ["setuptools>=68"]

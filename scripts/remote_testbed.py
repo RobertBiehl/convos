@@ -139,18 +139,19 @@ def archive_evidence(client):
     path=client.root/"data/convos.db"
     db=duckdb.connect(str(path),read_only=True)
     counts={table:db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("conversations","messages","tool_calls","attachments","artifacts","file_edits")}
-    semantic=db.execute("SELECT id,source,title FROM conversations ORDER BY id").fetchall(),db.execute("SELECT id,conversation_id,role,content FROM messages ORDER BY id").fetchall(),db.execute("SELECT id,message_id,file_path,edit_type,content FROM file_edits ORDER BY id").fetchall()
+    semantic=db.execute("SELECT id,source,title FROM conversations ORDER BY id").fetchall(),db.execute("SELECT id,conversation_id,role,content FROM messages ORDER BY id").fetchall(),db.execute("SELECT id,message_id,file_path,edit_type,content FROM file_edits ORDER BY id").fetchall(),db.execute("SELECT file_edit_id,status,reason,tool_call_id FROM provenance.file_edit_evidence ORDER BY file_edit_id").fetchall()
     state=archive_state(db)
     conflicts=db.execute("SELECT COUNT(*) FROM remote.row_conflicts").fetchone()[0]
     db.close()
     return {"counts":counts,"semantic_sha256":hashlib.sha256(json.dumps(semantic,sort_keys=True).encode()).hexdigest(),"archive":state[:2],"conflicts":conflicts}
-def assert_team_projection(client,prompt):
+def assert_team_projection(client,prompt,exact=True):
     db=duckdb.connect(str(client.root/"data/convos.db"),read_only=True)
     found=db.execute("SELECT COUNT(*) FROM messages WHERE content=?",(prompt,)).fetchone()[0]
     paths=db.execute("SELECT file_path FROM file_edits ORDER BY id").fetchall()
     graph=db.execute("SELECT COUNT(*) FROM provenance.file_edit_files").fetchone()[0]
+    confirmed=db.execute("SELECT COUNT(*) FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN messages a ON a.id=fe.message_id WHERE a.conversation_id IN (SELECT conversation_id FROM messages WHERE content=?)",(prompt,)).fetchone()[0]
     db.close()
-    if not found or ("app.py",) not in paths or not graph: raise AssertionError("team projection is incomplete")
+    if not found or ("app.py",) not in paths or not graph or exact and not confirmed: raise AssertionError("team projection is incomplete")
 def assert_message(client,prompt):
     db=duckdb.connect(str(client.root/"data/convos.db"),read_only=True)
     found=db.execute("SELECT COUNT(*) FROM messages WHERE content=?",(prompt,)).fetchone()[0]
@@ -312,8 +313,9 @@ def canary_lane(released_venv,current_venv,released_commit,current_commit):
         cli(a,"remote","sync")
         mixed_client=b_old if bootstrap else b
         cli(mixed_client,"remote","sync")
-        assert_team_projection(mixed_client,prompt)
+        assert_team_projection(mixed_client,prompt,not bootstrap)
         cli(b,"remote","sync")
+        assert_team_projection(b,prompt)
         after={"a":archive_evidence(a),"b":archive_evidence(b)}
         if any(after[name]["counts"]["conversations"]<before[name]["counts"]["conversations"] for name in before): raise AssertionError("canary archive lost conversations")
         assert_opaque(relay,prompt,repo)

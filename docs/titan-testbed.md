@@ -31,7 +31,7 @@ lxc launch ubuntu-minimal:24.04 convos-testbed --storage convos-testbed
 lxc config device override convos-testbed eth0 nictype=macvlan parent=eno1
 lxc restart convos-testbed
 lxc exec convos-testbed -- apt-get update
-lxc exec convos-testbed -- apt-get install -y ca-certificates curl git python3-venv build-essential
+lxc exec convos-testbed -- apt-get install -y ca-certificates curl git python3-venv
 lxc exec convos-testbed -- sh -c 'curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh'
 for user in convos-relay convos-fresh-a convos-fresh-b convos-canary-a convos-canary-b; do
   lxc exec convos-testbed -- useradd -m -s /bin/bash "$user"
@@ -80,11 +80,10 @@ versions, semantic archive hashes and counts, conflicts, input outcomes, harness
 retries and failures, elapsed time, peak child RSS, relay row count, doctor output,
 migration backups, and the plaintext-canary result.
 
-## Known clean-install finding
+## Clean-install contract
 
-Installing Convos plus the remote products in a clean Ubuntu 24.04 container did
-not succeed before `build-essential` was installed. `llama-cpp-python==0.3.35`
-fell back to a local source build, so the current distribution has an undocumented
-compiler/toolchain requirement and incurred a large package installation plus an
-approximately 68-second native build. This is a stable-release blocker until the
-installation contract is deliberately fixed or documented and tested.
+Core plus the remote products install and run without `build-essential`.
+`llama-cpp-python` and `huggingface-hub` belong to the explicit `semantic` extra;
+install `convos[semantic]` only in environments that need `query` and `embed`.
+The wheel smoke lane verifies that the base distribution has no unconditional
+semantic dependencies and that literal retrieval works in a fresh environment.

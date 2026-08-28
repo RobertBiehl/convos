@@ -152,7 +152,7 @@ product is strictly read-only.
 | `file_versions` | Observed full-content hashes |
 | `file_edit_scopes` | Immutable capture-time repository-relative path, resolved filesystem route, root, and checkout marker for each local edit |
 | `file_edit_files` | Edit-to-file edges plus hashes of captured old/new edit material and evidence quality |
-| `file_edit_evidence` | Per-edit classification (`confirmed`, `invalid`, `unknown`, or `legacy_unverified`), reason, and exact tool-call link |
+| `file_edit_evidence` | Per-edit classification (`confirmed`, `invalid`, `unknown`, or `unverified`), reason, and exact tool-call link |
 | `git_checkpoints` | Git head plus capture-time working-tree hash, changed paths, and capture source |
 | `checkpoint_edits` | Checkpoint-to-`file_edits.id` evidence |
 | `local_facts` | Content-free marker that this archive independently observed a fact and may sign it locally |
@@ -164,10 +164,12 @@ schema.
 Raw `file_edits` remain lossless archive records. Exact provenance,
 changegraph, project summaries, and team contribution use only `confirmed`
 rows. Replay and export retain every row and expose its evidence status.
-Provider results that are missing or nonterminal remain `unknown`; rows whose
-source transcript no longer survives are `legacy_unverified`. Received signed
-rows default to `legacy_unverified` locally while their immutable signed facts
-remain forwardable for replica compatibility.
+Provider results that are missing or nonterminal remain `unknown`; rows without
+surviving source evidence are `unverified` with a specific reason. Received v1
+rows initially use `unverified/signed_replica_missing_evidence`. A separately
+root-signed evidence object, bound to the exact edit and tool-call row revisions,
+then restores the sender's exact classification. Old clients can still ingest
+and forward the unchanged signed-v1 logical row.
 
 The `remote` schema is the separate identifier-only exception for remotely
 projected archive rows. Core writes it atomically with each imported row so
@@ -185,6 +187,7 @@ separate provenance and does not change semantic row identity after recovery.
 | `workspace_controls` | Signed origin-workspace authorization chain, once per control revision |
 | `row_conflicts` | Canonical logical body for a rare verified incomparable head not selected as the main row |
 | `provider_session_aliases` | Author-scoped root-signed exact provider-session membership leaves and their deterministic canonical source row |
+| `file_edit_evidence_proofs` | Root-signed evidence leaves bound to exact edit and optional tool-call row revisions |
 
 Proof rows never duplicate conversation content. Reissuing an equivalent
 certificate for the same certified device keys does not create another signer.

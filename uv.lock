@@ -121,8 +121,6 @@ source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
     { name = "duckdb" },
-    { name = "huggingface-hub" },
-    { name = "llama-cpp-python" },
     { name = "typer" },
 ]
 
@@ -141,6 +139,10 @@ dev = [
 redact = [
     { name = "convos-redact" },
 ]
+semantic = [
+    { name = "huggingface-hub" },
+    { name = "llama-cpp-python" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -154,13 +156,13 @@ requires-dist = [
     { name = "convos-resume", marker = "extra == 'dev'", editable = "apps/resume" },
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "duckdb", specifier = ">=1.2.0" },
-    { name = "huggingface-hub", specifier = ">=0.20.0" },
-    { name = "llama-cpp-python", specifier = ">=0.3.0" },
+    { name = "huggingface-hub", marker = "extra == 'semantic'", specifier = ">=0.20.0" },
+    { name = "llama-cpp-python", marker = "extra == 'semantic'", specifier = ">=0.3.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
-provides-extras = ["redact", "dev"]
+provides-extras = ["semantic", "redact", "dev"]
 
 [[package]]
 name = "convos-changegraph"
