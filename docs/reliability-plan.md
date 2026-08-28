@@ -24,7 +24,7 @@ gate below are acceptance criteria, not additional tasks.
 | In review in stacked PR #101 | Replace the blocking pre-existing-duplicate migration with a backed-up, non-destructive admission: retain every row, bind future parsing deterministically, and let the signed alias ledger own convergence. |
 | In review in stacked PR #102 | Implement backed-up alias reconciliation and prove pre-existing and cross-device duplicate row successors/tombstones converge with retained v1 replicas. |
 | In review in stacked PR #103 | Add an auditable file-edit evidence ledger, reclassify surviving provider transcripts, retain raw uncertain history, and exclude anything except confirmed edits from exact provenance and team sharing. |
-| Pending | Harden remote synchronization: fix duplicate-root proof-chain convergence, add observable exponential backoff, narrow local mutation locks, cover interruption recovery, and prove retained signed logical replicas remain ingestible. |
+| In review in stacked PR #104 | Harden remote synchronization: converge duplicate-root proof chains without hiding true forks, add observable exponential backoff, separate nonblocking sync and control-mutation leases, cover interruption recovery, and prove retained signed logical replicas remain ingestible. |
 | Pending | Build and qualify the Titan multi-user testbed with a fresh synthetic lane and a persistent upgrade canary before declaring a stable release. |
 
 ## Production evidence register
@@ -37,9 +37,11 @@ evidence register; remediation is represented by the work items above.
 | v3 migration omitted `local_facts` | Fixed in 0.10.1; regression retained. |
 | Projection failed on legacy rows | Fixed in 0.10.1; regression retained. |
 | State rebaseline used excessive time and memory | Fixed in 0.10.1; release benchmark retained. |
-| Attestation failed on duplicate-root proof chains | Open; remote-hardening task. |
-| Remote watch swallowed repeated failures without backoff | Open; remote-hardening task. |
-| Remote synchronization held coarse locks around unrelated work | Open; remote-hardening task. |
+| Attestation failed on duplicate-root proof chains | Fixed in stacked PR #104; duplicate-root, true-fork, and retained-v1 regressions retained. |
+| Remote watch swallowed repeated failures without backoff | Fixed in stacked PR #104; failures, retry time, recovery, and capped exponential delays are visible. |
+| Remote synchronization held coarse locks around unrelated work | Fixed in stacked PR #104; sync and explicit control mutations use separate nonblocking leases. |
+| Recovered-device approval re-emitted another member's signed preference under the approver's event identity | Fixed in stacked PR #104; epoch retention republishes only objects signed by the local user. |
+| A removed device's persisted `READY` state attempted publication without the withheld epoch key | Fixed in stacked PR #104; signed device authorization gates settlement, scanning, retention, and publication. |
 | Commands blocked behind a running hook drain | Fixed in current PR. |
 | One hook event performed archive-sized work | Fixed in current PR. |
 | One winning hook drain claimed the entire backlog | Fixed in current PR; bounded workers hand remaining backlog to a successor. |
@@ -97,7 +99,7 @@ evidence register; remediation is represented by the work items above.
 
 ## Stable release gate
 
-A stable release requires all eleven findings to be closed or explicitly blocked
+A stable release requires every registered finding to be closed or explicitly blocked
 with user agreement, their regressions passing, complete input accounting, zero
 unexplained duplicate transcripts or orphaned rows, idempotent second sync, verified
 migration interruption recovery, bounded performance, a passing fresh Titan run, a

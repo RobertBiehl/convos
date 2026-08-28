@@ -70,6 +70,14 @@ def provider_alias_token(root):
 def provider_alias_bridge(): return dict(v=2,objects={"provider.session"},records=provider_alias_records,accept=provider_alias_accept,token=provider_alias_token)
 def save(cfg,root=None):
     base,path,_=paths(root); base.mkdir(parents=True,exist_ok=True); os.chmod(base,0o700); tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_text(json.dumps(cfg)); os.chmod(tmp,0o600); durable_replace(tmp,path)
+def save_watch_status(value,root=None):
+    path=paths(root)[0]/"watch.json"
+    path.parent.mkdir(parents=True,exist_ok=True)
+    os.chmod(path.parent,0o700)
+    tmp=path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps(value))
+    os.chmod(tmp,0o600)
+    durable_replace(tmp,path)
 def rescue_bindings(cfg,state_path,root=None):
     db=sqlite3.connect(Path(state_path).resolve().as_uri()+"?mode=ro",uri=True)
     try: rows=db.execute(f"SELECT workspace,value,{('local_root' if 'local_root' in columns else 'NULL')} FROM policies WHERE kind='path'").fetchall() if {"workspace","kind","value"}<=(columns:={r[1] for r in db.execute("PRAGMA table_info(policies)").fetchall()}) else []
@@ -100,14 +108,30 @@ def request(cfg,body,auth=True):
     except urllib.error.HTTPError as e: raise ValueError(json.loads(e.read())["error"]) from e
 def health(cfg): safe_url(cfg["url"]); result=json.loads(urllib.request.urlopen(cfg["url"].rstrip("/")+"/v1/health",timeout=3).read()); required(result.get("version")==1,ValueError("relay protocol v1 required")); return result
 @contextmanager
-def sync_lock(root):
-    path=paths(root)[0]/"sync.lock"; path.parent.mkdir(parents=True,exist_ok=True); handle=path.open("a+"); os.chmod(path,0o600); fcntl.flock(handle,fcntl.LOCK_EX)
-    try: handle.seek(0); handle.truncate(); handle.write(str(os.getpid())); handle.flush(); yield
-    finally: fcntl.flock(handle,fcntl.LOCK_UN); handle.close()
+def local_lock(root,name="mutation",blocking=True):
+    path=paths(root)[0]/f"{name}.lock"
+    path.parent.mkdir(parents=True,exist_ok=True)
+    handle=path.open("a+")
+    os.chmod(path,0o600)
+    try: fcntl.flock(handle,fcntl.LOCK_EX|(0 if blocking else fcntl.LOCK_NB))
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(f"Remote {name} already running") from None
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        yield
+    finally:
+        fcntl.flock(handle,fcntl.LOCK_UN)
+        handle.close()
+def mutation_lock(root): return local_lock(root,"mutation",False)
+def sync_run(root): return local_lock(root,"sync",False)
 def locked(fn):
     @wraps(fn)
     def call(*args,**kwargs):
-        with sync_lock(None): return fn(*args,**kwargs)
+        with mutation_lock(None): return fn(*args,**kwargs)
     return call
 def workspace(cfg,value):
     if len(hits:=[k for k,v in cfg["workspaces"].items() if k.startswith(value) or v["name"]==value])!=1: raise ValueError(f"Workspace must match exactly one of: {', '.join(v['name'] for v in cfg['workspaces'].values())}")
@@ -236,7 +260,7 @@ def retained_sharing(state,ws,epoch=None):
     return [r for r in records if epoch is None or not state.execute("SELECT 1 FROM outbox WHERE workspace=? AND entity=? AND revision=? AND epoch=? UNION SELECT 1 FROM receipts WHERE workspace=? AND entity=? AND revision=? AND epoch=?",(ws,r["entity"],digest(r["payload"]),epoch,ws,r["entity"],digest(r["payload"]),epoch)).fetchone()]
 def retain_sharing(cfg,ws,root=None,state=None):
     if cfg["workspaces"][ws]["kind"]!="team": return 0
-    owned=state is None; state=state or connect(paths(root)[2]); records=retained_sharing(state,ws,cfg["workspaces"][ws]["epoch"]); [publish(cfg,state,ws,r,root,force=True) for r in records]; records and upload(cfg,state,root,{ws}); owned and state.close(); return len(records)
+    owned=state is None; state=state or connect(paths(root)[2]); records=[r for r in retained_sharing(state,ws,cfg["workspaces"][ws]["epoch"]) if r["payload"]["proof"]["author_user_id"]==cfg["user"]]; [publish(cfg,state,ws,r,root,force=True) for r in records]; records and upload(cfg,state,root,{ws}); owned and state.close(); return len(records)
 def settle_sharing(cfg,state,ready,root=None):
     changed=False
     for ws in ready&set(cfg["workspaces"]):
@@ -472,7 +496,7 @@ def fetch_lazy(cfg,state,event_id=None,root=None):
     state.commit(); return len(rows)
 def sync_once(root=None,force=False):
     root=local_root(root)
-    with sync_lock(root):
+    with sync_run(root):
         cfg=load(root); _,_,state_path=paths(root); info=inspect_state(state_path,force); cutover=None
         relocate_attachments(core_path(root),paths(root)[0]/"attachments")
         if info["status"] in ("incompatible","invalid"): refresh(cfg,root); info["status"]=="incompatible" and rescue_bindings(cfg,state_path,root); cutover=cutover_state(state_path)
@@ -483,14 +507,14 @@ def sync_once(root=None,force=False):
                 for ws in ready: state.execute("INSERT OR REPLACE INTO meta VALUES (?,'1')",(f"replica_repair:{ws}",))
             state.commit(); upload(cfg,state,root,ready); prepare_archive(cfg,state,root); baseline=archive_info(root); bound={r[0] for r in state.execute("SELECT DISTINCT workspace FROM origin_bindings").fetchall()}
             pull(cfg,state,root)
-            ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
-            aliases={ws:reconcile_provider_aliases(core_path(root),cfg,ws) for ws in ready if cfg["workspaces"].get(ws,{}).get("kind")=="personal"}
+            ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; authorized={w["id"] for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
+            aliases={ws:reconcile_provider_aliases(core_path(root),cfg,ws) for ws in ready&authorized if cfg["workspaces"].get(ws,{}).get("kind")=="personal"}
             [state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"provider_aliases:{ws}",json.dumps(value,sort_keys=True))) for ws,value in aliases.items()]
             state.commit()
-            settle_sharing(cfg,state,ready,root)
-            path,active,generation=(path:=core_path(root)),{w["id"] for w in cfg["server_state"]["workspaces"]},archive_info(root)[1] if path.is_file() else 0
+            settle_sharing(cfg,state,ready&authorized,root)
+            path,active,generation=(path:=core_path(root)),authorized,archive_info(root)[1] if path.is_file() else 0
             known=core_repository_state(core) if (core:=open_db(path,True) if path.is_file() else None) else {"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}}
-            (core and core.close(),promote_paths(cfg,state,known,root),upgrade_repository_policies(cfg,state,known,root),[retain_sharing(cfg,ws,root,state) for ws in ready&set(cfg["workspaces"])])
+            (core and core.close(),promote_paths(cfg,state,known,root),upgrade_repository_policies(cfg,state,known,root),[retain_sharing(cfg,ws,root,state) for ws in ready&active])
             if baseline and baseline[2]==0:
                 for ws in ready&active-bound: state.execute("INSERT OR IGNORE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation)))
             scans=[(ws,meta,state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()) for ws,meta in cfg["workspaces"].items() if path.is_file() and ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]]
@@ -598,7 +622,7 @@ def remove_cmd(space:str,user:str): cfg=load(); typer.echo(f"epoch {add_member(c
 def grant_all_cmd(space:str,user:str): cfg=load(); typer.echo(f"Granted {grant_all(cfg,workspace(cfg,space),user)} epochs")
 @remote.command("refound")
 def refound_cmd(space:str,origin_workspace_id:str):
-    with sync_lock(None): cfg=load(); state=connect(paths()[2]); count=bind_origin(cfg,state,workspace(cfg,space),origin_workspace_id); state.close()
+    with mutation_lock(None): cfg=load(); state=connect(paths()[2]); count=bind_origin(cfg,state,workspace(cfg,space),origin_workspace_id); state.close()
     sync_once(force=True); typer.echo(f"Bound {count} signed origin controls")
 @remote.command("origins")
 def origins_cmd(): db=open_db(core_path(),True); typer.echo(json.dumps([{"workspace":r[0],"rows":r[1]} for r in db.execute("SELECT workspace_id,COUNT(*) FROM remote.row_proofs GROUP BY workspace_id ORDER BY workspace_id").fetchall()])); db.close()
@@ -646,10 +670,28 @@ def fetch_cmd(event_id:Optional[str]=None):
     with closing(connect(paths()[2])) as state: typer.echo(f"Fetched {fetch_lazy(load(),state,event_id)} lazy events")
 @remote.command("watch")
 def watch(interval:int=typer.Option(2,"--interval")):
+    failures=0
     while True:
         try: sync_once()
-        except Exception: paths()[0].mkdir(parents=True,exist_ok=True); (paths()[0]/"last_error").write_text(traceback.format_exc())
-        time.sleep(interval)
+        except Exception as e:
+            failures+=1
+            delay=min(300,interval*2**min(failures-1,9))
+            base=paths()[0]
+            base.mkdir(parents=True,exist_ok=True)
+            error=base/"last_error"
+            error.write_text(traceback.format_exc())
+            os.chmod(error,0o600)
+            failed_at=time.time()
+            watch_status={"failures":failures,"failed_at":failed_at,"next_retry":failed_at+delay,"error":f"{type(e).__name__}: {e}"}
+            save_watch_status(watch_status)
+            typer.echo(f"Remote sync failed ({watch_status['error']}); retry in {delay}s",err=True)
+        else:
+            delay=interval
+            if failures: typer.echo("Remote sync recovered")
+            failures=0
+            (paths()[0]/"last_error").unlink(missing_ok=True)
+            save_watch_status({"failures":0,"succeeded_at":time.time()})
+        time.sleep(delay)
 @remote.command("enable")
 def enable_cmd(remove:bool=typer.Option(False,"--remove")): not remove and install_hooks(False,False); typer.echo(enable(paths()[0],remove))
 def doctor_status():
@@ -669,7 +711,10 @@ def doctor_status():
             alias_blocked=sum(len(json.loads(r[0])["blocked"]) for r in state.execute("SELECT value FROM meta WHERE key LIKE 'provider_aliases:%'").fetchall())
         finally:
             state.close()
-        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, alias_blocked={alias_blocked}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")
+        watch_path=paths()[0]/"watch.json"
+        watch=json.loads(watch_path.read_text()) if watch_path.exists() else {"failures":0}
+        retry=f", next_retry={watch['next_retry']}" if watch["failures"] else ""
+        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, alias_blocked={alias_blocked}, watch_failures={watch['failures']}{retry}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")
     except Exception as e: return f"remote: unavailable ({e})"
 @remote.command("doctor")
 def doctor_cmd(): typer.echo(doctor_status())

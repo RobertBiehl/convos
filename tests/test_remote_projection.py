@@ -80,6 +80,40 @@ def test_refounded_successor_keeps_origin_and_separates_current_authorization(tm
     db=duckdb.connect(str(tmp_path/"source.db"),read_only=True); assert db.execute("SELECT workspace_id,authorization_workspace_id,previous_revision FROM remote.row_proofs WHERE previous_revision IS NOT NULL").fetchone()==("origin","replacement",old); db.close()
 
 
+def test_duplicate_logical_roots_across_workspaces_converge_before_successor(tmp_path):
+    repo,core=source(tmp_path)
+    state=connect(tmp_path/"state.db")
+    records=scan(core,state)
+    core.close()
+    state.close()
+    root,device=identity("root"),identity("device")
+    user=public_id(root["sign_public"])
+    cert=certificate(root,user,device)
+    entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":cert,"history":True}
+    control=lambda ws:{"workspace":ws,"revision":1,"epoch":1,"devices":{device["id"]:entry}}
+    cfg=lambda ws:{"user":user,"device":device,"workspaces":{ws:{"kind":"team","epoch":1}},"controls":{ws:control(ws)},"server_state":{"workspaces":[{"id":ws,"controls":[control(ws)]}]}}
+    assert attest_rows(tmp_path/"source.db",cfg("origin-a"),"origin-a",records)==len(records) and attest_rows(tmp_path/"source.db",cfg("origin-b"),"origin-b",records)==len(records)
+    db=duckdb.connect(str(tmp_path/"source.db"))
+    db.execute("UPDATE conversations SET title='successor'")
+    db.close()
+    fresh=connect(tmp_path/"fresh.db")
+    core=duckdb.connect(str(tmp_path/"source.db"),read_only=True)
+    changed=scan(core,fresh)
+    core.close()
+    fresh.close()
+    current=cfg("replacement")
+    current["server_state"]["workspaces"][0]["controls"]=[control("replacement")]
+    assert attest_rows(tmp_path/"source.db",current,"replacement",changed,{"origin-a","origin-b"})==1
+    envs=row_replicas(tmp_path/"source.db",current,"replacement",changed,{1:bytes(32)},origins={"origin-a","origin-b"},origin_epochs={"origin-a":1,"origin-b":1})
+    bodies=[open_replica(env,bytes(32)) for env in envs]
+    rows=[body for body in bodies if body["row"]["kind"]=="conversations"]
+    assert len(rows)==1 and rows[0]["row"]["data"]["title"]=="successor" and len(rows[0]["lineage"])==1
+    assert any(apply_row_replicas(tmp_path/"target.db",bodies,"replacement",[control(ws) for ws in ("origin-a","origin-b","replacement")],local_user=user))
+    target=duckdb.connect(str(tmp_path/"target.db"),read_only=True)
+    assert target.execute("SELECT title FROM conversations").fetchone()[0]=="successor"
+    target.close()
+
+
 def test_row_attestation_refuses_to_guess_between_concurrent_heads(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); records=scan(core,state); core.close(); state.close(); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); cert=certificate(root,user,device); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":cert,"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; cfg={"user":user,"device":device,"workspaces":{"w":{"kind":"personal","epoch":1}},"controls":{"w":control},"server_state":{"workspaces":[{"id":"w","controls":[control]}]}}; attest_rows(tmp_path/"source.db",cfg,"w",records)
     db=duckdb.connect(str(tmp_path/"source.db")); base=db.execute("SELECT revision FROM remote.row_proofs WHERE row_kind='conversations'").fetchone()[0]; row=lambda title:projection_module.logical_row("conversations",["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],["c","codex",title,"2026-01-01","2026-01-01","m",str(repo),None,None,"{}"]); [project_row_proof(db,projection_module.row_proof(device,user,"w",1,row(title),base),root["sign_public"],cert) for title in ("branch-a","branch-b")]; db.execute("UPDATE conversations SET title='third'"); db.close(); fresh=connect(tmp_path/"fresh.db"); core=duckdb.connect(str(tmp_path/"source.db"),read_only=True); current=scan(core,fresh); core.close(); fresh.close()

@@ -38,6 +38,43 @@ def test_upload_batches_bound_count_and_wire_size():
     assert [len(x) for x in _upload_batches([row(1)]*501,1000)]==[500,1] and [len(x) for x in _upload_batches([row(6)]*2,10)]==[1,1]
 
 
+def test_sync_lease_is_nonblocking_and_separate_from_mutation_lease(tmp_path):
+    with remote_client.mutation_lock(tmp_path):
+        with remote_client.sync_run(tmp_path): pass
+        with pytest.raises(RuntimeError,match="already running"):
+            with remote_client.mutation_lock(tmp_path): pass
+    with remote_client.sync_run(tmp_path):
+        with pytest.raises(RuntimeError,match="already running"):
+            with remote_client.sync_run(tmp_path): pass
+    with pytest.raises(KeyboardInterrupt):
+        with remote_client.sync_run(tmp_path): raise KeyboardInterrupt
+    with remote_client.sync_run(tmp_path): pass
+
+
+def test_watch_persists_exponential_backoff_and_clears_failure_after_recovery(tmp_path,monkeypatch):
+    monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(tmp_path))
+    outcomes=[ValueError("first"),ValueError("second"),None,KeyboardInterrupt()]
+    snapshots=[]
+    def attempt():
+        if (outcome:=outcomes.pop(0)) is not None: raise outcome
+    def sleep(delay): snapshots.append((delay,json.loads((tmp_path/"remote/watch.json").read_text())))
+    monkeypatch.setattr(remote_client,"sync_once",attempt); monkeypatch.setattr(remote_client.time,"sleep",sleep)
+    with pytest.raises(KeyboardInterrupt): remote_client.watch(2)
+    assert [delay for delay,status in snapshots]==[2,4,2] and [status["failures"] for delay,status in snapshots]==[1,2,0]
+    assert snapshots[0][1]["next_retry"]>=snapshots[0][1]["failed_at"]+2 and snapshots[1][1]["next_retry"]>=snapshots[1][1]["failed_at"]+4 and not (tmp_path/"remote/last_error").exists()
+
+
+def test_doctor_reports_watch_failure_and_next_retry(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db")
+    monkeypatch.setattr("ai_convos_remote.request",transport(server))
+    monkeypatch.setattr(remote_client,"health",lambda cfg:{"ok":True})
+    monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(tmp_path/"client"))
+    setup_client("http://server","alice",root=tmp_path/"client")
+    remote_client.save_watch_status({"failures":3,"next_retry":123.0})
+    status=doctor_status()
+    assert "watch_failures=3" in status and "next_retry=123.0" in status
+
+
 def test_settled_state_is_payload_size_independent_and_contains_no_bodies(tmp_path,monkeypatch):
     def settled(root,size):
         server=server_connect(tmp_path/f"{root.name}.server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); cfg,_=setup_client("http://server","alice",root=root); ws=workspace(cfg,"Personal"); state=connect(root/"remote/state.db"); marker=f"settled-{size}-marker-"+"x"*size; eid=publish(cfg,state,ws,ledger_event(marker),root); pending=next((root/"remote/outbox").iterdir()); assert marker.encode() not in pending.read_bytes() and state.execute("SELECT COUNT(*) FROM outbox WHERE event=?",(eid,)).fetchone()[0]==1; upload(cfg,state,root); state.execute("PRAGMA wal_checkpoint(TRUNCATE)"); pages=state.execute("PRAGMA page_count").fetchone()[0]; columns={r[1] for table, in state.execute("SELECT name FROM sqlite_master WHERE type='table'") for r in state.execute(f"PRAGMA table_info({table})")}; counts=tuple(state.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("receipts","publication_heads","event_sequences")); state.close(); files=[root/"remote/state.db",root/"remote/state.db-wal"]
@@ -299,6 +336,32 @@ def test_future_only_recovered_device_reasserts_explicit_sharing_preference(tmp_
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,_=setup_client("http://server","alice",root=a); bob,recovery=setup_client("http://server","bob","laptop",root=b); team=create(alice,"Team","team",a); add_member(alice,team,"bob",root=a); bob=load(b); refresh(bob,b); state=connect(b/"remote/state.db"); configure_sharing(bob,state,team,False,["edit"],b); state.close(); desktop,_=setup_client("http://server","bob","desktop",recovery,root=c); request_device(desktop,team,c,0); approve_device(load(b),team,desktop["device"]["id"],root=b); sync_once(c); state=connect(c/"remote/state.db"); assert sharing(state,team,desktop["user"])["auto_contribute"] is False and sharing(state,team,desktop["user"])["match"]==["edit"] and load(c)["sharing"][team]=={"auto_contribute":False,"match":["edit"]}
 
 
+def test_device_approval_does_not_republish_another_users_signed_preference(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db")
+    monkeypatch.setattr("ai_convos_remote.request",transport(server))
+    monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None)
+    a,b,c=tmp_path/"alice",tmp_path/"bob",tmp_path/"recovered"
+    alice,recovery=setup_client("http://server","alice","laptop",root=a)
+    bob,_=setup_client("http://server","bob",root=b)
+    recovered,_=setup_client("http://server","alice","recovered",recovery,root=c)
+    team=create(alice,"Team","team",a)
+    add_member(alice,team,"bob",root=a)
+    bob=load(b)
+    refresh(bob,b)
+    state=connect(b/"remote/state.db")
+    configure_sharing(bob,state,team,False,["edit"],b)
+    state.close()
+    sync_once(a)
+    request_device(recovered,team,c,0)
+    result=approve_device(load(a),team,recovered["device"]["id"],root=a)
+    assert result["approved"] and result["history"]>0
+    sync_once(c)
+    remove_device(load(a),team,recovered["device"]["id"],a)
+    sync_once(c)
+    current=load(c)
+    assert recovered["device"]["id"] in current["controls"][team]["removed"] and f"{team}:{current['workspaces'][team]['epoch']}" not in current["keys"]
+
+
 def test_epoch_preference_retention_resumes_after_rotation_crash(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,_=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); state=connect(a/"remote/state.db"); configure_sharing(alice,state,team,False,["edit"],a); state.close(); real=remote_client.retain_sharing; monkeypatch.setattr(remote_client,"retain_sharing",lambda *args,**kwargs:0); add_member(load(a),team,"bob",root=a); monkeypatch.setattr(remote_client,"retain_sharing",real); before=server.execute("SELECT COUNT(*) FROM events WHERE workspace=? AND epoch=2",(team,)).fetchone()[0]; sync_once(a); after=server.execute("SELECT COUNT(*) FROM events WHERE workspace=? AND epoch=2",(team,)).fetchone()[0]; sync_once(a); assert after==before+1 and server.execute("SELECT COUNT(*) FROM events WHERE workspace=? AND epoch=2",(team,)).fetchone()[0]==after
 
@@ -498,6 +561,31 @@ def test_replication_boundary_crash_matrix_converges_after_restart(tmp_path,monk
         with pytest.raises(ConnectionError,match="boundary crash"): sync_once(b,True)
         monkeypatch.setattr(remote_client,name,real); sync_once(b,True); db=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="crash matrix"; path=db.execute("SELECT path FROM attachments").fetchone()[0] if kind=="blob" else None; db.close(); assert path is None or Path(path).read_bytes()==payload
     assert fired[0] and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==(1 if kind=="row" else 3) and server.execute("SELECT COUNT(*) FROM blob_replicas").fetchone()[0]==(kind=="blob")
+
+
+def test_keyboard_interrupt_releases_sync_lease_and_retry_converges(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db")
+    direct=transport(server)
+    monkeypatch.setattr("ai_convos_remote.request",direct)
+    monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None)
+    root=tmp_path/"client"
+    setup_client("http://server","alice",root=root)
+    write_archive(root/"data/convos.db","interrupt safe")
+    fired=False
+    def interrupt(cfg,body,auth=True):
+        nonlocal fired
+        result=direct(cfg,body,auth)
+        if body["op"]=="replica_upload_many" and not fired:
+            fired=True
+            raise KeyboardInterrupt
+        return result
+    monkeypatch.setattr("ai_convos_remote.request",interrupt)
+    with pytest.raises(KeyboardInterrupt): sync_once(root,True)
+    monkeypatch.setattr("ai_convos_remote.request",direct)
+    sync_once(root,True)
+    state=connect(root/"remote/state.db")
+    assert fired and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]==1
+    state.close()
 
 
 def test_lost_upload_response_and_interrupted_pull_recover_idempotently(tmp_path,monkeypatch):
