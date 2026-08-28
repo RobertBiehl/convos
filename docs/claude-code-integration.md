@@ -10,6 +10,8 @@ read_when:
 # Claude Code Integration
 
 Parses local Claude Code session files from `~/.claude/projects/`.
+Canonical field semantics and subagent relationships are defined in
+[Provider conversation contract](provider-conversation-contract.md).
 
 ## Session Files
 
@@ -110,18 +112,24 @@ Result of tool execution:
 
 ### Conversations
 
-- `id`: Hash of file path
+- `id`: Internal physical ID (path-based until the 0.11 identity migration)
+- `metadata.session_id`: Main `sessionId`, or `agentId` for a subagent
+- `metadata.parent_session_id`: Root `sessionId` for a subagent
+- `metadata.session_kind`: `main` or `subagent`
 - `source`: `claude-code`
 - `title`: Derived from directory name and session ID
 - `cwd`: Working directory from system event
 - `git_branch`: Git branch from system event
-- `model`: Always `claude`
+- `model`: First exact non-synthetic assistant model
+- `metadata`: Agent, entrypoint, client version, and capture mode when recorded
 
 ### Messages
 
 - User messages from `human` events
 - Assistant messages from `assistant` events
 - `thinking` column populated from thinking blocks
+- Legacy `human` roles normalize to `user`
+- Assistant `model` retains the exact provider model
 
 ### Tool Calls
 
@@ -180,5 +188,6 @@ Teleported sessions appear in `~/.claude/projects/` and sync normally.
 - Older sessions may not have thinking
 
 **Duplicate sessions:**
-- IDs are based on file path - same file = same ID
-- Re-syncing updates existing records
+- Re-syncing the same path updates existing records today
+- Native session identity is retained in metadata and becomes physical identity in
+  the 0.11 identity migration

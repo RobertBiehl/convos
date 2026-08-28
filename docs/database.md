@@ -38,7 +38,7 @@ Primary record for each conversation session.
 | cwd | VARCHAR | Working directory (CLI tools only) |
 | git_branch | VARCHAR | Git branch (CLI tools only) |
 | project_id | VARCHAR | Project/gizmo ID if applicable |
-| metadata | JSON | Source-specific extra fields |
+| metadata | JSON | Stable normalized session fields plus documented provider extensions; see the [provider conversation contract](provider-conversation-contract.md) |
 
 ### messages
 
@@ -48,7 +48,7 @@ Individual messages within conversations. Has FTS index.
 |--------|------|-------------|
 | id | VARCHAR PK | Deterministic hash |
 | conversation_id | VARCHAR FK | References conversations.id |
-| role | VARCHAR | `user`, `assistant`, `human`, `system`, `tool` |
+| role | VARCHAR | Canonical `user`, `assistant`, `system`, `developer`, or `tool` |
 | content | VARCHAR | Message text content |
 | thinking | VARCHAR | Extended thinking/reasoning (Claude) |
 | created_at | TIMESTAMP | Message timestamp |

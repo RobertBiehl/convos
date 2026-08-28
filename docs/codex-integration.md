@@ -9,6 +9,8 @@ read_when:
 # Codex Integration
 
 Parses local Codex CLI session files from `~/.codex/sessions/`.
+Canonical field semantics and subagent relationships are defined in
+[Provider conversation contract](provider-conversation-contract.md).
 
 ## Session Files
 
@@ -119,17 +121,24 @@ the same `call_id`:
 
 ### Conversations
 
-- `id`: Hash of file path
+- `id`: Internal physical ID (path-based until the 0.11 identity migration)
+- `metadata.session_id`: Exact first `session_meta.payload.id`
+- `metadata.session_kind`: `main` or `subagent`
+- `metadata.parent_session_id`: Explicit spawned-parent thread ID
 - `source`: `codex`
 - `title`: Working directory or session stem
 - `cwd`: From session_meta payload
-- `model`: From model_provider (usually "openai")
+- `git_branch`: From session metadata Git observation
+- `model`: First exact assistant model from turn context
+- `metadata`: Agent name/role/depth, originator, client version, capture mode,
+  repository URL, commit, and documented provider extensions when recorded
 
 ### Messages
 
 - User/assistant messages from `response_item` with `type: message`
-- Developer and system messages are filtered out
+- Developer and system messages are preserved for query-time filtering
 - Content extracted from `input_text`, `output_text`, or `text` blocks
+- `model` records the exact active turn model when available
 
 ### Attachments
 
@@ -190,5 +199,6 @@ uv run convos sql "SELECT id, title, created_at FROM conversations WHERE source=
 - Status shows as "pending" for incomplete calls
 
 **Duplicate sessions:**
-- IDs based on file path ensure no duplicates
-- Re-syncing updates existing records
+- Re-syncing the same path updates existing records today
+- Native session identity is retained in metadata and becomes physical identity in
+  the 0.11 identity migration
