@@ -112,7 +112,7 @@ Result of tool execution:
 
 ### Conversations
 
-- `id`: Internal physical ID (path-based until the 0.11 identity migration)
+- `id`: Opaque stable physical ID; native identity is `source` plus `metadata.session_id`
 - `metadata.session_id`: Main `sessionId`, or `agentId` for a subagent
 - `metadata.parent_session_id`: Root `sessionId` for a subagent
 - `metadata.session_kind`: `main` or `subagent`
@@ -189,5 +189,5 @@ Teleported sessions appear in `~/.claude/projects/` and sync normally.
 
 **Duplicate sessions:**
 - Re-syncing the same path updates existing records today
-- Native session identity is retained in metadata and becomes physical identity in
-  the 0.11 identity migration
+- Native session identity is retained in metadata and indexed independently of the
+  stable physical ID

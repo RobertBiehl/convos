@@ -8,9 +8,10 @@ metadata and never invents facts a source did not record.
 
 ## Identity and relationships
 
-- `conversations.id` is the internal physical identifier. The identity migration
-  derives it from author, source, and the exact provider session identity; a local
-  transcript path is evidence location, not logical identity.
+- `conversations.id` is an opaque internal physical identifier. Once published in
+  a signed row it remains stable. Native import identity is the pair of `source`
+  and exact `metadata.session_id`; a local transcript path is evidence location,
+  not logical identity.
 - `metadata.session_id` is the exact provider-native session identity. For a Claude
   Code subagent this is its `agentId`; the root `sessionId` becomes its parent.
 - `metadata.parent_session_id` is present only when the provider explicitly names a
@@ -111,6 +112,6 @@ prove that tools, edits, or assistant turns were absent.
   orphan-recovery script. They are not evidence of current-parser duplication.
 
 This PR records and begins emitting the normalized contract without changing
-physical conversation IDs. The dependent identity/migration PR performs dedupe,
-admission cleanup, recovery classification, obsolete split-result cleanup, and
-backed-up ID replacement together.
+physical conversation IDs. The dependent migration adds native-identity indexing,
+dedupe, admission cleanup, recovery classification, and obsolete split-result
+cleanup while preserving released signed row identities.

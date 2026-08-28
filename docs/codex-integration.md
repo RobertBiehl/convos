@@ -121,7 +121,7 @@ the same `call_id`:
 
 ### Conversations
 
-- `id`: Internal physical ID (path-based until the 0.11 identity migration)
+- `id`: Opaque stable physical ID; native identity is `source` plus `metadata.session_id`
 - `metadata.session_id`: Exact first `session_meta.payload.id`
 - `metadata.session_kind`: `main` or `subagent`
 - `metadata.parent_session_id`: Explicit spawned-parent thread ID
@@ -200,5 +200,5 @@ uv run convos sql "SELECT id, title, created_at FROM conversations WHERE source=
 
 **Duplicate sessions:**
 - Re-syncing the same path updates existing records today
-- Native session identity is retained in metadata and becomes physical identity in
-  the 0.11 identity migration
+- Native session identity is retained in metadata and indexed independently of the
+  stable physical ID
