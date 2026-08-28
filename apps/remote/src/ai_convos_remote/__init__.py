@@ -8,11 +8,11 @@ import typer
 from ai_convos_redact import protect_all
 _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import PROJECT_ROOT, archive_changes as core_archive_changes, archive_state as core_archive_state, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, open_db, project_attachment_body, project_workspace_controls, repository as core_repository, repository_evidence, repository_state as core_repository_state, required
+from ai_convos.cli import PROJECT_ROOT, archive_changes as core_archive_changes, archive_state as core_archive_state, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, open_db, project_attachment_body, project_provider_alias, project_workspace_controls, repository as core_repository, repository_evidence, repository_state as core_repository_state, required
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
-                       recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate)
+                       recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
 
 remote=typer.Typer(help="End-to-end encrypted personal and team synchronization")
@@ -27,6 +27,47 @@ def archive_info(root=None,create=False):
 def load(root=None):
     if not (path:=paths(root)[1]).exists(): raise ValueError("Remote is not configured. Run `convos remote setup`.")
     return json.loads(path.read_text())
+def provider_alias_id(source,session): return "provider-session:"+digest([source,session])
+def _provider_alias_value(row):
+    workspace,author,object_id,revision,source,session,members,canonical,proof=row
+    members=json.loads(members)
+    proof=json.loads(proof)
+    body={"v":1,"kind":"provider.session","id":object_id,"state":"active","data":{"source":source,"session_id":session,"members":members,"canonical":canonical}}
+    return dict(row=body,proof=proof,previous=None,workspace=workspace,author=author)
+def provider_alias_records(root,user,workspace,kind):
+    if kind!="personal" or not core_path(root).is_file(): return []
+    db=open_db(core_path(root))
+    init_schema(db)
+    stored=[_provider_alias_value(r) for r in db.execute("SELECT workspace_id,author_user_id,object_id,revision,source,session_id,CAST(members AS VARCHAR),canonical_source_row_id,CAST(proof AS VARCHAR) FROM remote.provider_session_aliases WHERE author_user_id=? ORDER BY object_id,revision",(user,)).fetchall()]
+    ancestors={a for value in stored for a in value["proof"]["ancestors"]}
+    leaves=[value for value in stored if value["proof"]["revision"] not in ancestors]
+    groups={(source,session):set(members) for source,session,members in db.execute("SELECT source,session_id,list(member ORDER BY member) FROM (SELECT DISTINCT c.source,json_extract_string(c.metadata,'$.session_id') session_id,COALESCE(o.source_row_id,c.id) member,COALESCE(o.author_user_id,?) author FROM conversations c LEFT JOIN remote.row_origins o ON o.table_name='conversations' AND o.physical_row_id=c.id WHERE session_id IS NOT NULL) WHERE author=? GROUP BY source,session_id HAVING count(*)>1 ORDER BY source,session_id",(user,user)).fetchall()}
+    db.close()
+    for value in leaves: groups.setdefault((value["row"]["data"]["source"],value["row"]["data"]["session_id"]),set()).update(value["row"]["data"]["members"])
+    records=[{k:v[k] for k in ("row","proof","previous")} for v in leaves]
+    for (source,session),members in sorted(groups.items()):
+        members=sorted(members)
+        row={"v":1,"kind":"provider.session","id":provider_alias_id(source,session),"state":"active","data":{"source":source,"session_id":session,"members":members,"canonical":members[0]}}
+        matching=[v for v in leaves if v["row"]["id"]==row["id"]]
+        if len(matching)!=1 or matching[0]["row"]!=row: records.append(dict(row=row,proof=None,previous=[v["proof"] for v in matching] if len(matching)>1 else matching[0]["proof"] if matching else None))
+    return records
+def provider_alias_accept(root,row,proof,project=True):
+    data=row.get("data")
+    members=data.get("members") if isinstance(data,dict) else None
+    author=proof.get("author_user_id")
+    verify_semantic_proof(proof,row,author)
+    if set(row)!={"v","kind","id","state","data"} or row["v"]!=1 or row["kind"]!="provider.session" or row["state"]!="active" or set(data)!={"source","session_id","members","canonical"} or not all(isinstance(data[k],str) and data[k] for k in ("source","session_id","canonical")) or not isinstance(members,list) or len(members)<2 or members!=sorted(set(members)) or data["canonical"]!=members[0] or row["id"]!=provider_alias_id(data["source"],data["session_id"]): raise ValueError("Malformed provider session alias")
+    db=open_db(core_path(root))
+    init_schema(db)
+    project_provider_alias(db,dict(workspace_id=proof["workspace"],author_user_id=author,object_id=row["id"],revision=proof["revision"],source=data["source"],session_id=data["session_id"],members=members,canonical_source_row_id=data["canonical"],proof=proof))
+    values=[_provider_alias_value(r) for r in db.execute("SELECT workspace_id,author_user_id,object_id,revision,source,session_id,CAST(members AS VARCHAR),canonical_source_row_id,CAST(proof AS VARCHAR) FROM remote.provider_session_aliases WHERE author_user_id=? AND object_id=?",(author,row["id"])).fetchall()]
+    db.close()
+    ancestors={a for value in values for a in value["proof"]["ancestors"]}
+    return len([value for value in values if value["proof"]["revision"] not in ancestors])==1
+def provider_alias_token(root):
+    cfg=load(root)
+    return digest([(v["row"],v["proof"]["revision"] if v["proof"] else None) for v in provider_alias_records(root,cfg["user"],"","personal")])
+def provider_alias_bridge(): return dict(v=2,objects={"provider.session"},records=provider_alias_records,accept=provider_alias_accept,token=provider_alias_token)
 def save(cfg,root=None):
     base,path,_=paths(root); base.mkdir(parents=True,exist_ok=True); os.chmod(base,0o700); tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_text(json.dumps(cfg)); os.chmod(tmp,0o600); durable_replace(tmp,path)
 def rescue_bindings(cfg,state_path,root=None):

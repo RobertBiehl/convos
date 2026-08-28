@@ -7,7 +7,7 @@ import ai_convos.cli as core_module
 from ai_convos.cli import ARCHIVE_COLUMNS, capture_provenance, init_schema, project_attachment_body, project_row_proof, provenance_digest, repository
 import ai_convos_remote as remote_client
 import ai_convos_remote.projection as projection_module
-from ai_convos_remote import promote_paths, publish, sharing_routes
+from ai_convos_remote import promote_paths, provider_alias_accept, provider_alias_bridge, provider_alias_id, provider_alias_records, publish, sharing_routes
 from ai_convos_remote.projection import apply_row_replicas, attest_rows, blob_replicas, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, row_replicas, scan, sequence, sharing
 from ai_convos_remote.protocol import b64, certificate, digest, event, identity, logical_row, open_blob, open_replica, public, public_id, row_proof, semantic_proof
 
@@ -147,6 +147,20 @@ def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
     bridges.cache_clear(); monkeypatch.setattr(projection_module,"entry_points",lambda **_:[Entry()])
     with pytest.raises(ValueError,match="Unsupported remote bridge"): bridges()
     bridges.cache_clear()
+
+
+def test_provider_session_alias_converges_one_author_and_separates_authors(tmp_path):
+    archive=tmp_path/"archive"; path=archive/"data/convos.db"; path.parent.mkdir(parents=True); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); db=duckdb.connect(str(path)); init_schema(db); remote=foreign_id(user,"conversations","b"); metadata='{"session_id":"same","session_kind":"main","session_kind_evidence":"exact"}'; db.executemany("INSERT INTO conversations(id,source,title,metadata) VALUES (?, 'codex','T',?)",[("a",metadata),(remote,metadata)]); db.execute("INSERT INTO remote.row_origins VALUES ('conversations',?,'personal',?,'other-device','b','event','conversations:b',NULL,NULL)",(remote,user)); db.close()
+    pending=[v for v in provider_alias_records(archive,user,"personal","personal") if v["proof"] is None]; assert len(pending)==1 and pending[0]["row"]["data"]=={"source":"codex","session_id":"same","members":["a","b"],"canonical":"a"} and pending[0]["row"]["id"]==provider_alias_id("codex","same")
+    first=semantic_proof(root,user,device["id"],"personal",1,pending[0]["row"]); assert provider_alias_accept(archive,pending[0]["row"],first,False); assert len(provider_alias_records(archive,user,"personal","personal"))==1
+    right={**pending[0]["row"],"data":{**pending[0]["row"]["data"],"members":["a","c"],"canonical":"a"}}; fork=semantic_proof(root,user,identity("other")["id"],"personal",1,right); assert not provider_alias_accept(archive,right,fork)
+    merge=next(v for v in provider_alias_records(archive,user,"personal","personal") if v["proof"] is None); assert merge["row"]["data"]["members"]==["a","b","c"] and {first["revision"],fork["revision"]}=={p["revision"] for p in merge["previous"]}; merged=semantic_proof(root,user,device["id"],"personal",1,merge["row"],merge["previous"]); assert provider_alias_accept(archive,merge["row"],merged) and len(provider_alias_records(archive,user,"personal","personal"))==1
+    other_root=identity("other-root"); other_user=public_id(other_root["sign_public"]); other=semantic_proof(other_root,other_user,identity("other-device")["id"],"personal",1,pending[0]["row"]); assert provider_alias_accept(archive,pending[0]["row"],other); db=duckdb.connect(str(path),read_only=True); assert {r[0] for r in db.execute("SELECT author_user_id FROM remote.provider_session_aliases").fetchall()}=={user,other_user}; db.close(); bridges.cache_clear(); assert len(provider_alias_records(archive,user,"team","team"))==0 and provider_alias_bridge()["objects"]=={"provider.session"} and "provider.session" in set().union(*(b["objects"] for b in bridges())); bridges.cache_clear()
+
+
+def test_provider_session_alias_rejects_noncanonical_members(tmp_path):
+    archive=tmp_path/"archive"; path=archive/"data/convos.db"; path.parent.mkdir(parents=True); db=duckdb.connect(str(path)); init_schema(db); db.close(); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); row={"v":1,"kind":"provider.session","id":provider_alias_id("codex","s"),"state":"active","data":{"source":"codex","session_id":"s","members":["b","a"],"canonical":"a"}}; proof=semantic_proof(root,user,device["id"],"personal",1,row)
+    with pytest.raises(ValueError,match="Malformed provider session alias"): provider_alias_accept(archive,row,proof)
 
 
 def test_event_support_is_exact_and_unknowns_fail_closed(monkeypatch):

@@ -2,6 +2,9 @@
 
 Status: accepted design for the 0.11 schema epoch, 2026-08-28
 
+Implementation status: the additive proof ledger and personal-workspace bridge are
+in stacked PR #100; backed-up row reconciliation remains a dependent task.
+
 ## Outcome
 
 Two devices belonging to one user must converge when they imported the same exact
@@ -54,7 +57,7 @@ Core owns an additive durable proof ledger:
 
 ```text
 remote.provider_session_aliases(
-  author_user_id, object_id, revision, source, session_id,
+  workspace_id, author_user_id, object_id, revision, source, session_id,
   members JSON, canonical_source_row_id, proof JSON,
   PRIMARY KEY(author_user_id, object_id, revision)
 )

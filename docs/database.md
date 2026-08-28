@@ -175,6 +175,7 @@ separate provenance and does not change semantic row identity after recovery.
 | `row_signers` | One normalized root key and device certificate per author device |
 | `workspace_controls` | Signed origin-workspace authorization chain, once per control revision |
 | `row_conflicts` | Canonical logical body for a rare verified incomparable head not selected as the main row |
+| `provider_session_aliases` | Author-scoped root-signed exact provider-session membership leaves and their deterministic canonical source row |
 
 Proof rows never duplicate conversation content. Reissuing an equivalent
 certificate for the same certified device keys does not create another signer.
