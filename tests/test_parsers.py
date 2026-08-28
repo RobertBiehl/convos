@@ -19,9 +19,9 @@ class TestClaudeCodeParser:
 
         jsonl = session_dir / "session-123.jsonl"
         jsonl.write_text("\n".join([
-            json.dumps({"type": "system", "timestamp": "2024-01-01T00:00:00Z", "cwd": "/test", "gitBranch": "main"}),
+            json.dumps({"type": "system", "timestamp": "2024-01-01T00:00:00Z", "sessionId":"session-123", "cwd": "/test", "gitBranch": "main", "version":"2.1.9", "entrypoint":"cli"}),
             json.dumps({"type": "human", "timestamp": "2024-01-01T00:00:01Z", "message": {"content": "Hello"}}),
-            json.dumps({"type": "assistant", "timestamp": "2024-01-01T00:00:02Z", "message": {"content": [{"type": "text", "text": "Hi there!"}]}}),
+            json.dumps({"type": "assistant", "timestamp": "2024-01-01T00:00:02Z", "message": {"model":"claude-opus-4-8", "content": [{"type": "text", "text": "Hi there!"}]}}),
         ]))
 
         result = parse_claude_code(tmp_path / ".claude" / "projects")
@@ -30,8 +30,19 @@ class TestClaudeCodeParser:
         assert len(result.msgs) == 2
         assert result.convs[0]["cwd"] == "/test"
         assert result.convs[0]["git_branch"] == "main"
-        assert result.msgs[0]["role"] == "human"
-        assert result.msgs[1]["role"] == "assistant"
+        assert result.msgs[0]["role"] == "user"
+        assert result.msgs[1]["role"] == "assistant" and result.msgs[1]["model"] == "claude-opus-4-8"
+        assert result.convs[0]["model"] == "claude-opus-4-8"
+        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"session-123","session_kind":"main","originator":"cli","client_version":"2.1.9","capture_mode":"transcript"}
+
+    def test_subagent_session_metadata_is_normalized(self,tmp_path):
+        from ai_convos.cli import parse_claude_code
+        sessions=tmp_path/".claude/projects/-test/root/subagents"; sessions.mkdir(parents=True); (sessions/"agent-child.jsonl").write_text("\n".join(json.dumps(x) for x in [
+            {"type":"system","timestamp":"2026-01-01T00:00:00Z","sessionId":"root","agentId":"child","isSidechain":True,"cwd":"/repo","gitBranch":"main","version":"2.1.9"},
+            {"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":"inspect"}},
+            {"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"done"}]}}]))
+        conv=parse_claude_code(tmp_path/".claude/projects").convs[0]; meta=json.loads(conv["metadata"])
+        assert (conv["cwd"],conv["git_branch"],conv["model"]) == ("/repo","main","claude-opus-4-8") and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","agent_id":"child","client_version":"2.1.9","capture_mode":"transcript"}
 
     def test_parent_thread_tree(self, tmp_path):
         """parentUuid chains become parent_id links; roots and unknown parents stay NULL."""
@@ -93,6 +104,13 @@ class TestClaudeCodeParser:
 
         assert len(result.tools) == 1
         assert result.tools[0]["tool_name"] == "Read"
+
+    def test_tool_results_merge_into_their_invocation(self,tmp_path):
+        from ai_convos.cli import parse_claude_code
+        session=tmp_path/".claude/projects/-test"; session.mkdir(parents=True); (session/"s.jsonl").write_text("\n".join(json.dumps(x) for x in [
+            {"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"call-1","name":"Read","input":{"file_path":"x"}}]}},
+            {"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"body"}]}}]))
+        result=parse_claude_code(tmp_path/".claude/projects"); assert len(result.tools)==1 and result.tools[0]["status"]=="complete" and json.loads(result.tools[0]["output"])=="body"
 
     def test_parse_file_edits(self, tmp_path):
         """Parse session with file edits."""
@@ -174,7 +192,8 @@ class TestCodexParser:
 
         jsonl = sessions_dir / "session-123.jsonl"
         jsonl.write_text("\n".join([
-            json.dumps({"type": "session_meta", "timestamp": "2024-01-01T00:00:00Z", "payload": {"cwd": "/test", "model_provider": "openai"}}),
+            json.dumps({"type": "session_meta", "timestamp": "2024-01-01T00:00:00Z", "payload": {"id":"provider-123", "cwd": "/test", "model_provider": "openai", "originator":"codex-tui", "cli_version":"0.116.0", "git":{"branch":"main","commit_hash":"abc","repository_url":"https://example.com/repo.git"}}}),
+            json.dumps({"type":"turn_context","timestamp":"2024-01-01T00:00:00Z","payload":{"model":"gpt-5.6-sol"}}),
             json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]}}),
             json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:02Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hi!"}]}}),
         ]))
@@ -184,7 +203,20 @@ class TestCodexParser:
         assert len(result.convs) == 1
         assert len(result.msgs) == 2
         assert result.convs[0]["cwd"] == "/test"
-        assert result.convs[0]["model"] == "openai"
+        assert (result.convs[0]["model"],result.convs[0]["git_branch"]) == ("gpt-5.6-sol","main")
+        assert {m["model"] for m in result.msgs} == {"gpt-5.6-sol"}
+        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"provider-123","session_kind":"main","originator":"codex-tui","client_version":"0.116.0","capture_mode":"transcript","git_repository":"https://example.com/repo.git","git_commit":"abc"}
+
+    def test_subagent_session_metadata_is_normalized(self,tmp_path):
+        from ai_convos.cli import parse_codex
+        sessions=tmp_path/".codex/sessions"; sessions.mkdir(parents=True); spawn={"thread_spawn":{"parent_thread_id":"root","agent_nickname":"Ada","agent_role":"explorer","depth":1}}
+        (sessions/"child.jsonl").write_text("\n".join(json.dumps(x) for x in [
+            {"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"child","cwd":"/repo","source":{"subagent":spawn},"cli_version":"0.116.0"}},
+            {"type":"turn_context","timestamp":"2026-01-01T00:00:00Z","payload":{"model":"gpt-5.6-luna"}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"}]}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}]))
+        conv=parse_codex(tmp_path/".codex").convs[0]; meta=json.loads(conv["metadata"])
+        assert conv["model"] == "gpt-5.6-luna" and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","agent_name":"Ada","agent_role":"explorer","agent_depth":1,"client_version":"0.116.0","capture_mode":"transcript"}
 
     def test_input_images_become_bounded_durable_attachments(self,tmp_path,monkeypatch):
         import ai_convos.cli as cli
@@ -234,7 +266,7 @@ class TestCodexParser:
         jsonl.write_text("\n".join([
             json.dumps({"type": "session_meta", "timestamp": "2024-01-01T00:00:00Z", "payload": {}}),
             json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix it"}]}}),
-            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:02Z", "payload": {"type": "function_call", "name": "shell", "arguments": {"command": "echo x > /out.txt"}}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:02Z", "payload": {"type": "function_call", "name": "shell", "call_id": "c1", "arguments": {"command": "echo x > /out.txt"}}}),
             json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:03Z", "payload": {"type": "function_call_output", "call_id": "c1", "output": "ok"}}),
             json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:04Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}}),
         ]))
@@ -242,7 +274,7 @@ class TestCodexParser:
         result = parse_codex(tmp_path / ".codex")
 
         user_id = next(m["id"] for m in result.msgs if m["role"] == "user")
-        assert len(result.tools) == 2
+        assert len(result.tools) == 1 and result.tools[0]["status"] == "complete" and json.loads(result.tools[0]["output"]) == "ok"
         assert all(t["message_id"] == user_id for t in result.tools)
         assert len(result.edits) == 1  # redirect target is exact; content stays the command (unknown effect)
         assert result.edits[0]["file_path"] == "/out.txt"
@@ -348,8 +380,8 @@ class TestCodexParser:
         assert [m["content"] for m in result.msgs] == ["keep me"] and len(result.tools) == 2 and {t["status"] for t in result.tools} == {"failed"} and result.edits == []
         assert not capsys.readouterr().err
 
-    def test_skip_system_messages(self, tmp_path):
-        """System and developer messages are skipped."""
+    def test_preserve_system_messages(self, tmp_path):
+        """System and developer evidence is preserved for query-time filtering."""
         from ai_convos.cli import parse_codex
 
         sessions_dir = tmp_path / ".codex" / "sessions"
@@ -365,8 +397,7 @@ class TestCodexParser:
 
         result = parse_codex(tmp_path / ".codex")
 
-        assert len(result.msgs) == 1
-        assert result.msgs[0]["role"] == "user"
+        assert [m["role"] for m in result.msgs] == ["developer","system","user"]
 
 
 # ---- ChatGPT Export Parser Tests ----
@@ -514,7 +545,7 @@ class TestClaudeExportParser:
             "created_at": "2024-01-01T00:00:00Z",
             "chat_messages": [
                 {"uuid": "msg-1", "sender": "human", "text": "Hello"},
-                {"uuid": "msg-2", "sender": "assistant", "text": "Hi there!"},
+                {"uuid": "msg-2", "sender": "assistant", "model":"claude-opus-4-8", "text": "Hi there!"},
             ]
         }]))
 
@@ -523,6 +554,9 @@ class TestClaudeExportParser:
         assert len(result.convs) == 1
         assert result.convs[0]["title"] == "Test Chat"
         assert len(result.msgs) == 2
+        assert [m["role"] for m in result.msgs] == ["user","assistant"]
+        assert result.msgs[1]["model"] == "claude-opus-4-8"
+        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"conv-123","session_kind":"main","capture_mode":"export"}
 
     def test_parse_with_attachments(self, tmp_path):
         """Parse Claude export with attachments."""
