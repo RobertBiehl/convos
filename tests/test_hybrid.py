@@ -258,3 +258,7 @@ def test_export_parameterizes_source_and_path(tmp_path, monkeypatch):
     conn.execute("INSERT INTO messages VALUES ('m1','c1','user','hello',NULL,NULL,NULL,NULL,NULL,NULL)"); conn.close()
     out = tmp_path / "quoted'out.csv"; r = CliRunner().invoke(cli.app, ["export", str(out), "-f", "csv", "-s", "quoted'source"])
     assert r.exit_code == 0 and "hello" in out.read_text()
+
+def test_json_export_retains_and_labels_unconfirmed_edits(tmp_path,monkeypatch):
+    db=tmp_path/"test.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(cli,"DATA_DIR",tmp_path); conn=duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations(id,source,metadata) VALUES ('c','codex','{}'); INSERT INTO messages(id,conversation_id,role,metadata) VALUES ('m','c','assistant','{}'); INSERT INTO file_edits VALUES ('ok','m','a.py','write','a',NULL,NULL),('bad','m','b.py','write','b',NULL,NULL); INSERT INTO provenance.file_edit_evidence VALUES ('ok','confirmed','provider_success','t1'),('bad','invalid','provider_failure','t2')"); conn.close(); out=tmp_path/"export.json"; result=CliRunner().invoke(cli.app,["export",str(out)])
+    assert result.exit_code==0 and [(e["file"],e["evidence_status"],e["tool_call_id"]) for e in __import__("json").loads(out.read_text())[0]["file_edits"]]==[("b.py","invalid","t2"),("a.py","confirmed","t1")]

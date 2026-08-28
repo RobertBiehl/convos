@@ -18,7 +18,9 @@ def git(root,*args): return subprocess.run(("git","-C",str(root),*args),check=Tr
 def seed(root,cid,title,prompt,cwd=None,edit=None):
     path=Path(root)/"data/convos.db"; path.parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(path)); init_schema(db)
     db.execute("INSERT INTO conversations (id,source,title,created_at,updated_at,cwd,metadata) VALUES (?,?,?,'2026-01-01','2026-01-01',?,'{}')",(cid,"demo",title,str(cwd) if cwd else None)); db.execute("INSERT INTO messages (id,conversation_id,role,content,created_at,metadata) VALUES (?,?, 'user',?,'2026-01-01 00:00:00','{}'),(?,?, 'assistant','done','2026-01-01 00:00:01','{}')",(f"u-{cid}",cid,prompt,f"a-{cid}",cid))
-    if edit: db.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at,old_content) VALUES (?,?,?,'write',?,'2026-01-01 00:00:01',?)",(f"e-{cid}",f"a-{cid}",str(edit[0]),edit[1],edit[2]))
+    if edit:
+        db.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at,old_content) VALUES (?,?,?,'write',?,'2026-01-01 00:00:01',?)",(f"e-{cid}",f"a-{cid}",str(edit[0]),edit[1],edit[2]))
+        db.execute("INSERT INTO provenance.file_edit_evidence VALUES (?,'confirmed','synthetic_fixture',NULL)",(f"e-{cid}",))
     db.close(); capture_provenance(path)
 def wait_message(root,content,workers,timeout=10,graph=False):
     start=time.monotonic(); path=Path(root)/"data/convos.db"

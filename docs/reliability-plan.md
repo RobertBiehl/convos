@@ -23,6 +23,7 @@ gate below are acceptance criteria, not additional tasks.
 | In review in stacked PR #100 | Add the core-owned provider-session proof ledger and personal-workspace bridge; derive aliases only for actual exact-evidence conflicts, converge concurrent same-author leaves, and keep different authors separate. |
 | In review in stacked PR #101 | Replace the blocking pre-existing-duplicate migration with a backed-up, non-destructive admission: retain every row, bind future parsing deterministically, and let the signed alias ledger own convergence. |
 | In review in stacked PR #102 | Implement backed-up alias reconciliation and prove pre-existing and cross-device duplicate row successors/tombstones converge with retained v1 replicas. |
+| In review in stacked PR #103 | Add an auditable file-edit evidence ledger, reclassify surviving provider transcripts, retain raw uncertain history, and exclude anything except confirmed edits from exact provenance and team sharing. |
 | Pending | Harden remote synchronization: fix duplicate-root proof-chain convergence, add observable exponential backoff, narrow local mutation locks, cover interruption recovery, and prove retained signed logical replicas remain ingestible. |
 | Pending | Build and qualify the Titan multi-user testbed with a fresh synthetic lane and a persistent upgrade canary before declaring a stable release. |
 

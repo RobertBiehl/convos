@@ -141,6 +141,8 @@ class TestClaudeCodeParser:
         assert result.edits[1]["edit_type"] == "edit"
         assert result.edits[1]["content"] == "print('world')"
         assert result.edits[1]["old_content"] == "print('hello')"
+        assert {v["status"] for v in result.edit_evidence} == {"confirmed"}
+        assert {v["tool_call_id"] for v in result.edit_evidence} == {t["id"] for t in result.tools if t["tool_name"] in ("Write","Edit")}
 
     def test_tool_only_turns_keep_message_rows(self, tmp_path):
         """Tool-only assistant turns produce message rows so tools/edits are not orphaned."""
@@ -273,8 +275,15 @@ class TestCodexParser:
     def test_upsert_provenance_targets_only_changed_rows(self):
         import duckdb
         from ai_convos import cli
-        conv=dict(id="c",source="codex",title="t",created_at=None,updated_at=None,model=None,cwd="/repo",git_branch=None,project_id=None,metadata="{}"); msg=dict(id="m",conversation_id="c",role="assistant",content="done",thinking=None,created_at=None,model=None,metadata="{}",parent_id=None); edit=dict(id="e",message_id="m",file_path="x.py",edit_type="write",content="x",created_at=None,old_content=None); result=cli.ParseResult([conv],[msg],edits=[edit]); db=duckdb.connect(); cli.init_schema(db)
+        conv=dict(id="c",source="codex",title="t",created_at=None,updated_at=None,model=None,cwd="/repo",git_branch=None,project_id=None,metadata="{}"); msg=dict(id="m",conversation_id="c",role="assistant",content="done",thinking=None,created_at=None,model=None,metadata="{}",parent_id=None); edit=dict(id="e",message_id="m",file_path="x.py",edit_type="write",content="x",created_at=None,old_content=None); result=cli.ParseResult([conv],[msg],edits=[edit],edit_evidence=[dict(file_edit_id="e",status="confirmed",reason="test_fixture",tool_call_id=None)]); db=duckdb.connect(); cli.init_schema(db)
         cli.upsert(db,result); assert result.provenance_conversations=={"c"} and result.provenance_edits=={"e"}; cli.upsert(db,result); assert not result.provenance_conversations and not result.provenance_edits
+
+    def test_upsert_reclassifies_historical_edit_without_deleting_raw_row(self):
+        import duckdb
+        from ai_convos import cli
+        db=duckdb.connect(); cli.init_schema(db); db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('c','codex','{}'); INSERT INTO messages(id,conversation_id,role,metadata) VALUES ('m','c','assistant','{}'); INSERT INTO tool_calls(id,message_id,input,output) VALUES ('t','m','{}','{}'); INSERT INTO file_edits VALUES ('e','m','x.py','write','x',NULL,NULL); INSERT INTO provenance.file_edit_evidence VALUES ('e','legacy_unverified','source_unavailable',NULL)"); before=cli.archive_state(db)[1]; result=cli.ParseResult(edit_evidence=[dict(file_edit_id="e",status="invalid",reason="provider_failure",tool_call_id="t")]); cli.upsert(db,result)
+        assert db.execute("SELECT COUNT(*) FROM file_edits WHERE id='e'").fetchone()[0]==1 and db.execute("SELECT status,reason,tool_call_id FROM provenance.file_edit_evidence WHERE file_edit_id='e'").fetchone()==("invalid","provider_failure","t") and cli.archive_state(db)[1]>before
+        generation=cli.archive_state(db)[1]; cli.upsert(db,result); assert cli.archive_state(db)[1]==generation
 
     def test_input_images_become_bounded_durable_attachments(self,tmp_path,monkeypatch):
         import ai_convos.cli as cli
@@ -406,8 +415,9 @@ class TestCodexParser:
 
     def test_failed_missing_and_timed_out_function_edits_are_not_facts(self,tmp_path):
         from ai_convos.cli import parse_codex
-        sessions=tmp_path/".codex/sessions"; sessions.mkdir(parents=True); call=lambda cid,path:{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":cid,"arguments":json.dumps({"cmd":f"echo x > {path}"})}}; output=lambda cid,text:{"type":"response_item","payload":{"type":"function_call_output","call_id":cid,"output":text}}; events=[{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"try"}]}},call("failed","a.py"),output("failed","Process exited with code 2"),call("timeout","b.py"),output("timeout","Command timed out"),call("missing","c.py")]; (sessions/"s.jsonl").write_text("\n".join(map(json.dumps,events))); result=parse_codex(tmp_path/".codex")
-        assert len(result.tools)==3 and {t["status"] for t in result.tools}=={"failed","pending"} and result.edits==[]
+        sessions=tmp_path/".codex/sessions"; sessions.mkdir(parents=True); call=lambda cid,path:{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":cid,"arguments":json.dumps({"cmd":f"echo x > {path}"})}}; output=lambda cid,text:{"type":"response_item","payload":{"type":"function_call_output","call_id":cid,"output":text}}; events=[{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"try"}]}},call("failed","a.py"),output("failed","Process exited with code 2"),call("negative","b.py"),output("negative",'{"exit_code":-1}'),call("rejected","c.py"),output("rejected","Rejected by user"),call("running","d.py"),output("running","Process running with session ID 42"),call("missing","e.py")]; (sessions/"s.jsonl").write_text("\n".join(map(json.dumps,events))); result=parse_codex(tmp_path/".codex")
+        assert len(result.tools)==5 and {t["status"] for t in result.tools}=={"failed","complete","pending"} and result.edits==[]
+        assert [(v["status"],v["reason"]) for v in result.edit_evidence]==[("invalid","provider_failure")]*3+[("unknown","nonterminal_result"),("unknown","result_missing")]
 
     def test_direct_custom_apply_patch_captures_raw_patch_without_scanning_its_code(self, tmp_path, capsys):
         from ai_convos.cli import parse_codex
@@ -419,6 +429,7 @@ class TestCodexParser:
             {"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"custom_tool_call_output","call_id":"c1","output":"Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated"}}]))
         result = parse_codex(tmp_path/".codex")
         assert [(e["file_path"],e["old_content"],e["content"]) for e in result.edits] == [("/repo/src/app.py","old","new"),("/repo/tests/test_app.py",'code = r\'await tools.apply_patch("\\s")\'','code = "safe"')]
+        assert {v["status"] for v in result.edit_evidence}=={"confirmed"} and {v["tool_call_id"] for v in result.edit_evidence}=={result.tools[0]["id"]}
         assert len(result.tools) == 1 and result.tools[0]["tool_name"] == "apply_patch" and not capsys.readouterr().err
 
     def test_custom_exec_patch_text_is_not_an_edit(self, tmp_path):

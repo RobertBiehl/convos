@@ -14,9 +14,9 @@ from ai_convos.cli import get_db
 _Q = """SELECT fe.edit_type, fe.content, fe.old_content, fe.created_at, COALESCE(m.conversation_id, 'unknown'), COALESCE(c.source, '?'),
     (SELECT u.content FROM messages u WHERE u.conversation_id = m.conversation_id AND u.role = 'user'
      AND u.content != '' AND u.created_at <= fe.created_at ORDER BY u.created_at DESC LIMIT 1)
-FROM file_edits fe LEFT JOIN messages m ON fe.message_id = m.id LEFT JOIN conversations c ON c.id = m.conversation_id
+FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' LEFT JOIN messages m ON fe.message_id = m.id LEFT JOIN conversations c ON c.id = m.conversation_id
 WHERE fe.file_path = ? ORDER BY fe.created_at, fe.id"""
-_GQ = """SELECT fe.file_path, m.conversation_id, fe.message_id, c.source FROM file_edits fe
+_GQ = """SELECT fe.file_path, m.conversation_id, fe.message_id, c.source FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed'
 JOIN messages m ON fe.message_id = m.id JOIN conversations c ON c.id = m.conversation_id"""
 
 def edits_for(conn, path: str) -> list[dict]:

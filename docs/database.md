@@ -152,6 +152,7 @@ product is strictly read-only.
 | `file_versions` | Observed full-content hashes |
 | `file_edit_scopes` | Immutable capture-time repository-relative path, resolved filesystem route, root, and checkout marker for each local edit |
 | `file_edit_files` | Edit-to-file edges plus hashes of captured old/new edit material and evidence quality |
+| `file_edit_evidence` | Per-edit classification (`confirmed`, `invalid`, `unknown`, or `legacy_unverified`), reason, and exact tool-call link |
 | `git_checkpoints` | Git head plus capture-time working-tree hash, changed paths, and capture source |
 | `checkpoint_edits` | Checkpoint-to-`file_edits.id` evidence |
 | `local_facts` | Content-free marker that this archive independently observed a fact and may sign it locally |
@@ -159,6 +160,14 @@ product is strictly read-only.
 There are intentionally no copied prompts, message bodies, changesets,
 file-edit bodies, raw remote payloads, workspace IDs, or device IDs in this
 schema.
+
+Raw `file_edits` remain lossless archive records. Exact provenance,
+changegraph, project summaries, and team contribution use only `confirmed`
+rows. Replay and export retain every row and expose its evidence status.
+Provider results that are missing or nonterminal remain `unknown`; rows whose
+source transcript no longer survives are `legacy_unverified`. Received signed
+rows default to `legacy_unverified` locally while their immutable signed facts
+remain forwardable for replica compatibility.
 
 The `remote` schema is the separate identifier-only exception for remotely
 projected archive rows. Core writes it atomically with each imported row so

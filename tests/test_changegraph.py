@@ -6,6 +6,8 @@ import typer
 from ai_convos.cli import init_schema
 from ai_convos_changegraph import cut, edits_for, register, replay
 
+def confirm(conn,*ids): conn.executemany("INSERT INTO provenance.file_edit_evidence VALUES (?,'confirmed','test_fixture',NULL)",[(i,) for i in ids])
+
 
 def _e(type, content, old=None, ts="2024-01-01 00:00:00", conv="c1", source="claude-code", prompt="p"):
     return dict(type=type, content=content, old=old, ts=ts, conv=conv, source=source, prompt=prompt)
@@ -70,12 +72,17 @@ def test_edits_for_attributes_prompt(tmp_path):
     conn.execute("INSERT INTO messages VALUES ('u1','c1','user','please edit',NULL,'2024-01-01 00:00:00',NULL,'{}',NULL,NULL),"
                  "('a1','c1','assistant','done',NULL,'2024-01-01 00:00:01',NULL,'{}',NULL,'u1')")
     conn.execute("INSERT INTO file_edits VALUES ('e1','a1','/f.py','write','x','2024-01-01 00:00:01',NULL)")
+    confirm(conn,"e1")
     edits = edits_for(conn, "/f.py")
     conn.close()
     assert len(edits) == 1
     assert edits[0]["prompt"] == "please edit"
     assert edits[0]["conv"] == "c1"
     assert edits[0]["type"] == "write"
+
+def test_exact_views_exclude_unconfirmed_edits(tmp_path):
+    conn=duckdb.connect(str(tmp_path/"t.db")); init_schema(conn); conn.execute("INSERT INTO file_edits VALUES ('ok','gone','/f.py','write','ok','2024-01-01',NULL),('bad','gone','/f.py','write','bad','2024-01-02',NULL),('maybe','gone','/f.py','write','maybe','2024-01-03',NULL),('old','gone','/f.py','write','old','2024-01-04',NULL); INSERT INTO provenance.file_edit_evidence VALUES ('ok','confirmed','provider_success',NULL),('bad','invalid','provider_failure',NULL),('maybe','unknown','nonterminal_result',NULL),('old','legacy_unverified','source_unavailable',NULL)")
+    assert [e["content"] for e in edits_for(conn,"/f.py")]==["ok"]
 
 
 def test_register_adds_commands():
@@ -88,6 +95,7 @@ def test_orphaned_edits_labeled_unknown(tmp_path):
     conn = duckdb.connect(str(tmp_path / "t.db"))
     init_schema(conn)
     conn.execute("INSERT INTO file_edits VALUES ('e1','gone','/f.py','write','x','2024-01-01',NULL)")
+    confirm(conn,"e1")
     edits = edits_for(conn, "/f.py")
     conn.close()
     assert edits[0]["conv"] == "unknown"
@@ -102,6 +110,7 @@ def _tui_db(tmp_path):
     conn.execute("INSERT INTO messages VALUES ('u1','c1','user','please fix',NULL,'2024-01-01 00:00:00',NULL,'{}',NULL,NULL),"
                  "('a1','c1','assistant','',NULL,'2024-01-01 00:00:01',NULL,'{}',NULL,'u1')")
     conn.execute("INSERT INTO file_edits VALUES ('e1','a1','/f.py','edit','new','2024-01-01 00:00:01','old')")
+    confirm(conn,"e1")
     return conn
 
 
@@ -111,6 +120,7 @@ def test_tui_graph_panes_and_walk(tmp_path):
     conn = _tui_db(tmp_path)
     conn.execute("INSERT INTO file_edits VALUES ('e2','a1','/g.py','write','x','2024-01-02',NULL),"
                  "('e3','gone','/f.py','shell','rm x','2024-01-03',NULL)")  # second file + an orphaned edit
+    confirm(conn,"e2","e3")
     v = _graph(conn)
     files, convs = _nodes(v["E"], 0), _nodes(v["E"], 1)
     assert [f[0] for f in files] == ["/f.py", "/g.py"]  # recency order
@@ -132,6 +142,7 @@ def test_tui_unknown_conv_has_no_pivot(tmp_path):
     conn = duckdb.connect(str(tmp_path / "t.db"))
     init_schema(conn)
     conn.execute("INSERT INTO file_edits VALUES ('e1','gone','/f.py','shell','rm x','2024-01-01',NULL)")
+    confirm(conn,"e1")
     tl = _timeline(conn, "/f.py")
     assert "unknown" in tl["fmt"](tl["rows"][0])
     assert tl["conv"](tl["rows"][0]) is None

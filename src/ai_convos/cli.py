@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import base64, contextlib, json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile, duckdb, typer
-from importlib.metadata import entry_points, version; from concurrent.futures import ThreadPoolExecutor, as_completed; from contextlib import ExitStack; from datetime import datetime, timedelta, timezone; from functools import lru_cache; from pathlib import Path; from typing import Optional; from hashlib import pbkdf2_hmac; from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from importlib.metadata import entry_points, version; from concurrent.futures import ThreadPoolExecutor, as_completed; from contextlib import ExitStack; from dataclasses import dataclass, field; from datetime import datetime, timedelta, timezone; from functools import lru_cache; from pathlib import Path; from typing import Optional; from hashlib import pbkdf2_hmac; from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remote_data, migrate_remote_ids, migration_memory, remote_id_migration_scope
 
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT = find_root(); DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"; STATE_PATH = DATA_DIR / "sync_state.json"
-HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(content,'{_NR}')",8,10,20,8/15,3  # conservative policy below the observed ~200-detail failure point
+HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(content,'{_NR}')",8,10,20,8/15,4  # conservative policy below the observed ~200-detail failure point
 _INJECTED_RE=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*"
 MESSAGE_ORDER,MESSAGE_ORDER_DESC="m.created_at NULLS FIRST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) NULLS LAST,m.id","m.created_at DESC NULLS LAST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) DESC NULLS LAST,m.id DESC"
 
@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS provenance.files(id VARCHAR PRIMARY KEY,repository VA
 CREATE TABLE IF NOT EXISTS provenance.file_versions(id VARCHAR PRIMARY KEY,file_id VARCHAR,content_hash VARCHAR,observed_at TIMESTAMP);
 CREATE TABLE IF NOT EXISTS provenance.file_edit_scopes(file_edit_id VARCHAR PRIMARY KEY,path VARCHAR,repository VARCHAR,root VARCHAR,checkout VARCHAR,observed_at TIMESTAMP,route VARCHAR);
 CREATE TABLE IF NOT EXISTS provenance.file_edit_files(file_edit_id VARCHAR PRIMARY KEY,file_id VARCHAR,old_content_hash VARCHAR,new_content_hash VARCHAR,evidence VARCHAR);
+CREATE TABLE IF NOT EXISTS provenance.file_edit_evidence(file_edit_id VARCHAR PRIMARY KEY,status VARCHAR NOT NULL CHECK(status IN ('confirmed','invalid','unknown','legacy_unverified')),reason VARCHAR NOT NULL,tool_call_id VARCHAR);
 CREATE TABLE IF NOT EXISTS provenance.git_checkpoints(id VARCHAR PRIMARY KEY,repository VARCHAR,head VARCHAR,state_hash VARCHAR,paths JSON,observed_at TIMESTAMP,capture_source VARCHAR);
 CREATE TABLE IF NOT EXISTS provenance.checkpoint_edits(checkpoint_id VARCHAR,file_edit_id VARCHAR,evidence VARCHAR,PRIMARY KEY(checkpoint_id,file_edit_id));
 CREATE TABLE IF NOT EXISTS provenance.local_facts(kind VARCHAR,entity VARCHAR,PRIMARY KEY(kind,entity));
@@ -182,7 +183,7 @@ def _provenance_record(kind,entity,payload,observed_at): return dict(kind=kind,e
 def _provenance_edits(core,edit_ids=None):
     ids=sorted(set(edit_ids or ())) if edit_ids is not None else None
     selected=" AND NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_edit_id=fe.id)"+(f" AND fe.id IN ({','.join('?'*len(ids))})" if ids else " AND FALSE" if ids==[] else "")
-    sql="""SELECT fe.id,fe.file_path,fe.edit_type,fe.content,fe.old_content,CAST(fe.created_at AS VARCHAR),m.id,m.conversation_id,c.cwd,s.path,s.repository,s.root,s.checkout,s.route,CAST(s.observed_at AS VARCHAR) FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id LEFT JOIN provenance.file_edit_scopes s ON s.file_edit_id=fe.id WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='file_edits' AND o.physical_row_id=fe.id)"""+selected+" ORDER BY fe.created_at,fe.id"
+    sql="""SELECT fe.id,fe.file_path,fe.edit_type,fe.content,fe.old_content,CAST(fe.created_at AS VARCHAR),m.id,m.conversation_id,c.cwd,s.path,s.repository,s.root,s.checkout,s.route,CAST(s.observed_at AS VARCHAR) FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id LEFT JOIN provenance.file_edit_scopes s ON s.file_edit_id=fe.id WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='file_edits' AND o.physical_row_id=fe.id)"""+selected+" ORDER BY fe.created_at,fe.id"
     return [dict(zip(("id","path","type","content","old","ts","turn","conversation","cwd","scope_path","repository","root","checkout","route","scope_at"),r)) for r in core.execute(sql,ids or ()).fetchall()]
 def _observe_provenance(edits,source="sync",known=None,conversations=(),cache=None):
     cache={} if cache is None and _refresh_repository() is None else cache
@@ -216,7 +217,7 @@ def provenance_records(db,only=None):
     for r in rows("repository.observed","SELECT id,lineage,CAST(roots AS VARCHAR),CAST(remotes AS VARCHAR),last_head,observed_at FROM provenance.repositories"): out.append(_provenance_record("repository.observed",r[0],dict(id=r[0],lineage=r[1],roots=json.loads(r[2]),remotes=json.loads(r[3]),head=r[4]),r[5]))
     for r in rows("file.observed","SELECT * FROM provenance.files"): out.append(_provenance_record("file.observed",r[0],dict(zip(("id","repository","path","kind"),r)),None))
     for r in rows("file.version","SELECT * FROM provenance.file_versions"): out.append(_provenance_record("file.version",r[0],dict(zip(("id","file","content_hash"),r[:3])),r[3]))
-    for r in rows("edit.observed","SELECT x.file_edit_id,fe.message_id,x.file_id,f.repository,x.old_content_hash,x.new_content_hash,x.evidence FROM provenance.file_edit_files x JOIN file_edits fe ON fe.id=x.file_edit_id JOIN provenance.files f ON f.id=x.file_id","x.file_edit_id"): out.append(_provenance_record("edit.observed",r[0],dict(zip(("id","turn","file","repository","old_content_hash","new_content_hash","evidence"),r)),None))
+    for r in rows("edit.observed","SELECT x.file_edit_id,fe.message_id,x.file_id,f.repository,x.old_content_hash,x.new_content_hash,x.evidence FROM provenance.file_edit_files x LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=x.file_edit_id JOIN file_edits fe ON fe.id=x.file_edit_id JOIN provenance.files f ON f.id=x.file_id AND (v.status='confirmed' OR EXISTS (SELECT 1 FROM remote.provenance_origins o WHERE o.kind='edit.observed' AND o.physical_entity=x.file_edit_id))","x.file_edit_id"): out.append(_provenance_record("edit.observed",r[0],dict(zip(("id","turn","file","repository","old_content_hash","new_content_hash","evidence"),r)),None))
     for r in rows("git.checkpoint","SELECT id,repository,head,state_hash,CAST(paths AS VARCHAR),observed_at,capture_source FROM provenance.git_checkpoints"): out.append(_provenance_record("git.checkpoint",r[0],dict(id=r[0],repository=r[1],head=r[2],state_hash=r[3],paths=json.loads(r[4]),capture_source=r[6]),r[5]))
     for r in db.execute("SELECT * FROM provenance.checkpoint_edits").fetchall():
         if only is None or provenance_digest({"checkpoint":r[0],"edit":r[1]}) in ids("checkpoint.link"): out.append(_provenance_record("checkpoint.link",provenance_digest({"checkpoint":r[0],"edit":r[1]}),dict(zip(("checkpoint","edit","evidence"),r)),None))
@@ -300,10 +301,11 @@ def project_archive_row(db,table,columns,values,origin=None,touch=True):
     required=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at")
     if origin and set(origin) not in (set(required),set(required)|{"proof_id"}): raise ValueError("record origin schema mismatch")
     updates=_MSG_UPDATES if table=="messages" else ",".join(f"{c}=excluded.{c}" for c in columns[1:]); db.execute(_MSG_UPS,values) if table=="messages" else db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?'*len(columns))}) ON CONFLICT(id) DO UPDATE SET {updates}",values)
+    if table=="file_edits": db.execute("INSERT OR IGNORE INTO provenance.file_edit_evidence VALUES (?,'legacy_unverified','signed_replica',NULL)",(values[0],))
     if origin: db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,values[0],*(origin[k] for k in required),origin.get("proof_id")))
     touch and _archive_touch(db,[(table,values[0])])
 def _insert_pages(db,target,rows,columns=None,conflict="",mode="",embedding=False): schema={r[0]:r[1] for r in db.execute(f"DESCRIBE {target}").fetchall()}; columns=columns or list(schema); shape=json.dumps([{c:schema[c] for c in columns}]); norm=lambda c,v:json.loads(v) if schema[c]=="JSON" and isinstance(v,str) else v; extra=",embedding" if embedding else ""; source="SELECT x.*,m.embedding FROM UNNEST(from_json(?,?)) t(x) LEFT JOIN messages m ON m.id=x.id AND m.content IS NOT DISTINCT FROM x.content" if embedding else "SELECT x.* FROM UNNEST(from_json(?,?)) t(x)"; [db.execute(f"INSERT{mode} INTO {target} ({','.join(columns)}{extra}) {source}{conflict}",(json.dumps([{c:norm(c,v) for c,v in zip(columns,row)} for row in page],default=str,ensure_ascii=True,allow_nan=False),shape)) for page in (rows[i:i+500] for i in range(0,len(rows),500))]
-def project_archive_rows(db,table,columns,rows): fields=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at"); values=[r[0] for r in rows]; origins=[(table,v[0],*(o[k] for k in fields),o.get("proof_id")) for v,o in rows if o]; updates=_MSG_UPDATES if table=="messages" else ','.join(f"{c}=excluded.{c}" for c in columns[1:]); required(table in ARCHIVE_COLUMNS and columns==ARCHIVE_COLUMNS[table] and not any(len(v)!=len(columns) or o and set(o) not in (set(fields),set(fields)|{"proof_id"}) for v,o in rows),ValueError("record schema/entity mismatch")); _insert_pages(db,table,values,columns,f" ON CONFLICT(id) DO UPDATE SET {updates}",embedding=table=="messages"); origins and _insert_pages(db,"remote.row_origins",origins,mode=" OR REPLACE")
+def project_archive_rows(db,table,columns,rows): fields=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at"); values=[r[0] for r in rows]; origins=[(table,v[0],*(o[k] for k in fields),o.get("proof_id")) for v,o in rows if o]; updates=_MSG_UPDATES if table=="messages" else ','.join(f"{c}=excluded.{c}" for c in columns[1:]); required(table in ARCHIVE_COLUMNS and columns==ARCHIVE_COLUMNS[table] and not any(len(v)!=len(columns) or o and set(o) not in (set(fields),set(fields)|{"proof_id"}) for v,o in rows),ValueError("record schema/entity mismatch")); _insert_pages(db,table,values,columns,f" ON CONFLICT(id) DO UPDATE SET {updates}",embedding=table=="messages"); table=="file_edits" and _insert_pages(db,"provenance.file_edit_evidence",[(v[0],"legacy_unverified","signed_replica",None) for v in values],mode=" OR IGNORE"); origins and _insert_pages(db,"remote.row_origins",origins,mode=" OR REPLACE")
 def project_row_proofs(db,proofs,root_public,certificate):
     if not proofs: return []
     fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); expected={"v","kind",*fields}; signer=(proofs[0]["author_user_id"],proofs[0]["author_device_id"]); packed=json.dumps(certificate,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)
@@ -389,6 +391,7 @@ def init_schema(conn):
     current==1 and scope and ("core_migrations" not in tables or not conn.execute("SELECT 1 FROM core_migrations WHERE name='remote_ids'").fetchone()) and _migration_backup(conn,2)
     current==2 and _migration_backup(conn,3)
     current in (3,4) and _migration_backup(conn,current+1)
+    current==5 and _migration_backup(conn,6)
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
         id VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, title VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP,
         model VARCHAR, cwd VARCHAR, git_branch VARCHAR, project_id VARCHAR, metadata JSON)""")
@@ -454,6 +457,12 @@ def init_schema(conn):
             conn.execute((("INSERT INTO provider_sessions SELECT source,json_extract_string(metadata,'$.session_id'),min(id) FROM conversations c WHERE json_extract_string(metadata,'$.session_id') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) GROUP BY source,json_extract_string(metadata,'$.session_id');" if metadata else "")+"INSERT OR REPLACE INTO core_schema VALUES (TRUE,5)"))
             recoveries and _archive_touch(conn,recoveries)
     with _transaction(conn) if (binding_v5:=conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone()[0]==4) else contextlib.nullcontext(): binding_v5 and conn.execute("CREATE TABLE provider_sessions_v5(source VARCHAR,session_id VARCHAR,conversation_id VARCHAR,PRIMARY KEY(source,session_id)); INSERT INTO provider_sessions_v5 SELECT * FROM provider_sessions; DROP TABLE provider_sessions; ALTER TABLE provider_sessions_v5 RENAME TO provider_sessions; INSERT OR REPLACE INTO core_schema VALUES (TRUE,5)")
+    if conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone()[0]<6:
+        legacy=conn.execute("SELECT id FROM file_edits fe WHERE NOT EXISTS (SELECT 1 FROM provenance.file_edit_evidence v WHERE v.file_edit_id=fe.id)").fetchall()
+        with _transaction(conn):
+            legacy and conn.executemany("INSERT INTO provenance.file_edit_evidence VALUES (?,'legacy_unverified','source_unavailable',NULL)",legacy)
+            legacy and _archive_touch(conn,[("file_edits",r[0]) for r in legacy])
+            conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,6)")
     with _transaction(conn):
         conn.execute("""CREATE OR REPLACE TEMP TABLE core_legacy_conflicts AS SELECT x.file_edit_id edit,x.file_id old_id,f.path,sha256(json_object('path',f.path,'repository',NULL)) new_id,EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='edit.observed' AND l.entity=x.file_edit_id) is_local FROM provenance.file_edit_files x JOIN provenance.files f ON f.id=x.file_id WHERE x.evidence='legacy_scope_conflict' AND (x.file_id<>sha256(json_object('path',f.path,'repository',NULL)) OR EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='edit.observed' AND l.entity=x.file_edit_id) AND NOT EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='file.observed' AND l.entity=sha256(json_object('path',f.path,'repository',NULL)))); INSERT OR IGNORE INTO provenance.files SELECT new_id,NULL,path,'external' FROM core_legacy_conflicts; UPDATE provenance.file_edit_files x SET file_id=c.new_id FROM core_legacy_conflicts c WHERE x.file_edit_id=c.edit; INSERT OR IGNORE INTO provenance.local_facts SELECT 'file.observed',new_id FROM core_legacy_conflicts WHERE is_local; DELETE FROM provenance.local_facts l USING core_legacy_conflicts c WHERE l.kind='file.observed' AND l.entity=c.old_id AND c.old_id<>c.new_id; DELETE FROM provenance.files f USING core_legacy_conflicts c WHERE f.id=c.old_id AND c.old_id<>c.new_id AND NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_id=f.id) AND NOT EXISTS (SELECT 1 FROM provenance.file_versions v WHERE v.file_id=f.id) AND NOT EXISTS (SELECT 1 FROM remote.provenance_origins o WHERE o.kind='file.observed' AND o.physical_entity=f.id); UPDATE archive_state SET generation=generation+1 WHERE singleton AND EXISTS(SELECT 1 FROM core_legacy_conflicts WHERE is_local); INSERT OR REPLACE INTO archive_changes SELECT kind,entity,generation FROM archive_state,(SELECT 'file_edits' kind,edit entity FROM core_legacy_conflicts WHERE is_local UNION ALL SELECT 'edit.observed',edit FROM core_legacy_conflicts WHERE is_local UNION ALL SELECT 'file.observed',new_id FROM core_legacy_conflicts WHERE is_local) WHERE singleton; DROP TABLE core_legacy_conflicts""")
 
@@ -611,7 +620,7 @@ def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
         pass
     return headers
 
-def merge_results(dst: "ParseResult", src: "ParseResult"): dst.convs += src.convs; dst.msgs += src.msgs; dst.tools += src.tools; dst.attachs += src.attachs
+def merge_results(dst: "ParseResult", src: "ParseResult"): dst += src
 
 def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 15, retries: int = 1, before_request=None, rate_limit_backoff=None) -> dict:
     parts = []
@@ -635,9 +644,29 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
             if code == 429: typer.echo(f"  rate limited; retrying in {delay}s", err=True)
             time.sleep(delay)
 
+@dataclass(slots=True)
 class ParseResult:
-    def __init__(self, convs=None, msgs=None, tools=None, attachs=None, artifacts=None, edits=None):
-        self.convs, self.msgs, self.tools, self.attachs, self.artifacts, self.edits = convs or [], msgs or [], tools or [], attachs or [], artifacts or [], edits or []
+    convs: list = field(default_factory=list)
+    msgs: list = field(default_factory=list)
+    tools: list = field(default_factory=list)
+    attachs: list = field(default_factory=list)
+    artifacts: list = field(default_factory=list)
+    edits: list = field(default_factory=list)
+    edit_evidence: list = field(default_factory=list)
+    scopes: list | None = None
+    edit_scopes: list | None = None
+    provenance_edits: set = field(default_factory=set)
+    provenance_conversations: set = field(default_factory=set)
+
+    def __iadd__(self,other):
+        self.convs += other.convs
+        self.msgs += other.msgs
+        self.tools += other.tools
+        self.attachs += other.attachs
+        self.artifacts += other.artifacts
+        self.edits += other.edits
+        self.edit_evidence += other.edit_evidence
+        return self
 
 def log_parse_error(context: str, err: Exception): typer.echo(f"  parse error ({context}): {type(err).__name__}: {err}", err=True)
 
@@ -851,6 +880,10 @@ def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
                     old_content=t["input"].get("old_string"))
                for j, t in enumerate(c["tools"]) if t.get("name") in ("Write", "Edit", "MultiEdit") and t.get("input", {}).get("file_path") and t.get("id") in tool_results and not tool_results[t["id"]].get("error")]
 
+    def make_evidence(idx,i,e):
+        tools=extract_content(e["message"].get("content",[]))["tools"]
+        return [dict(file_edit_id=gen_id(src,f"edit:{cid}:{idx}:{j}"),status=status,reason=reason,tool_call_id=gen_id(src,f"tool:{cid}:{t.get('id') or f'{idx}:{j}'}")) for j,t in enumerate(tools) if t.get("name") in ("Write","Edit","MultiEdit") and t.get("input",{}).get("file_path") for result in [tool_results.get(t.get("id"))] for status,reason in [(('unknown','result_missing') if result is None else ('invalid','provider_failure') if result.get('error') else ('confirmed','provider_success'))]]
+
     msgs = [make_msg(idx, i, e) for idx, (i, e) in enumerate(msg_events) if (c := extract_content(e["message"].get("content", "")))["text"] or c["tools"]]  # keep tool-only turns: tools/edits reference them
     if not msgs: return None
     return {
@@ -858,12 +891,12 @@ def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
                     created_at=timestamps[0] if timestamps else None, updated_at=timestamps[-1] if timestamps else None,
                     model=next((m["model"] for m in msgs if m["model"] and m["model"]!="<synthetic>"),None), cwd=system.get("cwd") or next((e.get("cwd") for e in events if e.get("cwd")),None), git_branch=system.get("gitBranch") or next((e.get("gitBranch") for e in events if e.get("gitBranch")),None), project_id=None,
                     metadata=json.dumps({k:v for k,v in {"session_id":agent_id or root_session,"parent_session_id":parent,"session_kind":kind,"session_kind_evidence":"exact" if explicit_agent or sidechain else "inferred","agent_id":agent_id,"agent_name":next((e.get("agentName") for e in events if e.get("agentName")),None),"agent_role":next((e.get("agentType") for e in events if e.get("agentType")),None),"agent_depth":next((e.get("agentDepth") for e in events if e.get("agentDepth") is not None),None),"originator":system.get("entrypoint"),"client_version":system.get("version"),"capture_mode":"transcript"}.items() if v is not None})),
-        "msgs":msgs,"tools":[t for idx,(i,e) in enumerate(msg_events) for t in make_tools(idx,i,e)],"edits":[ed for idx,(i,e) in enumerate(msg_events) for ed in make_edits(idx,i,e)]}
+        "msgs":msgs,"tools":[t for idx,(i,e) in enumerate(msg_events) for t in make_tools(idx,i,e)],"attachs":[],"edits":[ed for idx,(i,e) in enumerate(msg_events) for ed in make_edits(idx,i,e)],"edit_evidence":[v for idx,(i,e) in enumerate(msg_events) for v in make_evidence(idx,i,e)]}
 
 def _parse_sessions(paths,parser,bindings):
     bound={} if bindings is None else bindings
     sessions=[(bound.setdefault((s["conv"]["source"],m["session_id"]),s["conv"]["id"]),s)[1] if (m:=json.loads(s["conv"]["metadata"] or "{}")).get("session_id") else s for path in sorted(paths) if (s:=safe_parse(f"{parser.__name__.removeprefix('parse_').replace('_session','').replace('_','-')} session {path}",parser,path,bound))]
-    return ParseResult(convs=[s["conv"] for s in sessions],msgs=[m for s in sessions for m in s["msgs"]],tools=[t for s in sessions for t in s["tools"]],attachs=[a for s in sessions for a in s.get("attachs",[])],edits=[e for s in sessions for e in s["edits"]])
+    return ParseResult(convs=[s["conv"] for s in sessions],msgs=[m for s in sessions for m in s["msgs"]],tools=[t for s in sessions for t in s["tools"]],attachs=[a for s in sessions for a in s["attachs"]],edits=[e for s in sessions for e in s["edits"]],edit_evidence=[v for s in sessions for v in s["edit_evidence"]])
 def parse_claude_code(projects_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult: return _parse_sessions(files or projects_dir.rglob("*.jsonl"),parse_claude_code_session,bindings)
 
 def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
@@ -888,8 +921,14 @@ def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
     anchor = lambda k: gen_id(src, f"{cid}:{next((i for i, _, _ in reversed(mitems) if i <= k), mitems[0][0])}")  # function_call items are not messages; attach to nearest preceding one
 
     function_out={p.get("call_id"):p.get("output","") for _,p in items if p.get("type")=="function_call_output"}
-    failed=lambda out:any(x in json.dumps(out).lower() for x in ("timed out","timeout","script failed","verification failed","is_error\": true")) or bool(re.search(r"(?:exit(?:ed with)? code|exit_code)[\"': ]+[1-9]\d*",json.dumps(out).lower()))
-    edit_ok=lambda call:call in function_out and not failed(function_out[call]) and (not str(function_out[call]).strip() or str(function_out[call]).strip().lower()=="ok" or bool(re.search(r"(?:exit(?:ed with)? code|exit_code)[\"': ]+0\b|script completed|success\. updated",json.dumps(function_out[call]).lower())))
+    def edit_result(call,outputs,outer=None):
+        if call not in outputs: return "unknown","result_missing"
+        raw=json.dumps(outputs[call]).lower().replace("\\","")
+        if any(x in raw for x in ("timed out","timeout","script failed","verification failed","is_error\": true","<tool_use_error>","aborted","rejected","denied","cancelled","canceled")) or re.search(r"(?:exit(?:ed with)? code|exit_code)[\"': ]+-?[1-9]\d*",raw): return "invalid","provider_failure"
+        if "process running with session id" in raw or "script running with cell id" in raw: return "unknown","nonterminal_result"
+        if not str(outputs[call]).strip() or str(outputs[call]).strip().lower() in ("ok","{}") or re.search(r"(?:exit(?:ed with)? code|exit_code)[\"': ]+0\b|script completed|success\. updated",raw): return "confirmed","provider_success"
+        return ("confirmed","provider_success") if outer=="completed" and not raw.strip('"') else ("unknown","inconclusive_result")
+    failed=lambda out:edit_result("result",{"result":out})[0]=="invalid"
     tools = [dict(id=gen_id(src,f"tool:{cid}:{p.get('call_id') or i}"),message_id=anchor(i),tool_name=p["name"],
                  input=json.dumps(args),output=json.dumps(function_out.get(p.get("call_id"),"")),status="failed" if p.get("call_id") in function_out and failed(function_out[p.get("call_id")]) else "complete" if p.get("call_id") in function_out else "pending",duration_ms=None,
                  created_at=timestamps.get(i))
@@ -925,19 +964,21 @@ def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
         flush(); return out
 
     def custom_edits(p):
-        code = p.get("input", ""); names = re.findall(r"await\s+tools\.apply_patch\(\s*(\w+)\s*\)", code); out=json.dumps(custom_out.get(p.get("call_id"), "")).lower(); ok=any(x in out for x in ("script completed","exit code: 0","success. updated")) and not any(x in out for x in ("script failed","verification failed")) and not re.search(r"exit code: [1-9]\d*",out)
-        if not ok or p.get("name") == "apply_patch": return patch_edits({"cmd":code}) if ok else []
-        vals = {n:v for n, s in re.findall(r"(?:const|let|var)\s+(\w+)\s*=\s*(\"(?:\\.|[^\"\\])*\")", code, re.S) if n in names and (v := safe_parse("codex custom edit", json.loads, s)) is not None}
-        patches = [vals[n] for n in names if n in vals] + [p for s in re.findall(r"await\s+tools\.apply_patch\(\s*(\"(?:\\.|[^\"\\])*\")\s*\)", code, re.S) if (p := safe_parse("codex custom edit", json.loads, s)) is not None]
+        code = p.get("input", ""); names = re.findall(r"await\s+tools\.apply_patch\(\s*(\w+)\s*\)", code)
+        if p.get("name") == "apply_patch": return patch_edits({"cmd":code})
+        def json_string(value):
+            try: return json.loads(value)
+            except json.JSONDecodeError: return None
+        vals = {n:v for n, s in re.findall(r"(?:const|let|var)\s+(\w+)\s*=\s*(\"(?:\\.|[^\"\\])*\")", code, re.S) if n in names and (v := json_string(s)) is not None}
+        patches = [vals[n] for n in names if n in vals] + [p for s in re.findall(r"await\s+tools\.apply_patch\(\s*(\"(?:\\.|[^\"\\])*\")\s*\)", code, re.S) if (p := json_string(s)) is not None]
         return [e for patch in patches if "*** Begin Patch" in patch for e in patch_edits({"cmd":patch})]
 
-    edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op,
-                 content=c, created_at=timestamps.get(i), old_content=o)
-            for i, p in items if p.get("type") == "function_call" and p.get("name") in ("exec_command", "shell_command", "shell")
-            and edit_ok(p.get("call_id")) and (args := norm_args(p)) for j, (fp, op, c, o) in enumerate(patch_edits(args))]
-    edits += [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op, content=c, created_at=timestamps.get(i), old_content=o) for i, p in items if p.get("type") == "custom_tool_call" for j, (fp, op, c, o) in enumerate(custom_edits(p))]
+    candidates=[(i,p,gen_id(src,f"tool:{cid}:{p.get('call_id') or i}"),edit_result(p.get("call_id"),function_out),patch_edits(args)) for i,p in items if p.get("type")=="function_call" and p.get("name") in ("exec_command","shell_command","shell") and (args:=norm_args(p))]
+    candidates += [(i,p,gen_id(src,f"custom:{cid}:{i}"),edit_result(p.get("call_id"),custom_out,p.get("status")),custom_edits(p)) for i,p in items if p.get("type")=="custom_tool_call"]
+    evidence=[dict(file_edit_id=gen_id(src,f"edit:{cid}:{i}:{j}"),status=status,reason=reason,tool_call_id=tool) for i,p,tool,(status,reason),rows in candidates for j,row in enumerate(rows)]
+    edits=[dict(id=gen_id(src,f"edit:{cid}:{i}:{j}"),message_id=anchor(i),file_path=fp,edit_type=op,content=c,created_at=timestamps.get(i),old_content=o) for i,p,tool,(status,reason),rows in candidates if status=="confirmed" for j,(fp,op,c,o) in enumerate(rows)]
 
-    return {"conv":dict(id=cid,source=src,title=meta.get("cwd") or jsonl.stem,created_at=min(timestamps.values(),default=None),updated_at=max(timestamps.values(),default=None),model=next((m["model"] for m in msgs if m["role"]=="assistant" and m["model"]),None),cwd=meta.get("cwd"),git_branch=(meta.get("git") or {}).get("branch"),project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":provider_id,"parent_session_id":spawn.get("parent_thread_id") or meta.get("parent_thread_id"),"session_kind":"subagent" if subagent is not None else "main","session_kind_evidence":"exact" if subagent is not None else "inferred","agent_name":spawn.get("agent_nickname") or meta.get("agent_nickname"),"agent_role":spawn.get("agent_role") or (subagent if isinstance(subagent,str) else meta.get("agent_role")),"agent_depth":spawn.get("depth"),"originator":meta.get("originator"),"client_version":meta.get("cli_version"),"capture_mode":"transcript","git_repository":(meta.get("git") or {}).get("repository_url"),"git_commit":(meta.get("git") or {}).get("commit_hash"),"forked_from_id":meta.get("forked_from_id"),"thread_source":meta.get("thread_source")}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")],"edits":edits}
+    return {"conv":dict(id=cid,source=src,title=meta.get("cwd") or jsonl.stem,created_at=min(timestamps.values(),default=None),updated_at=max(timestamps.values(),default=None),model=next((m["model"] for m in msgs if m["role"]=="assistant" and m["model"]),None),cwd=meta.get("cwd"),git_branch=(meta.get("git") or {}).get("branch"),project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":provider_id,"parent_session_id":spawn.get("parent_thread_id") or meta.get("parent_thread_id"),"session_kind":"subagent" if subagent is not None else "main","session_kind_evidence":"exact" if subagent is not None else "inferred","agent_name":spawn.get("agent_nickname") or meta.get("agent_nickname"),"agent_role":spawn.get("agent_role") or (subagent if isinstance(subagent,str) else meta.get("agent_role")),"agent_depth":spawn.get("depth"),"originator":meta.get("originator"),"client_version":meta.get("cli_version"),"capture_mode":"transcript","git_repository":(meta.get("git") or {}).get("repository_url"),"git_commit":(meta.get("git") or {}).get("commit_hash"),"forked_from_id":meta.get("forked_from_id"),"thread_source":meta.get("thread_source")}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")],"edits":edits,"edit_evidence":evidence}
 
 def parse_codex(codex_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult:
     if not (sessions_dir:=codex_dir/"sessions").exists(): return ParseResult()
@@ -960,7 +1001,7 @@ def upsert(conn, r: ParseResult):
     updated = {m["conversation_id"] for m in r.msgs if m["id"] in changed_msgs} - new_convs
     [conn.execute(_CONV_UPS,list(c.values())) for c in r.convs if old_convs.get(c["id"])!=tuple(c.values())]
     bindings and conn.executemany("INSERT INTO provider_sessions VALUES (?,?,?) ON CONFLICT(source,session_id) DO NOTHING",list(dict.fromkeys(bindings)))
-    frozen=getattr(r,"scopes",None)
+    frozen=r.scopes
     frozen=frozen if frozen is not None else pending_scopes([(c["id"],c["cwd"]) for c in r.convs])
     frozen and conn.executemany("INSERT OR IGNORE INTO provenance.conversation_scopes VALUES (?,?,?,?,?,?)",frozen)
     for m in r.msgs:
@@ -978,16 +1019,24 @@ def upsert(conn, r: ParseResult):
             if prev and payload(prev) != payload(vals): hist = list(prev); hist[0] = gen_id("history", f"{table}:{r['id']}:{json.dumps(payload(hist), default=str)}"); historical.append((table,hist[0])); cur(f"INSERT INTO {table} VALUES ({','.join(['?']*len(hist))}) ON CONFLICT DO NOTHING", hist)
             if not prev or payload(prev)!=payload(vals): cur(f"INSERT OR REPLACE INTO {table} VALUES ({','.join(['?']*len(vals))})", vals)
     [replace_preserving(t, rows) for t, rows in (("tool_calls", r.tools), ("attachments", r.attachs), ("artifacts", r.artifacts), ("file_edits", r.edits))]
-    (frozen_edits:=getattr(r,"edit_scopes",None)) is not None or (frozen_edits:=pending_edit_scopes(edit_scope_inputs(r)))
+    evidence_row=lambda v:(v["file_edit_id"],v["status"],v["reason"],v["tool_call_id"])
+    evidence={v[0]:v for v in conn.execute("SELECT * FROM provenance.file_edit_evidence WHERE file_edit_id IN (SELECT UNNEST(?))",[[v["file_edit_id"] for v in r.edit_evidence]+[e["id"] for e in r.edits]]).fetchall()} if r.edit_evidence or r.edits else {}
+    classified={v["file_edit_id"] for v in r.edit_evidence}; incoming=[*r.edit_evidence,*(dict(file_edit_id=e["id"],status="unknown",reason="unclassified_input",tool_call_id=None) for e in r.edits if e["id"] not in classified)]
+    required(all(set(v)=={"file_edit_id","status","reason","tool_call_id"} and v["status"] in {"confirmed","invalid","unknown","legacy_unverified"} and v["file_edit_id"] and v["reason"] for v in incoming),ValueError("invalid file edit evidence"))
+    tool_ids={v["tool_call_id"] for v in incoming if v["tool_call_id"]}; required(not tool_ids or conn.execute("SELECT COUNT(*) FROM tool_calls WHERE id IN (SELECT UNNEST(?))",[list(tool_ids)]).fetchone()[0]==len(tool_ids),ValueError("file edit evidence tool call unavailable"))
+    incoming and conn.executemany("INSERT OR REPLACE INTO provenance.file_edit_evidence VALUES (?,?,?,?)",list(map(evidence_row,incoming)))
+    evidence_changed={v["file_edit_id"] for v in incoming if evidence.get(v["file_edit_id"])!=evidence_row(v) and conn.execute("SELECT 1 FROM file_edits WHERE id=?",[v["file_edit_id"]]).fetchone()}
+    statuses={v["file_edit_id"]:v["status"] for v in incoming}
+    (frozen_edits:=r.edit_scopes) is not None or (frozen_edits:=pending_edit_scopes(edit_scope_inputs(r)))
     frozen_edits and conn.executemany("INSERT OR IGNORE INTO provenance.file_edit_scopes(file_edit_id,path,repository,root,checkout,route,observed_at) VALUES (?,?,?,?,?,?,?)",frozen_edits)
     [index_attachment_body(conn,a["id"],a["path"],a.get("size")) for a in r.attachs if a.get("path")]
     changed_convs={x[0] for x in cur(f"SELECT * FROM conversations WHERE id IN ({','.join(['?']*len(cids))})",cids).fetchall() if old_convs.get(x[0])!=x} if cids else set(); archive_msgs=changed_rows|changed_msgs-set(mids)
-    if changed_convs or archive_msgs or historical: _archive_touch(conn,[("conversations",x) for x in changed_convs]+[("messages",x) for x in archive_msgs]+historical)
-    r.provenance_edits,r.provenance_conversations={x["id"] for x in r.edits}&{i for t,i in historical if t=="file_edits"},changed_convs
+    if changed_convs or archive_msgs or historical or evidence_changed: _archive_touch(conn,[("conversations",x) for x in changed_convs]+[("messages",x) for x in archive_msgs]+historical+[("file_edits",x) for x in evidence_changed])
+    r.provenance_edits,r.provenance_conversations={x["id"] for x in r.edits if statuses.get(x["id"])=="confirmed"}&({i for t,i in historical if t=="file_edits"}|evidence_changed),changed_convs
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated), changed_msgs
 
 def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
-def hook_result(source, path, bindings=None): s = (parse_claude_code_session if source == "claude-code" else parse_codex_session)(path,bindings); return ParseResult(convs=[s["conv"]], msgs=s["msgs"], tools=s["tools"], attachs=s.get("attachs",[]), edits=s["edits"]) if s else ParseResult()
+def hook_result(source, path, bindings=None): s = (parse_claude_code_session if source == "claude-code" else parse_codex_session)(path,bindings); return ParseResult(convs=[s["conv"]],msgs=s["msgs"],tools=s["tools"],attachs=s["attachs"],edits=s["edits"],edit_evidence=s["edit_evidence"]) if s else ParseResult()
 def enqueue_hook(source, payload):
     path = Path(payload["transcript_path"]).expanduser().resolve(); root = hook_root(source).expanduser().resolve()
     if source not in ("claude-code", "codex") or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")
@@ -1230,9 +1279,9 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
     typer.echo(f"ingest: pending={pending}, embedding_ids={dirty}, embedding_claims={claims}, last={datetime.fromtimestamp(last/1e9).isoformat(timespec='seconds') if last else 'never'}, oldest={age:.0f}s, last_batch={progress.get('processed',0)} ok/{progress.get('failed',0)} failed")
     if DB_PATH.exists():
         try:
-            conn = get_db(read_only=True); cols = set(conn.execute("SELECT table_name,column_name FROM information_schema.columns").fetchall()); required = {"conversations":("id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"), "messages":("id","conversation_id","role","content","thinking","created_at","model","metadata","embedding","parent_id"), "tool_calls":("id","message_id","tool_name","input","output","status","duration_ms","created_at"), "attachments":("id","message_id","filename","mime_type","size","path","url","created_at"), "artifacts":("id","conversation_id","artifact_type","title","content","language","created_at","version"), "file_edits":("id","message_id","file_path","edit_type","content","created_at","old_content")}; missing = [f"{t}.{c}" for t, cs in required.items() for c in cs if (t,c) not in cols]
-            convs, msgs, unembedded, latest = conn.execute(f"SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM messages WHERE embedding IS NULL AND COALESCE(content,'')!=''{_NOISE}),(SELECT MAX(updated_at) FROM conversations)").fetchone() if not missing else (0,0,0,None); fts = bool(conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()); conn.close()
-            typer.echo(f"archive: {convs} convs, {msgs} msgs, {unembedded} unembedded, {DB_PATH.stat().st_size/1024**3:.1f} GB, latest={latest or 'never'}, schema={'ready' if not missing else 'missing:' + ','.join(missing)}, fts={'yes' if fts else 'no'}")
+            conn = get_db(read_only=True); cols = set(conn.execute("SELECT table_name,column_name FROM information_schema.columns").fetchall()); required = {"conversations":("id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"), "messages":("id","conversation_id","role","content","thinking","created_at","model","metadata","embedding","parent_id"), "tool_calls":("id","message_id","tool_name","input","output","status","duration_ms","created_at"), "attachments":("id","message_id","filename","mime_type","size","path","url","created_at"), "artifacts":("id","conversation_id","artifact_type","title","content","language","created_at","version"), "file_edits":("id","message_id","file_path","edit_type","content","created_at","old_content"), "file_edit_evidence":("file_edit_id","status","reason","tool_call_id")}; missing = [f"{t}.{c}" for t, cs in required.items() for c in cs if (t,c) not in cols]
+            convs, msgs, unembedded, latest = conn.execute(f"SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM messages WHERE embedding IS NULL AND COALESCE(content,'')!=''{_NOISE}),(SELECT MAX(updated_at) FROM conversations)").fetchone() if not missing else (0,0,0,None); fts = bool(conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()); evidence=dict(conn.execute("SELECT status,COUNT(*) FROM provenance.file_edit_evidence GROUP BY status").fetchall()) if not missing else {}; conn.close()
+            typer.echo(f"archive: {convs} convs, {msgs} msgs, {unembedded} unembedded, {DB_PATH.stat().st_size/1024**3:.1f} GB, latest={latest or 'never'}, schema={'ready' if not missing else 'missing:' + ','.join(missing)}, fts={'yes' if fts else 'no'}, edit_evidence="+",".join(f"{k}:{evidence.get(k,0)}" for k in ("confirmed","unknown","invalid","legacy_unverified")))
             if missing or not fts: typer.echo("repair: convos init")
             elif unembedded: typer.echo("repair: convos embed")
         except Exception as e: typer.echo(f"archive: unavailable ({e})")
@@ -1302,8 +1351,8 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional
                    for m in conn.execute(f"SELECT m.role,m.content,m.thinking,m.created_at,m.model FROM messages m WHERE m.conversation_id=? ORDER BY {MESSAGE_ORDER}",[r[0]]).fetchall()]
             tcs = [dict(tool=t[0], input=json.loads(t[1]), output=json.loads(t[2]), status=t[3])
                   for t in conn.execute("SELECT tool_name, input, output, status FROM tool_calls tc JOIN messages m ON tc.message_id = m.id WHERE m.conversation_id = ?", [r[0]]).fetchall()]
-            edits = [dict(file=e[0], type=e[1], content=e[2])
-                    for e in conn.execute("SELECT fe.file_path, fe.edit_type, fe.content FROM file_edits fe JOIN messages m ON fe.message_id = m.id WHERE m.conversation_id = ?", [r[0]]).fetchall()]
+            edits = [dict(file=e[0], type=e[1], content=e[2], evidence_status=e[3], evidence_reason=e[4], tool_call_id=e[5])
+                    for e in conn.execute("SELECT fe.file_path,fe.edit_type,fe.content,COALESCE(v.status,'legacy_unverified'),COALESCE(v.reason,'source_unavailable'),v.tool_call_id FROM file_edits fe JOIN messages m ON fe.message_id=m.id LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id WHERE m.conversation_id=? ORDER BY fe.created_at NULLS FIRST,fe.id",[r[0]]).fetchall()]
             result.append(dict(id=r[0], source=r[1], title=r[2], created_at=str(r[3]) if r[3] else None, updated_at=str(r[4]) if r[4] else None,
                               model=r[5], cwd=r[6], git_branch=r[7], project_id=r[8], messages=msgs, tool_calls=tcs, file_edits=edits))
         output.write_text(json.dumps(result, indent=2))
