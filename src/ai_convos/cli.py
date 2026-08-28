@@ -6,7 +6,7 @@ from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remot
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT = find_root(); DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"; STATE_PATH = DATA_DIR / "sync_state.json"
-HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty"," AND NOT regexp_matches(content,'^(Base directory for this skill:|# AGENTS\\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))')",8,10,20,8/15  # conservative policy below the observed ~200-detail failure point
+HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty"," AND NOT regexp_matches(content,'^(Base directory for this skill:|# AGENTS\\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))')",8,10,20,8/15,2  # conservative policy below the observed ~200-detail failure point
 
 # ---- db helpers ----
 def open_db(path=None,read_only=False,wait=30,deadline=None):
@@ -481,7 +481,7 @@ def extract_content(content) -> dict:
                 "\n".join(str(b) for b in content if isinstance(b, str)).strip(),
         "thinking": "\n".join(b["thinking"] for b in blocks if b.get("type") == "thinking" and b.get("thinking")).strip() or None,
         "tools": [{"name": b["name"], "input": b.get("input", {}), "id": b.get("id")} for b in blocks if b.get("type") == "tool_use"] +
-                 [{"id": b.get("tool_use_id"), "output": b.get("content", "")} for b in blocks if b.get("type") == "tool_result"],
+                 [{"id": b.get("tool_use_id"), "output": b.get("content", ""), "error":b.get("is_error",False)} for b in blocks if b.get("type") == "tool_result"],
         "attachments": [{"filename": b.get("name", b.get("file_name")), "mime_type": b.get("content_type", b.get("file_type")),
                         "size": b.get("size", b.get("file_size")), "url": b.get("asset_pointer", b.get("url"))}
                        for b in blocks if b.get("type") in ("image_asset_pointer", "file") or b.get("content_type") in ("image_asset_pointer", "file")]
@@ -683,7 +683,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
             cid, gizmo = gen_id("chatgpt", item["id"]), item.get("gizmo_id"); conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=20, retries=2, before_request=pace, rate_limit_backoff=300)
             msgs, tools, attachs = chatgpt_mapping(cid, conv.get("mapping", {})); times = [m["created_at"] for m in msgs if m["created_at"]]
             return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_any(conv.get("create_time") or item.get("create_time")) or min(times, key=datetime.timestamp, default=None), updated_at=ts_any(conv.get("update_time") or item.get("update_time")) or max(times, key=datetime.timestamp, default=None), model=item.get("model"), cwd=None, git_branch=None,
-                                  project_id=gizmo, metadata=json.dumps({"session_id":item["id"],"session_kind":"main","capture_mode":"api","remote_update_time":conv.get("update_time") or item.get("update_time"), **({"gizmo_id":gizmo} if gizmo else {})})), msgs=msgs, tools=tools, attachs=attachs)
+                                  project_id=gizmo, metadata=json.dumps({"session_id":item["id"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"api","remote_update_time":conv.get("update_time") or item.get("update_time"), **({"gizmo_id":gizmo} if gizmo else {})})), msgs=msgs, tools=tools, attachs=attachs)
         listed, seen, tail, offset, fetched, total = [], set(), set(), 0, 0, None
         while True:
             data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100&order=updated", cookies, headers, timeout=20, retries=1, before_request=pace, rate_limit_backoff=300)
@@ -743,7 +743,7 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
         project = item.get("project_uuid")
         r.convs.append(dict(id=cid, source="claude", title=item.get("name"), created_at=ts_from_iso(item.get("created_at")),
                            updated_at=ts_from_iso(item.get("updated_at")), model=item.get("model"), cwd=None, git_branch=None,
-                           project_id=project, metadata=json.dumps({"session_id":item["uuid"],"session_kind":"main","capture_mode":"api",**({"project_uuid":project} if project else {})})))
+                           project_id=project, metadata=json.dumps({"session_id":item["uuid"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"api",**({"project_uuid":project} if project else {})})))
         conv = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{item['uuid']}", cookies, headers)
         for m in conv.get("chat_messages", []):
             mid = gen_id("claude", f"{cid}:{m.get('uuid', '')}")
@@ -784,7 +784,7 @@ def parse_chatgpt(path: Path) -> ParseResult:
         cid, gizmo = gen_id("chatgpt", c.get("id", "")), c.get("gizmo_id")
         conv = dict(id=cid, source="chatgpt", title=c.get("title"), created_at=ts_any(c.get("create_time")),
                     updated_at=ts_any(c.get("update_time")), model=c.get("default_model_slug"), cwd=None, git_branch=None,
-                    project_id=gizmo, metadata=json.dumps({"session_id":c.get("id", ""),"session_kind":"main","capture_mode":"export",**({"gizmo_id":gizmo} if gizmo else {})}))
+                    project_id=gizmo, metadata=json.dumps({"session_id":c.get("id", ""),"session_kind":"main","session_kind_evidence":"exact","capture_mode":"export",**({"gizmo_id":gizmo} if gizmo else {})}))
         msgs, tools, attachs = chatgpt_mapping(cid, c.get("mapping", {}))
         return dict(conv=conv, msgs=msgs, tools=tools, attachs=attachs)
     for idx, c in enumerate(data):
@@ -798,22 +798,17 @@ def parse_claude(path: Path) -> ParseResult:
     def parse_conv(c):
         cid = gen_id("claude", c["uuid"] if "uuid" in c else c["id"])
         msgs_data = c.get("chat_messages", [])
+        parsed=[(m,gen_id("claude",f"{cid}:{m['uuid'] if 'uuid' in m else m['id']}"),extract_content(m.get("text") or m.get("content", ""))) for m in msgs_data]
+        results={t["id"]:t for m,mid,ec in parsed for t in ec["tools"] if "output" in t and t.get("id")}
         return {
             "conv": dict(id=cid, source="claude", title=c.get("name") or c.get("title"), created_at=ts_from_iso(c.get("created_at")),
-                        updated_at=ts_from_iso(c.get("updated_at")), model=c.get("model"), cwd=None, git_branch=None, project_id=None, metadata=json.dumps({"session_id":c["uuid"] if "uuid" in c else c["id"],"session_kind":"main","capture_mode":"export"})),
-            "msgs": [dict(id=(mid := gen_id("claude", f"{cid}:{m['uuid'] if 'uuid' in m else m['id']}")), conversation_id=cid,
-                        role="user" if m.get("sender")=="human" else m.get("sender", "unknown"), content=ec["text"], thinking=ec["thinking"],
-                        created_at=ts_from_iso(m.get("created_at")), model=m.get("model"), metadata="{}", parent_id=None)
-                    for m in msgs_data if (ec := extract_content(m.get("text") or m.get("content", "")))["text"]],
-            "attachs": [dict(id=gen_id("claude", f"attach:{gen_id('claude', f'{cid}:{m['uuid'] if 'uuid' in m else m['id']}')}:{i}"),
-                            message_id=gen_id("claude", f"{cid}:{m['uuid'] if 'uuid' in m else m['id']}"),
-                            filename=a.get("file_name"), mime_type=a.get("file_type"), size=a.get("file_size"),
-                            path=None, url=a.get("url"), created_at=ts_from_iso(m.get("created_at")))
-                       for m in msgs_data for i, a in enumerate(m.get("attachments", []))]}
+                        updated_at=ts_from_iso(c.get("updated_at")), model=c.get("model"), cwd=None, git_branch=None, project_id=None, metadata=json.dumps({"session_id":c["uuid"] if "uuid" in c else c["id"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"export"})),
+            "msgs":[dict(id=mid,conversation_id=cid,role="user" if m.get("sender")=="human" else m.get("sender","unknown"),content=ec["text"],thinking=ec["thinking"],created_at=ts_from_iso(m.get("created_at")),model=m.get("model"),metadata="{}",parent_id=None) for m,mid,ec in parsed if ec["text"] or ec["tools"] or ec["attachments"] or m.get("attachments")],
+            "tools":[dict(id=gen_id("claude",f"tool:{mid}:{t.get('id') or i}"),message_id=mid,tool_name=t["name"],input=json.dumps(t.get("input",{})),output=json.dumps((results.get(t.get("id")) or {}).get("output","")),status="failed" if (results.get(t.get("id")) or {}).get("error") else "complete" if t.get("id") in results else "pending",duration_ms=None,created_at=ts_from_iso(m.get("created_at"))) for m,mid,ec in parsed for i,t in enumerate(ec["tools"]) if "name" in t],
+            "attachs":[dict(id=gen_id("claude",f"attach:{mid}:{i}"),message_id=mid,filename=a.get("name",a.get("file_name")),mime_type=a.get("content_type",a.get("file_type")),size=a.get("size",a.get("file_size")),path=None,url=a.get("asset_pointer",a.get("url")),created_at=ts_from_iso(m.get("created_at"))) for m,mid,ec in parsed for i,a in enumerate([*ec["attachments"],*m.get("attachments",[])])]}
     parsed = [p for idx, c in enumerate(data)
               if (p := safe_parse(f"claude export conv {c.get('uuid') if isinstance(c, dict) else idx}", parse_conv, c))]
-    return ParseResult(convs=[p["conv"] for p in parsed], msgs=[m for p in parsed for m in p["msgs"]],
-                      attachs=[a for p in parsed for a in p["attachs"]])
+    return ParseResult(convs=[p["conv"] for p in parsed],msgs=[m for p in parsed for m in p["msgs"]],tools=[t for p in parsed for t in p["tools"]],attachs=[a for p in parsed for a in p["attachs"]])
 
 def load_jsonl(path: Path) -> list[dict]:
     out = []
@@ -828,10 +823,11 @@ def load_jsonl(path: Path) -> list[dict]:
 def parse_claude_code_session(jsonl: Path) -> dict:
     events = load_jsonl(jsonl)
     if not events: return None
-    system,root_session,agent_id=next((e for e in events if e.get("type")=="system"),{}),next((e.get("sessionId") or e.get("session_id") for e in events if e.get("sessionId") or e.get("session_id")),jsonl.stem),next((e["agentId"] for e in events if e.get("agentId")),jsonl.stem if "subagents" in jsonl.parts else None)
-    cid,src,kind,parent=gen_id("claude-code",str(jsonl)),"claude-code","subagent" if agent_id or any(e.get("isSidechain") for e in events) else "main",root_session if agent_id and agent_id!=root_session else None
+    system,root_session,explicit_agent,sidechain=next((e for e in events if e.get("type")=="system"),{}),next((e.get("sessionId") or e.get("session_id") for e in events if e.get("sessionId") or e.get("session_id")),jsonl.stem),next((e["agentId"] for e in events if e.get("agentId")),None),any(e.get("isSidechain") for e in events)
+    agent_id=explicit_agent or (jsonl.stem if "subagents" in jsonl.parts else None)
+    cid,src,kind,parent=gen_id("claude-code",str(jsonl)),"claude-code","subagent" if agent_id or sidechain else "main",root_session if agent_id and agent_id!=root_session else None
     timestamps = [ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e]
-    msg_events,tool_results=[(i,e) for i,e in enumerate(events) if "message" in e],{t["id"]:t["output"] for e in events if "message" in e for t in extract_content(e["message"].get("content",[]))["tools"] if "output" in t and t.get("id")}
+    msg_events,tool_results=[(i,e) for i,e in enumerate(events) if "message" in e],{t["id"]:t for e in events if "message" in e for t in extract_content(e["message"].get("content",[]))["tools"] if "output" in t and t.get("id")}
     uuid2id = {e["uuid"]: gen_id(src, f"{cid}:{idx}") for idx, (i, e) in enumerate(msg_events) if "uuid" in e}
 
     def make_msg(idx, i, e):
@@ -844,8 +840,8 @@ def parse_claude_code_session(jsonl: Path) -> dict:
         c, ts = extract_content(e["message"].get("content", [])), ts_from_iso(e.get("timestamp"))
         mid = gen_id(src, f"{cid}:{idx}")
         return [dict(id=gen_id(src,f"tool:{cid}:{t.get('id') or f'{idx}:{j}'}"),message_id=mid,tool_name=t["name"],
-                    input=json.dumps(t.get("input",{})),output=json.dumps(tool_results.get(t.get("id"),"")),
-                    status="complete" if t.get("id") in tool_results else "pending",duration_ms=None,created_at=ts) for j,t in enumerate(c["tools"]) if "name" in t]
+                    input=json.dumps(t.get("input",{})),output=json.dumps((tool_results.get(t.get("id")) or {}).get("output","")),
+                    status="failed" if (tool_results.get(t.get("id")) or {}).get("error") else "complete" if t.get("id") in tool_results else "pending",duration_ms=None,created_at=ts) for j,t in enumerate(c["tools"]) if "name" in t]
 
     def make_edits(idx, i, e):
         c, ts = extract_content(e["message"].get("content", [])), ts_from_iso(e.get("timestamp"))
@@ -853,7 +849,7 @@ def parse_claude_code_session(jsonl: Path) -> dict:
         return [dict(id=gen_id(src, f"edit:{cid}:{idx}:{j}"), message_id=mid, file_path=t["input"]["file_path"],
                     edit_type=t["name"].lower(), content=t["input"].get("content") or t["input"].get("new_string", ""), created_at=ts,
                     old_content=t["input"].get("old_string"))
-               for j, t in enumerate(c["tools"]) if t.get("name") in ("Write", "Edit", "MultiEdit") and t.get("input", {}).get("file_path")]
+               for j, t in enumerate(c["tools"]) if t.get("name") in ("Write", "Edit", "MultiEdit") and t.get("input", {}).get("file_path") and t.get("id") in tool_results and not tool_results[t["id"]].get("error")]
 
     msgs = [make_msg(idx, i, e) for idx, (i, e) in enumerate(msg_events) if (c := extract_content(e["message"].get("content", "")))["text"] or c["tools"]]  # keep tool-only turns: tools/edits reference them
     if not msgs: return None
@@ -861,7 +857,7 @@ def parse_claude_code_session(jsonl: Path) -> dict:
         "conv": dict(id=cid, source=src, title=f"{jsonl.parent.name.replace('-Users-', '~/').replace('-', '/')} ({jsonl.stem[:8]})",
                     created_at=timestamps[0] if timestamps else None, updated_at=timestamps[-1] if timestamps else None,
                     model=next((m["model"] for m in msgs if m["model"] and m["model"]!="<synthetic>"),None), cwd=system.get("cwd") or next((e.get("cwd") for e in events if e.get("cwd")),None), git_branch=system.get("gitBranch") or next((e.get("gitBranch") for e in events if e.get("gitBranch")),None), project_id=None,
-                    metadata=json.dumps({k:v for k,v in {"session_id":agent_id or root_session,"parent_session_id":parent,"session_kind":kind,"agent_id":agent_id,"agent_name":next((e.get("agentName") for e in events if e.get("agentName")),None),"agent_role":next((e.get("agentType") for e in events if e.get("agentType")),None),"agent_depth":next((e.get("agentDepth") for e in events if e.get("agentDepth") is not None),None),"originator":system.get("entrypoint"),"client_version":system.get("version"),"capture_mode":"transcript"}.items() if v is not None})),
+                    metadata=json.dumps({k:v for k,v in {"session_id":agent_id or root_session,"parent_session_id":parent,"session_kind":kind,"session_kind_evidence":"exact" if explicit_agent or sidechain else "inferred","agent_id":agent_id,"agent_name":next((e.get("agentName") for e in events if e.get("agentName")),None),"agent_role":next((e.get("agentType") for e in events if e.get("agentType")),None),"agent_depth":next((e.get("agentDepth") for e in events if e.get("agentDepth") is not None),None),"originator":system.get("entrypoint"),"client_version":system.get("version"),"capture_mode":"transcript"}.items() if v is not None})),
         "msgs": msgs,
         "tools": [t for idx, (i, e) in enumerate(msg_events) for t in make_tools(idx, i, e)],
         "edits": [ed for idx, (i, e) in enumerate(msg_events) for ed in make_edits(idx, i, e)]}
@@ -894,8 +890,10 @@ def parse_codex_session(jsonl: Path) -> dict | None:
     anchor = lambda k: gen_id(src, f"{cid}:{next((i for i, _, _ in reversed(mitems) if i <= k), mitems[0][0])}")  # function_call items are not messages; attach to nearest preceding one
 
     function_out={p.get("call_id"):p.get("output","") for _,p in items if p.get("type")=="function_call_output"}
+    failed=lambda out:any(x in json.dumps(out).lower() for x in ("timed out","timeout","script failed","verification failed","is_error\": true")) or bool(re.search(r"(?:exit(?:ed with)? code|exit_code)[\"': ]+[1-9]\d*",json.dumps(out).lower()))
+    edit_ok=lambda call:call in function_out and not failed(function_out[call]) and (not str(function_out[call]).strip() or str(function_out[call]).strip().lower()=="ok" or bool(re.search(r"(?:exit(?:ed with)? code|exit_code)[\"': ]+0\b|script completed|success\. updated",json.dumps(function_out[call]).lower())))
     tools = [dict(id=gen_id(src,f"tool:{cid}:{p.get('call_id') or i}"),message_id=anchor(i),tool_name=p["name"],
-                 input=json.dumps(args),output=json.dumps(function_out.get(p.get("call_id"),"")),status="complete" if p.get("call_id") in function_out else "pending",duration_ms=None,
+                 input=json.dumps(args),output=json.dumps(function_out.get(p.get("call_id"),"")),status="failed" if p.get("call_id") in function_out and failed(function_out[p.get("call_id")]) else "complete" if p.get("call_id") in function_out else "pending",duration_ms=None,
                  created_at=timestamps[i] if i < len(timestamps) else None)
             for i,p in items if p.get("type")=="function_call" and (args:=norm_args(p)) is not None]
     custom_out = {p.get("call_id"):p.get("output", "") for _, p in items if p.get("type") == "custom_tool_call_output"}
@@ -939,14 +937,14 @@ def parse_codex_session(jsonl: Path) -> dict | None:
     edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op,
                  content=c, created_at=timestamps[i] if i < len(timestamps) else None, old_content=o)
             for i, p in items if p.get("type") == "function_call" and p.get("name") in ("exec_command", "shell_command", "shell")
-            and (args := norm_args(p)) for j, (fp, op, c, o) in enumerate(patch_edits(args))]
+            and edit_ok(p.get("call_id")) and (args := norm_args(p)) for j, (fp, op, c, o) in enumerate(patch_edits(args))]
     edits += [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op, content=c, created_at=timestamps[i] if i < len(timestamps) else None, old_content=o) for i, p in items if p.get("type") == "custom_tool_call" for j, (fp, op, c, o) in enumerate(custom_edits(p))]
 
     return {
         "conv": dict(id=cid, source=src, title=meta.get("cwd") or jsonl.stem,
                     created_at=timestamps[0] if timestamps else None, updated_at=timestamps[-1] if timestamps else None,
                     model=next((m["model"] for m in msgs if m["role"]=="assistant" and m["model"]),None), cwd=meta.get("cwd"), git_branch=(meta.get("git") or {}).get("branch"), project_id=None,
-                    metadata=json.dumps({k:v for k,v in {"session_id":provider_id,"parent_session_id":spawn.get("parent_thread_id") or meta.get("parent_thread_id"),"session_kind":"subagent" if spawn else "main","agent_name":spawn.get("agent_nickname") or meta.get("agent_nickname"),"agent_role":spawn.get("agent_role") or meta.get("agent_role"),"agent_depth":spawn.get("depth"),"originator":meta.get("originator"),"client_version":meta.get("cli_version"),"capture_mode":"transcript","git_repository":(meta.get("git") or {}).get("repository_url"),"git_commit":(meta.get("git") or {}).get("commit_hash"),"forked_from_id":meta.get("forked_from_id"),"thread_source":meta.get("thread_source")}.items() if v is not None})),
+                    metadata=json.dumps({k:v for k,v in {"session_id":provider_id,"parent_session_id":spawn.get("parent_thread_id") or meta.get("parent_thread_id"),"session_kind":"subagent" if spawn else "main","session_kind_evidence":"exact" if spawn else "inferred","agent_name":spawn.get("agent_nickname") or meta.get("agent_nickname"),"agent_role":spawn.get("agent_role") or meta.get("agent_role"),"agent_depth":spawn.get("depth"),"originator":meta.get("originator"),"client_version":meta.get("cli_version"),"capture_mode":"transcript","git_repository":(meta.get("git") or {}).get("repository_url"),"git_commit":(meta.get("git") or {}).get("commit_hash"),"forked_from_id":meta.get("forked_from_id"),"thread_source":meta.get("thread_source")}.items() if v is not None})),
         "msgs": msgs, "tools": tools, "attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")], "edits": edits}
 
 def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult:
@@ -1333,8 +1331,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if not path.exists(): return None
         if name in ("codex", "claude-code"):
             prev, mt = local.get(name, {}).get("files", {}), {str(p):m for p in path.rglob("*.jsonl") if (m:=stat_mtime(p)) is not None}; files=list(map(Path,mt))
-            if not (chg := files if full else [p for p in files if mt.get(str(p), 0) > prev.get(str(p), 0)]): return None
-            return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path, fs=chg: parser(p, fs), state=("local", name, {"files": mt}))
+            if not (chg := files if full or local.get(name,{}).get("parser")!=PARSER_EPOCH else [p for p in files if mt.get(str(p), 0) > prev.get(str(p), 0)]): return None
+            return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path, fs=chg: parser(p, fs), state=("local", name, {"parser":PARSER_EPOCH,"files":mt}))
         mtime = latest_mtime(path)
         if not full and mtime <= local.get(name, {}).get("mtime", 0): return None
         return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path: parser(p), state=("local", name, {"mtime": mtime}))

@@ -33,7 +33,7 @@ class TestClaudeCodeParser:
         assert result.msgs[0]["role"] == "user"
         assert result.msgs[1]["role"] == "assistant" and result.msgs[1]["model"] == "claude-opus-4-8"
         assert result.convs[0]["model"] == "claude-opus-4-8"
-        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"session-123","session_kind":"main","originator":"cli","client_version":"2.1.9","capture_mode":"transcript"}
+        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"session-123","session_kind":"main","session_kind_evidence":"inferred","originator":"cli","client_version":"2.1.9","capture_mode":"transcript"}
 
     def test_subagent_session_metadata_is_normalized(self,tmp_path):
         from ai_convos.cli import parse_claude_code
@@ -42,7 +42,7 @@ class TestClaudeCodeParser:
             {"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":"inspect"}},
             {"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"done"}]}}]))
         conv=parse_claude_code(tmp_path/".claude/projects").convs[0]; meta=json.loads(conv["metadata"])
-        assert (conv["cwd"],conv["git_branch"],conv["model"]) == ("/repo","main","claude-opus-4-8") and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","agent_id":"child","client_version":"2.1.9","capture_mode":"transcript"}
+        assert (conv["cwd"],conv["git_branch"],conv["model"]) == ("/repo","main","claude-opus-4-8") and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","session_kind_evidence":"exact","agent_id":"child","client_version":"2.1.9","capture_mode":"transcript"}
 
     def test_parent_thread_tree(self, tmp_path):
         """parentUuid chains become parent_id links; roots and unknown parents stay NULL."""
@@ -122,13 +122,14 @@ class TestClaudeCodeParser:
         jsonl = session_dir / "session.jsonl"
         jsonl.write_text("\n".join([
             json.dumps({"type": "assistant", "timestamp": "2024-01-01T00:00:00Z", "message": {"content": [
-                {"type": "tool_use", "name": "Write", "input": {"file_path": "/test.py", "content": "print('hello')"}},
+                {"type": "tool_use", "id":"write-1", "name": "Write", "input": {"file_path": "/test.py", "content": "print('hello')"}},
                 {"type": "text", "text": "Created file."}
             ]}}),
+            json.dumps({"type":"user","timestamp":"2024-01-01T00:00:30Z","message":{"content":[{"type":"tool_result","tool_use_id":"write-1","content":"ok","is_error":False}]}}),
             json.dumps({"type": "assistant", "timestamp": "2024-01-01T00:01:00Z", "message": {"content": [
-                {"type": "tool_use", "name": "Edit", "input": {"file_path": "/test.py", "old_string": "print('hello')", "new_string": "print('world')"}},
+                {"type": "tool_use", "id":"edit-1", "name": "Edit", "input": {"file_path": "/test.py", "old_string": "print('hello')", "new_string": "print('world')"}},
                 {"type": "text", "text": "Updated file."}
-            ]}}),
+            ]}}), json.dumps({"type":"user","timestamp":"2024-01-01T00:01:30Z","message":{"content":[{"type":"tool_result","tool_use_id":"edit-1","content":"ok","is_error":False}]}}),
         ]))
 
         result = parse_claude_code(tmp_path / ".claude" / "projects")
@@ -161,7 +162,12 @@ class TestClaudeCodeParser:
         msg_ids = {m["id"] for m in result.msgs}
         assert len(result.msgs) == 2  # tool-only assistant turn included despite empty text
         assert all(t["message_id"] in msg_ids for t in result.tools)
-        assert all(e["message_id"] in msg_ids for e in result.edits)
+        assert result.edits == []
+
+    def test_failed_edit_result_retains_tool_but_not_canonical_edit(self,tmp_path):
+        from ai_convos.cli import parse_claude_code
+        session=tmp_path/".claude/projects/-test"; session.mkdir(parents=True); (session/"s.jsonl").write_text("\n".join(map(json.dumps,[{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"x.py","old_string":"a","new_string":"b"}}]}},{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"e1","content":"permission denied","is_error":True}]}}])))
+        result=parse_claude_code(tmp_path/".claude/projects"); assert len(result.tools)==1 and result.tools[0]["status"]=="failed" and result.edits==[]
 
     def test_empty_session_skipped(self, tmp_path):
         """Empty sessions (no messages) are skipped."""
@@ -205,7 +211,7 @@ class TestCodexParser:
         assert result.convs[0]["cwd"] == "/test"
         assert (result.convs[0]["model"],result.convs[0]["git_branch"]) == ("gpt-5.6-sol","main")
         assert {m["model"] for m in result.msgs} == {"gpt-5.6-sol"}
-        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"provider-123","session_kind":"main","originator":"codex-tui","client_version":"0.116.0","capture_mode":"transcript","git_repository":"https://example.com/repo.git","git_commit":"abc"}
+        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"provider-123","session_kind":"main","session_kind_evidence":"inferred","originator":"codex-tui","client_version":"0.116.0","capture_mode":"transcript","git_repository":"https://example.com/repo.git","git_commit":"abc"}
 
     def test_subagent_session_metadata_is_normalized(self,tmp_path):
         from ai_convos.cli import parse_codex
@@ -216,7 +222,7 @@ class TestCodexParser:
             {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"}]}},
             {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}]))
         conv=parse_codex(tmp_path/".codex").convs[0]; meta=json.loads(conv["metadata"])
-        assert conv["model"] == "gpt-5.6-luna" and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","agent_name":"Ada","agent_role":"explorer","agent_depth":1,"client_version":"0.116.0","capture_mode":"transcript"}
+        assert conv["model"] == "gpt-5.6-luna" and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","session_kind_evidence":"exact","agent_name":"Ada","agent_role":"explorer","agent_depth":1,"client_version":"0.116.0","capture_mode":"transcript"}
 
     def test_input_images_become_bounded_durable_attachments(self,tmp_path,monkeypatch):
         import ai_convos.cli as cli
@@ -293,8 +299,9 @@ class TestCodexParser:
         jsonl.write_text("\n".join([
             json.dumps({"type": "session_meta", "timestamp": "2024-01-01T00:00:00Z", "payload": {"cwd": "/repo"}}),
             json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "write it"}]}}),
-            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:02Z", "payload": {"type": "function_call", "name": "exec_command", "arguments": json.dumps({"cmd": cmd})}}),
-            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:03Z", "payload": {"type": "function_call", "name": "exec_command", "arguments": json.dumps({"cmd": "python3 - <<'PY'\nprint(1)\nPY"})}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:02Z", "payload": {"type": "function_call", "name": "exec_command", "call_id":"write", "arguments": json.dumps({"cmd": cmd})}}),
+            json.dumps({"type":"response_item","timestamp":"2024-01-01T00:00:03Z","payload":{"type":"function_call_output","call_id":"write","output":"Process exited with code 0"}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:04Z", "payload": {"type": "function_call", "name": "exec_command", "arguments": json.dumps({"cmd": "python3 - <<'PY'\nprint(1)\nPY"})}}),
         ]))
 
         result = parse_codex(tmp_path / ".codex")
@@ -319,7 +326,8 @@ class TestCodexParser:
         jsonl.write_text("\n".join([
             json.dumps({"type": "session_meta", "timestamp": "2024-01-01T00:00:00Z", "payload": {"cwd": "/repo"}}),
             json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "patch it"}]}}),
-            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:02Z", "payload": {"type": "function_call", "name": "exec_command", "arguments": json.dumps({"cmd": patch, "workdir": "/repo"})}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:02Z", "payload": {"type": "function_call", "name": "exec_command", "call_id":"patch", "arguments": json.dumps({"cmd": patch, "workdir": "/repo"})}}),
+            json.dumps({"type":"response_item","timestamp":"2024-01-01T00:00:03Z","payload":{"type":"function_call_output","call_id":"patch","output":"Exit code: 0"}}),
         ]))
 
         result = parse_codex(tmp_path / ".codex")
@@ -343,6 +351,11 @@ class TestCodexParser:
             {"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"Script completed\nWall time 0.0 seconds\nOutput:\n"},{"type":"input_text","text":"{}"}]}}]))
         result = parse_codex(tmp_path/".codex"); assert len(result.tools) == 1 and result.tools[0]["tool_name"] == "exec" and result.tools[0]["status"] == "complete" and json.loads(result.tools[0]["input"])["code"] == code and "Script completed" in result.tools[0]["output"]
         assert len(result.edits) == 1 and (result.edits[0]["file_path"], result.edits[0]["old_content"], result.edits[0]["content"]) == ("/repo/src/app.py", "old", "new")
+
+    def test_failed_missing_and_timed_out_function_edits_are_not_facts(self,tmp_path):
+        from ai_convos.cli import parse_codex
+        sessions=tmp_path/".codex/sessions"; sessions.mkdir(parents=True); call=lambda cid,path:{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":cid,"arguments":json.dumps({"cmd":f"echo x > {path}"})}}; output=lambda cid,text:{"type":"response_item","payload":{"type":"function_call_output","call_id":cid,"output":text}}; events=[{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"try"}]}},call("failed","a.py"),output("failed","Process exited with code 2"),call("timeout","b.py"),output("timeout","Command timed out"),call("missing","c.py")]; (sessions/"s.jsonl").write_text("\n".join(map(json.dumps,events))); result=parse_codex(tmp_path/".codex")
+        assert len(result.tools)==3 and {t["status"] for t in result.tools}=={"failed","pending"} and result.edits==[]
 
     def test_direct_custom_apply_patch_captures_raw_patch_without_scanning_its_code(self, tmp_path, capsys):
         from ai_convos.cli import parse_codex
@@ -556,7 +569,7 @@ class TestClaudeExportParser:
         assert len(result.msgs) == 2
         assert [m["role"] for m in result.msgs] == ["user","assistant"]
         assert result.msgs[1]["model"] == "claude-opus-4-8"
-        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"conv-123","session_kind":"main","capture_mode":"export"}
+        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"conv-123","session_kind":"main","session_kind_evidence":"exact","capture_mode":"export"}
 
     def test_parse_with_attachments(self, tmp_path):
         """Parse Claude export with attachments."""
@@ -581,6 +594,11 @@ class TestClaudeExportParser:
 
         assert len(result.attachs) == 1
         assert result.attachs[0]["filename"] == "doc.pdf"
+
+    def test_attachment_and_tool_only_turns_keep_parent_messages(self,tmp_path):
+        from ai_convos.cli import parse_claude
+        export=tmp_path/"claude.json"; export.write_text(json.dumps([{"uuid":"c","chat_messages":[{"uuid":"a","sender":"human","content":[],"attachments":[{"file_name":"x.pdf","file_type":"application/pdf"}]},{"uuid":"t","sender":"assistant","content":[{"type":"tool_use","id":"call","name":"lookup","input":{"q":"x"}}]},{"uuid":"r","sender":"human","content":[{"type":"tool_result","tool_use_id":"call","content":"found"}]}]}])); result=parse_claude(export); mids={m["id"] for m in result.msgs}
+        assert len(result.msgs)==3 and len(result.attachs)==len(result.tools)==1 and result.attachs[0]["message_id"] in mids and result.tools[0]["message_id"] in mids and result.tools[0]["status"]=="complete" and json.loads(result.tools[0]["output"])=="found"
 
     def test_parse_content_blocks(self, tmp_path):
         """Parse Claude export with content blocks format."""

@@ -16,8 +16,10 @@ metadata and never invents facts a source did not record.
   Code subagent this is its `agentId`; the root `sessionId` becomes its parent.
 - `metadata.parent_session_id` is present only when the provider explicitly names a
   parent session.
-- `metadata.session_kind` is `main` or `subagent`. It is never inferred merely from
-  a shared cwd or repository.
+- `metadata.session_kind` is the normalized `main` or `subagent` classification.
+  `metadata.session_kind_evidence` is `exact` when the provider format defines the
+  unit or explicitly marks a child, and `inferred` when absence of child evidence
+  is the only basis for `main`. It is never inferred from a shared cwd or repository.
 - Missing parents remain missing relationships. A child may retain its explicit
   parent identity even when the parent transcript is unavailable.
 
@@ -46,6 +48,7 @@ they carry additional meaning.
 | `session_id` | Exact provider-native identity for this main or subagent session. |
 | `parent_session_id` | Explicit native parent identity. |
 | `session_kind` | `main` or `subagent`. |
+| `session_kind_evidence` | `exact` or `inferred`; how `session_kind` was established. |
 | `agent_id` | Provider-native subagent identity when distinct from the session identity. |
 | `agent_name` | Provider-recorded agent name or nickname. |
 | `agent_role` | Provider-recorded agent role/type. |
@@ -59,6 +62,11 @@ they carry additional meaning.
 Sparse metadata omits unavailable keys rather than storing guessed values or NULL
 members. Codex currently also retains `forked_from_id` and `thread_source` as
 documented provider extensions; they do not replace the explicit parent relation.
+
+Normalized values have four distinct evidence states: exact values copied from the
+provider, absent values the provider did not supply, explicit provider `unknown`
+values, and inferred classifications carrying an evidence marker. Convos never
+promotes absent or inferred evidence to exact.
 
 ## Provider mapping
 
@@ -84,19 +92,22 @@ later parent metadata must not overwrite it.
 - System, developer, user, assistant, and tool evidence is parsed before retrieval
   filters are applied.
 - One logical tool invocation retains its provider call identity, input, output,
-  status, and timestamps. Results are joined to calls rather than counted as a
-  second invocation.
+  result-arrival status, and timestamps. Results are joined to calls rather than
+  counted as a second invocation; a returned result is not by itself proof that a
+  mutating operation succeeded.
 - Attachments retain provider metadata and bounded local bodies without reading
   arbitrary paths mentioned in text.
-- File edits retain the modifying turn, provider path, operation, exact captured
-  before/after material, and evidence quality. No file-system state is fabricated
-  for historical sessions.
+- File edits are emitted only after a matching provider result confirms success.
+  Failed, timed-out, missing-result, or indeterminate attempts remain tool calls but
+  never become canonical edit facts. No file-system state is fabricated for
+  historical sessions.
 
 ## Admission and recovery
 
-A coding-agent transcript is an admitted conversation only when it contains a real
-user/delegation prompt. Injected instructions, environment context, and startup
-metadata do not satisfy admission. Recovered prompt history is retained with
+A structurally exact wrapper-only main may be marked
+`capture_mode=startup-stub-candidate`; it is retained rather than destructively
+deleted. A wrapper followed by real prompt text and every explicit subagent remain
+ordinary conversations. Recovered prompt history is retained with
 `capture_mode=history`; it is not represented as a complete transcript and cannot
 prove that tools, edits, or assistant turns were absent.
 
@@ -111,7 +122,7 @@ prove that tools, edits, or assistant turns were absent.
   were explicitly tagged `history.jsonl` recoveries created by the old reversible
   orphan-recovery script. They are not evidence of current-parser duplication.
 
-This PR records and begins emitting the normalized contract without changing
-physical conversation IDs. The dependent migration adds native-identity indexing,
-dedupe, admission cleanup, recovery classification, and obsolete split-result
-cleanup while preserving released signed row identities.
+This PR emits the normalized contract without changing physical conversation IDs
+and advances a parser epoch so unchanged raw transcripts are reconsidered. The
+dependent migration adds native-identity indexing and owned-row recovery
+classification while preserving released signed row identities.
