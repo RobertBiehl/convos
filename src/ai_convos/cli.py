@@ -6,7 +6,7 @@ from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remot
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT = find_root(); DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"; STATE_PATH = DATA_DIR / "sync_state.json"
-HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty"," AND NOT regexp_matches(content,'^(Base directory for this skill:|# AGENTS\\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))')",8,10,20,8/15,2  # conservative policy below the observed ~200-detail failure point
+HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(content,'{_NR}')",8,10,20,8/15,2  # conservative policy below the observed ~200-detail failure point
 
 # ---- db helpers ----
 def open_db(path=None,read_only=False,wait=30,deadline=None):
@@ -376,6 +376,7 @@ def _repository_alias_migration(conn):
         if len(evidence)>1: ambiguous.add(rid)
     aliases=[(rid,repository_evidence({"lineage":lineage,"remotes":json.loads(remotes)})) for rid,lineage,remotes in conn.execute("SELECT id,lineage,CAST(remotes AS VARCHAR) FROM provenance.repositories WHERE lineage IS NOT NULL").fetchall() if rid not in ambiguous]
     return aliases,ambiguous
+def session_bindings(conn): return {(source,session):cid for source,session,cid in conn.execute("SELECT source,session_id,conversation_id FROM provider_sessions").fetchall()}
 def init_schema(conn):
     tables={r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()}
     current=(conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0] if "core_schema" in tables else 0
@@ -383,6 +384,7 @@ def init_schema(conn):
     _migration_backup(conn)
     current==1 and scope and ("core_migrations" not in tables or not conn.execute("SELECT 1 FROM core_migrations WHERE name='remote_ids'").fetchone()) and _migration_backup(conn,2)
     current==2 and _migration_backup(conn,3)
+    current==3 and _migration_backup(conn,4)
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
         id VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, title VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP,
         model VARCHAR, cwd VARCHAR, git_branch VARCHAR, project_id VARCHAR, metadata JSON)""")
@@ -441,6 +443,15 @@ def init_schema(conn):
             aliases and conn.executemany("INSERT OR IGNORE INTO provenance.repository_aliases VALUES (?,?)",aliases)
             legacy_edits and conn.executemany("INSERT OR IGNORE INTO provenance.file_edit_scopes(file_edit_id,path,repository,root,checkout,route,observed_at) VALUES (?,?,?,?,?,?,?)",legacy_edits)
             conn.execute("INSERT OR IGNORE INTO provenance.conversation_scopes SELECT c.id,NULL,NULL,NULL,NULL,NULL FROM conversations c WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id); INSERT OR REPLACE INTO core_schema VALUES (TRUE,3)")
+    if conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone()[0]<4:
+        metadata,stubs=(metadata:=conn.execute("SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='metadata'").fetchone()),(required(not (duplicates:=conn.execute("SELECT source,json_extract_string(metadata,'$.session_id') sid,count(*) FROM conversations c WHERE json_extract_string(metadata,'$.session_id') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) GROUP BY source,sid HAVING count(*)>1").fetchall()),ValueError(f"provider session identity conflicts require repair: {duplicates[:3]}")) and [r[0] for r in conn.execute(f"SELECT c.id FROM conversations c WHERE c.source='codex' AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.id AND m.role='user') AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.id AND m.role='user' {_NOISE}) AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.id AND m.role='assistant') AND NOT EXISTS (SELECT 1 FROM messages m JOIN (SELECT message_id FROM tool_calls UNION SELECT message_id FROM attachments UNION SELECT message_id FROM file_edits) x ON x.message_id=m.id WHERE m.conversation_id=c.id) AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.conversation_id=c.id)").fetchall()]) if metadata else []
+        dead,recoveries=([r[0] for r in conn.execute("SELECT id FROM messages WHERE conversation_id IN (SELECT UNNEST(?))",[stubs]).fetchall()] if stubs else []),conn.execute("SELECT 'conversations',id FROM conversations WHERE json_extract_string(metadata,'$.recovered')='history.jsonl' UNION ALL SELECT 'messages',id FROM messages WHERE json_extract_string(metadata,'$.recovered') IN ('history.jsonl','id-inversion')").fetchall() if metadata else []
+        with _transaction(conn):
+            conn.execute("CREATE TABLE IF NOT EXISTS provider_sessions(source VARCHAR,session_id VARCHAR,conversation_id VARCHAR UNIQUE,PRIMARY KEY(source,session_id)); DELETE FROM provider_sessions"+("; UPDATE conversations SET metadata=json_merge_patch(metadata,'{\"capture_mode\":\"history\"}') WHERE json_extract_string(metadata,'$.recovered')='history.jsonl'; UPDATE messages SET metadata=json_merge_patch(metadata,CASE json_extract_string(metadata,'$.recovered') WHEN 'history.jsonl' THEN '{\"capture_mode\":\"history\"}' ELSE '{\"capture_mode\":\"recovery\"}' END) WHERE json_extract_string(metadata,'$.recovered') IN ('history.jsonl','id-inversion')" if metadata else ""))
+            stubs and [conn.execute(sql,[ids]) for sql,ids in (("DELETE FROM attachments WHERE message_id IN (SELECT UNNEST(?))",dead),("DELETE FROM tool_calls WHERE message_id IN (SELECT UNNEST(?))",dead),("DELETE FROM file_edits WHERE message_id IN (SELECT UNNEST(?))",dead),("DELETE FROM artifacts WHERE conversation_id IN (SELECT UNNEST(?))",stubs),("DELETE FROM messages WHERE id IN (SELECT UNNEST(?))",dead),("DELETE FROM provenance.conversation_scopes WHERE conversation IN (SELECT UNNEST(?))",stubs),("DELETE FROM conversations WHERE id IN (SELECT UNNEST(?))",stubs))]
+            conn.execute((("INSERT INTO provider_sessions SELECT source,json_extract_string(metadata,'$.session_id'),id FROM conversations c WHERE json_extract_string(metadata,'$.session_id') IS NOT NULL AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id);" if metadata else "")+"INSERT OR REPLACE INTO core_schema VALUES (TRUE,4)"))
+            (stubs or dead or recoveries) and _archive_touch(conn,[*(('conversations',x) for x in stubs),*(('messages',x) for x in dead),*recoveries])
+        stubs and rebuild_fts_index(conn)
     with _transaction(conn):
         conn.execute("""CREATE OR REPLACE TEMP TABLE core_legacy_conflicts AS SELECT x.file_edit_id edit,x.file_id old_id,f.path,sha256(json_object('path',f.path,'repository',NULL)) new_id,EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='edit.observed' AND l.entity=x.file_edit_id) is_local FROM provenance.file_edit_files x JOIN provenance.files f ON f.id=x.file_id WHERE x.evidence='legacy_scope_conflict' AND (x.file_id<>sha256(json_object('path',f.path,'repository',NULL)) OR EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='edit.observed' AND l.entity=x.file_edit_id) AND NOT EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='file.observed' AND l.entity=sha256(json_object('path',f.path,'repository',NULL)))); INSERT OR IGNORE INTO provenance.files SELECT new_id,NULL,path,'external' FROM core_legacy_conflicts; UPDATE provenance.file_edit_files x SET file_id=c.new_id FROM core_legacy_conflicts c WHERE x.file_edit_id=c.edit; INSERT OR IGNORE INTO provenance.local_facts SELECT 'file.observed',new_id FROM core_legacy_conflicts WHERE is_local; DELETE FROM provenance.local_facts l USING core_legacy_conflicts c WHERE l.kind='file.observed' AND l.entity=c.old_id AND c.old_id<>c.new_id; DELETE FROM provenance.files f USING core_legacy_conflicts c WHERE f.id=c.old_id AND c.old_id<>c.new_id AND NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_id=f.id) AND NOT EXISTS (SELECT 1 FROM provenance.file_versions v WHERE v.file_id=f.id) AND NOT EXISTS (SELECT 1 FROM remote.provenance_origins o WHERE o.kind='file.observed' AND o.physical_entity=f.id); UPDATE archive_state SET generation=generation+1 WHERE singleton AND EXISTS(SELECT 1 FROM core_legacy_conflicts WHERE is_local); INSERT OR REPLACE INTO archive_changes SELECT kind,entity,generation FROM archive_state,(SELECT 'file_edits' kind,edit entity FROM core_legacy_conflicts WHERE is_local UNION ALL SELECT 'edit.observed',edit FROM core_legacy_conflicts WHERE is_local UNION ALL SELECT 'file.observed',new_id FROM core_legacy_conflicts WHERE is_local) WHERE singleton; DROP TABLE core_legacy_conflicts""")
 
@@ -635,11 +646,11 @@ def safe_parse(context: str, fn, *args, **kwargs):
     try: return fn(*args, **kwargs)
     except Exception as e: log_parse_error(context, e); return None
 
-def parse_source(path: Path, source: Optional[str] = None) -> ParseResult:
+def parse_source(path: Path, source: Optional[str] = None, bindings=None) -> ParseResult:
     parsers = {"chatgpt": parse_chatgpt, "claude": parse_claude, "claude-code": parse_claude_code, "codex": parse_codex}
     src = source or detect_source(path)
     if src not in parsers: raise ValueError(f"Unknown source: {src}")
-    return parsers[src](path)
+    return parsers[src](path,bindings=bindings) if src in ("claude-code","codex") else parsers[src](path)
 
 # ---- web fetchers ----
 def chatgpt_mapping(cid: str, mapping: dict) -> tuple[list, list, list]:
@@ -820,21 +831,19 @@ def load_jsonl(path: Path) -> list[dict]:
             log_parse_error(f"jsonl {path} line {i}", e)
     return out
 
-def parse_claude_code_session(jsonl: Path) -> dict:
+def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
     events = load_jsonl(jsonl)
     if not events: return None
     system,root_session,explicit_agent,sidechain=next((e for e in events if e.get("type")=="system"),{}),next((e.get("sessionId") or e.get("session_id") for e in events if e.get("sessionId") or e.get("session_id")),jsonl.stem),next((e["agentId"] for e in events if e.get("agentId")),None),any(e.get("isSidechain") for e in events)
     agent_id=explicit_agent or (jsonl.stem if "subagents" in jsonl.parts else None)
-    cid,src,kind,parent=gen_id("claude-code",str(jsonl)),"claude-code","subagent" if agent_id or sidechain else "main",root_session if agent_id and agent_id!=root_session else None
+    src,kind,parent,cid="claude-code","subagent" if agent_id or sidechain else "main",root_session if agent_id and agent_id!=root_session else None,(bindings or {}).get(("claude-code",agent_id or root_session),gen_id("claude-code",str(jsonl)))
     timestamps = [ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e]
     msg_events,tool_results=[(i,e) for i,e in enumerate(events) if "message" in e],{t["id"]:t for e in events if "message" in e for t in extract_content(e["message"].get("content",[]))["tools"] if "output" in t and t.get("id")}
     uuid2id = {e["uuid"]: gen_id(src, f"{cid}:{idx}") for idx, (i, e) in enumerate(msg_events) if "uuid" in e}
 
     def make_msg(idx, i, e):
         c = extract_content(e["message"].get("content", e["message"].get("text", "")))
-        return dict(id=gen_id(src, f"{cid}:{idx}"), conversation_id=cid, role="user" if e["type"] in ("human","user") else e["type"],
-                   content=c["text"], thinking=c["thinking"], created_at=ts_from_iso(e.get("timestamp")),
-                   model=e["message"].get("model") if e["type"]=="assistant" else None, metadata="{}", parent_id=uuid2id.get(e.get("parentUuid")))
+        return dict(id=gen_id(src,f"{cid}:{idx}"),conversation_id=cid,role="user" if e["type"] in ("human","user") else e["type"],content=c["text"],thinking=c["thinking"],created_at=ts_from_iso(e.get("timestamp")),model=e["message"].get("model") if e["type"]=="assistant" else None,metadata="{}",parent_id=uuid2id.get(e.get("parentUuid")))
 
     def make_tools(idx, i, e):
         c, ts = extract_content(e["message"].get("content", [])), ts_from_iso(e.get("timestamp"))
@@ -862,20 +871,17 @@ def parse_claude_code_session(jsonl: Path) -> dict:
         "tools": [t for idx, (i, e) in enumerate(msg_events) for t in make_tools(idx, i, e)],
         "edits": [ed for idx, (i, e) in enumerate(msg_events) for ed in make_edits(idx, i, e)]}
 
-def parse_claude_code(projects_dir: Path, files: list[Path] | None = None) -> ParseResult:
-    sessions = [s for jsonl in (files or projects_dir.rglob("*.jsonl"))
-                if (s := safe_parse(f"claude-code session {jsonl}", parse_claude_code_session, jsonl))]
-    return ParseResult(
-        convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
-        tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
+def parse_claude_code(projects_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult:
+    sessions=[s for jsonl in (files or projects_dir.rglob("*.jsonl")) if (s:=safe_parse(f"claude-code session {jsonl}",parse_claude_code_session,jsonl,bindings))]
+    return ParseResult(convs=[s["conv"] for s in sessions],msgs=[m for s in sessions for m in s["msgs"]],tools=[t for s in sessions for t in s["tools"]],edits=[e for s in sessions for e in s["edits"]])
 
-def parse_codex_session(jsonl: Path) -> dict | None:
+def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
     events = load_jsonl(jsonl)
     if not events: return None
     timestamps = [ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e]
     meta,contexts=next((e["payload"] for e in events if e.get("type")=="session_meta"),{}),[(i,e["payload"].get("model")) for i,e in enumerate(events) if e.get("type")=="turn_context" and e.get("payload",{}).get("model")]
     provider_id,spawn=(meta.get("id") or jsonl.stem),(meta.get("source") or {}).get("subagent",{}).get("thread_spawn",{}) if isinstance(meta.get("source"),dict) else {}
-    cid,src,items=gen_id("codex",str(jsonl)),"codex",[(i,e["payload"]) for i,e in enumerate(events) if e.get("type")=="response_item" and "payload" in e]
+    src,items,cid="codex",[(i,e["payload"]) for i,e in enumerate(events) if e.get("type")=="response_item" and "payload" in e],(bindings or {}).get(("codex",provider_id),gen_id("codex",str(jsonl)))
 
     extract_msg_text,model_at=(lambda p:"\n".join(b["text"] for b in p.get("content",[]) if isinstance(b,dict) and b.get("type") in ("input_text","output_text","text") and b.get("text"))),(lambda i:next((m for j,m in reversed(contexts) if j<=i),None))
     def image(i,j,b):
@@ -884,8 +890,7 @@ def parse_codex_session(jsonl: Path) -> dict | None:
     def norm_args(p): return json.loads(a) if isinstance((a := p.get("arguments", {})), str) else a
 
     mitems = [(i, p, t) for i, p in items if p.get("type") == "message" and ((t := extract_msg_text(p)) or any(isinstance(b,dict) and b.get("type")=="input_image" for b in p.get("content",[])))]
-    if not (msgs := [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(),
-                          thinking=None, created_at=timestamps[i] if i < len(timestamps) else None, model=model_at(i), metadata="{}", parent_id=None)
+    if not (msgs := [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(), thinking=None, created_at=timestamps[i] if i < len(timestamps) else None, model=model_at(i), metadata="{}", parent_id=None)
                      for i, p, t in mitems]): return None
     anchor = lambda k: gen_id(src, f"{cid}:{next((i for i, _, _ in reversed(mitems) if i <= k), mitems[0][0])}")  # function_call items are not messages; attach to nearest preceding one
 
@@ -947,15 +952,18 @@ def parse_codex_session(jsonl: Path) -> dict | None:
                     metadata=json.dumps({k:v for k,v in {"session_id":provider_id,"parent_session_id":spawn.get("parent_thread_id") or meta.get("parent_thread_id"),"session_kind":"subagent" if spawn else "main","session_kind_evidence":"exact" if spawn else "inferred","agent_name":spawn.get("agent_nickname") or meta.get("agent_nickname"),"agent_role":spawn.get("agent_role") or meta.get("agent_role"),"agent_depth":spawn.get("depth"),"originator":meta.get("originator"),"client_version":meta.get("cli_version"),"capture_mode":"transcript","git_repository":(meta.get("git") or {}).get("repository_url"),"git_commit":(meta.get("git") or {}).get("commit_hash"),"forked_from_id":meta.get("forked_from_id"),"thread_source":meta.get("thread_source")}.items() if v is not None})),
         "msgs": msgs, "tools": tools, "attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")], "edits": edits}
 
-def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult:
+def parse_codex(codex_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult:
     if not (sessions_dir := codex_dir / "sessions").exists(): return ParseResult()
-    sessions = [s for jsonl in (files or sessions_dir.rglob("*.jsonl")) if (s := safe_parse(f"codex session {jsonl}", parse_codex_session, jsonl))]
-    return ParseResult(convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]], tools=[t for s in sessions for t in s["tools"]], attachs=[a for s in sessions for a in s["attachs"]], edits=[e for s in sessions for e in s["edits"]])
+    sessions=[s for jsonl in (files or sessions_dir.rglob("*.jsonl")) if (s:=safe_parse(f"codex session {jsonl}",parse_codex_session,jsonl,bindings))]
+    return ParseResult(convs=[s["conv"] for s in sessions],msgs=[m for s in sessions for m in s["msgs"]],tools=[t for s in sessions for t in s["tools"]],attachs=[a for s in sessions for a in s["attachs"]],edits=[e for s in sessions for e in s["edits"]])
 
 _CONV_UPS = "INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source,title=excluded.title,created_at=CASE WHEN conversations.created_at IS NULL OR excluded.created_at < conversations.created_at THEN excluded.created_at ELSE conversations.created_at END,updated_at=CASE WHEN conversations.updated_at IS NULL OR excluded.updated_at > conversations.updated_at THEN excluded.updated_at ELSE conversations.updated_at END,model=COALESCE(excluded.model,conversations.model),cwd=COALESCE(excluded.cwd,conversations.cwd),git_branch=COALESCE(excluded.git_branch,conversations.git_branch),project_id=COALESCE(excluded.project_id,conversations.project_id),metadata=excluded.metadata"
 
 def upsert(conn, r: ParseResult):
-    cids, mids = [c["id"] for c in r.convs], [m["id"] for m in r.msgs]
+    rejected,rejected_msgs=(rejected:={c["id"] for c in r.convs if c["source"]=="codex" and (meta:=json.loads(c["metadata"] or "{}")).get("session_kind")=="main" and not any(m["conversation_id"]==c["id"] and m["role"]=="user" and not re.match(_NOISE_RE,m["content"]) for m in r.msgs) and not any(m["conversation_id"]==c["id"] and m["role"]=="assistant" for m in r.msgs) and not any(x.get("conversation_id")==c["id"] or x.get("message_id") in {m["id"] for m in r.msgs if m["conversation_id"]==c["id"]} for x in [*r.tools,*r.attachs,*r.artifacts,*r.edits])}),{m["id"] for m in r.msgs if m["conversation_id"] in rejected}
+    r.convs,r.msgs,r.tools,r.attachs,r.artifacts,r.edits=[c for c in r.convs if c["id"] not in rejected],[m for m in r.msgs if m["id"] not in rejected_msgs],[t for t in r.tools if t["message_id"] not in rejected_msgs],[a for a in r.attachs if a["message_id"] not in rejected_msgs],[a for a in r.artifacts if a["conversation_id"] not in rejected],[e for e in r.edits if e["message_id"] not in rejected_msgs]
+    cids,mids,bindings=[c["id"] for c in r.convs],[m["id"] for m in r.msgs],[(c["source"],meta["session_id"],c["id"]) for c in r.convs if (meta:=json.loads(c["metadata"] or "{}")).get("session_id")]
+    required(not (conflict:=conn.execute("SELECT p.source,p.session_id,p.conversation_id,json_extract_string(j.value,'$.conversation_id') FROM provider_sessions p JOIN json_each(?) j ON p.source=json_extract_string(j.value,'$.source') AND p.session_id=json_extract_string(j.value,'$.session_id') WHERE p.conversation_id<>json_extract_string(j.value,'$.conversation_id') LIMIT 1",(json.dumps([dict(source=s,session_id=i,conversation_id=c) for s,i,c in bindings]),)).fetchone() if bindings else None),ValueError(f"provider session identity conflict: {conflict}"))
     cur = conn.execute
     old_convs = {x[0]:x for x in cur(f"SELECT * FROM conversations WHERE id IN ({','.join(['?']*len(cids))})", cids).fetchall()} if cids else {}
     old_msgs = {x[0]: x for x in cur(f"SELECT * FROM messages WHERE id IN ({','.join(['?']*len(mids))})", mids).fetchall()} if mids else {}
@@ -963,6 +971,7 @@ def upsert(conn, r: ParseResult):
     changed_msgs = {m["id"] for m in r.msgs if m["id"] not in old_msgs or old_msgs[m["id"]][2:5] != tuple(m[k] for k in ("role", "content", "thinking"))}
     updated = {m["conversation_id"] for m in r.msgs if m["id"] in changed_msgs} - new_convs
     for c in r.convs: conn.execute(_CONV_UPS, list(c.values()))
+    bindings and conn.executemany("INSERT OR IGNORE INTO provider_sessions VALUES (?,?,?)",bindings)
     frozen=getattr(r,"scopes",None)
     frozen=frozen if frozen is not None else pending_scopes([(c["id"],c["cwd"]) for c in r.convs])
     frozen and conn.executemany("INSERT OR IGNORE INTO provenance.conversation_scopes VALUES (?,?,?,?,?,?)",frozen)
@@ -989,7 +998,7 @@ def upsert(conn, r: ParseResult):
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated), changed_msgs
 
 def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
-def hook_result(source, path): s = (parse_claude_code_session if source == "claude-code" else parse_codex_session)(path); return ParseResult(convs=[s["conv"]], msgs=s["msgs"], tools=s["tools"], attachs=s.get("attachs",[]), edits=s["edits"]) if s else ParseResult()
+def hook_result(source, path, bindings=None): s = (parse_claude_code_session if source == "claude-code" else parse_codex_session)(path,bindings); return ParseResult(convs=[s["conv"]], msgs=s["msgs"], tools=s["tools"], attachs=s.get("attachs",[]), edits=s["edits"]) if s else ParseResult()
 def enqueue_hook(source, payload):
     path = Path(payload["transcript_path"]).expanduser().resolve(); root = hook_root(source).expanduser().resolve()
     if source not in ("claude-code", "codex") or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")
@@ -1014,12 +1023,14 @@ def drain_hooks(embed=False, local_only=False,block=False):
             for w in HOOK_DIR.glob("*.work"):
                 e=json.loads(w.read_text()); done.append((w,w.stem,e["snap"],set(e["changed"]))) if "changed" in e else retry_hook(w,True)
             for q in sorted(HOOK_DIR.glob("*.json"),key=lambda p:(p.stat().st_mtime_ns,p.name))[:HOOK_DRAIN_EVENTS]: work=q.with_suffix(".work"); os.replace(q,work); claims.append(work)
+        if claims: init_schema(conn:=get_db()); bindings=session_bindings(conn)
+        claims and conn.close()
         for n,work in enumerate(claims):
             if n and time.monotonic()-started>=HOOK_DRAIN_SECONDS: break
             try:
                 e,path,key,st,snap=(e:=json.loads(work.read_text())),(path:=Path(e["path"])),work.stem,(st:=path.stat()),[st.st_mtime_ns,st.st_size]
                 if state.get(key)==snap: work.unlink(); continue
-                r=hook_result(e["source"],path); st2=path.stat()
+                r=hook_result(e["source"],path,bindings); st2=path.stat()
                 if snap!=[st2.st_mtime_ns,st2.st_size]:
                     with (HOOK_DIR/".lock").open("w") as lock: fcntl.flock(lock,fcntl.LOCK_EX); retry_hook(work)
                     continue
@@ -1327,12 +1338,12 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
     def set_state(section, key, val):
         nonlocal dirty
         if state.setdefault(section, {}).get(key) != val: state[section][key] = val; dirty = True
-    def plan_local(name, path, parser):
+    def plan_local(name, path, parser, bindings):
         if not path.exists(): return None
         if name in ("codex", "claude-code"):
             prev, mt = local.get(name, {}).get("files", {}), {str(p):m for p in path.rglob("*.jsonl") if (m:=stat_mtime(p)) is not None}; files=list(map(Path,mt))
             if not (chg := files if full or local.get(name,{}).get("parser")!=PARSER_EPOCH else [p for p in files if mt.get(str(p), 0) > prev.get(str(p), 0)]): return None
-            return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path, fs=chg: parser(p, fs), state=("local", name, {"parser":PARSER_EPOCH,"files":mt}))
+            return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path, fs=chg: parser(p, fs, bindings), state=("local", name, {"parser":PARSER_EPOCH,"files":mt}))
         mtime = latest_mtime(path)
         if not full and mtime <= local.get(name, {}).get("mtime", 0): return None
         return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path: parser(p), state=("local", name, {"mtime": mtime}))
@@ -1406,7 +1417,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if repair: conn.execute("BEGIN"); repaired=[r[0] for r in conn.execute("SELECT id FROM conversations WHERE source='chatgpt' AND (created_at IS NULL OR updated_at IS NULL)").fetchall()]; conn.execute("UPDATE conversations c SET created_at=COALESCE(c.created_at,t.first_seen),updated_at=COALESCE(c.updated_at,t.last_seen) FROM (SELECT conversation_id,MIN(created_at) first_seen,MAX(created_at) last_seen FROM messages GROUP BY conversation_id) t WHERE c.id=t.conversation_id AND c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL)"); _archive_touch(conn,[("conversations",x) for x in repaired]); conn.execute("COMMIT")
         conn.close()
         conn = get_db(read_only=True)
-        cur = counts_by_source(conn)
+        cur,bindings = counts_by_source(conn),session_bindings(conn)
         rows = conn.execute("SELECT id,updated_at,json_extract_string(metadata,'$.remote_update_time') FROM conversations WHERE source='chatgpt'").fetchall()
         known = {cid:(v.timestamp() if (v := ts_any(raw)) else ts.timestamp() if ts else None) for cid, ts, raw in rows}
         legacy = {cid for cid, _, raw in rows if raw is None}
@@ -1417,9 +1428,9 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
             start("imports")
             jobs += [j for p in paths if (j := plan_import(p))]
         if claude_code and (p := Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects").exists():
-            start("Claude Code", "claude-code"); jobs += [j for j in [plan_local("claude-code", p, parse_claude_code)] if j]
+            start("Claude Code", "claude-code"); jobs += [j for j in [plan_local("claude-code", p, parse_claude_code,bindings)] if j]
         if codex and (p := Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))).exists():
-            start("Codex", "codex"); jobs += [j for j in [plan_local("codex", p, parse_codex)] if j]
+            start("Codex", "codex"); jobs += [j for j in [plan_local("codex", p, parse_codex,bindings)] if j]
         if not offline: start("ChatGPT", "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt, {} if full else known, checkpoint, legacy)] if j]
         if not offline: start("Claude", "claude"); jobs += [j for j in [plan_web("claude", fetch_claude, probe_claude)] if j]
         verbose and typer.echo(f"Planning took {time.perf_counter()-t0:.2f}s")

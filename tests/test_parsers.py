@@ -224,6 +224,16 @@ class TestCodexParser:
         conv=parse_codex(tmp_path/".codex").convs[0]; meta=json.loads(conv["metadata"])
         assert conv["model"] == "gpt-5.6-luna" and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","session_kind_evidence":"exact","agent_name":"Ada","agent_role":"explorer","agent_depth":1,"client_version":"0.116.0","capture_mode":"transcript"}
 
+    def test_native_binding_survives_transcript_move(self,tmp_path):
+        import duckdb
+        from ai_convos import cli
+        root=tmp_path/".codex"; a,b=root/"sessions/a.jsonl",root/"sessions/b.jsonl"; a.parent.mkdir(parents=True); a.write_text("\n".join(json.dumps(x) for x in [{"type":"session_meta","payload":{"id":"native","cwd":"/repo"}},{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}},{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}])); first=cli.parse_codex(root,files=[a]); db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,first); b.write_text(a.read_text()); moved=cli.parse_codex(root,files=[b],bindings=cli.session_bindings(db)); assert ([c["id"] for c in moved.convs],[m["id"] for m in moved.msgs])==([c["id"] for c in first.convs],[m["id"] for m in first.msgs]); cli.upsert(db,moved); assert db.execute("SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages)").fetchone()==(1,2)
+
+    def test_admission_rejects_only_main_startup_wrapper_after_parsing(self,tmp_path):
+        import duckdb
+        from ai_convos import cli
+        root=tmp_path/".codex"; session=root/"sessions/noise.jsonl"; session.parent.mkdir(parents=True); session.write_text("\n".join(json.dumps(x) for x in [{"type":"session_meta","payload":{"id":"noise"}},{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo"}]}}])); parsed=cli.parse_codex(root); assert len(parsed.convs)==len(parsed.msgs)==1; db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,parsed); assert db.execute("SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM provider_sessions)").fetchone()==(0,0,0)
+
     def test_input_images_become_bounded_durable_attachments(self,tmp_path,monkeypatch):
         import ai_convos.cli as cli
         raw=b"\x89PNG\r\n\x1a\ncapture"; monkeypatch.setattr(cli,"DATA_DIR",tmp_path/"archive"); monkeypatch.setattr(cli,"ATTACHMENT_LIMIT",len(raw)); sessions=tmp_path/".codex/sessions"; sessions.mkdir(parents=True); session=sessions/"image.jsonl"
