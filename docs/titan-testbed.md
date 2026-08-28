@@ -60,7 +60,7 @@ idempotent second sync.
 
 ```sh
 commit=$(git rev-parse HEAD)
-ssh titan "lxc exec convos-testbed -- /opt/convos/wip/bin/python /opt/convos/source-$commit/scripts/remote_testbed.py fresh --venv /opt/convos/wip --commit $commit"
+ssh titan "lxc exec convos-testbed -- /opt/convos/wip/bin/python /opt/convos/source-$commit/scripts/remote_testbed.py fresh --venv /opt/convos/wip --released-venv /opt/convos/released-v0.10.1 --commit $commit"
 ```
 
 The canary lane never resets its homes, archives, relay, manifest, or migration

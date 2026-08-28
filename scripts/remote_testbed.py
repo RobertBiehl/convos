@@ -163,7 +163,7 @@ def assert_opaque(relay,*sentinels):
     if leaked: raise AssertionError(f"relay contains plaintext: {leaked}")
 
 
-def fresh_lane(venv,commit):
+def fresh_lane(venv,commit,released_venv=None):
     lane="fresh"
     a=Client(USERS[lane][0],Path(f"/home/{USERS[lane][0]}/convos-testbed/{lane}/laptop"),Path(venv))
     a2=Client(a.user,Path(f"/home/{a.user}/convos-testbed/{lane}/desktop"),Path(venv))
@@ -220,6 +220,10 @@ def fresh_lane(venv,commit):
         cli(a2,"remote","sync")
         assert_team_projection(b,team_prompt)
         assert_team_projection(a2,team_prompt)
+        if released_venv:
+            old=Client(b.user,b.home/"convos-testbed"/lane/"released-probe",Path(released_venv)); shutil.rmtree(old.root,ignore_errors=True); (old.root/"remote").mkdir(parents=True); shutil.copy2(b.root/"remote/config.json",old.root/"remote/config.json")
+            for path in (old.root,*old.root.rglob("*")): os.chown(path,bob_user.pw_uid,bob_user.pw_gid)
+            cli(old,"remote","sync"); assert_message(old,team_prompt)
         concurrent_a="fresh concurrent A sentinel 96da8f"
         concurrent_b="fresh concurrent B sentinel b20c74"
         a_prior=(a_repo/"app.py").read_text()
@@ -254,7 +258,7 @@ def fresh_lane(venv,commit):
         if before!=after or final_relay_rows!=relay_rows: raise AssertionError("second sync was not idempotent")
         assert_opaque(relay,personal_prompt,team_prompt,a_repo,b_repo)
         doctors={name:cli(client,"doctor").stdout.strip() for name,client in (("a",a),("a2",a2),("b",b))}
-        evidence={"lane":lane,"commit":commit,"version":package_version(a),"passed":True,"seconds":round(time.monotonic()-started,3),"users":[a.user,b.user],"devices":3,"workspace":workspace,"user_ids":[alice,bob],"archives":after,"relay_rows":relay_rows,"relay_plaintext":False,"backup":backup,"concurrent_updates":2,"device_recovery_and_removal":True,"doctors":doctors,"peak_child_kib":resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,"input_outcomes":{"synthetic":4,"imported":4,"skipped":0,"failed":0},"harness_retries":0,"failures":[],"conflicts":sum(archive["conflicts"] for archive in after.values())}
+        evidence={"lane":lane,"commit":commit,"version":package_version(a),"passed":True,"seconds":round(time.monotonic()-started,3),"users":[a.user,b.user],"devices":3,"workspace":workspace,"user_ids":[alice,bob],"archives":after,"relay_rows":relay_rows,"relay_plaintext":False,"backup":backup,"concurrent_updates":2,"device_recovery_and_removal":True,"mixed_released_client":bool(released_venv),"doctors":doctors,"peak_child_kib":resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,"input_outcomes":{"synthetic":4,"imported":4,"skipped":0,"failed":0},"harness_retries":0,"failures":[],"conflicts":sum(archive["conflicts"] for archive in after.values())}
     path=STATE/"evidence"/f"fresh-{int(time.time())}-{commit[:12]}.json"
     path.write_text(json.dumps(evidence,sort_keys=True,indent=2))
     os.chmod(path,0o600)
@@ -339,6 +343,7 @@ def main():
     lane=sub.add_parser("fresh")
     lane.add_argument("--venv",type=Path,required=True)
     lane.add_argument("--commit",required=True)
+    lane.add_argument("--released-venv",type=Path)
     canary=sub.add_parser("canary")
     canary.add_argument("--released-venv",type=Path,required=True)
     canary.add_argument("--current-venv",type=Path,required=True)
@@ -354,7 +359,7 @@ def main():
     seed_parser.add_argument("--content")
     seed_parser.add_argument("--old-content")
     args=parser.parse_args()
-    if args.command=="fresh": fresh_lane(args.venv,args.commit)
+    if args.command=="fresh": fresh_lane(args.venv,args.commit,args.released_venv)
     elif args.command=="canary": canary_lane(args.released_venv,args.current_venv,args.released_commit,args.current_commit)
     else: seed_archive(args.root,args.cid,args.title,args.prompt,args.cwd,args.edit,args.content,args.old_content)
 if __name__=="__main__": main()
