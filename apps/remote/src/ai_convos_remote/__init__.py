@@ -10,7 +10,7 @@ _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, archive_changes as core_archive_changes, archive_state as core_archive_state, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, open_db, project_attachment_body, project_provider_alias, project_workspace_controls, repository as core_repository, repository_evidence, repository_state as core_repository_state, required
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, sharing, stored_controls, verify_history
+from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, row_replicas, scan, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
                        recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
@@ -482,7 +482,12 @@ def sync_once(root=None,force=False):
             if force:
                 for ws in ready: state.execute("INSERT OR REPLACE INTO meta VALUES (?,'1')",(f"replica_repair:{ws}",))
             state.commit(); upload(cfg,state,root,ready); prepare_archive(cfg,state,root); baseline=archive_info(root); bound={r[0] for r in state.execute("SELECT DISTINCT workspace FROM origin_bindings").fetchall()}
-            pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; settle_sharing(cfg,state,ready,root)
+            pull(cfg,state,root)
+            ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
+            aliases={ws:reconcile_provider_aliases(core_path(root),cfg,ws) for ws in ready if cfg["workspaces"].get(ws,{}).get("kind")=="personal"}
+            [state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"provider_aliases:{ws}",json.dumps(value,sort_keys=True))) for ws,value in aliases.items()]
+            state.commit()
+            settle_sharing(cfg,state,ready,root)
             path,active,generation=(path:=core_path(root)),{w["id"] for w in cfg["server_state"]["workspaces"]},archive_info(root)[1] if path.is_file() else 0
             known=core_repository_state(core) if (core:=open_db(path,True) if path.is_file() else None) else {"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}}
             (core and core.close(),promote_paths(cfg,state,known,root),upgrade_repository_policies(cfg,state,known,root),[retain_sharing(cfg,ws,root,state) for ws in ready&set(cfg["workspaces"])])
@@ -654,9 +659,17 @@ def doctor_status():
         except Exception: online="error"
         if info["status"]!="current": return f"remote: {online}, state={info['status']}, schema={info['version'] or 'unknown'}, next_sync={'backup+rebaseline' if info['status'] in ('incompatible','invalid') else 'initialize'}"
         state=read_state(paths()[2])
-        try: pending=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]; lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; deferred,required=state.execute("SELECT COUNT(*),COALESCE(SUM(required),0) FROM deferred_events").fetchone(); lifecycle=",".join(f"{r[0][:8]}:{r[1]}" for r in state.execute("SELECT workspace,lifecycle FROM sync_states ORDER BY workspace").fetchall()) or "uninitialized"; last=(state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone() or ["never"])[0]; backup=(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone() or [None])[0]
-        finally: state.close()
-        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")
+        try:
+            pending=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+            lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]
+            deferred,required=state.execute("SELECT COUNT(*),COALESCE(SUM(required),0) FROM deferred_events").fetchone()
+            lifecycle=",".join(f"{r[0][:8]}:{r[1]}" for r in state.execute("SELECT workspace,lifecycle FROM sync_states ORDER BY workspace").fetchall()) or "uninitialized"
+            last=(state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone() or ["never"])[0]
+            backup=(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone() or [None])[0]
+            alias_blocked=sum(len(json.loads(r[0])["blocked"]) for r in state.execute("SELECT value FROM meta WHERE key LIKE 'provider_aliases:%'").fetchall())
+        finally:
+            state.close()
+        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, alias_blocked={alias_blocked}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")
     except Exception as e: return f"remote: unavailable ({e})"
 @remote.command("doctor")
 def doctor_cmd(): typer.echo(doctor_status())

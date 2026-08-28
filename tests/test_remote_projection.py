@@ -8,7 +8,7 @@ from ai_convos.cli import ARCHIVE_COLUMNS, capture_provenance, init_schema, proj
 import ai_convos_remote as remote_client
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import promote_paths, provider_alias_accept, provider_alias_bridge, provider_alias_id, provider_alias_records, publish, sharing_routes
-from ai_convos_remote.projection import apply_row_replicas, attest_rows, blob_replicas, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, row_replicas, scan, sequence, sharing
+from ai_convos_remote.projection import apply_row_replicas, attest_rows, blob_replicas, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, reconcile_provider_aliases, relocate_attachments, row_replicas, scan, sequence, sharing
 from ai_convos_remote.protocol import b64, certificate, digest, event, identity, logical_row, open_blob, open_replica, public, public_id, row_proof, semantic_proof
 
 
@@ -161,6 +161,204 @@ def test_provider_session_alias_converges_one_author_and_separates_authors(tmp_p
 def test_provider_session_alias_rejects_noncanonical_members(tmp_path):
     archive=tmp_path/"archive"; path=archive/"data/convos.db"; path.parent.mkdir(parents=True); db=duckdb.connect(str(path)); init_schema(db); db.close(); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); row={"v":1,"kind":"provider.session","id":provider_alias_id("codex","s"),"state":"active","data":{"source":"codex","session_id":"s","members":["b","a"],"canonical":"a"}}; proof=semantic_proof(root,user,device["id"],"personal",1,row)
     with pytest.raises(ValueError,match="Malformed provider session alias"): provider_alias_accept(archive,row,proof)
+
+
+@pytest.mark.parametrize(("native_id","imported_id"),[("a","b"),("b","a")])
+def test_provider_alias_reconciliation_signs_successors_and_replays_mixed_native_imported_rows(tmp_path,native_id,imported_id):
+    archive=tmp_path/"archive"
+    path=archive/"data/convos.db"
+    path.parent.mkdir(parents=True)
+    root,device,peer=identity("root"),identity("device"),identity("peer")
+    user=public_id(root["sign_public"])
+    entry=lambda value:{"user":user,"root_public":root["sign_public"],"device":public(value),"certificate":certificate(root,user,value),"history":True}
+    control={"workspace":"personal","revision":1,"epoch":1,"devices":{device["id"]:entry(device),peer["id"]:entry(peer)}}
+    cfg={"user":user,"device":device,"workspaces":{"personal":{"kind":"personal","epoch":1}},"controls":{"personal":control},"server_state":{"workspaces":[{"id":"personal","controls":[control]}]}}
+    metadata='{"session_id":"same","session_kind":"main","session_kind_evidence":"exact"}'
+    native_message,native_artifact=f"message-{native_id}",f"artifact-{native_id}"
+    imported_message,imported_artifact=f"message-{imported_id}",f"artifact-{imported_id}"
+    db=duckdb.connect(str(path))
+    init_schema(db)
+    db.execute("INSERT INTO conversations(id,source,title,metadata) VALUES (?,'codex','native',?)",(native_id,metadata))
+    db.execute("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES (?,?,'user','native','{}')",(native_message,native_id))
+    db.execute("INSERT INTO artifacts(id,conversation_id,artifact_type,title,content) VALUES (?,?,'text','native','body')",(native_artifact,native_id))
+    db.execute("INSERT INTO provider_sessions VALUES ('codex','same',?),('codex','legacy',?)",(native_id,native_id))
+    state=connect(tmp_path/"state.db")
+    records=scan(db,state)
+    db.close()
+    assert attest_rows(path,cfg,"personal",records)==3
+    conversation=logical_row("conversations",ARCHIVE_COLUMNS["conversations"],[imported_id,"codex","imported",None,None,None,None,None,None,metadata])
+    message=logical_row("messages",ARCHIVE_COLUMNS["messages"],[imported_message,imported_id,"assistant","imported",None,None,None,"{}",None])
+    artifact=logical_row("artifacts",ARCHIVE_COLUMNS["artifacts"],[imported_artifact,imported_id,"text","imported","body",None,None,None])
+    imported=[{"row":row,"proof":row_proof(peer,user,"personal",1,row)} for row in (conversation,message,artifact)]
+    assert apply_row_replicas(path,imported,"personal",[control])==[True,True,True]
+    db=duckdb.connect(str(path))
+    remote_conversation=foreign_id(user,"conversations",imported_id)
+    db.execute("UPDATE provider_sessions SET conversation_id=?",(remote_conversation,))
+    initial={(kind,row_id):revision for kind,row_id,revision in db.execute("SELECT row_kind,source_row_id,revision FROM remote.row_proofs").fetchall()}
+    db.close()
+    alias={"v":1,"kind":"provider.session","id":provider_alias_id("codex","same"),"state":"active","data":{"source":"codex","session_id":"same","members":["a","b"],"canonical":"a"}}
+    assert provider_alias_accept(archive,alias,semantic_proof(root,user,device["id"],"personal",1,alias))
+    first=reconcile_provider_aliases(path,cfg,"personal")
+    assert first=={"changed":1,"settled":0,"blocked":{}}
+    db=duckdb.connect(str(path),read_only=True)
+    canonical="a" if native_id=="a" else foreign_id(user,"conversations","a")
+    loser_message=native_message if native_id=="b" else imported_message
+    loser_artifact=native_artifact if native_id=="b" else imported_artifact
+    assert db.execute("SELECT id FROM conversations").fetchall()==[(canonical,)]
+    assert {r[0] for r in db.execute("SELECT conversation_id FROM messages").fetchall()}=={canonical}
+    assert {r[0] for r in db.execute("SELECT conversation_id FROM artifacts").fetchall()}=={canonical}
+    assert set(db.execute("SELECT source,session_id,conversation_id FROM provider_sessions").fetchall())=={("codex","same",canonical),("codex","legacy",canonical)}
+    heads=db.execute("SELECT row_kind,source_row_id,state,previous_revision FROM remote.row_proofs p WHERE source_row_id IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision) ORDER BY row_kind",(["b",loser_message,loser_artifact],)).fetchall()
+    assert heads==[("artifacts",loser_artifact,"active",initial[("artifacts",loser_artifact)]),("conversations","b","deleted",initial[("conversations","b")]),("messages",loser_message,"active",initial[("messages",loser_message)])]
+    generation=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]
+    db.close()
+    assert (path.with_name(path.name+".pre-provider-alias-reconciliation.bak")).is_file()
+    assert reconcile_provider_aliases(path,cfg,"personal")=={"changed":0,"settled":1,"blocked":{}}
+    db=duckdb.connect(str(path),read_only=True)
+    assert db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation
+    replay_records=scan(db,state)
+    db.close()
+    key=bytes(range(32))
+    bodies=[open_replica(value,key) for value in row_replicas(path,cfg,"personal",replay_records,{1:key})]
+    target=tmp_path/"target.db"
+    assert any(apply_row_replicas(target,bodies,"personal",[control]))
+    replay=duckdb.connect(str(target),read_only=True)
+    replay_canonical=foreign_id(user,"conversations","a")
+    assert replay.execute("SELECT id FROM conversations").fetchall()==[(replay_canonical,)]
+    assert {r[0] for r in replay.execute("SELECT conversation_id FROM messages").fetchall()}=={replay_canonical}
+    assert {r[0] for r in replay.execute("SELECT conversation_id FROM artifacts").fetchall()}=={replay_canonical}
+    replay.close()
+    state.close()
+
+
+def test_provider_alias_reconciliation_blocks_before_mutation_when_attachment_body_is_missing(tmp_path):
+    archive=tmp_path/"archive"
+    path=archive/"data/convos.db"
+    path.parent.mkdir(parents=True)
+    root,device=identity("root"),identity("device")
+    user=public_id(root["sign_public"])
+    entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":certificate(root,user,device),"history":True}
+    control={"workspace":"personal","revision":1,"epoch":1,"devices":{device["id"]:entry}}
+    cfg={"user":user,"device":device,"workspaces":{"personal":{"kind":"personal","epoch":1}},"controls":{"personal":control},"server_state":{"workspaces":[{"id":"personal","controls":[control]}]}}
+    metadata='{"session_id":"same","session_kind":"main","session_kind_evidence":"exact"}'
+    db=duckdb.connect(str(path))
+    init_schema(db)
+    db.executemany("INSERT INTO conversations(id,source,title,metadata) VALUES (?,'codex','T',?)",[("a",metadata),("b",metadata)])
+    db.execute("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('m','b','user','file','{}')")
+    db.execute("INSERT INTO attachments(id,message_id,filename,size) VALUES ('attachment','m','missing.bin',7)")
+    db.execute("INSERT INTO attachment_bodies VALUES ('attachment','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',7)")
+    db.execute("INSERT INTO provider_sessions VALUES ('codex','same','b')")
+    state=connect(tmp_path/"state.db")
+    records=scan(db,state)
+    before=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]
+    db.close()
+    assert attest_rows(path,cfg,"personal",records)==4
+    alias={"v":1,"kind":"provider.session","id":provider_alias_id("codex","same"),"state":"active","data":{"source":"codex","session_id":"same","members":["a","b"],"canonical":"a"}}
+    assert provider_alias_accept(archive,alias,semantic_proof(root,user,device["id"],"personal",1,alias))
+    result=reconcile_provider_aliases(path,cfg,"personal")
+    assert result["changed"]==result["settled"]==0 and "attachment body unavailable" in next(iter(result["blocked"].values()))
+    db=duckdb.connect(str(path),read_only=True)
+    assert db.execute("SELECT id FROM conversations ORDER BY id").fetchall()==[("a",),("b",)]
+    assert db.execute("SELECT conversation_id FROM messages").fetchone()[0]=="b"
+    assert db.execute("SELECT conversation_id FROM provider_sessions").fetchone()[0]=="b"
+    assert db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==before
+    db.close()
+    assert not path.with_name(path.name+".pre-provider-alias-reconciliation.bak").exists()
+    state.close()
+
+
+def _provider_alias_archive(tmp_path,session_b="same"):
+    archive=tmp_path/"archive"
+    path=archive/"data/convos.db"
+    path.parent.mkdir(parents=True)
+    root,device=identity("root"),identity("device")
+    user=public_id(root["sign_public"])
+    entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":certificate(root,user,device),"history":True}
+    control={"workspace":"personal","revision":1,"epoch":1,"devices":{device["id"]:entry}}
+    cfg={"user":user,"device":device,"workspaces":{"personal":{"kind":"personal","epoch":1}},"controls":{"personal":control},"server_state":{"workspaces":[{"id":"personal","controls":[control]}]}}
+    metadata=lambda session:json.dumps({"session_id":session,"session_kind":"main","session_kind_evidence":"exact"})
+    db=duckdb.connect(str(path))
+    init_schema(db)
+    db.executemany("INSERT INTO conversations(id,source,title,metadata) VALUES (?,'codex',?,?)",[("a","A",metadata("same")),("b","B",metadata(session_b))])
+    db.execute("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('message-b','b','user','B','{}')")
+    db.execute("INSERT INTO provider_sessions VALUES ('codex','same','b')")
+    state=connect(tmp_path/"state.db")
+    records=scan(db,state)
+    db.close()
+    state.close()
+    assert attest_rows(path,cfg,"personal",records)==3
+    alias={"v":1,"kind":"provider.session","id":provider_alias_id("codex","same"),"state":"active","data":{"source":"codex","session_id":"same","members":["a","b"],"canonical":"a"}}
+    assert provider_alias_accept(archive,alias,semantic_proof(root,user,device["id"],"personal",1,alias))
+    return archive,path,root,device,user,cfg,entry
+
+
+def test_provider_alias_reconciliation_blocks_on_row_fork(tmp_path):
+    archive,path,root,device,user,cfg,entry=_provider_alias_archive(tmp_path)
+    db=duckdb.connect(str(path))
+    base=db.execute("SELECT revision FROM remote.row_proofs WHERE row_kind='conversations' AND source_row_id='b'").fetchone()[0]
+    values=lambda title:["b","codex",title,None,None,None,None,None,None,'{"session_id":"same","session_kind":"main","session_kind_evidence":"exact"}']
+    rows=[logical_row("conversations",ARCHIVE_COLUMNS["conversations"],values(title)) for title in ("fork one","fork two")]
+    [project_row_proof(db,row_proof(device,user,"personal",1,row,base),root["sign_public"],entry["certificate"]) for row in rows]
+    before=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]
+    db.close()
+    result=reconcile_provider_aliases(path,cfg,"personal")
+    assert result["changed"]==0 and "forked" in next(iter(result["blocked"].values()))
+    db=duckdb.connect(str(path),read_only=True)
+    assert db.execute("SELECT id FROM conversations ORDER BY id").fetchall()==[("a",),("b",)]
+    assert db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==before
+    db.close()
+    assert not path.with_name(path.name+".pre-provider-alias-reconciliation.bak").exists()
+
+
+def test_provider_alias_reconciliation_blocks_on_conflicting_exact_evidence(tmp_path):
+    archive,path,root,device,user,cfg,entry=_provider_alias_archive(tmp_path,"different")
+    result=reconcile_provider_aliases(path,cfg,"personal")
+    assert result["changed"]==0 and "exact evidence conflicts" in next(iter(result["blocked"].values()))
+    db=duckdb.connect(str(path),read_only=True)
+    assert db.execute("SELECT id FROM conversations ORDER BY id").fetchall()==[("a",),("b",)]
+    assert db.execute("SELECT conversation_id FROM provider_sessions").fetchone()[0]=="b"
+    db.close()
+
+
+def test_provider_alias_reconciliation_rolls_back_interrupted_projection(tmp_path,monkeypatch):
+    archive,path,root,device,user,cfg,entry=_provider_alias_archive(tmp_path)
+    db=duckdb.connect(str(path),read_only=True)
+    before=(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0])
+    db.close()
+    monkeypatch.setattr(projection_module,"project_provider_bindings",lambda *_:(_ for _ in ()).throw(RuntimeError("interrupted")))
+    result=reconcile_provider_aliases(path,cfg,"personal")
+    assert result["changed"]==0 and next(iter(result["blocked"].values()))=="interrupted"
+    db=duckdb.connect(str(path),read_only=True)
+    assert db.execute("SELECT id FROM conversations ORDER BY id").fetchall()==[("a",),("b",)]
+    assert db.execute("SELECT conversation_id FROM messages").fetchone()[0]=="b"
+    assert db.execute("SELECT conversation_id FROM provider_sessions").fetchone()[0]=="b"
+    assert (db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0])==before
+    db.close()
+    assert path.with_name(path.name+".pre-provider-alias-reconciliation.bak").is_file()
+
+
+def test_provider_alias_reconciliation_takes_one_backup_for_a_batch(tmp_path,monkeypatch):
+    archive,path,root,device,user,cfg,entry=_provider_alias_archive(tmp_path)
+    metadata='{"session_id":"second","session_kind":"main","session_kind_evidence":"exact"}'
+    db=duckdb.connect(str(path))
+    db.executemany("INSERT INTO conversations(id,source,title,metadata) VALUES (?,'codex',?,?)",[("c","C",metadata),("d","D",metadata)])
+    db.execute("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('message-d','d','user','D','{}')")
+    db.execute("INSERT INTO provider_sessions VALUES ('codex','second','d')")
+    state=connect(tmp_path/"second-state.db")
+    records=scan(db,state)
+    db.close()
+    state.close()
+    assert attest_rows(path,cfg,"personal",records)==3
+    alias={"v":1,"kind":"provider.session","id":provider_alias_id("codex","second"),"state":"active","data":{"source":"codex","session_id":"second","members":["c","d"],"canonical":"c"}}
+    assert provider_alias_accept(archive,alias,semantic_proof(root,user,device["id"],"personal",1,alias))
+    backups=[]
+    original=projection_module._migration_backup
+    def backup(*args):
+        backups.append(1)
+        return original(*args)
+    monkeypatch.setattr(projection_module,"_migration_backup",backup)
+    assert reconcile_provider_aliases(path,cfg,"personal")=={"changed":2,"settled":0,"blocked":{}}
+    assert len(backups)==1
 
 
 def test_event_support_is_exact_and_unknowns_fail_closed(monkeypatch):
