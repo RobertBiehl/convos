@@ -33,7 +33,7 @@ def test_app_line_budgets():
 def test_statement_packing_budget():
     """Dense expressions are welcome; packing unrelated statements behind separators is not."""
     root = Path(__file__).resolve().parents[1]
-    paths = sorted([*(root/"src").rglob("*.py"), *(root/"apps").rglob("*.py"), *(root/"scripts").rglob("*.py"), *(root/"evals").rglob("*.py")])
+    paths = sorted([*(root/"src").rglob("*.py"), *(p for src in (root/"apps").glob("*/src") for p in src.rglob("*.py")), *(root/"scripts").rglob("*.py"), *(root/"evals").rglob("*.py")])
     separators = [(path, tok.start[0]) for path in paths for tok in tokenize.generate_tokens(path.read_text().splitlines(True).__iter__().__next__) if tok.type == token.OP and tok.string == ";"]
     packed = {f"{path.relative_to(root)}:{line}":count for (path,line),count in Counter(separators).items()}
     assert len(separators) < 1875, f"Statement separator budget exceeded: {len(separators)} >= 1875"

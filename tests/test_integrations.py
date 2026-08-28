@@ -122,13 +122,14 @@ class TestChatGPTAPI:
         def fake(url, *a, **k):
             if "/conversations?offset=0" in url: return {"items": [{"id": "c1", "title": "T", "create_time": None, "update_time": None}], "total": 1}
             if "/conversations?offset=" in url: return {"items": [], "total": 1}
-            return {"create_time": 1709294400, "update_time": 1709294500,
-                    "mapping": {"n1": {"message": {"author": {"role": "user"}, "content": {"parts": ["hi"]}, "create_time": 1709294400}}}}
+            return {"create_time": 1709294400, "update_time": 1709294500, "current_node":"n1",
+                    "mapping": {"n1": {"message": {"author": {"role": "assistant"}, "content": {"parts": ["hi"]}, "create_time": 1709294400,"status":"finished_successfully"}}}}
         monkeypatch.setattr(cli, "fetch_json", fake)
         r = cli.fetch_chatgpt("safari")
         assert len(r.convs) == 1
         assert r.convs[0]["created_at"] == cli.ts_from_epoch(1709294400)
         assert r.convs[0]["updated_at"] == cli.ts_from_epoch(1709294500)
+        assert json.loads(r.convs[0]["metadata"])["remote_complete"] is True
 
     def test_fetch_chatgpt_dates_fall_back_to_messages(self, monkeypatch):
         from ai_convos import cli

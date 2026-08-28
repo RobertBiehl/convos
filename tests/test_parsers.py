@@ -224,6 +224,25 @@ class TestCodexParser:
         conv=parse_codex(tmp_path/".codex").convs[0]; meta=json.loads(conv["metadata"])
         assert conv["model"] == "gpt-5.6-luna" and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","session_kind_evidence":"exact","agent_name":"Ada","agent_role":"explorer","agent_depth":1,"client_version":"0.116.0","capture_mode":"transcript"}
 
+    def test_review_subagent_string_is_normalized(self,tmp_path):
+        from ai_convos import cli
+        session=tmp_path/".codex/sessions/review.jsonl"; session.parent.mkdir(parents=True); session.write_text("\n".join(json.dumps(x) for x in [
+            {"type":"session_meta","payload":{"id":"review","cwd":"/repo","source":{"subagent":"review"}}},
+            {"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"review"}]}},
+            {"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}]))
+        meta=json.loads(cli.parse_codex(tmp_path/".codex").convs[0]["metadata"]); assert meta["session_id"]=="review" and meta["session_kind"]=="subagent" and meta["agent_role"]=="review"
+
+    def test_irrelevant_events_are_streamed_without_shifting_ids_or_timestamps(self,tmp_path):
+        from ai_convos import cli
+        session=tmp_path/".codex/sessions/stream.jsonl"; session.parent.mkdir(parents=True); session.write_text("\n".join(json.dumps(x) for x in [
+            {"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"stream"}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"reasoning","summary":[],"content":"x"*10000}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}},
+            {"type":"event_msg","timestamp":"2026-01-01T00:00:04Z","payload":{"type":"token_count","info":"ignored"}}]))
+        result=cli.parse_codex(tmp_path/".codex"); assert [m["created_at"].second for m in result.msgs]==[1,3] and result.convs[0]["updated_at"].second==4
+        assert [m["id"] for m in result.msgs]==[cli.gen_id("codex",f"{result.convs[0]['id']}:{i}") for i in (1,3)]
+
     def test_native_binding_survives_transcript_move(self,tmp_path):
         import duckdb
         from ai_convos import cli
@@ -250,6 +269,12 @@ class TestCodexParser:
         import duckdb
         from ai_convos import cli
         root=tmp_path/".codex"; sessions=root/"sessions"; sessions.mkdir(parents=True); wrapper="# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>"; event=lambda sid,text:[{"type":"session_meta","payload":{"id":sid}},{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}]; (sessions/"noise.jsonl").write_text("\n".join(map(json.dumps,event("noise",wrapper)))); (sessions/"prompt.jsonl").write_text("\n".join(map(json.dumps,event("prompt",wrapper+"\nactual request")))); parsed=cli.parse_codex(root); db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,parsed); assert db.execute("SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM provider_sessions)").fetchone()==(2,2,2); assert db.execute("SELECT json_extract_string(metadata,'$.capture_mode') FROM conversations WHERE json_extract_string(metadata,'$.session_id')='noise'").fetchone()[0]=="startup-stub-candidate" and db.execute("SELECT json_extract_string(metadata,'$.capture_mode') FROM conversations WHERE json_extract_string(metadata,'$.session_id')='prompt'").fetchone()[0]=="transcript"
+
+    def test_upsert_provenance_targets_only_changed_rows(self):
+        import duckdb
+        from ai_convos import cli
+        conv=dict(id="c",source="codex",title="t",created_at=None,updated_at=None,model=None,cwd="/repo",git_branch=None,project_id=None,metadata="{}"); msg=dict(id="m",conversation_id="c",role="assistant",content="done",thinking=None,created_at=None,model=None,metadata="{}",parent_id=None); edit=dict(id="e",message_id="m",file_path="x.py",edit_type="write",content="x",created_at=None,old_content=None); result=cli.ParseResult([conv],[msg],edits=[edit]); db=duckdb.connect(); cli.init_schema(db)
+        cli.upsert(db,result); assert result.provenance_conversations=={"c"} and result.provenance_edits=={"e"}; cli.upsert(db,result); assert not result.provenance_conversations and not result.provenance_edits
 
     def test_input_images_become_bounded_durable_attachments(self,tmp_path,monkeypatch):
         import ai_convos.cli as cli
@@ -536,7 +561,7 @@ class TestChatGPTExportParser:
             "mapping": {
                 "root": {"message": None, "parent": None},
                 "n1": {"message": {"author": {"role": "user"}, "content": {"parts": ["search the web"]}}, "parent": "root"},
-                "n2": {"message": {"author": {"role": "tool"}, "content": {"content_type": "code", "text": ""}}, "parent": "n1"},
+                "n2": {"message": {"author": {"role": "tool"}, "content": {"content_type": "execution_output", "text": "raw output"}}, "parent": "n1"},
                 "n3": {"message": {"author": {"role": "assistant"}, "content": {"parts": ["Found it."]}}, "parent": "n2"},
             }
         }]))
@@ -547,7 +572,7 @@ class TestChatGPTExportParser:
         assert len(result.tools) == 1
         assert result.tools[0]["message_id"] in by_id  # no orphan
         tool_msg = by_id[result.tools[0]["message_id"]]
-        assert tool_msg["role"] == "tool" and tool_msg["content"] == ""
+        assert tool_msg["role"] == "tool" and tool_msg["content"] == "raw output"
         user_msg = next(m for m in result.msgs if m["content"] == "search the web")
         assert user_msg["parent_id"] is None  # walks past the message-less root
         assert tool_msg["parent_id"] == user_msg["id"]

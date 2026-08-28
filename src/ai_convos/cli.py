@@ -9,7 +9,6 @@ PROJECT_ROOT = find_root(); DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_R
 HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(content,'{_NR}')",8,10,20,8/15,2  # conservative policy below the observed ~200-detail failure point
 _INJECTED_RE=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*"
 
-# ---- db helpers ----
 def open_db(path=None,read_only=False,wait=30,deadline=None):
     path=Path(path or DB_PATH); path.parent.mkdir(parents=True,exist_ok=True); deadline=deadline if deadline is not None else time.monotonic()+wait
     if read_only and not path.exists(): return None
@@ -497,7 +496,6 @@ def extract_content(content) -> dict:
                        for b in blocks if b.get("type") in ("image_asset_pointer", "file") or b.get("content_type") in ("image_asset_pointer", "file")]
     }
 
-# ---- cookie extraction ----
 def read_safari_cookies(domain: str) -> dict[str, str]:
     path = Path.home() / "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"
     if not path.exists(): path = Path.home() / "Library/Cookies/Cookies.binarycookies"
@@ -634,7 +632,6 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
             if code == 429: typer.echo(f"  rate limited; retrying in {delay}s", err=True)
             time.sleep(delay)
 
-# ---- result type ----
 class ParseResult:
     def __init__(self, convs=None, msgs=None, tools=None, attachs=None, artifacts=None, edits=None):
         self.convs, self.msgs, self.tools, self.attachs, self.artifacts, self.edits = convs or [], msgs or [], tools or [], attachs or [], artifacts or [], edits or []
@@ -651,7 +648,6 @@ def parse_source(path: Path, source: Optional[str] = None, bindings=None) -> Par
     if src not in parsers: raise ValueError(f"Unknown source: {src}")
     return parsers[src](path,bindings=bindings) if src in ("claude-code","codex") else parsers[src](path)
 
-# ---- web fetchers ----
 def chatgpt_mapping(cid: str, mapping: dict) -> tuple[list, list, list]:
     """Walk a chatgpt conversation mapping tree (shared by web fetcher and export parser)."""
     def pmid(nid):  # nearest ancestor that carries a message (roots are message-less)
@@ -665,11 +661,11 @@ def chatgpt_mapping(cid: str, mapping: dict) -> tuple[list, list, list]:
         if tool := bool(role == "tool" or meta.get("invoked_plugin")):
             tools.append(dict(id=gen_id("chatgpt", f"tool:{mid}"), message_id=mid, tool_name=meta.get("invoked_plugin", {}).get("namespace", role),
                               input=json.dumps(meta.get("args", {})), output=json.dumps(msg.get("content", {})), status="complete", duration_ms=None, created_at=ts))
-        parts = msg.get("content", {}).get("parts", []) if msg.get("content") else []
+        content,parts=(lambda c:(c,c.get("parts",[])))(msg.get("content") or {})
         att = [dict(id=gen_id("chatgpt", f"attach:{mid}:{i}"), message_id=mid, filename=p.get("name", ""), mime_type=p.get("content_type"),
                     size=p.get("size"), path=None, url=p.get("asset_pointer"), created_at=ts)
                for i, p in enumerate(parts) if isinstance(p, dict) and p.get("content_type") in ("image_asset_pointer", "file")]
-        text = "\n".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
+        text = "\n".join(dict.fromkeys(p.strip() for p in [*parts,content.get("text")] if isinstance(p, str) and p.strip()))
         if text or tool or att:  # keep tool-only turns: tool_calls/attachments reference them
             msgs.append(dict(id=mid, conversation_id=cid, role=role, content=text, thinking=None, created_at=ts, model=model, metadata=json.dumps(meta), parent_id=pmid(nid)))
         attachs += att
@@ -691,9 +687,9 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
             else: bucket[0] -= 1
         def parse_item_raw(item):
             cid, gizmo = gen_id("chatgpt", item["id"]), item.get("gizmo_id"); conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=20, retries=2, before_request=pace, rate_limit_backoff=300)
-            msgs, tools, attachs = chatgpt_mapping(cid, conv.get("mapping", {})); times = [m["created_at"] for m in msgs if m["created_at"]]
+            msgs, tools, attachs = chatgpt_mapping(cid, conv.get("mapping", {})); times,current=[m["created_at"] for m in msgs if m["created_at"]],(conv.get("mapping",{}).get(conv.get("current_node")) or {}).get("message")
             return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_any(conv.get("create_time") or item.get("create_time")) or min(times, key=datetime.timestamp, default=None), updated_at=ts_any(conv.get("update_time") or item.get("update_time")) or max(times, key=datetime.timestamp, default=None), model=item.get("model"), cwd=None, git_branch=None,
-                                  project_id=gizmo, metadata=json.dumps({"session_id":item["id"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"api","remote_update_time":conv.get("update_time") or item.get("update_time"), **({"gizmo_id":gizmo} if gizmo else {})})), msgs=msgs, tools=tools, attachs=attachs)
+                                  project_id=gizmo, metadata=json.dumps({"session_id":item["id"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"api","remote_update_time":conv.get("update_time") or item.get("update_time"), **({"remote_complete":current.get("metadata",{}).get("is_complete",current.get("author",{}).get("role")=="assistant" and current.get("status") not in ("in_progress","running"))} if current else {}), **({"gizmo_id":gizmo} if gizmo else {})})), msgs=msgs, tools=tools, attachs=attachs)
         listed, seen, tail, offset, fetched, total = [], set(), set(), 0, 0, None
         while True:
             data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100&order=updated", cookies, headers, timeout=20, retries=1, before_request=pace, rate_limit_backoff=300)
@@ -786,7 +782,6 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
         if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
     return r
 
-# ---- file parsers ----
 def parse_chatgpt(path: Path) -> ParseResult:
     data = json.load(zipfile.ZipFile(path).open('conversations.json')) if path.suffix == ".zip" else json.loads(path.read_text())
     r = ParseResult()
@@ -820,18 +815,15 @@ def parse_claude(path: Path) -> ParseResult:
               if (p := safe_parse(f"claude export conv {c.get('uuid') if isinstance(c, dict) else idx}", parse_conv, c))]
     return ParseResult(convs=[p["conv"] for p in parsed],msgs=[m for p in parsed for m in p["msgs"]],tools=[t for p in parsed for t in p["tools"]],attachs=[a for p in parsed for a in p["attachs"]])
 
-def load_jsonl(path: Path) -> list[dict]:
-    out = []
-    for i, line in enumerate(path.read_text().splitlines(), start=1):
+def iter_jsonl(path: Path):
+    for i, line in enumerate(path.open(), start=1):
         if not line.strip(): continue
-        try:
-            out.append(json.loads(line))
+        try: yield i-1,json.loads(line)
         except Exception as e:
             log_parse_error(f"jsonl {path} line {i}", e)
-    return out
 
 def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
-    events = load_jsonl(jsonl)
+    events = [e for _,e in iter_jsonl(jsonl)]
     if not events: return None
     system,root_session,explicit_agent,sidechain=next((e for e in events if e.get("type")=="system"),{}),next((e.get("sessionId") or e.get("session_id") for e in events if e.get("sessionId") or e.get("session_id")),jsonl.stem),next((e["agentId"] for e in events if e.get("agentId")),None),any(e.get("isSidechain") for e in events)
     agent_id=explicit_agent or (jsonl.stem if "subagents" in jsonl.parts else None)
@@ -873,21 +865,23 @@ def _parse_sessions(paths,parser,bindings):
 def parse_claude_code(projects_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult: return _parse_sessions(files or projects_dir.rglob("*.jsonl"),parse_claude_code_session,bindings)
 
 def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
-    events = load_jsonl(jsonl)
+    events,timestamps=[],{}
+    for i,e in iter_jsonl(jsonl):
+        if "timestamp" in e: timestamps[i]=ts_from_iso(e["timestamp"])
+        if e.get("type") in ("session_meta","turn_context") or e.get("type")=="response_item" and isinstance(e.get("payload"),dict) and e["payload"].get("type") in ("message","function_call","function_call_output","custom_tool_call","custom_tool_call_output"): events.append((i,e))
     if not events: return None
-    timestamps = [ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e]
-    meta,contexts=next((e["payload"] for e in events if e.get("type")=="session_meta"),{}),[(i,e["payload"].get("model")) for i,e in enumerate(events) if e.get("type")=="turn_context" and e.get("payload",{}).get("model")]
-    provider_id,spawn=(meta.get("id") or jsonl.stem),(meta.get("source") or {}).get("subagent",{}).get("thread_spawn",{}) if isinstance(meta.get("source"),dict) else {}
-    src,items,cid="codex",[(i,e["payload"]) for i,e in enumerate(events) if e.get("type")=="response_item" and "payload" in e],(bindings or {}).get(("codex",provider_id),gen_id("codex",str(jsonl)))
+    meta,contexts=next((e["payload"] for _,e in events if e.get("type")=="session_meta"),{}),[(i,e["payload"].get("model")) for i,e in events if e.get("type")=="turn_context" and e.get("payload",{}).get("model")]
+    subagent,spawn,provider_id=(lambda s:(s,s.get("thread_spawn",{}) if isinstance(s,dict) else {},meta.get("id") or jsonl.stem))((meta.get("source") or {}).get("subagent") if isinstance(meta.get("source"),dict) else None)
+    src,items,cid="codex",[(i,e["payload"]) for i,e in events if e.get("type")=="response_item"],(bindings or {}).get(("codex",provider_id),gen_id("codex",str(jsonl)))
 
     extract_msg_text,model_at=(lambda p:"\n".join(b["text"] for b in p.get("content",[]) if isinstance(b,dict) and b.get("type") in ("input_text","output_text","text") and b.get("text"))),(lambda i:next((m for j,m in reversed(contexts) if j<=i),None))
     def image(i,j,b):
         url=b["image_url"]; data=url.startswith("data:"); head,encoded=url.split(",",1) if data else ("",""); mime=head[5:-7] if head.startswith("data:image/") and head.endswith(";base64") else b.get("mime_type"); required(not data or mime,ValueError("invalid Codex image data URL")); size=len(encoded.rstrip("="))*3//4 if data else None; body=base64.b64decode(encoded,validate=True) if data and len(encoded)<=4*((ATTACHMENT_LIMIT+2)//3) else None; path=attachment_body(body) if body is not None else None; ext={"image/jpeg":"jpg"}.get(mime,mime.rsplit("/",1)[-1] if mime and re.fullmatch(r"image/[a-z0-9.+-]+",mime) else "bin")
-        return dict(id=gen_id(src,f"attach:{cid}:{i}:{j}"),message_id=gen_id(src,f"{cid}:{i}"),filename=f"image-{j+1}.{ext}",mime_type=mime,size=len(body) if body is not None else size,path=str(path) if path else None,url=None if data else url,created_at=timestamps[i] if i<len(timestamps) else None)
+        return dict(id=gen_id(src,f"attach:{cid}:{i}:{j}"),message_id=gen_id(src,f"{cid}:{i}"),filename=f"image-{j+1}.{ext}",mime_type=mime,size=len(body) if body is not None else size,path=str(path) if path else None,url=None if data else url,created_at=timestamps.get(i))
     def norm_args(p): return json.loads(a) if isinstance((a := p.get("arguments", {})), str) else a
 
     mitems = [(i, p, t) for i, p in items if p.get("type") == "message" and ((t := extract_msg_text(p)) or any(isinstance(b,dict) and b.get("type")=="input_image" for b in p.get("content",[])))]
-    if not (msgs := [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(), thinking=None, created_at=timestamps[i] if i < len(timestamps) else None, model=model_at(i), metadata="{}", parent_id=None)
+    if not (msgs := [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(), thinking=None, created_at=timestamps.get(i), model=model_at(i), metadata="{}", parent_id=None)
                      for i, p, t in mitems]): return None
     anchor = lambda k: gen_id(src, f"{cid}:{next((i for i, _, _ in reversed(mitems) if i <= k), mitems[0][0])}")  # function_call items are not messages; attach to nearest preceding one
 
@@ -896,14 +890,13 @@ def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
     edit_ok=lambda call:call in function_out and not failed(function_out[call]) and (not str(function_out[call]).strip() or str(function_out[call]).strip().lower()=="ok" or bool(re.search(r"(?:exit(?:ed with)? code|exit_code)[\"': ]+0\b|script completed|success\. updated",json.dumps(function_out[call]).lower())))
     tools = [dict(id=gen_id(src,f"tool:{cid}:{p.get('call_id') or i}"),message_id=anchor(i),tool_name=p["name"],
                  input=json.dumps(args),output=json.dumps(function_out.get(p.get("call_id"),"")),status="failed" if p.get("call_id") in function_out and failed(function_out[p.get("call_id")]) else "complete" if p.get("call_id") in function_out else "pending",duration_ms=None,
-                 created_at=timestamps[i] if i < len(timestamps) else None)
+                 created_at=timestamps.get(i))
             for i,p in items if p.get("type")=="function_call" and (args:=norm_args(p)) is not None]
     custom_out = {p.get("call_id"):p.get("output", "") for _, p in items if p.get("type") == "custom_tool_call_output"}
-    tools += [dict(id=gen_id(src, f"custom:{cid}:{i}"), message_id=anchor(i), tool_name=p["name"], input=json.dumps({"code":p.get("input", "")}), output=json.dumps(custom_out.get(p.get("call_id"), "")), status="failed" if any(x in json.dumps(custom_out.get(p.get("call_id"), "")).lower() for x in ("script failed","verification failed")) or re.search(r"exit code: [1-9]\d*",json.dumps(custom_out.get(p.get("call_id"), "")).lower()) else "complete" if p.get("call_id") in custom_out or p.get("status") == "completed" else p.get("status", "pending"), duration_ms=None, created_at=timestamps[i] if i < len(timestamps) else None) for i, p in items if p.get("type") == "custom_tool_call"]
+    tools += [dict(id=gen_id(src, f"custom:{cid}:{i}"), message_id=anchor(i), tool_name=p["name"], input=json.dumps({"code":p.get("input", "")}), output=json.dumps(custom_out.get(p.get("call_id"), "")), status="failed" if any(x in json.dumps(custom_out.get(p.get("call_id"), "")).lower() for x in ("script failed","verification failed")) or re.search(r"exit code: [1-9]\d*",json.dumps(custom_out.get(p.get("call_id"), "")).lower()) else "complete" if p.get("call_id") in custom_out or p.get("status") == "completed" else p.get("status", "pending"), duration_ms=None, created_at=timestamps.get(i)) for i, p in items if p.get("type") == "custom_tool_call"]
 
     def patch_edits(args):
-        """File edits from shell commands, exact or skipped: apply_patch hunks (context+minus -> context+plus,
-        replays like Edit old/new), heredoc writes (full content), plain redirects (file exact, content unknown)."""
+        """Exact file edits from patches/heredocs; retain commands for redirects with unknown content."""
         cmd = args.get("cmd") or args.get("command") or ""
         cmd = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
         root = args.get("workdir") or meta.get("cwd") or ""
@@ -937,13 +930,12 @@ def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
         return [e for patch in patches if "*** Begin Patch" in patch for e in patch_edits({"cmd":patch})]
 
     edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op,
-                 content=c, created_at=timestamps[i] if i < len(timestamps) else None, old_content=o)
+                 content=c, created_at=timestamps.get(i), old_content=o)
             for i, p in items if p.get("type") == "function_call" and p.get("name") in ("exec_command", "shell_command", "shell")
             and edit_ok(p.get("call_id")) and (args := norm_args(p)) for j, (fp, op, c, o) in enumerate(patch_edits(args))]
-    edits += [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op, content=c, created_at=timestamps[i] if i < len(timestamps) else None, old_content=o) for i, p in items if p.get("type") == "custom_tool_call" for j, (fp, op, c, o) in enumerate(custom_edits(p))]
+    edits += [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op, content=c, created_at=timestamps.get(i), old_content=o) for i, p in items if p.get("type") == "custom_tool_call" for j, (fp, op, c, o) in enumerate(custom_edits(p))]
 
-    return {"conv":dict(id=cid,source=src,title=meta.get("cwd") or jsonl.stem,created_at=timestamps[0] if timestamps else None,updated_at=timestamps[-1] if timestamps else None,model=next((m["model"] for m in msgs if m["role"]=="assistant" and m["model"]),None),cwd=meta.get("cwd"),git_branch=(meta.get("git") or {}).get("branch"),project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":provider_id,"parent_session_id":spawn.get("parent_thread_id") or meta.get("parent_thread_id"),"session_kind":"subagent" if spawn else "main","session_kind_evidence":"exact" if spawn else "inferred","agent_name":spawn.get("agent_nickname") or meta.get("agent_nickname"),"agent_role":spawn.get("agent_role") or meta.get("agent_role"),"agent_depth":spawn.get("depth"),"originator":meta.get("originator"),"client_version":meta.get("cli_version"),"capture_mode":"transcript","git_repository":(meta.get("git") or {}).get("repository_url"),"git_commit":(meta.get("git") or {}).get("commit_hash"),"forked_from_id":meta.get("forked_from_id"),"thread_source":meta.get("thread_source")}.items() if v is not None})),
-            "msgs":msgs,"tools":tools,"attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")],"edits":edits}
+    return {"conv":dict(id=cid,source=src,title=meta.get("cwd") or jsonl.stem,created_at=min(timestamps.values(),default=None),updated_at=max(timestamps.values(),default=None),model=next((m["model"] for m in msgs if m["role"]=="assistant" and m["model"]),None),cwd=meta.get("cwd"),git_branch=(meta.get("git") or {}).get("branch"),project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":provider_id,"parent_session_id":spawn.get("parent_thread_id") or meta.get("parent_thread_id"),"session_kind":"subagent" if subagent is not None else "main","session_kind_evidence":"exact" if subagent is not None else "inferred","agent_name":spawn.get("agent_nickname") or meta.get("agent_nickname"),"agent_role":spawn.get("agent_role") or (subagent if isinstance(subagent,str) else meta.get("agent_role")),"agent_depth":spawn.get("depth"),"originator":meta.get("originator"),"client_version":meta.get("cli_version"),"capture_mode":"transcript","git_repository":(meta.get("git") or {}).get("repository_url"),"git_commit":(meta.get("git") or {}).get("commit_hash"),"forked_from_id":meta.get("forked_from_id"),"thread_source":meta.get("thread_source")}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")],"edits":edits}
 
 def parse_codex(codex_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult:
     if not (sessions_dir:=codex_dir/"sessions").exists(): return ParseResult()
@@ -962,9 +954,9 @@ def upsert(conn, r: ParseResult):
     old_convs = {x[0]:x for x in cur(f"SELECT * FROM conversations WHERE id IN ({','.join(['?']*len(cids))})", cids).fetchall()} if cids else {}
     old_msgs = {x[0]: x for x in cur(f"SELECT * FROM messages WHERE id IN ({','.join(['?']*len(mids))})", mids).fetchall()} if mids else {}
     new_convs = set(cids) - set(old_convs)
-    changed_msgs = {m["id"] for m in r.msgs if m["id"] not in old_msgs or old_msgs[m["id"]][2:5] != tuple(m[k] for k in ("role", "content", "thinking"))}
+    changed_rows,changed_msgs={m["id"] for m in r.msgs if m["id"] not in old_msgs or old_msgs[m["id"]][:8]+old_msgs[m["id"]][9:]!=tuple(m.values())},{m["id"] for m in r.msgs if m["id"] not in old_msgs or old_msgs[m["id"]][2:5] != tuple(m[k] for k in ("role", "content", "thinking"))}
     updated = {m["conversation_id"] for m in r.msgs if m["id"] in changed_msgs} - new_convs
-    for c in r.convs: conn.execute(_CONV_UPS, list(c.values()))
+    [conn.execute(_CONV_UPS,list(c.values())) for c in r.convs if old_convs.get(c["id"])!=tuple(c.values())]
     bindings and conn.executemany("INSERT INTO provider_sessions VALUES (?,?,?) ON CONFLICT(source,session_id) DO NOTHING",list(dict.fromkeys(bindings)))
     frozen=getattr(r,"scopes",None)
     frozen=frozen if frozen is not None else pending_scopes([(c["id"],c["cwd"]) for c in r.convs])
@@ -972,7 +964,7 @@ def upsert(conn, r: ParseResult):
     for m in r.msgs:
         vals = list(m.values()); old = old_msgs.get(m["id"])
         if old and old[2:5] != tuple(vals[2:5]): hist = list(old); hist[0] = gen_id("history", f"messages:{m['id']}:{json.dumps(hist[2:5], default=str)}"); meta = json.loads(hist[7] or "{}"); hist[7] = json.dumps({**meta, "history_of":m["id"], "superseded_at":datetime.now().isoformat()}); changed_msgs.add(hist[0]); conn.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING", hist)
-    [conn.execute(_MSG_UPS,list(m.values())) for m in r.msgs]
+    [conn.execute(_MSG_UPS,list(m.values())) for m in r.msgs if m["id"] in changed_rows]
     historical=[]
     def replace_preserving(table, rows):
         if not rows: return
@@ -982,13 +974,14 @@ def upsert(conn, r: ParseResult):
             skip = {"tool_calls":7, "attachments":7, "artifacts":6, "file_edits":5}[table]; prev = old.get(r["id"]); payload = lambda x: tuple(v for i, v in enumerate(x) if i not in (0, skip))
             if not prev or payload(prev)!=payload(vals): historical.append((table,r["id"]))
             if prev and payload(prev) != payload(vals): hist = list(prev); hist[0] = gen_id("history", f"{table}:{r['id']}:{json.dumps(payload(hist), default=str)}"); historical.append((table,hist[0])); cur(f"INSERT INTO {table} VALUES ({','.join(['?']*len(hist))}) ON CONFLICT DO NOTHING", hist)
-            cur(f"INSERT OR REPLACE INTO {table} VALUES ({','.join(['?']*len(vals))})", vals)
+            if not prev or payload(prev)!=payload(vals): cur(f"INSERT OR REPLACE INTO {table} VALUES ({','.join(['?']*len(vals))})", vals)
     [replace_preserving(t, rows) for t, rows in (("tool_calls", r.tools), ("attachments", r.attachs), ("artifacts", r.artifacts), ("file_edits", r.edits))]
     (frozen_edits:=getattr(r,"edit_scopes",None)) is not None or (frozen_edits:=pending_edit_scopes(edit_scope_inputs(r)))
     frozen_edits and conn.executemany("INSERT OR IGNORE INTO provenance.file_edit_scopes(file_edit_id,path,repository,root,checkout,route,observed_at) VALUES (?,?,?,?,?,?,?)",frozen_edits)
     [index_attachment_body(conn,a["id"],a["path"],a.get("size")) for a in r.attachs if a.get("path")]
-    changed_convs={x[0] for x in cur(f"SELECT * FROM conversations WHERE id IN ({','.join(['?']*len(cids))})",cids).fetchall() if old_convs.get(x[0])!=x} if cids else set(); archive_msgs=({x[0] for x in cur(f"SELECT * FROM messages WHERE id IN ({','.join(['?']*len(mids))})",mids).fetchall() if old_msgs.get(x[0])!=x} if mids else set())|changed_msgs-set(mids)
+    changed_convs={x[0] for x in cur(f"SELECT * FROM conversations WHERE id IN ({','.join(['?']*len(cids))})",cids).fetchall() if old_convs.get(x[0])!=x} if cids else set(); archive_msgs=changed_rows|changed_msgs-set(mids)
     if changed_convs or archive_msgs or historical: _archive_touch(conn,[("conversations",x) for x in changed_convs]+[("messages",x) for x in archive_msgs]+historical)
+    r.provenance_edits,r.provenance_conversations={x["id"] for x in r.edits}&{i for t,i in historical if t=="file_edits"},changed_convs
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated), changed_msgs
 
 def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
@@ -1066,7 +1059,6 @@ def flush_fts():
         finally: claim.unlink(missing_ok=True)
     return True
 
-# ---- embeddings ----
 _MODEL, _MCFG, _LLAMA_LOG = None, dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), None
 def embedding_model_path(local_only=False): from huggingface_hub import hf_hub_download; return hf_hub_download(_MCFG["repo_id"],_MCFG["filename"],revision=_MCFG["revision"],local_files_only=local_only)
 def _llama(local_only=False):
@@ -1115,7 +1107,6 @@ def embed_hook_pending(all_msgs=False, batch=32, local_only=False):
             raise
         finally: claim.unlink(missing_ok=True)
 
-# ---- commands ----
 def _ro():
     try: c = get_db(read_only=True)
     except ValueError as e: typer.echo(str(e), err=True); return None
@@ -1332,12 +1323,12 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
     def set_state(section, key, val):
         nonlocal dirty
         if state.setdefault(section, {}).get(key) != val: state[section][key] = val; dirty = True
-    def plan_local(name, path, parser, bindings):
+    def plan_local(name, path, parser, bindings, sink):
         if not path.exists(): return None
         if name in ("codex", "claude-code"):
             prev, mt = local.get(name, {}).get("files", {}), {str(p):m for p in path.rglob("*.jsonl") if (m:=stat_mtime(p)) is not None}; files=list(map(Path,mt))
             if not (chg := files if full or local.get(name,{}).get("parser")!=PARSER_EPOCH else [p for p in files if mt.get(str(p), 0) > prev.get(str(p), 0)]): return None
-            return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path, fs=chg: parser(p, fs, bindings), state=("local", name, {"parser":PARSER_EPOCH,"files":mt}))
+            return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path, fs=chg, saved=(saved:=[]): [saved.append(sink(parser(p,fs[i:i+20],bindings))) for i in range(0,len(fs),20)] and ParseResult(), saved=saved, state=("local", name, {"parser":PARSER_EPOCH,"files":mt}))
         mtime = latest_mtime(path)
         if not full and mtime <= local.get(name, {}).get("mtime", 0): return None
         return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path: parser(p), state=("local", name, {"mtime": mtime}))
@@ -1406,15 +1397,15 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
             ids = {m["id"] for m in r.msgs}
             with (HOOK_DIR/".lock").open("w") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX); HOOK_FTS_DIRTY.touch() if ids else None; ids and merge_embed_dirty(ids); conn = get_db()
-                with contextlib.closing(conn),_transaction(conn): out = upsert(conn, r); known.update({c["id"]:(u.timestamp() if (u := ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs}); return out
+                with contextlib.closing(conn),_transaction(conn): out = upsert(conn, r); known.update({c["id"]:(u.timestamp() if (u := ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"}); return (*out,getattr(r,"provenance_edits",set()),getattr(r,"provenance_conversations",set()))
         conn = get_db(); repair=conn.execute("SELECT 1 FROM conversations WHERE source='chatgpt' AND (created_at IS NULL OR updated_at IS NULL) LIMIT 1").fetchone()
         if repair: conn.execute("BEGIN"); repaired=[r[0] for r in conn.execute("SELECT id FROM conversations WHERE source='chatgpt' AND (created_at IS NULL OR updated_at IS NULL)").fetchall()]; conn.execute("UPDATE conversations c SET created_at=COALESCE(c.created_at,t.first_seen),updated_at=COALESCE(c.updated_at,t.last_seen) FROM (SELECT conversation_id,MIN(created_at) first_seen,MAX(created_at) last_seen FROM messages GROUP BY conversation_id) t WHERE c.id=t.conversation_id AND c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL)"); _archive_touch(conn,[("conversations",x) for x in repaired]); conn.execute("COMMIT")
         conn.close()
         conn = get_db(read_only=True)
         cur,bindings = counts_by_source(conn),session_bindings(conn)
-        rows = conn.execute("SELECT id,updated_at,json_extract_string(metadata,'$.remote_update_time') FROM conversations WHERE source='chatgpt'").fetchall()
-        known = {cid:(v.timestamp() if (v := ts_any(raw)) else ts.timestamp() if ts else None) for cid, ts, raw in rows}
-        legacy = {cid for cid, _, raw in rows if raw is None}
+        rows = conn.execute("SELECT c.id,c.updated_at,json_extract_string(c.metadata,'$.remote_update_time'),json_extract_string(c.metadata,'$.remote_complete'),(SELECT role FROM messages m WHERE m.conversation_id=c.id ORDER BY created_at DESC NULLS LAST LIMIT 1) FROM conversations c WHERE source='chatgpt'").fetchall()
+        known = {cid:None if complete is None and role=="tool" or complete=="false" and (v:=ts_any(raw)) and (datetime.now()-v).total_seconds()<900 else v.timestamp() if (v := ts_any(raw)) else ts.timestamp() if ts else None for cid, ts, raw, complete, role in rows}
+        legacy = {cid for cid, _, raw, _, _ in rows if raw is None}
         conn.close()
         fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"
         start = lambda label, src=None: typer.echo(f"Syncing {label}" if not src else f"Syncing {label} ({fmt(cur.setdefault(src, [0]*5))})")
@@ -1422,9 +1413,9 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
             start("imports")
             jobs += [j for p in paths if (j := plan_import(p))]
         if claude_code and (p := Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects").exists():
-            start("Claude Code", "claude-code"); jobs += [j for j in [plan_local("claude-code", p, parse_claude_code,bindings)] if j]
+            start("Claude Code", "claude-code"); jobs += [j for j in [plan_local("claude-code", p, parse_claude_code,bindings,checkpoint)] if j]
         if codex and (p := Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))).exists():
-            start("Codex", "codex"); jobs += [j for j in [plan_local("codex", p, parse_codex,bindings)] if j]
+            start("Codex", "codex"); jobs += [j for j in [plan_local("codex", p, parse_codex,bindings,checkpoint)] if j]
         if not offline: start("ChatGPT", "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt, {} if full else known, checkpoint, legacy)] if j]
         if not offline: start("Claude", "claude"); jobs += [j for j in [plan_web("claude", fetch_claude, probe_claude)] if j]
         verbose and typer.echo(f"Planning took {time.perf_counter()-t0:.2f}s")
@@ -1437,7 +1428,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                         r = fut.result()
                     except Exception as e: typer.echo(f"{j['name']} failed: {e}"); r = None
                     if saved := j.get("saved"):
-                        c, m, t, a, e, n, u = [sum(s[i] for s in saved) for i in range(7)]; changed_ids = set()
+                        c,m,t,a,e,n,u,changed_ids,provenance_edits,provenance_conversations=(*[sum(s[i] for s in saved) for i in range(7)],set().union(*(s[7] for s in saved)),provenance_edits|set().union(*(s[8] for s in saved)),provenance_conversations|set().union(*(s[9] for s in saved)))
                     elif r is not None:
                         with (HOOK_DIR/".lock").open("w") as lock:
                             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1447,7 +1438,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     total = [total[i]+v for i, v in enumerate([c, m, t, a, e])]
                     newc, updc = newc+n, updc+u
                     changed |= changed_ids
-                    if r is not None: provenance_edits|={x["id"] for x in r.edits}; provenance_conversations|={x["id"] for x in r.convs}
+                    if r is not None: provenance_edits|=getattr(r,"provenance_edits",set()); provenance_conversations|=getattr(r,"provenance_conversations",set())
                     if r is not None and (st := j.get("state")):
                         if j["name"] == "chatgpt": st[2]["coverage"] = sorted(known)
                         set_state(*st)
@@ -1475,7 +1466,6 @@ def sql(query: str, fmt: str = typer.Option("text", "-f", "--format")):
     if fmt != "text": emit([dict(zip(cols, r)) for r in rows], fmt); return
     typer.echo(" | ".join(cols)); [typer.echo(" | ".join("" if v is None else str(v) for v in r)) for r in rows]; typer.echo(f"\n{len(rows)} rows")
 
-# ---- plugin seam: installed apps register subcommands (entry point group convos.commands) ----
 for _ep in entry_points(group="convos.commands"):
     try: _ep.load()(app)
     except Exception as _e: typer.echo(f"plugin {_ep.name} failed: {_e}", err=True)  # a broken plugin must not kill the CLI
