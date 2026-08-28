@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 import typer
-from ai_convos.cli import drain_hooks, get_db
+from ai_convos.cli import MESSAGE_ORDER, MESSAGE_ORDER_DESC, drain_hooks, get_db
 from ai_convos_redact import inspect
 
 NOISE=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"
@@ -48,7 +48,7 @@ def packet_data(scope=".",days=None,limit=4,turns=6,context=1200,budget=16000):
     remaining=budget; evidence=redactions=0; result=[]
     for index,(cid,source,title,cwd,last_at) in enumerate(sessions):
         turn_clause=" AND created_at>=CURRENT_TIMESTAMP-(?*INTERVAL '1 day')" if days else ""
-        raw=db.execute(f"""SELECT id,role,content,created_at FROM messages WHERE conversation_id=? AND COALESCE(content,'')!='' AND json_extract_string(metadata,'$.history_of') IS NULL AND NOT regexp_matches(content,?){turn_clause} ORDER BY created_at DESC NULLS LAST,id DESC LIMIT ?""",[cid,NOISE,*([days] if days else []),turns]).fetchall()
+        raw=db.execute(f"""SELECT m.id,m.role,m.content,m.created_at FROM messages m WHERE m.conversation_id=? AND COALESCE(m.content,'')!='' AND json_extract_string(m.metadata,'$.history_of') IS NULL AND NOT regexp_matches(m.content,?){turn_clause} ORDER BY {MESSAGE_ORDER_DESC} LIMIT ?""",[cid,NOISE,*([days] if days else []),turns]).fetchall()
         quota=min(remaining,max(context,remaining//(len(sessions)-index))) if remaining else 0; shown=[]
         for mid,role,content,created_at in raw:
             if quota<=0: break
@@ -64,7 +64,7 @@ def replay_data(ref,around="",limit=20,context=2000,activity=100):
     if db is None: raise ValueError("Archive not found")
     cs=db.execute("SELECT id,title,source,cwd FROM conversations WHERE starts_with(id,?) ORDER BY updated_at DESC NULLS LAST LIMIT 2",[ref]).fetchall()
     if len(cs)!=1: db.close(); raise ValueError("Conversation reference is missing or ambiguous")
-    cid,title,source,cwd=cs[0]; base="SELECT id,role,content,created_at,ROW_NUMBER() OVER (ORDER BY created_at NULLS FIRST,id) pos FROM messages WHERE conversation_id=? AND json_extract_string(metadata,'$.history_of') IS NULL AND COALESCE(content,'')!=''"
+    cid,title,source,cwd=cs[0]; base=f"SELECT m.id,m.role,m.content,m.created_at,ROW_NUMBER() OVER (ORDER BY {MESSAGE_ORDER}) pos FROM messages m WHERE m.conversation_id=? AND json_extract_string(m.metadata,'$.history_of') IS NULL AND COALESCE(m.content,'')!=''"
     if around and len(mids:=db.execute("SELECT id FROM messages WHERE conversation_id=? AND starts_with(id,?) AND json_extract_string(metadata,'$.history_of') IS NULL LIMIT 2",[cid,around]).fetchall())!=1: db.close(); raise ValueError("Message reference is missing or ambiguous")
     rows=db.execute(f"WITH b AS ({base}),t AS (SELECT pos FROM b WHERE id=?) SELECT id,role,content,created_at FROM (SELECT b.*,abs(b.pos-t.pos) d FROM b,t ORDER BY d,b.pos LIMIT ?) ORDER BY pos",[cid,mids[0][0],limit]).fetchall() if around else db.execute(f"SELECT id,role,content,created_at FROM ({base}) ORDER BY pos DESC LIMIT ?",[cid,limit]).fetchall()[::-1]
     messages=[dict(id=mid,role=role,content=_clip(content,context),created_at=at) for mid,role,content,at in rows]; selected=[m["id"] for m in messages]; event_rows=[]

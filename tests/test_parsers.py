@@ -578,6 +578,11 @@ class TestChatGPTExportParser:
         assert tool_msg["parent_id"] == user_msg["id"]
         assert next(m for m in result.msgs if m["content"] == "Found it.")["parent_id"] == tool_msg["id"]
 
+    def test_tree_order_is_explicit_when_timestamps_tie(self,tmp_path):
+        from ai_convos.cli import parse_chatgpt
+        export=tmp_path/"conversations.json"; same=100; export.write_text(json.dumps([{"id":"ordered","mapping":{"root":{"message":None,"parent":None,"children":["user"]},"final":{"message":{"author":{"role":"assistant"},"content":{"parts":["verdict"]},"create_time":same},"parent":"tool","children":[]},"tool":{"message":{"author":{"role":"tool"},"content":{},"create_time":same},"parent":"user","children":["final"]},"user":{"message":{"author":{"role":"user"},"content":{"parts":["question"]},"create_time":same},"parent":"root","children":["tool"]}}}]))
+        result=parse_chatgpt(export); assert [(m["role"],json.loads(m["metadata"])["provider_index"]) for m in result.msgs]==[("user",1),("tool",2),("assistant",3)] and result.msgs[-1]["content"]=="verdict"
+
     def test_iso_timestamps(self, tmp_path):
         """create_time as ISO string (web list api format) parses instead of becoming NULL."""
         from ai_convos.cli import parse_chatgpt, ts_any

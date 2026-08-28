@@ -44,6 +44,12 @@ such as `openai` or `claude` is not a model name. Claude's legacy `human` role i
 normalized to `user`; provider spellings may be retained in message metadata when
 they carry additional meaning.
 
+`messages.metadata.provider_index` is the zero-based provider record order. Codex
+uses the JSONL event index, Claude Code uses transcript event order, Claude export
+uses message-array order, and ChatGPT uses parent-before-child tree order with the
+provider's child ordering. It breaks timestamp ties for `read`, export, resume,
+replay, and last-role decisions; timestamps never substitute for it.
+
 ## Stable session metadata
 
 | Key | Meaning |

@@ -37,6 +37,10 @@ def test_packet_combines_live_git_and_exact_scope_isolated_archive_evidence(tmp_
     assert data["git"]["branch"]==git(repo,"branch","--show-current") and data["git"]["head"]==git(repo,"rev-parse","HEAD") and any("tracked.py" in row for row in data["git"]["status"])
     assert secret not in raw and "\u001b" not in raw and "[REDACTED:github_token]" in raw and data["redactions"]==1 and "recommended_plugins" not in raw and "private other project" not in raw and "superseded" not in raw
 
+def test_packet_and_replay_use_provider_order_for_timestamp_ties(tmp_path,monkeypatch):
+    repo,_=archive(tmp_path,monkeypatch); db=duckdb.connect(str(tmp_path/"convos.db")); db.execute("UPDATE messages SET created_at='2026-01-01',metadata=CASE id WHEN 'm1' THEN '{\"provider_index\":2}' WHEN 'm2' THEN '{\"provider_index\":0}' WHEN 'm3' THEN '{\"provider_index\":1}' ELSE metadata END WHERE id IN ('m1','m2','m3'); UPDATE messages SET created_at='2025-01-01' WHERE id='wrapper'"); db.close()
+    packet=resume.packet_data(repo,limit=2,turns=3); replay=resume.replay_data("c1",limit=3); assert packet["sessions"][1]["last_message_id"]=="m1" and [m["message_id"] for m in packet["sessions"][1]["turns"]]==["m2","m3","m1"] and [m["id"] for m in replay["messages"]]==["m2","m3","m1"]
+
 
 def test_global_evidence_budget_is_exact_and_keeps_newest_sessions(tmp_path,monkeypatch):
     repo,_=archive(tmp_path,monkeypatch); conn=duckdb.connect(str(tmp_path/"convos.db")); conn.execute("UPDATE messages SET content=repeat('x',500) WHERE id IN ('m3','s1')"); conn.close()

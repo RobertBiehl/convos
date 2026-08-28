@@ -6,8 +6,9 @@ from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remot
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT = find_root(); DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"; STATE_PATH = DATA_DIR / "sync_state.json"
-HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(content,'{_NR}')",8,10,20,8/15,2  # conservative policy below the observed ~200-detail failure point
+HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(content,'{_NR}')",8,10,20,8/15,3  # conservative policy below the observed ~200-detail failure point
 _INJECTED_RE=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*"
+MESSAGE_ORDER,MESSAGE_ORDER_DESC="m.created_at NULLS FIRST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) NULLS LAST,m.id","m.created_at DESC NULLS LAST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) DESC NULLS LAST,m.id DESC"
 
 def open_db(path=None,read_only=False,wait=30,deadline=None):
     path=Path(path or DB_PATH); path.parent.mkdir(parents=True,exist_ok=True); deadline=deadline if deadline is not None else time.monotonic()+wait
@@ -650,11 +651,12 @@ def parse_source(path: Path, source: Optional[str] = None, bindings=None) -> Par
 
 def chatgpt_mapping(cid: str, mapping: dict) -> tuple[list, list, list]:
     """Walk a chatgpt conversation mapping tree (shared by web fetcher and export parser)."""
+    tree_path=lambda nid:(*tree_path(parent),(mapping[parent].get("children") or [x for x in mapping if mapping[x].get("parent")==parent]).index(nid)) if (parent:=mapping[nid].get("parent")) in mapping else (tuple(mapping).index(nid),)
     def pmid(nid):  # nearest ancestor that carries a message (roots are message-less)
         while (nid := mapping[nid].get("parent")) and not mapping[nid].get("message"): pass
         return gen_id("chatgpt", f"{cid}:{nid}") if nid else None
     msgs, tools, attachs = [], [], []
-    for nid, node in mapping.items():
+    for provider_index,(nid,node) in enumerate((nid,mapping[nid]) for nid in sorted(mapping,key=tree_path)):
         if not (msg := node.get("message")): continue
         mid, role, meta = gen_id("chatgpt", f"{cid}:{nid}"), msg.get("author", {}).get("role", "unknown"), msg.get("metadata", {})
         ts, model = ts_any(msg.get("create_time")), meta.get("model_slug")
@@ -666,8 +668,7 @@ def chatgpt_mapping(cid: str, mapping: dict) -> tuple[list, list, list]:
                     size=p.get("size"), path=None, url=p.get("asset_pointer"), created_at=ts)
                for i, p in enumerate(parts) if isinstance(p, dict) and p.get("content_type") in ("image_asset_pointer", "file")]
         text = "\n".join(dict.fromkeys(p.strip() for p in [*parts,content.get("text")] if isinstance(p, str) and p.strip()))
-        if text or tool or att:  # keep tool-only turns: tool_calls/attachments reference them
-            msgs.append(dict(id=mid, conversation_id=cid, role=role, content=text, thinking=None, created_at=ts, model=model, metadata=json.dumps(meta), parent_id=pmid(nid)))
+        msgs.append(dict(id=mid, conversation_id=cid, role=role, content=text, thinking=None, created_at=ts, model=model, metadata=json.dumps({**meta,"provider_index":provider_index}), parent_id=pmid(nid)))
         attachs += att
     return msgs, tools, attachs
 
@@ -803,14 +804,14 @@ def parse_claude(path: Path) -> ParseResult:
     def parse_conv(c):
         cid = gen_id("claude", c["uuid"] if "uuid" in c else c["id"])
         msgs_data = c.get("chat_messages", [])
-        parsed=[(m,gen_id("claude",f"{cid}:{m['uuid'] if 'uuid' in m else m['id']}"),extract_content(m.get("text") or m.get("content", ""))) for m in msgs_data]
-        results={t["id"]:t for m,mid,ec in parsed for t in ec["tools"] if "output" in t and t.get("id")}
+        parsed=[(i,m,gen_id("claude",f"{cid}:{m['uuid'] if 'uuid' in m else m['id']}"),extract_content(m.get("text") or m.get("content", ""))) for i,m in enumerate(msgs_data)]
+        results={t["id"]:t for i,m,mid,ec in parsed for t in ec["tools"] if "output" in t and t.get("id")}
         return {
             "conv": dict(id=cid, source="claude", title=c.get("name") or c.get("title"), created_at=ts_from_iso(c.get("created_at")),
                         updated_at=ts_from_iso(c.get("updated_at")), model=c.get("model"), cwd=None, git_branch=None, project_id=None, metadata=json.dumps({"session_id":c["uuid"] if "uuid" in c else c["id"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"export"})),
-            "msgs":[dict(id=mid,conversation_id=cid,role="user" if m.get("sender")=="human" else m.get("sender","unknown"),content=ec["text"],thinking=ec["thinking"],created_at=ts_from_iso(m.get("created_at")),model=m.get("model"),metadata="{}",parent_id=None) for m,mid,ec in parsed if ec["text"] or ec["tools"] or ec["attachments"] or m.get("attachments")],
-            "tools":[dict(id=gen_id("claude",f"tool:{mid}:{t.get('id') or i}"),message_id=mid,tool_name=t["name"],input=json.dumps(t.get("input",{})),output=json.dumps((results.get(t.get("id")) or {}).get("output","")),status="failed" if (results.get(t.get("id")) or {}).get("error") else "complete" if t.get("id") in results else "pending",duration_ms=None,created_at=ts_from_iso(m.get("created_at"))) for m,mid,ec in parsed for i,t in enumerate(ec["tools"]) if "name" in t],
-            "attachs":[dict(id=gen_id("claude",f"attach:{mid}:{i}"),message_id=mid,filename=a.get("name",a.get("file_name")),mime_type=a.get("content_type",a.get("file_type")),size=a.get("size",a.get("file_size")),path=None,url=a.get("asset_pointer",a.get("url")),created_at=ts_from_iso(m.get("created_at"))) for m,mid,ec in parsed for i,a in enumerate([*ec["attachments"],*m.get("attachments",[])])]}
+            "msgs":[dict(id=mid,conversation_id=cid,role="user" if m.get("sender")=="human" else m.get("sender","unknown"),content=ec["text"],thinking=ec["thinking"],created_at=ts_from_iso(m.get("created_at")),model=m.get("model"),metadata=json.dumps({"provider_index":i}),parent_id=None) for i,m,mid,ec in parsed if ec["text"] or ec["tools"] or ec["attachments"] or m.get("attachments")],
+            "tools":[dict(id=gen_id("claude",f"tool:{mid}:{t.get('id') or j}"),message_id=mid,tool_name=t["name"],input=json.dumps(t.get("input",{})),output=json.dumps((results.get(t.get("id")) or {}).get("output","")),status="failed" if (results.get(t.get("id")) or {}).get("error") else "complete" if t.get("id") in results else "pending",duration_ms=None,created_at=ts_from_iso(m.get("created_at"))) for i,m,mid,ec in parsed for j,t in enumerate(ec["tools"]) if "name" in t],
+            "attachs":[dict(id=gen_id("claude",f"attach:{mid}:{j}"),message_id=mid,filename=a.get("name",a.get("file_name")),mime_type=a.get("content_type",a.get("file_type")),size=a.get("size",a.get("file_size")),path=None,url=a.get("asset_pointer",a.get("url")),created_at=ts_from_iso(m.get("created_at"))) for i,m,mid,ec in parsed for j,a in enumerate([*ec["attachments"],*m.get("attachments",[])])]}
     parsed = [p for idx, c in enumerate(data)
               if (p := safe_parse(f"claude export conv {c.get('uuid') if isinstance(c, dict) else idx}", parse_conv, c))]
     return ParseResult(convs=[p["conv"] for p in parsed],msgs=[m for p in parsed for m in p["msgs"]],tools=[t for p in parsed for t in p["tools"]],attachs=[a for p in parsed for a in p["attachs"]])
@@ -834,7 +835,7 @@ def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
 
     def make_msg(idx, i, e):
         c = extract_content(e["message"].get("content", e["message"].get("text", "")))
-        return dict(id=gen_id(src,f"{cid}:{idx}"),conversation_id=cid,role="user" if e["type"] in ("human","user") else e["type"],content=c["text"],thinking=c["thinking"],created_at=ts_from_iso(e.get("timestamp")),model=e["message"].get("model") if e["type"]=="assistant" else None,metadata="{}",parent_id=uuid2id.get(e.get("parentUuid")))
+        return dict(id=gen_id(src,f"{cid}:{idx}"),conversation_id=cid,role="user" if e["type"] in ("human","user") else e["type"],content=c["text"],thinking=c["thinking"],created_at=ts_from_iso(e.get("timestamp")),model=e["message"].get("model") if e["type"]=="assistant" else None,metadata=json.dumps({"provider_index":i}),parent_id=uuid2id.get(e.get("parentUuid")))
 
     def make_tools(idx, i, e):
         c, ts = extract_content(e["message"].get("content", [])), ts_from_iso(e.get("timestamp"))
@@ -881,7 +882,7 @@ def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
     def norm_args(p): return json.loads(a) if isinstance((a := p.get("arguments", {})), str) else a
 
     mitems = [(i, p, t) for i, p in items if p.get("type") == "message" and ((t := extract_msg_text(p)) or any(isinstance(b,dict) and b.get("type")=="input_image" for b in p.get("content",[])))]
-    if not (msgs := [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(), thinking=None, created_at=timestamps.get(i), model=model_at(i), metadata="{}", parent_id=None)
+    if not (msgs := [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(), thinking=None, created_at=timestamps.get(i), model=model_at(i), metadata=json.dumps({"provider_index":i}), parent_id=None)
                      for i, p, t in mitems]): return None
     anchor = lambda k: gen_id(src, f"{cid}:{next((i for i, _, _ in reversed(mitems) if i <= k), mitems[0][0])}")  # function_call items are not messages; attach to nearest preceding one
 
@@ -1181,7 +1182,7 @@ def read_cmd(conversation: str, limit: int = typer.Option(20, "-n", min=1), cont
     if len(cs) != 1:
         conn.close(); typer.echo("No matching conversation" if not cs else "Ambiguous prefix: " + ", ".join(c[0] for c in cs), err=True); raise typer.Exit(1)
     cid, title, src, cwd = cs[0]
-    base = "SELECT id,role,content,thinking,created_at,ROW_NUMBER() OVER (ORDER BY created_at NULLS FIRST,id) pos FROM messages WHERE conversation_id=? AND json_extract_string(metadata,'$.history_of') IS NULL AND (COALESCE(content,'')!='' OR COALESCE(thinking,'')!='')"
+    base = f"SELECT m.id,m.role,m.content,m.thinking,m.created_at,ROW_NUMBER() OVER (ORDER BY {MESSAGE_ORDER}) pos FROM messages m WHERE m.conversation_id=? AND json_extract_string(m.metadata,'$.history_of') IS NULL AND (COALESCE(m.content,'')!='' OR COALESCE(m.thinking,'')!='')"
     if around and len(mids := conn.execute("SELECT id FROM messages WHERE conversation_id=? AND starts_with(id,?) AND json_extract_string(metadata,'$.history_of') IS NULL LIMIT 2", [cid, around]).fetchall()) != 1:
         conn.close(); typer.echo("No matching message" if not mids else "Ambiguous message prefix: " + ", ".join(m[0] for m in mids), err=True); raise typer.Exit(1)
     rows = conn.execute(f"WITH b AS ({base}),t AS (SELECT pos FROM b WHERE id=?) SELECT id,role,content,thinking,created_at FROM (SELECT b.*,abs(b.pos-t.pos) d FROM b,t ORDER BY d,b.pos LIMIT ?) ORDER BY pos", [cid, mids[0][0], limit]).fetchall() if around else conn.execute(f"SELECT id,role,content,thinking,created_at FROM ({base}) ORDER BY pos DESC LIMIT ?", [cid, limit]).fetchall()[::-1]
@@ -1297,7 +1298,7 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional
         result = []
         for r in rows:
             msgs = [dict(role=m[0], content=m[1], thinking=m[2], created_at=str(m[3]) if m[3] else None, model=m[4])
-                   for m in conn.execute("SELECT role, content, thinking, created_at, model FROM messages WHERE conversation_id = ? ORDER BY created_at", [r[0]]).fetchall()]
+                   for m in conn.execute(f"SELECT m.role,m.content,m.thinking,m.created_at,m.model FROM messages m WHERE m.conversation_id=? ORDER BY {MESSAGE_ORDER}",[r[0]]).fetchall()]
             tcs = [dict(tool=t[0], input=json.loads(t[1]), output=json.loads(t[2]), status=t[3])
                   for t in conn.execute("SELECT tool_name, input, output, status FROM tool_calls tc JOIN messages m ON tc.message_id = m.id WHERE m.conversation_id = ?", [r[0]]).fetchall()]
             edits = [dict(file=e[0], type=e[1], content=e[2])
@@ -1306,7 +1307,7 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional
                               model=r[5], cwd=r[6], git_branch=r[7], project_id=r[8], messages=msgs, tool_calls=tcs, file_edits=edits))
         output.write_text(json.dumps(result, indent=2))
     else:
-        cur = conn.execute(f"SELECT c.id, c.source, c.title, c.cwd, m.role, m.content, m.created_at FROM conversations c JOIN messages m ON c.id = m.conversation_id {where} ORDER BY c.created_at, m.created_at", params)
+        cur = conn.execute(f"SELECT c.id,c.source,c.title,c.cwd,m.role,m.content,m.created_at FROM conversations c JOIN messages m ON c.id=m.conversation_id {where} ORDER BY c.created_at,{MESSAGE_ORDER}",params)
         with output.open("w", newline="") as f: w = csv.writer(f); w.writerow([d[0] for d in cur.description]); w.writerows(cur.fetchall())
     conn.close(); typer.echo(f"Exported to {output}")
 
@@ -1361,7 +1362,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         items = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations", cookies, headers)
         if not items: return None
         return f"{(item := items[0])['uuid']}:{item.get('updated_at') or item.get('created_at')}"
-    def plan_web(name, fetcher, probe, known=None, sink=None, legacy=None):
+    def plan_web(name, fetcher, probe, known=None, sink=None, legacy=None, frontier_ok=True):
         pref = web.get(name, {})
         forced = os.environ.get(f"CONVOS_{name.upper()}_BROWSER")
         order = [forced] if forced else [pref.get("browser")] + [b for b in ("safari", "chrome") if b != pref.get("browser")]
@@ -1376,7 +1377,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                 last = pref.get("last_updated")
                 since = ts_from_iso(last) if (name == "claude" and last and not full) else None
                 saved = None if name == "claude" else []
-                coverage = pref.get("coverage"); frontier = pref.get("frontiers") if not full and b == pref.get("browser") and known and isinstance(coverage, list) and set(coverage) <= set(known) else None
+                coverage = pref.get("coverage"); frontier = pref.get("frontiers") if frontier_ok and not full and b == pref.get("browser") and known and isinstance(coverage, list) and set(coverage) <= set(known) else None
                 func = (lambda b=b, since=since: fetcher(b, since=since)) if name == "claude" else (lambda b=b, saved=saved: fetcher(b, profiles=chatgpt_ok[b], known=known, legacy=legacy, frontiers=frontier, sink=lambda r: saved.append(sink(r))))
                 return dict(name=name, label=name.title(), source=name, func=func, state=("web", name, st), saved=saved)
             except Exception as e:
@@ -1392,19 +1393,19 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         nonlocal state, dirty, local, web, imports
         sync_lock=_sync_leader(); state=load_state()
         local,web,imports=state.setdefault("local",{}),state.setdefault("web",{}),state.setdefault("imports",{}); chatgpt_ok.clear(); chatgpt_frontiers.clear()
-        t0 = time.perf_counter(); dirty, total, changed, jobs, newc, updc, provenance_edits, provenance_conversations = False, [0]*5, set(), [], 0, 0, set(), set()
+        t0 = time.perf_counter(); dirty, total, changed, jobs, newc, updc, provenance_edits, provenance_conversations, repair_attempted = False, [0]*5, set(), [], 0, 0, set(), set(), set()
         def checkpoint(r):
             ids = {m["id"] for m in r.msgs}
             with (HOOK_DIR/".lock").open("w") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX); HOOK_FTS_DIRTY.touch() if ids else None; ids and merge_embed_dirty(ids); conn = get_db()
-                with contextlib.closing(conn),_transaction(conn): out = upsert(conn, r); known.update({c["id"]:(u.timestamp() if (u := ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"}); return (*out,getattr(r,"provenance_edits",set()),getattr(r,"provenance_conversations",set()))
+                with contextlib.closing(conn),_transaction(conn): out = upsert(conn, r); known.update({c["id"]:(u.timestamp() if (u := ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"}); repair_attempted.update(c["id"] for c in r.convs if c["id"] in repair_order); return (*out,getattr(r,"provenance_edits",set()),getattr(r,"provenance_conversations",set()))
         conn = get_db(); repair=conn.execute("SELECT 1 FROM conversations WHERE source='chatgpt' AND (created_at IS NULL OR updated_at IS NULL) LIMIT 1").fetchone()
         if repair: conn.execute("BEGIN"); repaired=[r[0] for r in conn.execute("SELECT id FROM conversations WHERE source='chatgpt' AND (created_at IS NULL OR updated_at IS NULL)").fetchall()]; conn.execute("UPDATE conversations c SET created_at=COALESCE(c.created_at,t.first_seen),updated_at=COALESCE(c.updated_at,t.last_seen) FROM (SELECT conversation_id,MIN(created_at) first_seen,MAX(created_at) last_seen FROM messages GROUP BY conversation_id) t WHERE c.id=t.conversation_id AND c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL)"); _archive_touch(conn,[("conversations",x) for x in repaired]); conn.execute("COMMIT")
         conn.close()
         conn = get_db(read_only=True)
         cur,bindings = counts_by_source(conn),session_bindings(conn)
-        rows = conn.execute("SELECT c.id,c.updated_at,json_extract_string(c.metadata,'$.remote_update_time'),json_extract_string(c.metadata,'$.remote_complete'),(SELECT role FROM messages m WHERE m.conversation_id=c.id ORDER BY created_at DESC NULLS LAST LIMIT 1) FROM conversations c WHERE source='chatgpt'").fetchall()
-        known = {cid:None if complete is None and role=="tool" or complete=="false" and (v:=ts_any(raw)) and (datetime.now()-v).total_seconds()<900 else v.timestamp() if (v := ts_any(raw)) else ts.timestamp() if ts else None for cid, ts, raw, complete, role in rows}
+        rows,candidates,prior_order,updated,repair_order=(rs:=conn.execute(f"SELECT c.id,c.updated_at,json_extract_string(c.metadata,'$.remote_update_time'),json_extract_string(c.metadata,'$.remote_complete'),(SELECT role FROM messages m WHERE m.conversation_id=c.id ORDER BY {MESSAGE_ORDER_DESC} LIMIT 1) FROM conversations c WHERE source='chatgpt'").fetchall()),(cs:={r[0] for r in conn.execute("SELECT DISTINCT m.conversation_id FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.source='chatgpt' AND json_extract_string(m.metadata,'$.provider_index') IS NULL QUALIFY count(*) OVER (PARTITION BY m.conversation_id,m.created_at)>1").fetchall()}),(po:=web.get("chatgpt",{}).get("order_repairs",{})),(us:={cid:v.timestamp() if (v:=ts_any(raw)) else ts.timestamp() if ts else None for cid,ts,raw,_,_ in rs}),{cid for cid in cs if po.get(cid)!=us[cid]}
+        known = {cid:None if cid in repair_order or (complete=="false" or complete is None and role=="tool") and (v:=ts_any(raw) or ts) and (datetime.now()-v).total_seconds()<900 else updated[cid] for cid, ts, raw, complete, role in rows}
         legacy = {cid for cid, _, raw, _, _ in rows if raw is None}
         conn.close()
         fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"
@@ -1416,7 +1417,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
             start("Claude Code", "claude-code"); jobs += [j for j in [plan_local("claude-code", p, parse_claude_code,bindings,checkpoint)] if j]
         if codex and (p := Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))).exists():
             start("Codex", "codex"); jobs += [j for j in [plan_local("codex", p, parse_codex,bindings,checkpoint)] if j]
-        if not offline: start("ChatGPT", "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt, {} if full else known, checkpoint, legacy)] if j]
+        if not offline: start("ChatGPT"+(f", provider order={len(candidates)-len(repair_order)} attempted/{len(candidates)} unresolved" if candidates else ""), "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt, {} if full else known, checkpoint, legacy, not repair_order)] if j]
         if not offline: start("Claude", "claude"); jobs += [j for j in [plan_web("claude", fetch_claude, probe_claude)] if j]
         verbose and typer.echo(f"Planning took {time.perf_counter()-t0:.2f}s")
         if jobs:
@@ -1440,7 +1441,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     changed |= changed_ids
                     if r is not None: provenance_edits|=getattr(r,"provenance_edits",set()); provenance_conversations|=getattr(r,"provenance_conversations",set())
                     if r is not None and (st := j.get("state")):
-                        if j["name"] == "chatgpt": st[2]["coverage"] = sorted(known)
+                        if j["name"] == "chatgpt": st[2]["coverage"],st[2]["order_repairs"]=sorted(known),{cid:known[cid] for cid in ({cid for cid in candidates if prior_order.get(cid)==updated[cid]}|repair_attempted)}
                         set_state(*st)
                     if src := j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} processed){' before failure' if r is None else ''}{' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
         capture_provenance() if full else capture_provenance(edit_ids=provenance_edits,conversation_ids=provenance_conversations)

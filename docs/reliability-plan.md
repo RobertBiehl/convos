@@ -18,7 +18,7 @@ gate below are acceptance criteria, not additional tasks.
 | In review in stacked PR #95 | Freeze the cross-provider conversation contract and audit real Codex and Claude imports. Define transcript and session identity, main-versus-subagent relationships, cwd, Git and model evidence, tools, attachments, and confirmed edits without deriving unavailable facts. |
 | In review in stacked PR #96 | Install backed-up local native-session bindings without rewriting released physical IDs; preserve safe filename-to-native aliases, make a batch converge or fail before mutation, preserve foreign signed rows, structurally quarantine startup stubs, and keep migration commit independent of FTS rebuild. |
 | In review in stacked PR #97 | Make ordinary imports complete and bounded: stream relevant Codex records, retain current ChatGPT content forms, recheck incomplete and tool-ended web sessions, checkpoint chunks, and keep parse failures visible. |
-| Pending | Add explicit provider turn ordering so timestamp ties cannot hide the terminal message from bounded `read`, replay, resume, or last-role logic. |
+| In review in stacked PR #98 | Add explicit provider turn ordering so timestamp ties cannot hide the terminal message from bounded `read`, export, replay, resume, or last-role logic, and selectively refetch affected ChatGPT conversations. |
 | Pending | Design signed author-scoped provider-session aliases/tombstones that reconcile pre-existing local duplicates and converge two devices of one author while preserving equal native IDs from different authors. |
 | Pending | Harden remote synchronization: fix duplicate-root proof-chain convergence, add observable exponential backoff, narrow local mutation locks, cover interruption recovery, and prove retained signed logical replicas remain ingestible. |
 | Pending | Build and qualify the Titan multi-user testbed with a fresh synthetic lane and a persistent upgrade canary before declaring a stable release. |
@@ -42,7 +42,7 @@ evidence register; remediation is represented by the work items above.
 | Imported cwd, Git, model, tool, and edit evidence was incomplete | Fixed in stacked PR #95; parser and live-sample regressions retained. |
 | Provider transcripts could be imported more than once | Same-batch and later moved-local inputs are covered in stacked PR #96; pre-existing and cross-device reconciliation remains open. |
 | Promptless startup stubs became conversations | Exact wrapper-only candidates are retained and marked in stacked PR #96; ownership-safe cleanup remains open. |
-| Completed ChatGPT verdict was absent from bounded `read` | The row was synced; timestamp ties made ID ordering hide it. Explicit provider ordering remains open. |
+| Completed ChatGPT verdict was absent from bounded `read` | Fixed in stacked PR #98 with canonical provider order and selective repair of affected ChatGPT conversations. |
 
 ## Acceptance criteria
 
