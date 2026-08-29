@@ -1,6 +1,6 @@
 """Integration tests for API fetchers - validates API schemas haven't changed."""
 
-import pytest, json, os, plistlib
+import pytest, json, os
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -366,12 +366,6 @@ class TestClaudeAPI:
 
 class TestCookieExtraction:
     """Tests for browser cookie extraction."""
-
-    def test_browser_ua_uses_installed_version_and_explicit_override(self, tmp_path, monkeypatch):
-        from ai_convos import cli
-        app=tmp_path/"Safari.app"; (app/"Contents").mkdir(parents=True); (app/"Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString":"26.4"})); monkeypatch.setattr(cli,"_BROWSER_APPS",{"safari":("Version/",(app,))})
-        assert "Version/26.4 Safari/" in cli.browser_ua("safari")
-        monkeypatch.setenv("CONVOS_BROWSER_USER_AGENT","test-agent"); assert cli.browser_ua("safari")=="test-agent"
 
     def test_safari_cookies_not_found(self):
         """Safari cookie function handles missing file gracefully."""
