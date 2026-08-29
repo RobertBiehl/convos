@@ -14,18 +14,16 @@ export CONVOS_PROJECT_ROOT="$sandbox/root" CODEX_HOME="$sandbox/codex" CLAUDE_CO
 
 "$sandbox/venv/bin/python" <<'PY'
 from importlib.metadata import metadata, version
+from importlib.util import find_spec
 from pathlib import Path
 import duckdb
-import model2vec
 from ai_convos import cli
 from typer.testing import CliRunner
 
 requirements = metadata("convos").get_all("Requires-Dist") or []
 assert version("convos") == "0.10.1"
-assert any(r.startswith("model2vec==0.9.0") and "sys_platform == \"linux\"" in r for r in requirements), requirements
-assert cli.semantic_backend() == "model2vec" and cli.embedding_profile()["dimensions"] == 256
-vector = cli.embed_text("portable semantic retrieval")
-assert len(vector) == 256 and any(vector)
+assert not any("model2vec" in r or "sys_platform == \"linux\"" in r for r in requirements), requirements
+assert find_spec("model2vec") is None and find_spec("llama_cpp") is None and not cli.semantic_enabled()
 conn = duckdb.connect(str(cli.DB_PATH))
 conn.execute("INSERT INTO conversations (id,source,title) VALUES ('smoke-conversation','codex','Packaging decision')")
 conn.execute("INSERT INTO messages (id,conversation_id,role,content) VALUES ('smoke-message','smoke-conversation','assistant','The base installation needs no native compiler.')")
@@ -33,5 +31,5 @@ cli.rebuild_fts_index(conn); conn.close()
 result = CliRunner().invoke(cli.app, ["search", "native compiler", "-n", "1"])
 assert result.exit_code == 0 and "base installation needs no native compiler" in result.output, result.output
 assert Path(cli.PROJECT_ROOT).exists()
-print("clean wheel: convos 0.10.1, compiler-free Linux semantic runtime ready")
+print("clean wheel: convos 0.10.1, compiler-free Linux core and literal retrieval ready")
 PY

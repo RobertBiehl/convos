@@ -62,10 +62,10 @@ def test_installable_product_versions_are_aligned():
     assert not any(d.startswith("convos-changegraph") for d in projects["remote"]["dependencies"])
 
 
-def test_default_semantic_runtime_is_platform_specific_and_wheel_only_on_linux():
+def test_default_semantic_runtime_is_macos_only():
     project=tomllib.loads((Path(__file__).resolve().parents[1]/"pyproject.toml").read_text())["project"]
     deps=set(project["dependencies"])
-    assert "llama-cpp-python>=0.3.0; sys_platform == 'darwin'" in deps and "huggingface-hub>=0.20.0; sys_platform == 'darwin' or sys_platform == 'linux'" in deps and "model2vec==0.9.0; sys_platform == 'linux'" in deps
+    assert "llama-cpp-python>=0.3.0; sys_platform == 'darwin'" in deps and "huggingface-hub>=0.20.0; sys_platform == 'darwin'" in deps and not any("model2vec" in dep or "sys_platform == 'linux'" in dep for dep in deps)
 
 
 def test_release_has_one_trusted_publisher_per_public_product():

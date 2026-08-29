@@ -939,14 +939,15 @@ def flush_fts():
         finally: claim.unlink(missing_ok=True)
     return True
 
-_MODELS,_MCFG,_M2VCFG,_LLAMA_LOG,_SEMANTIC_INSTALL={},dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF",filename="embeddinggemma-300m-qat-q8_0.gguf",revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64",artifact_sha256="6fa0c02a9c302be6f977521d399b4de3a46310a4f2621ee0063747881b673f67",embedding=True,n_ctx=16384,n_batch=2048,n_ubatch=2048,n_seq_max=8,n_gpu_layers=-1),dict(repo_id="minishlab/potion-base-8M",revision="bf8b056651a2c21b8d2565580b8569da283cab23",artifact_sha256="f65d0f325faadc1e121c319e2faa41170d3fa07d8c89abd48ca5358d9a223de2"),None,"Semantic runtime unavailable. Reinstall Convos for this platform, or install `convos[semantic]` for llama.cpp, then run `convos embed`; literal `convos search` needs no model."
-def semantic_enabled(): return os.environ.get("CONVOS_SEMANTIC","auto").lower() not in ("0","false","no","off")
+_MODELS,_MCFG,_LLAMA_LOG,_SEMANTIC_INSTALL={},dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF",filename="embeddinggemma-300m-qat-q8_0.gguf",revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64",artifact_sha256="6fa0c02a9c302be6f977521d399b4de3a46310a4f2621ee0063747881b673f67",embedding=True,n_ctx=16384,n_batch=2048,n_ubatch=2048,n_seq_max=8,n_gpu_layers=-1),None,"Semantic runtime unavailable. macOS includes it; elsewhere install `convos[semantic]`, set CONVOS_SEMANTIC=llama, then run `convos embed`. Literal `convos search` needs no model."
+def semantic_enabled(): return (mode:=os.environ.get("CONVOS_SEMANTIC","auto").lower()) not in ("0","false","no","off") and (mode!="auto" or sys.platform=="darwin")
 def semantic_backend():
     mode=os.environ.get("CONVOS_SEMANTIC","auto").lower()
     required(mode not in ("0","false","no","off"),ValueError("Semantic retrieval is disabled by CONVOS_SEMANTIC=0; use `convos search` for literal retrieval."))
-    required(mode in ("auto","1","true","yes","on","llama","model2vec"),ValueError("CONVOS_SEMANTIC must be auto, llama, model2vec, or 0"))
-    return mode if mode in ("llama","model2vec") else "model2vec" if sys.platform.startswith("linux") else "llama"
-_EPROFILES={"llama":{"backend":"llama.cpp","model":_MCFG["repo_id"],"revision":_MCFG["revision"],"artifact":_MCFG["filename"],"artifact_sha256":_MCFG["artifact_sha256"],"dimensions":768,"pooling":"model","normalization":"l2","character_limit":1600,"token_limit":_MCFG["n_ctx"],"query_prefix":"task: search result | query: ","document_prefix":"task: search result | document: "},"model2vec":{"backend":"model2vec","model":_M2VCFG["repo_id"],"revision":_M2VCFG["revision"],"artifact":"model.safetensors","artifact_sha256":_M2VCFG["artifact_sha256"],"dimensions":256,"pooling":"token-mean","normalization":"l2","character_limit":1600,"token_limit":512,"query_prefix":"","document_prefix":""}}
+    required(mode in ("auto","1","true","yes","on","llama"),ValueError("CONVOS_SEMANTIC must be auto, llama, or 0"))
+    required(mode!="auto" or sys.platform=="darwin",ValueError(_SEMANTIC_INSTALL))
+    return "llama"
+_EPROFILES={"llama":{"backend":"llama.cpp","model":_MCFG["repo_id"],"revision":_MCFG["revision"],"artifact":_MCFG["filename"],"artifact_sha256":_MCFG["artifact_sha256"],"dimensions":768,"pooling":"model","normalization":"l2","character_limit":1600,"token_limit":_MCFG["n_ctx"],"query_prefix":"task: search result | query: ","document_prefix":"task: search result | document: "}}
 def embedding_profile(): return _EPROFILES[semantic_backend()]
 def embedding_model_path(local_only=False):
     try: from huggingface_hub import hf_hub_download
@@ -966,15 +967,6 @@ def _llama(local_only=False):
         try: _MODELS["llama"] = Llama(model_path=embedding_model_path(local_only), **cfg, verbose=False)
         finally: lc.llama_context_default_params=orig if nseq else lc.llama_context_default_params
     return _MODELS["llama"]
-def _model2vec(local_only=False):
-    if "model2vec" not in _MODELS:
-        try:
-            snapshot_download,StaticModel=__import__("huggingface_hub").snapshot_download,__import__("model2vec").StaticModel
-        except ImportError as e: raise ValueError(_SEMANTIC_INSTALL) from e
-        path=snapshot_download(_M2VCFG["repo_id"],revision=_M2VCFG["revision"],local_files_only=local_only)
-        required(_file_sha256(Path(path)/"model.safetensors")==_M2VCFG["artifact_sha256"],ValueError("Semantic model artifact hash mismatch"))
-        _MODELS["model2vec"]=StaticModel.from_pretrained(path,normalize=True,force_download=False)
-    return _MODELS["model2vec"]
 def _activate_embedding_profile():
     profile=embedding_profile()
     with _core(ready=True) as conn:
@@ -986,7 +978,7 @@ def _activate_embedding_profile():
 def embed_texts(ss: list[str], doc: bool = False, local_only=False) -> list[list[float]]:
     profile=embedding_profile()
     texts=[profile["document_prefix" if doc else "query_prefix"]+(s or "")[:profile["character_limit"]] for s in ss]
-    vectors=[d["embedding"] for d in _llama(local_only).create_embedding(texts)["data"]] if semantic_backend()=="llama" else _model2vec(local_only).encode(texts,max_length=profile["token_limit"]).tolist()
+    vectors=[d["embedding"] for d in _llama(local_only).create_embedding(texts)["data"]]
     required(all(len(v)==profile["dimensions"] for v in vectors),ValueError("Embedding runtime returned the wrong dimensions"))
     return vectors
 def embed_text(s: str, doc: bool = False, local_only=False) -> list[float]: return embed_texts([s], doc, local_only)[0]

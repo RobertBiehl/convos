@@ -49,7 +49,7 @@ evidence register; remediation is represented by the work items above.
 | Provider transcripts could be imported more than once | Fixed in PR #105 through exact native bindings and signed cross-device alias reconciliation; every physical row remains retained. |
 | Promptless startup stubs became conversations | Exact wrapper-only candidates are retained and marked in PR #105; ownership-safe cleanup remains open. |
 | Completed ChatGPT verdict was absent from bounded `read` | Fixed in PR #105 with canonical provider order and selective repair of affected ChatGPT conversations. |
-| A clean Ubuntu 24.04 install of core plus remote required an undocumented native compiler toolchain for `llama-cpp-python` | Fixed in PR #105; Linux defaults to the small Model2Vec backend, so install, remote sync, and semantic retrieval are compiler-free. macOS retains llama.cpp. |
+| A clean Ubuntu 24.04 install of core plus remote required an undocumented native compiler toolchain for `llama-cpp-python` | Fixed in PR #105 and narrowed before release: Linux installs compiler-free core, literal retrieval, and relay support without a default semantic runtime; macOS retains llama.cpp. |
 | A confirmed local edit lost its evidence classification through a signed replica | Fixed in PR #105 without changing signed-v1 rows; an authorized root-signed evidence object binds the classification to exact edit/tool revisions, and old rows remain `unverified` until that evidence arrives. |
 
 ## Acceptance criteria

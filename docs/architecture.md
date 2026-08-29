@@ -147,14 +147,13 @@ remain outside core.
 Literal `search` is conversation-first as well: BM25 ranks messages, then only
 the strongest matching message from each conversation consumes a result slot.
 
-The default backend is platform-specific: macOS uses EmbeddingGemma through
-`llama-cpp-python`, while Linux uses the compact Model2Vec `potion-base-8M`
-model without a compiler toolchain. Both model revisions are pinned and fetched
-on first semantic use. `embedding_state` records the complete vector-space
+macOS includes EmbeddingGemma through `llama-cpp-python`; its pinned model is
+fetched on first semantic use. Linux installs only the compiler-free core and
+relay products by default. `embedding_state` records the complete vector-space
 profile; changing it clears incompatible vectors transactionally before they
 can participate in retrieval. `CONVOS_SEMANTIC=0` disables semantic work while
-leaving literal retrieval available, and the `semantic` extra explicitly adds
-llama.cpp on other platforms.
+leaving literal retrieval available, and the `semantic` extra plus
+`CONVOS_SEMANTIC=llama` explicitly enables llama.cpp on other platforms.
 
 ## Data Flow
 

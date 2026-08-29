@@ -23,6 +23,16 @@ from ai_convos.cli import archive_state, capture_provenance, init_schema
 
 USERS={"fresh":("convos-fresh-a","convos-fresh-b"),"canary":("convos-canary-a","convos-canary-b")}
 STATE=Path("/var/lib/convos-testbed")
+TEST_USERS={user for users in USERS.values() for user in users}
+
+
+def inside(path,base): return (path:=Path(path).resolve())==(base:=Path(base).resolve()) or base in path.parents
+def test_root(user,root):
+    if user not in TEST_USERS or not inside(root,Path("/home")/user/"convos-testbed"): raise ValueError(f"refusing non-test Convos root: {root}")
+    return Path(root)
+def isolated_root(root):
+    if len(users:=[user for user in TEST_USERS if inside(root,Path("/home")/user/"convos-testbed")])!=1: raise ValueError(f"refusing non-test Convos root: {root}")
+    return test_root(users[0],root)
 
 
 @dataclass(frozen=True,slots=True)
@@ -30,6 +40,8 @@ class Client:
     user: str
     root: Path
     venv: Path
+
+    def __post_init__(self): test_root(self.user,self.root)
 
     @property
     def home(self): return Path("/home")/self.user
@@ -161,6 +173,16 @@ def assert_opaque(relay,*sentinels):
     raw=b"".join(path.read_bytes() for path in relay.base.glob("server.db*") if path.is_file())
     leaked=[str(value) for value in sentinels if str(value).encode() in raw]
     if leaked: raise AssertionError(f"relay contains plaintext: {leaked}")
+def assert_relay_isolation(path,users,team):
+    with sqlite3.connect(path) as db:
+        found={r[0] for r in db.execute("SELECT id FROM users")}
+        workspaces={r[0]:(r[1],r[2]) for r in db.execute("SELECT id,kind,created_by FROM workspaces")}
+        members={ws:{u for w,u in db.execute("SELECT workspace,user_id FROM members WHERE active=1") if w==ws} for ws in workspaces}
+    personal={ws for ws,(kind,_) in workspaces.items() if kind=="personal"}
+    if found!=set(users) or any(creator not in users for _,creator in workspaces.values()): raise AssertionError("test relay contains a non-test user")
+    if set(workspaces)!=personal|{team} or len(personal)!=len(users) or {workspaces[ws][1] for ws in personal}!=set(users) or workspaces.get(team,(None,))[0]!="team": raise AssertionError("test relay contains an unexpected workspace")
+    if any(members[ws]!={creator} for ws,(kind,creator) in workspaces.items() if kind=="personal"): raise AssertionError("personal test workspace membership is not isolated")
+    if members.get(team)!=set(users): raise AssertionError("team test workspace membership is not isolated")
 
 
 def fresh_lane(venv,commit,released_venv=None):
@@ -260,6 +282,7 @@ def fresh_lane(venv,commit,released_venv=None):
         after={"a":archive_evidence(a),"a2":archive_evidence(a2),"b":archive_evidence(b)}
         with sqlite3.connect(relay.db) as db: final_relay_rows=db.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]
         if before!=after or final_relay_rows!=relay_rows: raise AssertionError("second sync was not idempotent")
+        assert_relay_isolation(relay.db,{alice,bob},workspace)
         assert_opaque(relay,personal_prompt,team_prompt,a_repo,b_repo)
         doctors={name:cli(client,"doctor").stdout.strip() for name,client in (("a",a),("a2",a2),("b",b))}
         evidence={"lane":lane,"commit":commit,"version":package_version(a),"passed":True,"seconds":round(time.monotonic()-started,3),"users":[a.user,b.user],"devices":3,"workspace":workspace,"user_ids":[alice,bob],"archives":after,"relay_rows":relay_rows,"relay_plaintext":False,"backup":backup,"concurrent_updates":2,"device_recovery_and_removal":True,"mixed_released_client":bool(released_venv),"doctors":doctors,"peak_child_kib":resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,"input_outcomes":{"synthetic":4,"imported":4,"skipped":0,"failed":0},"harness_retries":0,"failures":[],"conflicts":sum(archive["conflicts"] for archive in after.values())}
@@ -329,6 +352,7 @@ def canary_lane(released_venv,current_venv,released_commit,current_commit):
         assert_opaque(relay,prompt,repo)
         with sqlite3.connect(relay.db) as db: relay_rows=db.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]
         backups={name:sorted(str(path) for path in client.root.joinpath("data").glob("convos.db.pre-v*.bak")) for name,client in (("a",a),("b",b))}
+        assert_relay_isolation(relay.db,set(manifest["user_ids"]),manifest["workspace"])
         entry={"run":run_number,"released_commit":released_commit,"current_commit":current_commit,"released_version":package_version(a_old),"current_version":package_version(a),"mixed_released_client":bootstrap,"seconds":round(time.monotonic()-started,3),"archives":after,"migration_backups":backups,"relay_rows":relay_rows,"relay_plaintext":False,"peak_child_kib":resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,"doctors":{"a":cli(a,"doctor").stdout.strip(),"b":cli(b,"doctor").stdout.strip()},"harness_retries":0,"failures":[],"conflicts":sum(archive["conflicts"] for archive in after.values())}
     manifest["history"].append(entry)
     tmp=manifest_path.with_suffix(".tmp")
@@ -365,5 +389,5 @@ def main():
     args=parser.parse_args()
     if args.command=="fresh": fresh_lane(args.venv,args.commit,args.released_venv)
     elif args.command=="canary": canary_lane(args.released_venv,args.current_venv,args.released_commit,args.current_commit)
-    else: seed_archive(args.root,args.cid,args.title,args.prompt,args.cwd,args.edit,args.content,args.old_content)
+    else: seed_archive(isolated_root(args.root),args.cid,args.title,args.prompt,args.cwd,args.edit,args.content,args.old_content)
 if __name__=="__main__": main()
