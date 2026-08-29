@@ -24,6 +24,8 @@ requirements = metadata("convos").get_all("Requires-Dist") or []
 assert version("convos") == "0.10.1"
 assert any(r.startswith("model2vec==0.9.0") and "sys_platform == \"linux\"" in r for r in requirements), requirements
 assert cli.semantic_backend() == "model2vec" and cli.embedding_profile()["dimensions"] == 256
+vector = cli.embed_text("portable semantic retrieval")
+assert len(vector) == 256 and any(vector)
 conn = duckdb.connect(str(cli.DB_PATH))
 conn.execute("INSERT INTO conversations (id,source,title) VALUES ('smoke-conversation','codex','Packaging decision')")
 conn.execute("INSERT INTO messages (id,conversation_id,role,content) VALUES ('smoke-message','smoke-conversation','assistant','The base installation needs no native compiler.')")
