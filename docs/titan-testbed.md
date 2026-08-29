@@ -82,8 +82,8 @@ migration backups, and the plaintext-canary result.
 
 ## Clean-install contract
 
-Core plus the remote products install and run without `build-essential`.
-`llama-cpp-python` and `huggingface-hub` belong to the explicit `semantic` extra;
-install `convos[semantic]` only in environments that need `query` and `embed`.
-The wheel smoke lane verifies that the base distribution has no unconditional
-semantic dependencies and that literal retrieval works in a fresh environment.
+Core plus the remote products install and run without `build-essential` on
+Linux. The default Linux semantic backend is Model2Vec `potion-base-8M`; macOS
+retains the existing llama.cpp backend. The wheel smoke lane verifies the Linux
+dependency set resolves as wheels, literal retrieval works with
+`CONVOS_SEMANTIC=0`, and semantic retrieval works without a compiler toolchain.

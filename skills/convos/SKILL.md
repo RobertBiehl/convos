@@ -27,7 +27,7 @@ default is human text. Prefer `jsonl` when parsing programmatically.
 Schema (write `convos sql` against these tables):
 
 - `conversations(id, source, title, created_at, updated_at, model, cwd, git_branch, project_id, metadata JSON)`
-- `messages(id, conversation_id, role, content, thinking, created_at, model, metadata JSON, embedding FLOAT[768], parent_id)`
+- `messages(id, conversation_id, role, content, thinking, created_at, model, metadata JSON, embedding FLOAT[], parent_id)`
 - `tool_calls(id, message_id, tool_name, input JSON, output JSON, status, duration_ms, created_at)`
 - `attachments(id, message_id, filename, mime_type, size, path, url, created_at)`
 - `file_edits(id, message_id, file_path, edit_type, content, created_at, old_content)`

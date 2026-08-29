@@ -8,7 +8,7 @@ sandbox="$(mktemp -d)"
 trap 'rm -rf "$sandbox"' EXIT
 
 uv venv --python 3.12 "$sandbox/venv"
-uv pip install --python "$sandbox/venv/bin/python" "$wheel"
+uv pip install --python "$sandbox/venv/bin/python" --only-binary :all: "$wheel"
 export CONVOS_PROJECT_ROOT="$sandbox/root" CODEX_HOME="$sandbox/codex" CLAUDE_CONFIG_DIR="$sandbox/claude"
 "$sandbox/venv/bin/convos" init
 
@@ -16,13 +16,14 @@ export CONVOS_PROJECT_ROOT="$sandbox/root" CODEX_HOME="$sandbox/codex" CLAUDE_CO
 from importlib.metadata import metadata, version
 from pathlib import Path
 import duckdb
+import model2vec
 from ai_convos import cli
 from typer.testing import CliRunner
 
 requirements = metadata("convos").get_all("Requires-Dist") or []
 assert version("convos") == "0.10.1"
-assert not any(r.startswith("llama-cpp-python") and "extra ==" not in r for r in requirements), requirements
-assert not any(r.startswith("huggingface-hub") and "extra ==" not in r for r in requirements), requirements
+assert any(r.startswith("model2vec==0.9.0") and "sys_platform == \"linux\"" in r for r in requirements), requirements
+assert cli.semantic_backend() == "model2vec" and cli.embedding_profile()["dimensions"] == 256
 conn = duckdb.connect(str(cli.DB_PATH))
 conn.execute("INSERT INTO conversations (id,source,title) VALUES ('smoke-conversation','codex','Packaging decision')")
 conn.execute("INSERT INTO messages (id,conversation_id,role,content) VALUES ('smoke-message','smoke-conversation','assistant','The base installation needs no native compiler.')")
@@ -30,5 +31,5 @@ cli.rebuild_fts_index(conn); conn.close()
 result = CliRunner().invoke(cli.app, ["search", "native compiler", "-n", "1"])
 assert result.exit_code == 0 and "base installation needs no native compiler" in result.output, result.output
 assert Path(cli.PROJECT_ROOT).exists()
-print("clean wheel: convos 0.10.1, compiler-free base retrieval ready")
+print("clean wheel: convos 0.10.1, compiler-free Linux semantic runtime ready")
 PY

@@ -9,7 +9,7 @@ from ai_convos import cli
 from ai_convos_explore import register
 
 def emb(x,y=0.0):
-    value=[0.0]*768; value[0],value[1]=x,y; return value
+    value=[0.0]*256; value[0],value[1]=x,y; return value
 def archive(tmp_path,monkeypatch):
     path=tmp_path/"convos.db"; monkeypatch.setattr(cli,"DB_PATH",path); db=duckdb.connect(str(path)); cli.init_schema(db)
     db.executemany("INSERT INTO conversations (id,source,title,updated_at,cwd) VALUES (?,?,?,?,?)",[

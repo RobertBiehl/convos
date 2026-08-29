@@ -250,6 +250,12 @@ class TestCodexParser:
         from ai_convos import cli
         root=tmp_path/".codex"; a,b=root/"sessions/a.jsonl",root/"sessions/b.jsonl"; a.parent.mkdir(parents=True); a.write_text("\n".join(json.dumps(x) for x in [{"type":"session_meta","payload":{"id":"native","cwd":"/repo"}},{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}},{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}])); first=cli.parse_codex(root,files=[a]); db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,first); b.write_text(a.read_text()); moved=cli.parse_codex(root,files=[b],bindings=cli.session_bindings(db)); assert ([c["id"] for c in moved.convs],[m["id"] for m in moved.msgs])==([c["id"] for c in first.convs],[m["id"] for m in first.msgs]); cli.upsert(db,moved); assert db.execute("SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages)").fetchone()==(1,2)
 
+    def test_missing_native_id_remains_unbound_capture_identity(self,tmp_path):
+        import duckdb
+        from ai_convos import cli
+        root=tmp_path/".codex"; a,b=root/"sessions/a.jsonl",root/"sessions/renamed.jsonl"; a.parent.mkdir(parents=True); events=[{"type":"session_meta","payload":{"cwd":"/repo"}},{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}]; a.write_text("\n".join(map(json.dumps,events))); b.write_text(a.read_text()); parsed=cli.parse_codex(root); metadata=[json.loads(c["metadata"]) for c in parsed.convs]; db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,parsed)
+        assert len({c["id"] for c in parsed.convs})==2 and all("session_id" not in m for m in metadata) and db.execute("SELECT (SELECT count(*) FROM conversations),(SELECT count(*) FROM messages),(SELECT count(*) FROM provider_sessions)").fetchone()==(2,2,0)
+
     def test_legacy_filename_and_exact_native_ids_alias_one_conversation(self,tmp_path):
         import duckdb
         from ai_convos import cli
@@ -266,6 +272,16 @@ class TestCodexParser:
         root=tmp_path/".codex"; sessions=root/"sessions"; sessions.mkdir(parents=True); base=lambda text:[{"type":"session_meta","payload":{"id":"same","cwd":"/repo"}},{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}]; (sessions/"a.jsonl").write_text("\n".join(map(json.dumps,base("alpha")))); (sessions/"b.jsonl").write_text("\n".join(map(json.dumps,base("beta")))); db=duckdb.connect(); cli.init_schema(db)
         with pytest.raises(ValueError,match="divergent provider session"): cli.upsert(db,cli.parse_codex(root))
         assert db.execute("SELECT (SELECT count(*) FROM conversations),(SELECT count(*) FROM messages),(SELECT count(*) FROM provider_sessions)").fetchone()==(0,0,0)
+
+    def test_parse_result_relations_fail_before_any_write(self):
+        import duckdb,pytest
+        from ai_convos import cli
+        message=dict(id="m",conversation_id="missing",role="user",content="x",thinking=None,created_at=None,model=None,metadata="{}",parent_id=None)
+        cases=[cli.ParseResult(msgs=[message]),cli.ParseResult(tools=[dict(id="t",message_id="missing")]),cli.ParseResult(attachs=[dict(id="a",message_id="missing")]),cli.ParseResult(artifacts=[dict(id="a",conversation_id="missing")]),cli.ParseResult(edits=[dict(id="e",message_id="missing")]),cli.ParseResult(edit_evidence=[dict(file_edit_id="missing",status="confirmed",reason="x",tool_call_id=None)])]
+        for result in cases:
+            db=duckdb.connect(); cli.init_schema(db)
+            with pytest.raises(ValueError,match="reference unavailable"): cli.upsert(db,result)
+            assert db.execute("SELECT (SELECT count(*) FROM conversations),(SELECT count(*) FROM messages),(SELECT count(*) FROM tool_calls),(SELECT count(*) FROM attachments),(SELECT count(*) FROM artifacts),(SELECT count(*) FROM file_edits)").fetchone()==(0,0,0,0,0,0); db.close()
 
     def test_admission_quarantines_only_exact_main_startup_wrapper_after_parsing(self,tmp_path):
         import duckdb

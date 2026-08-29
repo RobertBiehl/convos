@@ -304,6 +304,16 @@ class TestClaudeAPI:
         monkeypatch.setattr(cli, "fetch_json", fake)
         with pytest.raises(TimeoutError, match="detail timeout"): cli.fetch_claude("safari")
 
+    def test_fetch_claude_keeps_structured_only_message_parents(self,monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"get_cookies",lambda *_:{"session":"x"})
+        def fake(url,*a,**k):
+            if url.endswith("/api/organizations"): return [{"uuid":"org"}]
+            if url.endswith("/chat_conversations"): return [{"uuid":"c","name":"structured"}]
+            return {"chat_messages":[{"uuid":"a","sender":"human","attachments":[{"file_name":"x.pdf"}],"content":[]},{"uuid":"t","sender":"assistant","content":[{"type":"tool_use","name":"lookup","input":{"q":"x"}}]}]}
+        monkeypatch.setattr(cli,"fetch_json",fake); result=cli.fetch_claude("safari"); mids={m["id"] for m in result.msgs}
+        assert len(result.msgs)==2 and result.attachs[0]["message_id"] in mids and result.tools[0]["message_id"] in mids
+
     @pytest.mark.integration
     def test_organizations_schema(self):
         """Verify /api/organizations returns expected schema."""

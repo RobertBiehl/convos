@@ -124,11 +124,11 @@ Web fetchers extract cookies from Safari or Chrome to authenticate with APIs. No
 
 Full-text search uses DuckDB's FTS extension with BM25 scoring. The index covers `content` and `thinking` columns. Ingest marks it dirty and the next search rebuilds it.
 
-### Hybrid Semantic Search (optional)
+### Hybrid Semantic Search
 
 `convos query` adds vector retrieval on top of BM25. Embeddings live in
-`messages.embedding` (FLOAT[768], NULL until embedded). Vector similarity is
-computed brute-force via DuckDB's `array_cosine_similarity` — at the current
+`messages.embedding` (`FLOAT[]`, NULL until embedded). Vector similarity is
+computed brute-force via DuckDB's `list_cosine_similarity` — at the current
 scale (tens of thousands of messages) this is fast enough that a vector index
 (VSS/HNSW) would only add complexity.
 
@@ -147,9 +147,14 @@ remain outside core.
 Literal `search` is conversation-first as well: BM25 ranks messages, then only
 the strongest matching message from each conversation consumes a result slot.
 
-The `semantic` extra supplies `llama-cpp-python` + `huggingface-hub`; the base
-archive and literal retrieval do not require a native compiler. The GGUF model
-is downloaded on first semantic call and cached by huggingface-hub.
+The default backend is platform-specific: macOS uses EmbeddingGemma through
+`llama-cpp-python`, while Linux uses the compact Model2Vec `potion-base-8M`
+model without a compiler toolchain. Both model revisions are pinned and fetched
+on first semantic use. `embedding_state` records the complete vector-space
+profile; changing it clears incompatible vectors transactionally before they
+can participate in retrieval. `CONVOS_SEMANTIC=0` disables semantic work while
+leaving literal retrieval available, and the `semantic` extra explicitly adds
+llama.cpp on other platforms.
 
 ## Data Flow
 

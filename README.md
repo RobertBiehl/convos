@@ -47,15 +47,18 @@ bounded reads provide exact evidence instead of generated recollections.
 Install from PyPI with uv, initialize local capture, and prepare semantic recall:
 
 ```bash
-uv tool install 'convos[semantic]'
+uv tool install convos
 convos init
 convos embed
 convos doctor
 ```
 
-Use `uv tool install convos` (or `pipx install convos`) for a compiler-free
-literal-search archive. Add the `semantic` extra when `convos query` and
-`convos embed` are wanted.
+Semantic retrieval is included on macOS and Linux. Linux uses the compact
+Model2Vec `potion-base-8M` model without a compiler toolchain; macOS keeps the
+existing EmbeddingGemma model through llama.cpp. Set `CONVOS_SEMANTIC=0` to
+disable model loading, embedding, and semantic queries while retaining literal
+`convos search`. The `semantic` extra remains available when llama.cpp is
+explicitly wanted on another platform.
 
 Upgrade later with:
 
@@ -64,8 +67,9 @@ uv tool upgrade convos
 convos install-skills
 ```
 
-The semantic extra may compile `llama-cpp-python` locally; the base archive,
-literal search, capture, and remote sync have no native compiler requirement.
+macOS may compile `llama-cpp-python` locally when no compatible wheel is
+available. The default Linux install, literal search, capture, and remote sync
+do not require a native compiler.
 
 `convos init` creates the archive, installs the bundled Codex + Claude Code
 skill and capture hooks, imports existing local Codex and Claude Code sessions,
@@ -268,9 +272,11 @@ replace the deferred custom query language.
 
 Semantic search is included by default. Run `convos embed` after install to
 backfill embeddings with a progress bar. Hooks and `convos sync` queue new or
-changed messages; `convos query` embeds that queue just in time. The
-`embeddinggemma-300m-qat-q8_0` model produces 768d embeddings locally via
-llama.cpp.
+changed messages; `convos query` embeds that queue just in time. macOS uses the
+768-dimensional `embeddinggemma-300m-qat-q8_0` model through llama.cpp; Linux
+uses the 256-dimensional `potion-base-8M` Model2Vec model. The archive stores
+the exact active profile and atomically queues a full rebuild before a different
+model, revision, dimension, prefix, or normalization contract can be used.
 
 Read a known conversation using an ID prefix from search/query:
 

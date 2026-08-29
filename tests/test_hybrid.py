@@ -1,10 +1,12 @@
 """Tests for the hybrid BM25 + vector RRF search pipeline."""
+import json, sys, types
 import duckdb, pytest
 from typer.testing import CliRunner
 from ai_convos import cli
 
 
-def _emb(idx: int, dim: int = 768) -> list[float]:
+def _emb(idx: int, dim: int | None = None) -> list[float]:
+    dim=dim or cli.embedding_profile()["dimensions"]
     v = [0.0] * dim
     v[idx % dim] = 1.0
     return v
@@ -140,12 +142,40 @@ def test_public_hybrid_hits_can_forbid_model_download(hybrid_db,monkeypatch):
 def test_embedding_model_path_is_revision_pinned_and_can_be_local_only(monkeypatch):
     calls=[]
     monkeypatch.setattr("huggingface_hub.hf_hub_download",lambda *a,**k:calls.append((a,k)) or "/model.gguf")
+    monkeypatch.setattr(cli,"_file_sha256",lambda _:cli._MCFG["artifact_sha256"])
     assert cli.embedding_model_path(True)=="/model.gguf"
     assert calls==[((cli._MCFG["repo_id"],cli._MCFG["filename"]),{"revision":cli._MCFG["revision"],"local_files_only":True})]
 
 def test_missing_semantic_extra_has_actionable_error(monkeypatch):
     real=__import__; monkeypatch.setattr("builtins.__import__",lambda name,*args,**kwargs:(_ for _ in ()).throw(ImportError(name)) if name=="huggingface_hub" else real(name,*args,**kwargs))
     with pytest.raises(ValueError,match=r"convos\[semantic\].*convos embed"): cli.embedding_model_path(True)
+
+
+def test_platform_profiles_invalidate_incompatible_vectors(tmp_path,monkeypatch):
+    path=tmp_path/"archive.db"; monkeypatch.setattr(cli,"DB_PATH",path); monkeypatch.setattr(cli,"DATA_DIR",tmp_path); monkeypatch.delenv("CONVOS_SEMANTIC",raising=False); monkeypatch.setattr(cli.sys,"platform","darwin")
+    db=duckdb.connect(str(path)); cli.init_schema(db); db.execute("INSERT INTO conversations(id,source) VALUES ('c','x'); INSERT INTO messages(id,conversation_id,role,embedding) VALUES ('m','c','user',?)",[ _emb(1,768)]); db.close(); profile,changed=cli._activate_embedding_profile(); assert profile["dimensions"]==768 and not changed
+    monkeypatch.setattr(cli.sys,"platform","linux"); profile,changed=cli._activate_embedding_profile(); db=duckdb.connect(str(path),read_only=True); stored=json.loads(db.execute("SELECT CAST(profile AS VARCHAR) FROM embedding_state").fetchone()[0]); assert changed and profile==stored and profile["dimensions"]==256 and db.execute("SELECT embedding IS NULL FROM messages").fetchone()[0] and db.execute("SELECT column_type FROM (DESCRIBE messages) WHERE column_name='embedding'").fetchone()[0]=="FLOAT[]"; db.close()
+
+
+def test_model2vec_backend_uses_pinned_snapshot_without_compilation(monkeypatch):
+    calls=[]
+    class Encoded:
+        def tolist(self): return [_emb(1,256)]
+    class StaticModel:
+        @classmethod
+        def from_pretrained(cls,*a,**k): calls.append(("load",a,k)); return cls()
+        def encode(self,texts,**kwargs): calls.append(("encode",texts,kwargs)); return Encoded()
+    monkeypatch.setenv("CONVOS_SEMANTIC","model2vec"); monkeypatch.setitem(sys.modules,"model2vec",types.SimpleNamespace(StaticModel=StaticModel)); monkeypatch.setattr("huggingface_hub.snapshot_download",lambda *a,**k:calls.append(("snapshot",a,k)) or "/model"); monkeypatch.setattr(cli,"_file_sha256",lambda _:cli._M2VCFG["artifact_sha256"]); cli._MODELS.clear()
+    assert len(cli.embed_texts(["hello"],doc=True,local_only=True)[0])==256 and calls[0]==("snapshot",(cli._M2VCFG["repo_id"],),{"revision":cli._M2VCFG["revision"],"local_files_only":True}) and calls[1]==("load",("/model",),{"normalize":True,"force_download":False}) and calls[2]==("encode",["hello"],{"max_length":512})
+
+def test_semantic_model_artifact_hash_is_enforced(monkeypatch):
+    monkeypatch.setattr("huggingface_hub.hf_hub_download",lambda *a,**k:"/model.gguf"); monkeypatch.setattr(cli,"_file_sha256",lambda _:"bad")
+    with pytest.raises(ValueError,match="artifact hash mismatch"): cli.embedding_model_path(True)
+
+
+def test_semantic_runtime_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("CONVOS_SEMANTIC","0"); assert not cli.semantic_enabled()
+    with pytest.raises(ValueError,match="CONVOS_SEMANTIC=0"): cli.embedding_profile()
 
 
 def test_query_no_embeddings_returns_friendly_error(tmp_path, monkeypatch):

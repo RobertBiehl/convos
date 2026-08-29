@@ -95,7 +95,7 @@ def connect(path):
     return db
 @lru_cache(maxsize=1)
 def bridges():
-    if (result:=[entry.load()() for entry in entry_points(group="convos.remote")]) and any(set(b)!={"v","objects","records","accept","token"} or b["v"]!=2 or isinstance(b["v"],bool) or any(not callable(b[k]) for k in ("records","accept","token")) or not isinstance(b["objects"],set) or not b["objects"] or any(not isinstance(v,str) or not v for v in b["objects"]) for b in result) or len([v for b in result for v in b["objects"]])!=len({v for b in result for v in b["objects"]}): raise ValueError("Unsupported remote bridge")
+    if (result:=[entry.load()() for entry in entry_points(group="convos.remote")]) and any(set(b)!={"v","schema","objects","records","accept"} or b["v"]!=3 or isinstance(b["v"],bool) or not isinstance(b["schema"],int) or isinstance(b["schema"],bool) or b["schema"]<1 or any(not callable(b[k]) for k in ("records","accept")) or not isinstance(b["objects"],set) or not b["objects"] or any(not isinstance(v,str) or not v for v in b["objects"]) for b in result) or len([v for b in result for v in b["objects"]])!=len({v for b in result for v in b["objects"]}): raise ValueError("Unsupported remote bridge")
     return result
 def control_chain(controls):
     ordered=sorted(controls,key=lambda c:c["revision"]); previous=None
@@ -109,7 +109,7 @@ def event_support(value):
     if not isinstance(kind:=value["kind"],str) or not isinstance(version:=value["payload_v"],int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
     return "supported" if (kind,version) in CORE_EVENTS else "required"
 def bridge_records(root,cfg,workspace,kind): return [record for bridge in bridges() for record in bridge["records"](root,cfg["user"],workspace,kind)]
-def bridge_stamp(root): return digest({kind:bridge["token"](root) for bridge in bridges() for kind in bridge["objects"]})
+def bridge_stamp(root): return digest({kind:(bridge["v"],bridge["schema"]) for bridge in bridges() for kind in bridge["objects"]})
 def bridge_accept(root,row,proof,project=True): return bool((found:=[bridge for bridge in bridges() if row["kind"] in bridge["objects"]]) and found[0]["accept"](root,row,proof,project))
 def bridge_replicas(root,cfg,workspace,kind,key_,known=(),inventory=None):
     for value in bridge_records(root,cfg,workspace,kind):

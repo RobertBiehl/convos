@@ -71,7 +71,7 @@ Individual messages within conversations. Has FTS index.
 | created_at | TIMESTAMP | Message timestamp |
 | model | VARCHAR | Model for this specific message |
 | metadata | JSON | Source-specific extra fields |
-| embedding | FLOAT[768] | embeddinggemma vector for hybrid search (NULL until embedded) |
+| embedding | FLOAT[] | Active-profile vector for hybrid search (NULL until embedded) |
 
 ### tool_calls
 
@@ -241,16 +241,20 @@ ORDER BY score DESC
 ## Hybrid Search
 
 `convos query` combines FTS (BM25) with vector similarity over the
-`embedding` column using DuckDB's built-in `array_cosine_similarity`. Top-50
+`embedding` column using DuckDB's built-in `list_cosine_similarity`. Top-50
 from each source is fused with Reciprocal Rank Fusion (`SUM(1/(60+rank))`),
 then the strongest message from each conversation is returned in fused order.
 Source/day/role/cwd/conversation filters are applied before candidate selection;
 injected skill and local-command wrapper messages are excluded from semantic
 candidates. A cwd filter includes the exact recorded path and descendants.
 
-Embeddings are produced by embeddinggemma-300M (768d) with the
-`task: search result | document:` prefix at index time and `query:` at query
-time. Truncation only — no chunking — at 1600 chars.
+On macOS, embeddings are produced by EmbeddingGemma (768d) with distinct query
+and document prefixes. On Linux, the default is the compact Model2Vec
+`potion-base-8M` model (256d). Both use L2-normalized vectors and character
+truncation — no chunking — at 1600 chars. The singleton `embedding_state` table
+stores the exact backend, model revision, artifact hash, dimensions, pooling,
+normalization, truncation, and prefixes. A profile change clears incompatible
+vectors transactionally before rebuilding them.
 
 Use `convos embed` to backfill missing embeddings without fetching from web
 APIs. Hooks and `convos sync` queue new or changed messages for just-in-time
@@ -264,7 +268,9 @@ output. Records retain full content plus exact message and conversation IDs.
 `local_only=True` forbids an implicit retrieval-model download.
 
 The `embedding` column is preserved across upserts when message `content`
-is unchanged, so only new or edited messages are queued again.
+and the archive profile are unchanged, so only new or edited messages are
+queued again. Set `CONVOS_SEMANTIC=0` to keep sync and literal search active
+without loading or downloading a semantic model.
 
 ## ID Generation
 
