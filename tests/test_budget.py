@@ -68,6 +68,12 @@ def test_default_semantic_runtime_is_macos_only():
     assert "llama-cpp-python>=0.3.0; sys_platform == 'darwin'" in deps and "huggingface-hub>=0.20.0; sys_platform == 'darwin'" in deps and not any("model2vec" in dep or "sys_platform == 'linux'" in dep for dep in deps)
 
 
+def test_linux_workflows_do_not_enable_optional_semantic_runtime():
+    root=Path(__file__).resolve().parents[1]
+    workflows=[(root/".github/workflows"/name).read_text() for name in ("tests.yml","release.yml")]
+    assert all("uv sync --extra dev" in workflow and "uv sync --all-extras" not in workflow for workflow in workflows)
+
+
 def test_release_has_one_trusted_publisher_per_public_product():
     workflow = (Path(__file__).resolve().parents[1]/".github/workflows/release.yml").read_text()
     public={"convos","convos-redact","convos-remote","convos-remote-server"}
