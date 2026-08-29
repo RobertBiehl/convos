@@ -74,7 +74,12 @@ def _walk(db,root,depth=2,width=3,max_nodes=20,minimum=.65,source=None,days=None
         for parent in frontier:
             if len(nodes)>=max_nodes: break
             for row in _neighbors(db,parent,source,days,role,min(width,max_nodes-len(nodes)),context,minimum,seen,contents):
-                child=_child(row); seen.add(child["conversation_id"]); contents.add(row["raw_content"]); upcoming.append(child); node=dict(conversation_id=child["conversation_id"],title=child["title"],source=child["source"],cwd=child["cwd"],depth=level,seed_type="message",seed_id=child["id"],role=child["role"],content=child["content"]); nodes.append(node); edges.append(dict(depth=level,from_conversation_id=parent["conversation_id"],to_conversation_id=child["conversation_id"],similarity=row["similarity"],message_id=row["message_id"],role=row["role"],content=row["content"],created_at=row["created_at"]))
+                child=_child(row)
+                seen.add(child["conversation_id"])
+                contents.add(row["raw_content"])
+                upcoming.append(child)
+                nodes.append(dict(conversation_id=child["conversation_id"],title=child["title"],source=child["source"],cwd=child["cwd"],depth=level,seed_type="message",seed_id=child["id"],role=child["role"],content=child["content"]))
+                edges.append(dict(depth=level,from_conversation_id=parent["conversation_id"],to_conversation_id=child["conversation_id"],similarity=row["similarity"],message_id=row["message_id"],role=row["role"],content=row["content"],created_at=row["created_at"]))
         frontier=upcoming
         if not frontier or len(nodes)>=max_nodes: break
     return dict(root=nodes[0],nodes=nodes,edges=edges)
@@ -95,19 +100,27 @@ def related(target: str, source: Optional[str]=typer.Option(None,"-s"), days: Op
     for i,row in enumerate(data,1): typer.echo(f"\n{i}. {row['similarity']:.3f} [{row['source']}] {row['title'] or 'Untitled'} ({row['conversation_id']})\n   {row['role']} @ {row['created_at'] or '?'} ({row['message_id']})\n   {row['content']}\n   read: convos read {row['conversation_id'][:8]} --around {row['message_id'][:8]}")
 def trail(target: str, depth: int=typer.Option(2,"--depth",min=1,max=3), width: int=typer.Option(3,"--width",min=1,max=8), max_nodes: int=typer.Option(20,"--max-nodes",min=2,max=100), minimum: float=typer.Option(.65,"--min-score",min=-1,max=1), source: Optional[str]=typer.Option(None,"-s"), days: Optional[int]=typer.Option(None,"-d",min=1), role: Optional[str]=typer.Option(None,"-r"), context: int=typer.Option(160,"-c",min=1), fmt: str=typer.Option("text","-f","--format")):
     """Walk a bounded multi-hop semantic trail with exact evidence."""
-    db=_db(); root=_target(db,target); result=_walk(db,root,depth,width,max_nodes,minimum,source,days,role,context); db.close(); nodes,edges=result["nodes"],result["edges"]
+    db=_db()
+    try:
+        root=_target(db,target)
+        result=_walk(db,root,depth,width,max_nodes,minimum,source,days,role,context)
+    finally: db.close()
+    nodes,edges=result["nodes"],result["edges"]
     if fmt=="json":
         typer.echo(json.dumps(result,default=str))
         return
     if fmt=="jsonl":
         typer.echo(json.dumps(dict(record="root",**nodes[0]),default=str))
-        [typer.echo(json.dumps(dict(record="edge",**edge,node=next(n for n in nodes if n["conversation_id"]==edge["to_conversation_id"])),default=str)) for edge in edges]; return
+        [typer.echo(json.dumps(dict(record="edge",**edge,node=next(n for n in nodes if n["conversation_id"]==edge["to_conversation_id"])),default=str)) for edge in edges]
+        return
     if fmt=="dot":
         esc=lambda value:str(value or "Untitled").replace("\\","\\\\").replace('"','\\"').replace("\n"," ")
-        typer.echo("digraph trail {\n"+ "\n".join([f'  "{n["conversation_id"]}" [label="{esc(n["source"])} | {esc(n["title"])} | {n["conversation_id"][:8]}"];' for n in nodes]+[f'  "{e["from_conversation_id"]}" -> "{e["to_conversation_id"]}" [label="{e["similarity"]:.3f} | {e["message_id"][:8]}"];' for e in edges])+"\n}"); return
+        typer.echo("digraph trail {\n"+ "\n".join([f'  "{n["conversation_id"]}" [label="{esc(n["source"])} | {esc(n["title"])} | {n["conversation_id"][:8]}"];' for n in nodes]+[f'  "{e["from_conversation_id"]}" -> "{e["to_conversation_id"]}" [label="{e["similarity"]:.3f} | {e["message_id"][:8]}"];' for e in edges])+"\n}")
+        return
     typer.echo(f"Semantic trail from {root['type']} {root['id']}\n[0] [{root['source']}] {root['title'] or 'Untitled'} ({root['conversation_id']})")
     by_id={n["conversation_id"]:n for n in nodes}
     for edge in edges:
-        node=by_id[edge["to_conversation_id"]]; indent="  "*(edge["depth"]-1); typer.echo(f"\n{indent}-> {edge['similarity']:.3f} [{edge['from_conversation_id'][:8]} -> {node['conversation_id'][:8]}] [{node['source']}] {node['title'] or 'Untitled'} ({node['conversation_id']})\n{indent}   evidence: {edge['role']} @ {edge['created_at'] or '?'} ({edge['message_id']})\n{indent}   {edge['content']}\n{indent}   read: convos read {node['conversation_id'][:8]} --around {edge['message_id'][:8]}")
+        node,indent=by_id[edge["to_conversation_id"]],"  "*(edge["depth"]-1)
+        typer.echo(f"\n{indent}-> {edge['similarity']:.3f} [{edge['from_conversation_id'][:8]} -> {node['conversation_id'][:8]}] [{node['source']}] {node['title'] or 'Untitled'} ({node['conversation_id']})\n{indent}   evidence: {edge['role']} @ {edge['created_at'] or '?'} ({edge['message_id']})\n{indent}   {edge['content']}\n{indent}   read: convos read {node['conversation_id'][:8]} --around {edge['message_id'][:8]}")
 def register(app: typer.Typer):
     for command in (related,trail): app.command()(command)

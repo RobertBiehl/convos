@@ -221,9 +221,13 @@ def fresh_lane(venv,commit,released_venv=None):
         assert_team_projection(b,team_prompt)
         assert_team_projection(a2,team_prompt)
         if released_venv:
-            old=Client(b.user,b.home/"convos-testbed"/lane/"released-probe",Path(released_venv)); shutil.rmtree(old.root,ignore_errors=True); (old.root/"remote").mkdir(parents=True); shutil.copy2(b.root/"remote/config.json",old.root/"remote/config.json")
+            old=Client(b.user,b.home/"convos-testbed"/lane/"released-probe",Path(released_venv))
+            shutil.rmtree(old.root,ignore_errors=True)
+            (old.root/"remote").mkdir(parents=True)
+            shutil.copy2(b.root/"remote/config.json",old.root/"remote/config.json")
             for path in (old.root,*old.root.rglob("*")): os.chown(path,bob_user.pw_uid,bob_user.pw_gid)
-            cli(old,"remote","sync"); assert_message(old,team_prompt)
+            cli(old,"remote","sync")
+            assert_message(old,team_prompt)
         concurrent_a="fresh concurrent A sentinel 96da8f"
         concurrent_b="fresh concurrent B sentinel b20c74"
         a_prior=(a_repo/"app.py").read_text()

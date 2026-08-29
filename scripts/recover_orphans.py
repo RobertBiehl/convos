@@ -66,7 +66,8 @@ def recover_history(conn):
 
 if __name__ == "__main__":
     conn = duckdb.connect(str(DB))
-    recover_stubs(conn); recover_history(conn)
+    recover_stubs(conn)
+    recover_history(conn)
     left = conn.execute("SELECT COUNT(*) FROM file_edits fe LEFT JOIN messages m ON fe.message_id = m.id WHERE m.id IS NULL").fetchone()[0]
     print(f"orphaned file_edits remaining: {left}")
     conn.close()
