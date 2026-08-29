@@ -135,6 +135,7 @@ dev = [
     { name = "convos-remote" },
     { name = "convos-remote-server" },
     { name = "convos-resume" },
+    { name = "huggingface-hub" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -159,6 +160,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "duckdb", specifier = ">=1.2.0" },
     { name = "huggingface-hub", marker = "sys_platform == 'darwin'", specifier = ">=0.20.0" },
+    { name = "huggingface-hub", marker = "extra == 'dev'", specifier = ">=0.20.0" },
     { name = "huggingface-hub", marker = "extra == 'semantic'", specifier = ">=0.20.0" },
     { name = "llama-cpp-python", marker = "sys_platform == 'darwin'", specifier = ">=0.3.0" },
     { name = "llama-cpp-python", marker = "extra == 'semantic'", specifier = ">=0.3.0" },

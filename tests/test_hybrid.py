@@ -5,6 +5,10 @@ from typer.testing import CliRunner
 from ai_convos import cli
 
 
+@pytest.fixture(autouse=True)
+def explicit_test_semantic_runtime(monkeypatch): monkeypatch.setenv("CONVOS_SEMANTIC","llama")
+
+
 def _emb(idx: int, dim: int | None = None) -> list[float]:
     dim=dim or cli.embedding_profile()["dimensions"]
     v = [0.0] * dim
