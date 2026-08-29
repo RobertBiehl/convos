@@ -1,6 +1,6 @@
 """Integration tests for API fetchers - validates API schemas haven't changed."""
 
-import pytest, json, os
+import pytest, json, os, plistlib
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -37,6 +37,14 @@ def validate_schema(data, schema_name):
                 return False, f"Missing required field: {field}"
         return True, "OK"
     return False, f"Unknown schema type: {schema['type']}"
+
+def assert_live_import(result, source, tmp_path):
+    from ai_convos import cli
+    assert result.convs and all(c["source"] == source for c in result.convs)
+    with cli._core(tmp_path/"convos.db", ready=True) as db:
+        cli.upsert(db, result)
+        assert db.execute("SELECT COUNT(*) FROM conversations WHERE source=?", [source]).fetchone()[0] == len(result.convs)
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == len(result.msgs)
 
 # Skip all integration tests if SKIP_INTEGRATION is set
 pytestmark = pytest.mark.skipif(
@@ -91,19 +99,11 @@ class TestChatGPTAPI:
         assert valid, f"Schema validation failed: {msg}"
 
     @pytest.mark.integration
-    def test_live_chatgpt_api(self, mock_cookies):
-        """Live test against ChatGPT API - requires valid cookies."""
-        pytest.skip("Requires real cookies - run manually with CHATGPT_TEST=1")
-
+    @pytest.mark.skipif(os.environ.get("CHATGPT_TEST") != "1", reason="Requires real cookies and CHATGPT_TEST=1")
+    def test_live_chatgpt_api(self, tmp_path):
+        """Fetch one ChatGPT conversation and ingest it into an isolated archive."""
         from ai_convos.cli import fetch_chatgpt
-        result = fetch_chatgpt("safari", limit=1)
-        assert len(result.convs) >= 0  # may be 0 if no conversations
-        # If we got conversations, verify structure
-        if result.convs:
-            conv = result.convs[0]
-            assert "id" in conv
-            assert "source" in conv
-            assert conv["source"] == "chatgpt"
+        assert_live_import(fetch_chatgpt("safari", limit=1), "chatgpt", tmp_path)
 
     def test_fetch_chatgpt_surfaces_total_failure(self, monkeypatch):
         """A fully failed fetch raises instead of returning empty (no silent 'success')."""
@@ -355,22 +355,23 @@ class TestClaudeAPI:
         assert valid, f"Schema validation failed: {msg}"
 
     @pytest.mark.integration
-    def test_live_claude_api(self):
-        """Live test against Claude API - requires valid cookies."""
-        pytest.skip("Requires real cookies - run manually with CLAUDE_TEST=1")
-
+    @pytest.mark.skipif(os.environ.get("CLAUDE_TEST") != "1", reason="Requires real cookies and CLAUDE_TEST=1")
+    def test_live_claude_api(self, tmp_path):
+        """Fetch one Claude conversation and ingest it into an isolated archive."""
         from ai_convos.cli import fetch_claude
-        result = fetch_claude("safari", limit=1)
-        assert len(result.convs) >= 0
-        if result.convs:
-            conv = result.convs[0]
-            assert conv["source"] == "claude"
+        assert_live_import(fetch_claude("safari", limit=1), "claude", tmp_path)
 
 
 # ---- Cookie Extraction Tests ----
 
 class TestCookieExtraction:
     """Tests for browser cookie extraction."""
+
+    def test_browser_ua_uses_installed_version_and_explicit_override(self, tmp_path, monkeypatch):
+        from ai_convos import cli
+        app=tmp_path/"Safari.app"; (app/"Contents").mkdir(parents=True); (app/"Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString":"26.4"})); monkeypatch.setattr(cli,"_BROWSER_APPS",{"safari":("Version/",(app,))})
+        assert "Version/26.4 Safari/" in cli.browser_ua("safari")
+        monkeypatch.setenv("CONVOS_BROWSER_USER_AGENT","test-agent"); assert cli.browser_ua("safari")=="test-agent"
 
     def test_safari_cookies_not_found(self):
         """Safari cookie function handles missing file gracefully."""

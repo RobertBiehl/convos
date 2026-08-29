@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, contextlib, csv, duckdb, fcntl, hashlib, itertools, json, os, re, shlex, shutil, signal, site, sqlite3, ssl, struct, subprocess, sys, sysconfig, tempfile, time, typer, urllib.request, zipfile
+import base64, contextlib, csv, duckdb, fcntl, hashlib, itertools, json, os, plistlib, re, shlex, shutil, signal, site, sqlite3, ssl, struct, subprocess, sys, sysconfig, tempfile, time, typer, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -13,7 +13,8 @@ app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, Cha
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT,DATA_DIR,DB_PATH,STATE_PATH=(root:=find_root()),(data:=root/"data"),data/"convos.db",data/"sync_state.json"
 HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(content,'{_NR}')",8,10,20,8/15,4  # conservative policy below the observed ~200-detail failure point
-_CHATGPT_HOSTS,_BROWSER_UA,_CLAUDE_HEADERS=(("https://chatgpt.com",("chatgpt.com",)),("https://chat.openai.com",("chat.openai.com","openai.com"))),(ua:={"safari":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15","chrome":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}),{"Origin":"https://claude.ai","Referer":"https://claude.ai/","User-Agent":ua["safari"],"Accept":"application/json","Accept-Language":"en-US,en;q=0.9","anthropic-client-sha":"unknown","anthropic-client-version":"unknown"}
+_CHATGPT_HOSTS,_BROWSER_UA,_CLAUDE_HEADERS=(("https://chatgpt.com",("chatgpt.com",)),("https://chat.openai.com",("chat.openai.com","openai.com"))),(ua:={"safari":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15","chrome":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}),{"Origin":"https://claude.ai","Referer":"https://claude.ai/","Accept":"application/json","Accept-Language":"en-US,en;q=0.9","anthropic-client-sha":"unknown","anthropic-client-version":"unknown"}
+_BROWSER_APPS={"safari":("Version/",(Path("/Applications/Safari.app"),Path("/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app"))),"chrome":("Chrome/",(Path("/Applications/Google Chrome.app"),Path.home()/"Applications/Google Chrome.app"))}
 _INJECTED_RE,MESSAGE_ORDER,MESSAGE_ORDER_DESC=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*","m.created_at NULLS FIRST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) NULLS LAST,m.id","m.created_at DESC NULLS LAST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) DESC NULLS LAST,m.id DESC"
 
 def open_db(path=None,read_only=False,wait=30,deadline=None):
@@ -548,13 +549,21 @@ def chrome_profiles() -> list[str]: return [p.name for p in base.iterdir() if p.
 
 def chatgpt_profiles(browser: str) -> list[str | None]: return [None] if browser!="chrome" else [prof] if (prof:=os.environ.get("CONVOS_CHROME_PROFILE")) else chrome_profiles() or [None]
 
+def browser_ua(browser):
+    if override:=os.environ.get("CONVOS_BROWSER_USER_AGENT"): return override
+    token,apps=_BROWSER_APPS[browser]
+    with contextlib.suppress(Exception):
+        version=plistlib.loads(next((app/"Contents/Info.plist").read_bytes() for app in apps if (app/"Contents/Info.plist").is_file()))["CFBundleShortVersionString"]
+        return re.sub(f"{token}[^ ]+",f"{token}{version}",_BROWSER_UA[browser])
+    return _BROWSER_UA[browser]
+
 def chatgpt_cookie_base(browser: str, hosts: list[tuple[str, list[str]]], profile: str | None):
     if found:=next(((cookies,url) for url,domains in hosts if (cookies:=get_cookies_any(domains,browser,profile=profile))),None): return found
     raise ValueError(f"No ChatGPT cookies found in {browser}" + (f" profile {profile}" if profile else ""))
 def claude_listing(browser):
-    cookies=required(get_cookies("claude.ai",browser),ValueError(f"No Claude cookies found in {browser}"))
-    org=required(fetch_json("https://claude.ai/api/organizations",cookies,_CLAUDE_HEADERS),ValueError("Could not get Claude org ID"))[0]["uuid"]
-    return cookies,org,fetch_json(f"https://claude.ai/api/organizations/{org}/chat_conversations",cookies,_CLAUDE_HEADERS)
+    cookies,headers=required(get_cookies("claude.ai",browser),ValueError(f"No Claude cookies found in {browser}")),{**_CLAUDE_HEADERS,"User-Agent":browser_ua(browser)}
+    org=required(fetch_json("https://claude.ai/api/organizations",cookies,headers),ValueError("Could not get Claude org ID"))[0]["uuid"]
+    return cookies,org,fetch_json(f"https://claude.ai/api/organizations/{org}/chat_conversations",cookies,headers),headers
 
 def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
     headers={"Origin":base,"Referer":f"{base}/","User-Agent":ua,"Accept":"application/json","Accept-Language":"en-US,en;q=0.9","Sec-Fetch-Site":"same-origin","Sec-Fetch-Mode":"cors","Sec-Fetch-Dest":"empty"}
@@ -626,7 +635,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
 
     def fetch_with_profile(profile: str | None) -> ParseResult:
         cookies,base=chatgpt_cookie_base(browser,_CHATGPT_HOSTS,profile)
-        headers,key,account,r,saved,matched,frontier,boundary,bucket=(headers:=chatgpt_headers(cookies,base,_BROWSER_UA[browser],debug_profile=profile if debug else None)),(key:=profile or "default"),(account:=headers.get("ChatGPT-Account-ID")),ParseResult(),(saved:=frontiers.get(key,{})),(matched:=account and isinstance(saved,dict) and saved.get("account")==account),*((ts_any(saved.get("updated")),saved.get("id")) if matched else (None,None)),limiters.setdefault(("account",account) if account else ("profile",browser,key),[CHATGPT_BURST,time.monotonic()])
+        headers,key,account,r,saved,matched,frontier,boundary,bucket=(headers:=chatgpt_headers(cookies,base,browser_ua(browser),debug_profile=profile if debug else None)),(key:=profile or "default"),(account:=headers.get("ChatGPT-Account-ID")),ParseResult(),(saved:=frontiers.get(key,{})),(matched:=account and isinstance(saved,dict) and saved.get("account")==account),*((ts_any(saved.get("updated")),saved.get("id")) if matched else (None,None)),limiters.setdefault(("account",account) if account else ("profile",browser,key),[CHATGPT_BURST,time.monotonic()])
         def pace():
             now,credit=time.monotonic(),min(CHATGPT_BURST,bucket[0]+(time.monotonic()-bucket[1])*CHATGPT_RATE)
             if delay:=max(0,(1-credit)/CHATGPT_RATE): time.sleep(delay)
@@ -669,7 +678,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
 
 def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None) -> ParseResult:
     print("  claude listing...", flush=True)
-    cookies,org_id,data=claude_listing(browser)
+    cookies,org_id,data,headers=claude_listing(browser)
     items=data if limit==0 else data[:limit]
     if items: print(f"  claude total {len(items)}", flush=True)
     def parse_message(cid,m):
@@ -678,7 +687,7 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
     def parse_item(item):
         updated=ts_from_iso(item.get("updated_at") or item.get("created_at"))
         if since and updated and updated<=since: return None
-        cid,project,conv,detail=(cid:=gen_id("claude",item["uuid"])),(project:=item.get("project_uuid")),dict(id=cid,source="claude",title=item.get("name"),created_at=ts_from_iso(item.get("created_at")),updated_at=ts_from_iso(item.get("updated_at")),model=item.get("model"),cwd=None,git_branch=None,project_id=project,metadata=json.dumps({"session_id":item["uuid"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"api",**({"project_uuid":project} if project else {})})),fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{item['uuid']}",cookies,_CLAUDE_HEADERS)
+        cid,project,conv,detail=(cid:=gen_id("claude",item["uuid"])),(project:=item.get("project_uuid")),dict(id=cid,source="claude",title=item.get("name"),created_at=ts_from_iso(item.get("created_at")),updated_at=ts_from_iso(item.get("updated_at")),model=item.get("model"),cwd=None,git_branch=None,project_id=project,metadata=json.dumps({"session_id":item["uuid"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"api",**({"project_uuid":project} if project else {})})),fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{item['uuid']}",cookies,headers)
         return sum((parse_message(cid,m) for m in detail.get("chat_messages",[])),ParseResult(convs=[conv]))
     fetched,step,r=0,max(1,len(items)//10),ParseResult()
     for idx, item in enumerate(items):
@@ -1236,7 +1245,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         def one(profile):
             try:
                 cookies,base=chatgpt_cookie_base(browser,_CHATGPT_HOSTS,profile)
-                headers=chatgpt_headers(cookies,base,_BROWSER_UA[browser])
+                headers=chatgpt_headers(cookies,base,browser_ua(browser))
                 items,account=fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1&order=updated",cookies,headers,rate_limit_backoff=300)["items"],headers.get("ChatGPT-Account-ID")
                 return profile,account,items[0] if items else None,None
             except Exception as error: return profile,None,None,error
