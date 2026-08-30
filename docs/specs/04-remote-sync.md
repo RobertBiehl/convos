@@ -149,6 +149,12 @@ holder without the author's private key. Only the author root can sign a new
 revision. A deleted revision has no semantic body and defeats all ancestors
 named in its proof.
 
+Provider-session aliases use the same root-signed, multi-ancestor proof envelope.
+They union exact provider-session membership for one author and select the
+lexicographically first logical conversation source-row ID. The alias is identity
+authorization only: row bodies and deletions still require ordinary row-proof
+successors. See [Author-scoped provider session aliases](../provider-session-aliases.md).
+
 ## Envelopes and idempotency
 
 Canonical archive rows and provenance facts carry independently signed origin

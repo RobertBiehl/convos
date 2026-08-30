@@ -18,6 +18,7 @@ def archive(tmp_path,monkeypatch):
     conn.executemany("INSERT INTO messages (id,conversation_id,role,content,created_at,metadata) VALUES (?,?,?,?,?,?)",[("m1","c1","user","start","2026-01-01 00:00:00","{}"),("wrapper","c1","user","<recommended_plugins>ignore me","2026-01-01 00:00:01","{}"),("m2","c1","assistant",f"use {secret}\u001b[31m","2026-01-01 00:00:02","{}"),("m3","c1","user","continue exactly","2026-01-01 00:00:03","{}"),("old","c1","assistant","superseded","2025-01-01",'{"history_of":"m2"}'),("s1","c2","assistant","sub work","2026-01-02","{}"),("o1","outside","user","private other project","2026-01-03","{}")])
     conn.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at,old_content) VALUES ('e','m2',?,'write','two','2026-01-01 00:00:02','one')",[str(tracked)])
     conn.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at) VALUES ('tmp','m2',?,'write','scratch','2026-01-01 00:00:03')",[str(tmp_path/"scratch")])
+    conn.execute("INSERT INTO provenance.file_edit_evidence VALUES ('e','confirmed','test_fixture',NULL),('tmp','invalid','provider_failure','t')")
     conn.execute("INSERT INTO tool_calls (id,message_id,tool_name,input,output,status,duration_ms,created_at) VALUES ('t','m2','pytest','{\"args\":\"tests\"}','{\"error\":\"failed output\"}','failed',12,'2026-01-01 00:00:02')"); conn.close()
     return repo,secret
 
@@ -36,6 +37,10 @@ def test_packet_combines_live_git_and_exact_scope_isolated_archive_evidence(tmp_
     assert [f["path"] for f in current["files"]]==["tracked.py"] and current["files"][0]["edits"]==1 and current["tools"][0]["name"]=="pytest" and current["tools"][0]["status"]=="failed"
     assert data["git"]["branch"]==git(repo,"branch","--show-current") and data["git"]["head"]==git(repo,"rev-parse","HEAD") and any("tracked.py" in row for row in data["git"]["status"])
     assert secret not in raw and "\u001b" not in raw and "[REDACTED:github_token]" in raw and data["redactions"]==1 and "recommended_plugins" not in raw and "private other project" not in raw and "superseded" not in raw
+
+def test_packet_and_replay_use_provider_order_for_timestamp_ties(tmp_path,monkeypatch):
+    repo,_=archive(tmp_path,monkeypatch); db=duckdb.connect(str(tmp_path/"convos.db")); db.execute("UPDATE messages SET created_at='2026-01-01',metadata=CASE id WHEN 'm1' THEN '{\"provider_index\":2}' WHEN 'm2' THEN '{\"provider_index\":0}' WHEN 'm3' THEN '{\"provider_index\":1}' ELSE metadata END WHERE id IN ('m1','m2','m3'); UPDATE messages SET created_at='2025-01-01' WHERE id='wrapper'"); db.close()
+    packet=resume.packet_data(repo,limit=2,turns=3); replay=resume.replay_data("c1",limit=3); assert packet["sessions"][1]["last_message_id"]=="m1" and [m["message_id"] for m in packet["sessions"][1]["turns"]]==["m2","m3","m1"] and [m["id"] for m in replay["messages"]]==["m2","m3","m1"]
 
 
 def test_global_evidence_budget_is_exact_and_keeps_newest_sessions(tmp_path,monkeypatch):
@@ -65,7 +70,7 @@ def test_cli_json_and_markdown_are_bounded_secret_free_handoffs(tmp_path,monkeyp
 def test_replay_orders_exact_messages_tools_and_edits(tmp_path,monkeypatch):
     archive(tmp_path,monkeypatch); data=resume.replay_data("c1",around="m2",limit=4,context=100,activity=3)
     assert [m["id"] for m in data["messages"]]==["m1","wrapper","m2","m3"] and [a["kind"] for a in data["messages"][2]["activity"]]==["edit","tool","edit"]
-    assert data["messages"][2]["activity"][0]["before"]=="one" and data["messages"][2]["activity"][1]["duration_ms"]==12 and data["counts"]=={"tools":1,"edits":2} and not data["activity_truncated"]
+    assert data["messages"][2]["activity"][0]["before"]=="one" and data["messages"][2]["activity"][0]["evidence_status"]=="confirmed" and data["messages"][2]["activity"][2]["evidence_status"]=="invalid" and data["messages"][2]["activity"][1]["duration_ms"]==12 and data["counts"]=={"tools":1,"edits":2} and not data["activity_truncated"]
     assert "recommended_plugins" in json.dumps(data,default=str) and "superseded" not in json.dumps(data,default=str)
 
 

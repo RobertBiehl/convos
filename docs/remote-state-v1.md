@@ -157,6 +157,12 @@ proof for the currently materialized revision, while every matching workspace
 proof remains available as an access path. Content equality is never used to
 infer row identity, and incomparable cross-workspace revisions stay conflicted
 instead of overwriting the materialized row by arrival order.
+The signed revision recipe deliberately excludes workspace authorization. Two
+valid proofs for the same author, logical row, predecessor, and content are one
+logical DAG node even when retained through different workspaces. Head
+selection collapses that duplicate revision deterministically; a successor in
+either retained chain dominates both copies. Distinct concurrent revisions
+remain a real fork and are never guessed between.
 
 Local absolute checkout paths are local-only and are never serialized to a
 remote canonical event. Remote workspace boundaries and device activity remain
@@ -189,7 +195,8 @@ Only `READY` may discover and publish new local archive revisions.
 An absent, incompatible, or incomplete state with configured workspaces enters
 `REBASELINING`. Recovery:
 
-1. Acquires the same exclusive lock used by the worker and explicit sync.
+1. Acquires the same nonblocking sync-run lease used by the worker and explicit
+   sync.
 2. Refreshes the complete signed control chain. Every epoch boundary commits
    the exact relay tail plus each author's `(sequence, event_id)` head.
 3. Starts full-history replay at genesis, or limited-history replay at the
@@ -232,7 +239,7 @@ copy.
 
 A ready synchronization cycle:
 
-1. Acquire the process lock and refresh signed control state.
+1. Acquire the nonblocking sync-run lease and refresh signed control state.
 2. Retry already committed encrypted outbox entries.
 3. Pull and project to the relay's advertised tail.
 4. Read core-captured local canonical changes and reconcile them.
@@ -243,6 +250,19 @@ A ready synchronization cycle:
 
 A rebaselining cycle performs only steps 1 through 3 until it becomes `READY`.
 It cannot scan or publish the existing archive.
+
+The run lease prevents two complete sync cycles from racing, but it is separate
+from the nonblocking mutation lease used by explicit multi-step control
+commands. Sync therefore never holds the command lease across relay requests,
+archive scans, Git inspection, or DuckDB projection. SQLite and DuckDB
+transactions remain the local mutation boundaries, and a competing run or
+control operation fails promptly instead of waiting behind unrelated work.
+
+`remote watch` records a mode-0600 `watch.json` alongside the private traceback,
+prints each failure and recovery transition, and reports consecutive failures
+and the exact next-retry time through `doctor`. Retries back off exponentially
+from the configured interval to five minutes; a successful sync clears the
+failure count and traceback.
 
 ## Commit protocol
 
@@ -377,7 +397,7 @@ Remote state schema 1 has no compatibility transform in this pre-stability
 release.
 Inspection and doctor are side-effect-free. An absent state is initialized as
 empty metadata. A mutating sync handles an incompatible or damaged regular
-state under the normal exclusive sync lock:
+state under the nonblocking sync-run lease:
 
 1. Verify that signed relay control state is reachable; if not, leave the old
    state untouched.

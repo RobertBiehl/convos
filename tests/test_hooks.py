@@ -8,7 +8,7 @@ POPEN=subprocess.Popen
 @pytest.fixture
 def hooks(tmp_path, monkeypatch):
     data, codex = tmp_path/"data", tmp_path/".codex"; sessions = codex/"sessions"; sessions.mkdir(parents=True)
-    for k, v in (("DATA_DIR", data), ("DB_PATH", data/"convos.db"), ("HOOK_DIR", data/"hook_inbox"), ("HOOK_STATE", data/"hook_state.json"), ("HOOK_EMBED_DIRTY", data/"hook_embeddings_dirty"), ("HOOK_FTS_DIRTY", data/"hook_fts_dirty")): monkeypatch.setattr(cli, k, v)
+    for k, v in (("DATA_DIR", data), ("DB_PATH", data/"convos.db"), ("HOOK_DIR", data/"hook_inbox"), ("HOOK_STATE", data/"hook_state.json"), ("HOOK_PROGRESS", data/"hook_progress.json"), ("HOOK_EMBED_DIRTY", data/"hook_embeddings_dirty"), ("HOOK_FTS_DIRTY", data/"hook_fts_dirty")): monkeypatch.setattr(cli, k, v)
     monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: None if a[0][1:4] == ["-m", "ai_convos", "drain-hooks"] else POPEN(*a, **k))
     return sessions, data
 
@@ -23,11 +23,53 @@ def enqueue(path,command="capture"):
     assert r.exit_code == 0
 
 def test_hook_is_nonblocking_coalesced_and_private(hooks, monkeypatch):
-    sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path)
+    sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); launched=[]; monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(args))
     monkeypatch.setattr(cli, "get_db", lambda *a, **k: (_ for _ in ()).throw(AssertionError("hook touched db")))
     enqueue(path); enqueue(path,"hook")
     queued = list((data/"hook_inbox").glob("*.json")); assert len(queued) == 1
-    raw = queued[0].read_text(); assert "remember alpha" not in raw and "secret" not in raw and set(json.loads(raw)) == {"source", "path", "mtime", "size"}
+    raw = queued[0].read_text(); assert "remember alpha" not in raw and "secret" not in raw and set(json.loads(raw)) == {"source", "path", "mtime", "size"} and all(args[-1]=="--no-block" for args in launched)
+
+def test_explicit_drain_is_nonblocking_unless_requested(hooks,monkeypatch):
+    calls=[]; monkeypatch.setattr(cli,"drain_hooks",lambda **kwargs:calls.append(kwargs)); runner=CliRunner(); assert runner.invoke(cli.app,["drain-hooks"]).exit_code==runner.invoke(cli.app,["drain-hooks","--block"]).exit_code==0 and calls==[{"block":False},{"block":True}]
+
+def test_incidental_drain_and_manual_sync_do_not_wait_for_worker(hooks, monkeypatch):
+    _,data=hooks; (data/"hook_inbox").mkdir(parents=True); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/"hook_inbox/.drain.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); monkeypatch.setattr(cli,"capture_provenance",lambda *a,**k:[])
+    try:
+        assert hold.stdout.readline().strip()=="ready"; started=time.monotonic(); assert cli.drain_hooks()==0; cli.sync(False,300,False,False,False,False,True); assert time.monotonic()-started<1
+        done=threading.Event(); waiter=threading.Thread(target=lambda:(cli.drain_hooks(block=True),done.set())); waiter.start(); assert not done.wait(.1); hold.stdin.write("\n"); hold.stdin.flush(); assert done.wait(5); waiter.join()
+    finally:
+        if hold.poll() is None: hold.stdin.write("\n"); hold.stdin.flush()
+        hold.wait(timeout=5)
+
+def test_drain_releases_inbox_lock_before_parsing(hooks, monkeypatch):
+    sessions,data=hooks; path=sessions/"s.jsonl"; transcript(path); enqueue(path); parse=cli.hook_result
+    def unlocked(*args):
+        result=subprocess.run([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)",str(data/"hook_inbox/.lock")]); assert result.returncode==0; return parse(*args)
+    monkeypatch.setattr(cli,"hook_result",unlocked); assert cli.drain_hooks()==1
+
+def test_drain_bounds_batch_records_progress_and_hands_off(hooks,monkeypatch):
+    sessions,data=hooks; launched=[]; monkeypatch.setattr(cli,"HOOK_DRAIN_EVENTS",2); monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(args))
+    for i in range(5): transcript(path:=sessions/f"{i}.jsonl",f"event {i}"); enqueue(path)
+    launched.clear(); assert cli.drain_hooks()==2 and len(list((data/"hook_inbox").glob("*.json")))==3 and len(launched)==1
+    progress=json.loads((data/"hook_progress.json").read_text()); assert (progress["processed"],progress["failed"],progress["pending"],bool(progress["oldest"]))==(2,0,3,True)
+
+def test_drain_stops_between_events_at_time_budget(hooks,monkeypatch):
+    sessions,data=hooks; launched=[]; monkeypatch.setattr(cli,"HOOK_DRAIN_SECONDS",-1); monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(args))
+    for i in range(3): transcript(path:=sessions/f"timed-{i}.jsonl",f"timed {i}"); enqueue(path)
+    launched.clear(); assert cli.drain_hooks()==1 and len([*list((data/"hook_inbox").glob("*.json")),*list((data/"hook_inbox").glob("*.work"))])==2 and len(launched)==1
+    monkeypatch.setattr(cli,"HOOK_DRAIN_SECONDS",10); assert cli.drain_hooks()==2 and not [*list((data/"hook_inbox").glob("*.json")),*list((data/"hook_inbox").glob("*.work"))]
+
+def test_failed_only_drain_does_not_respawn_tight_loop(hooks,monkeypatch):
+    sessions,data=hooks; path=sessions/"bad.jsonl"; transcript(path); enqueue(path); launched=[]; monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(args)); monkeypatch.setattr(cli,"hook_result",lambda *_:(_ for _ in ()).throw(ValueError("bad transcript")))
+    assert cli.drain_hooks()==0 and not launched and json.loads((data/"hook_progress.json").read_text())["failed"]==1
+
+def test_concurrent_sync_exits_immediately_and_explicitly(hooks,capsys):
+    _,data=hooks; data.mkdir(); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/".sync.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+    try:
+        assert hold.stdout.readline().strip()=="ready"; started=time.monotonic()
+        with pytest.raises(cli.typer.Exit): cli.sync(False,300,False,False,False,False,True)
+        assert time.monotonic()-started<1 and "Sync already running; no work was started" in capsys.readouterr().out
+    finally: hold.stdin.write("\n"); hold.stdin.flush(); hold.wait(timeout=5)
 
 def test_retrieval_drains_idempotently_and_preserves_truncated_rewritten_history(hooks):
     sessions, data = hooks; path = sessions/"s.jsonl"; runner = CliRunner(); transcript(path); enqueue(path)
@@ -101,11 +143,16 @@ def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
     finally: signal.signal(signal.SIGINT, old)
     assert (data/"hook_fts_dirty").exists() and json.loads((data/"hook_embeddings_dirty").read_text()) == ["sync-m"]
 
+def test_sync_targets_provenance_but_full_reconciles_all(hooks, monkeypatch):
+    _,data=hooks; monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); calls=[]; monkeypatch.setattr(cli,"capture_provenance",lambda *a,**k:calls.append((a,k)) or [])
+    cli.sync(False,300,False,False,False,False,True); cli.sync(False,300,False,False,True,False,True)
+    assert calls==[((),{"edit_ids":set(),"conversation_ids":set()}),((),{})]
+
 def test_local_only_sync_imports_configured_agent_roots_without_web(hooks, tmp_path, monkeypatch):
     sessions, data = hooks; transcript(sessions/"local.jsonl", "offline codex history"); (sessions/"gone.jsonl").symlink_to(tmp_path/"missing-codex.jsonl"); claude=tmp_path/"claude"; project=claude/"projects"/"-repo"; project.mkdir(parents=True); (project/"local.jsonl").write_text("\n".join([json.dumps({"type":"system","timestamp":"2026-01-01T00:00:00Z","cwd":"/repo"}),json.dumps({"type":"human","timestamp":"2026-01-01T00:00:01Z","message":{"content":"offline claude history"}})])); (project/"gone.jsonl").symlink_to(tmp_path/"missing-claude.jsonl"); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); blocked = lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("local-only sync touched web"))
     monkeypatch.setattr(cli, "chatgpt_profiles", blocked); monkeypatch.setattr(cli, "get_cookies", blocked); first = CliRunner().invoke(cli.app, ["sync","--local-only"]); second = CliRunner().invoke(cli.app, ["sync","--local-only"])
-    db=duckdb.connect(str(data/"convos.db"),read_only=True); rows=db.execute("SELECT source,content FROM conversations c JOIN messages m ON m.conversation_id=c.id").fetchall(); db.close()
-    assert first.exit_code == second.exit_code == 0 and set(rows) == {("codex","offline codex history"),("claude-code","offline claude history")} and "2 new, 0 updated" in first.output and "0 new, 0 updated" in second.output
+    db=duckdb.connect(str(data/"convos.db"),read_only=True); rows=db.execute("SELECT source,content FROM conversations c JOIN messages m ON m.conversation_id=c.id").fetchall(); db.close(); state=json.loads(cli.STATE_PATH.read_text()); state["local"]["codex"]["parser"]=cli.PARSER_EPOCH-1; cli.atomic_json(cli.STATE_PATH,state); real,calls=cli.parse_codex,[]; monkeypatch.setattr(cli,"parse_codex",lambda *a,**k:calls.append(a) or real(*a,**k)); third=CliRunner().invoke(cli.app,["sync","--local-only"]); fourth=CliRunner().invoke(cli.app,["sync","--local-only"])
+    assert first.exit_code == second.exit_code == third.exit_code == fourth.exit_code == 0 and set(rows) == {("codex","offline codex history"),("claude-code","offline claude history")} and "2 new, 0 updated" in first.output and "0 new, 0 updated" in second.output and len(calls)==1 and json.loads(cli.STATE_PATH.read_text())["local"]["codex"]["parser"]==cli.PARSER_EPOCH
 
 @pytest.mark.parametrize("stamp", [None, 100])
 def test_sync_rechecks_chatgpt_unchanged_head(hooks, monkeypatch, stamp):
@@ -121,6 +168,20 @@ def test_sync_repairs_legacy_chatgpt_timestamps_before_comparison(hooks, monkeyp
     monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{}); monkeypatch.setattr(cli,"fetch_json",lambda *a,**k:{"items":[{"id":"new","update_time":300}]}); monkeypatch.setattr(cli,"fetch_chatgpt",lambda *a,**k:captured.append(k) or cli.ParseResult()); monkeypatch.setattr(cli,"get_cookies",lambda *_:{})
     cli.sync(False,300,False,False,False,False); conn = duckdb.connect(str(data/"convos.db"),read_only=True); times = conn.execute("SELECT created_at,updated_at FROM conversations WHERE id=?",[cid]).fetchone(); conn.close()
     assert times == (when,when) and captured[0]["known"][cid] == when.timestamp() and cid in captured[0]["legacy"]
+
+def test_sync_refetches_tool_ended_chatgpt_at_same_timestamp(hooks,monkeypatch):
+    _,data=hooks; data.mkdir(); monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); cid=cli.gen_id("chatgpt","active"); now=time.time(); when=cli.ts_any(now); conv=dict(id=cid,source="chatgpt",title="T",created_at=when,updated_at=when,model=None,cwd=None,git_branch=None,project_id=None,metadata=json.dumps({"remote_update_time":now})); msg=dict(id="tool",conversation_id=cid,role="tool",content="running",thinking=None,created_at=when,model=None,metadata="{}",parent_id=None); db=duckdb.connect(str(data/"convos.db")); cli.init_schema(db); cli.upsert(db,cli.ParseResult([conv],[msg])); db.close(); captured=[]
+    monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{}); monkeypatch.setattr(cli,"fetch_json",lambda *a,**k:{"items":[{"id":"active","update_time":100}]}); monkeypatch.setattr(cli,"fetch_chatgpt",lambda *a,**k:captured.append(k) or cli.ParseResult()); monkeypatch.setattr(cli,"get_cookies",lambda *_:{})
+    cli.sync(False,300,False,False,False,False); assert captured[0]["known"][cid] is None
+
+def test_sync_refetches_tied_chatgpt_without_provider_order(hooks,monkeypatch):
+    _,data=hooks; data.mkdir(); monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); cid=cli.gen_id("chatgpt","tied"); when=cli.ts_any(100); conv=dict(id=cid,source="chatgpt",title="T",created_at=when,updated_at=when,model=None,cwd=None,git_branch=None,project_id=None,metadata=json.dumps({"remote_update_time":100,"remote_complete":True})); msgs=[dict(id=f"m{i}",conversation_id=cid,role="assistant",content=str(i),thinking=None,created_at=when,model=None,metadata="{}",parent_id=None) for i in range(2)]; db=duckdb.connect(str(data/"convos.db")); cli.init_schema(db); cli.upsert(db,cli.ParseResult([conv],msgs)); db.close(); cli.atomic_json(cli.STATE_PATH,{"web":{"chatgpt":{"browser":"safari","frontiers":{"default":{"account":"acct","updated":100}},"coverage":[cid]}}}); captured=[]
+    monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"acct"}); monkeypatch.setattr(cli,"fetch_json",lambda *a,**k:{"items":[{"id":"tied","update_time":100}]}); monkeypatch.setattr(cli,"fetch_chatgpt",lambda *a,**k:(captured.append({**k,"known":dict(k["known"])}),k["sink"](cli.ParseResult([conv],[])),cli.ParseResult())[-1]); monkeypatch.setattr(cli,"get_cookies",lambda *_:{})
+    cli.sync(False,300,False,False,False,False); cli.sync(False,300,False,False,False,False); assert captured[0]["known"][cid] is None and captured[0]["frontiers"] is None and captured[1]["known"][cid]==when.timestamp() and captured[1]["frontiers"] is not None
+
+def test_read_uses_provider_order_for_tied_timestamps(hooks):
+    _,data=hooks; data.mkdir(); db=duckdb.connect(str(data/"convos.db")); cli.init_schema(db); db.execute("INSERT INTO conversations(id,source,title,metadata) VALUES ('ordered','chatgpt','T','{}')"); db.executemany("INSERT INTO messages(id,conversation_id,role,content,created_at,metadata) VALUES (?,?,?,?,?,?)",[("z-start","ordered","user","start","2026-01-01",'{"provider_index":0}'),("z-middle","ordered","tool","middle","2026-01-01",'{"provider_index":1}'),("a-final","ordered","assistant","verdict","2026-01-01",'{"provider_index":2}')]); db.close()
+    rows=json.loads(CliRunner().invoke(cli.app,["read","ordered","-n","2","-f","json"]).output); assert [r["id"] for r in rows]==["z-middle","a-final"]
 
 def test_sync_disables_frontier_when_saved_ids_are_missing(hooks, monkeypatch):
     _, data = hooks; data.mkdir(); monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); cid = cli.gen_id("chatgpt","present"); missing = cli.gen_id("chatgpt","missing"); conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); cli.upsert(conn,cli.ParseResult([dict(id=cid,source="chatgpt",title="T",created_at=None,updated_at=cli.ts_any(100),model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")],[])); conn.close(); cli.atomic_json(cli.STATE_PATH,{"web":{"chatgpt":{"browser":"safari","head":"default:old:100","frontiers":{"default":{"account":"acct","updated":100}},"coverage":[missing]}}}); captured = []

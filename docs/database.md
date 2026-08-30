@@ -29,7 +29,7 @@ Primary record for each conversation session.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| id | VARCHAR PK | Deterministic hash of `source:original_id` |
+| id | VARCHAR PK | Opaque stable physical identity |
 | source | VARCHAR | `chatgpt`, `claude`, `claude-code`, `codex` |
 | title | VARCHAR | Conversation title or derived name |
 | created_at | TIMESTAMP | First message timestamp |
@@ -38,7 +38,24 @@ Primary record for each conversation session.
 | cwd | VARCHAR | Working directory (CLI tools only) |
 | git_branch | VARCHAR | Git branch (CLI tools only) |
 | project_id | VARCHAR | Project/gizmo ID if applicable |
-| metadata | JSON | Source-specific extra fields |
+| metadata | JSON | Stable normalized session fields plus documented provider extensions; see the [provider conversation contract](provider-conversation-contract.md) |
+
+### provider_sessions
+
+Local native-identity binding installed by schema v5. It is derived from owned
+conversation metadata and is not a replicated archive row. The unique
+`(source, session_id)` key maps a moved or copied provider transcript back to its
+already-published opaque conversation ID; imported relay rows remain author-scoped
+through `remote.row_origins` instead.
+
+Cross-device identity is not stored here; it uses the root-signed
+[provider-session alias](provider-session-aliases.md), keyed by author.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| source | VARCHAR PK | Provider/integration namespace |
+| session_id | VARCHAR PK | Exact provider-native session or subagent ID |
+| conversation_id | VARCHAR | Stable local `conversations.id`; multiple exact or legacy provider aliases may name the same local conversation |
 
 ### messages
 
@@ -48,13 +65,13 @@ Individual messages within conversations. Has FTS index.
 |--------|------|-------------|
 | id | VARCHAR PK | Deterministic hash |
 | conversation_id | VARCHAR FK | References conversations.id |
-| role | VARCHAR | `user`, `assistant`, `human`, `system`, `tool` |
+| role | VARCHAR | Canonical `user`, `assistant`, `system`, `developer`, or `tool` |
 | content | VARCHAR | Message text content |
 | thinking | VARCHAR | Extended thinking/reasoning (Claude) |
 | created_at | TIMESTAMP | Message timestamp |
 | model | VARCHAR | Model for this specific message |
 | metadata | JSON | Source-specific extra fields |
-| embedding | FLOAT[768] | embeddinggemma vector for hybrid search (NULL until embedded) |
+| embedding | FLOAT[] | Active-profile vector for hybrid search (NULL until embedded) |
 
 ### tool_calls
 
@@ -135,6 +152,7 @@ product is strictly read-only.
 | `file_versions` | Observed full-content hashes |
 | `file_edit_scopes` | Immutable capture-time repository-relative path, resolved filesystem route, root, and checkout marker for each local edit |
 | `file_edit_files` | Edit-to-file edges plus hashes of captured old/new edit material and evidence quality |
+| `file_edit_evidence` | Per-edit classification (`confirmed`, `invalid`, `unknown`, or `unverified`), reason, and exact tool-call link |
 | `git_checkpoints` | Git head plus capture-time working-tree hash, changed paths, and capture source |
 | `checkpoint_edits` | Checkpoint-to-`file_edits.id` evidence |
 | `local_facts` | Content-free marker that this archive independently observed a fact and may sign it locally |
@@ -142,6 +160,16 @@ product is strictly read-only.
 There are intentionally no copied prompts, message bodies, changesets,
 file-edit bodies, raw remote payloads, workspace IDs, or device IDs in this
 schema.
+
+Raw `file_edits` remain lossless archive records. Exact provenance,
+changegraph, project summaries, and team contribution use only `confirmed`
+rows. Replay and export retain every row and expose its evidence status.
+Provider results that are missing or nonterminal remain `unknown`; rows without
+surviving source evidence are `unverified` with a specific reason. Received v1
+rows initially use `unverified/signed_replica_missing_evidence`. A separately
+root-signed evidence object, bound to the exact edit and tool-call row revisions,
+then restores the sender's exact classification. Old clients can still ingest
+and forward the unchanged signed-v1 logical row.
 
 The `remote` schema is the separate identifier-only exception for remotely
 projected archive rows. Core writes it atomically with each imported row so
@@ -158,6 +186,8 @@ separate provenance and does not change semantic row identity after recovery.
 | `row_signers` | One normalized root key and device certificate per author device |
 | `workspace_controls` | Signed origin-workspace authorization chain, once per control revision |
 | `row_conflicts` | Canonical logical body for a rare verified incomparable head not selected as the main row |
+| `provider_session_aliases` | Author-scoped root-signed exact provider-session membership leaves and their deterministic canonical source row |
+| `file_edit_evidence_proofs` | Root-signed evidence leaves bound to exact edit and optional tool-call row revisions |
 
 Proof rows never duplicate conversation content. Reissuing an equivalent
 certificate for the same certified device keys does not create another signer.
@@ -211,16 +241,20 @@ ORDER BY score DESC
 ## Hybrid Search
 
 `convos query` combines FTS (BM25) with vector similarity over the
-`embedding` column using DuckDB's built-in `array_cosine_similarity`. Top-50
+`embedding` column using DuckDB's built-in `list_cosine_similarity`. Top-50
 from each source is fused with Reciprocal Rank Fusion (`SUM(1/(60+rank))`),
 then the strongest message from each conversation is returned in fused order.
 Source/day/role/cwd/conversation filters are applied before candidate selection;
 injected skill and local-command wrapper messages are excluded from semantic
 candidates. A cwd filter includes the exact recorded path and descendants.
 
-Embeddings are produced by embeddinggemma-300M (768d) with the
-`task: search result | document:` prefix at index time and `query:` at query
-time. Truncation only — no chunking — at 1600 chars.
+On macOS, embeddings are produced by EmbeddingGemma (768d) with distinct query
+and document prefixes. On Linux, the default is the compact Model2Vec
+`potion-base-8M` model (256d). Both use L2-normalized vectors and character
+truncation — no chunking — at 1600 chars. The singleton `embedding_state` table
+stores the exact backend, model revision, artifact hash, dimensions, pooling,
+normalization, truncation, and prefixes. A profile change clears incompatible
+vectors transactionally before rebuilding them.
 
 Use `convos embed` to backfill missing embeddings without fetching from web
 APIs. Hooks and `convos sync` queue new or changed messages for just-in-time
@@ -234,7 +268,9 @@ output. Records retain full content plus exact message and conversation IDs.
 `local_only=True` forbids an implicit retrieval-model download.
 
 The `embedding` column is preserved across upserts when message `content`
-is unchanged, so only new or edited messages are queued again.
+and the archive profile are unchanged, so only new or edited messages are
+queued again. Set `CONVOS_SEMANTIC=0` to keep sync and literal search active
+without loading or downloading a semantic model.
 
 ## ID Generation
 

@@ -8,27 +8,30 @@ sandbox="$(mktemp -d)"
 trap 'rm -rf "$sandbox"' EXIT
 
 uv venv --python 3.12 "$sandbox/venv"
-uv pip install --python "$sandbox/venv/bin/python" "$wheel"
+uv pip install --python "$sandbox/venv/bin/python" --only-binary :all: "$wheel"
 export CONVOS_PROJECT_ROOT="$sandbox/root" CODEX_HOME="$sandbox/codex" CLAUDE_CONFIG_DIR="$sandbox/claude"
 "$sandbox/venv/bin/convos" init
 
 "$sandbox/venv/bin/python" <<'PY'
 from importlib.metadata import metadata, version
 from pathlib import Path
-import duckdb, huggingface_hub, llama_cpp
+import duckdb
+import model2vec
 from ai_convos import cli
+from typer.testing import CliRunner
 
 requirements = metadata("convos").get_all("Requires-Dist") or []
 assert version("convos") == "0.10.1"
-assert any(r.startswith("llama-cpp-python") for r in requirements), requirements
-assert any(r.startswith("huggingface-hub") for r in requirements), requirements
+assert any(r.startswith("model2vec==0.9.0") and "sys_platform == \"linux\"" in r for r in requirements), requirements
+assert cli.semantic_backend() == "model2vec" and cli.embedding_profile()["dimensions"] == 256
+vector = cli.embed_text("portable semantic retrieval")
+assert len(vector) == 256 and any(vector)
 conn = duckdb.connect(str(cli.DB_PATH))
-vector = [0.0] * 768; vector[0] = 1.0
 conn.execute("INSERT INTO conversations (id,source,title) VALUES ('smoke-conversation','codex','Packaging decision')")
-conn.execute("INSERT INTO messages (id,conversation_id,role,content,embedding) VALUES ('smoke-message','smoke-conversation','assistant','We kept semantic recall in the default install.',?)", [vector])
-cli.rebuild_fts_index(conn); conn.close(); cli.embed_text = lambda *args, **kwargs: vector
-hits = cli.hybrid_hits("why is semantic recall included?", limit=1)
-assert hits[0]["conversation_id"] == "smoke-conversation", hits
+conn.execute("INSERT INTO messages (id,conversation_id,role,content) VALUES ('smoke-message','smoke-conversation','assistant','The base installation needs no native compiler.')")
+cli.rebuild_fts_index(conn); conn.close()
+result = CliRunner().invoke(cli.app, ["search", "native compiler", "-n", "1"])
+assert result.exit_code == 0 and "base installation needs no native compiler" in result.output, result.output
 assert Path(cli.PROJECT_ROOT).exists()
-print("clean wheel: convos 0.10.1, semantic dependencies and hybrid retrieval ready")
+print("clean wheel: convos 0.10.1, compiler-free Linux semantic runtime ready")
 PY

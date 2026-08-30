@@ -8,10 +8,10 @@ from . import _conn, edits_for
 
 _EDGES = """SELECT fe.file_path, COALESCE(m.conversation_id, 'unknown'), COALESCE(c.source, '?'),
     COALESCE(c.title, '(transcripts deleted)'), COUNT(*), MAX(fe.created_at)
-FROM file_edits fe LEFT JOIN messages m ON fe.message_id = m.id LEFT JOIN conversations c ON c.id = m.conversation_id
+FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' LEFT JOIN messages m ON fe.message_id = m.id LEFT JOIN conversations c ON c.id = m.conversation_id
 GROUP BY 1, 2, 3, 4"""
 _FILES = """SELECT fe.file_path, COUNT(*), MAX(fe.created_at), COALESCE(string_agg(DISTINCT c.source, ','), '?')
-FROM file_edits fe LEFT JOIN messages m ON fe.message_id = m.id LEFT JOIN conversations c ON c.id = m.conversation_id
+FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' LEFT JOIN messages m ON fe.message_id = m.id LEFT JOIN conversations c ON c.id = m.conversation_id
 WHERE m.conversation_id = ? GROUP BY fe.file_path ORDER BY MAX(fe.created_at) DESC"""
 
 def _files(conn, conv):

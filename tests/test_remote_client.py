@@ -38,6 +38,43 @@ def test_upload_batches_bound_count_and_wire_size():
     assert [len(x) for x in _upload_batches([row(1)]*501,1000)]==[500,1] and [len(x) for x in _upload_batches([row(6)]*2,10)]==[1,1]
 
 
+def test_sync_lease_is_nonblocking_and_separate_from_mutation_lease(tmp_path):
+    with remote_client.mutation_lock(tmp_path):
+        with remote_client.sync_run(tmp_path): pass
+        with pytest.raises(RuntimeError,match="already running"):
+            with remote_client.mutation_lock(tmp_path): pass
+    with remote_client.sync_run(tmp_path):
+        with pytest.raises(RuntimeError,match="already running"):
+            with remote_client.sync_run(tmp_path): pass
+    with pytest.raises(KeyboardInterrupt):
+        with remote_client.sync_run(tmp_path): raise KeyboardInterrupt
+    with remote_client.sync_run(tmp_path): pass
+
+
+def test_watch_persists_exponential_backoff_and_clears_failure_after_recovery(tmp_path,monkeypatch):
+    monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(tmp_path))
+    outcomes=[ValueError("first"),ValueError("second"),None,KeyboardInterrupt()]
+    snapshots=[]
+    def attempt():
+        if (outcome:=outcomes.pop(0)) is not None: raise outcome
+    def sleep(delay): snapshots.append((delay,json.loads((tmp_path/"remote/watch.json").read_text())))
+    monkeypatch.setattr(remote_client,"sync_once",attempt); monkeypatch.setattr(remote_client.time,"sleep",sleep)
+    with pytest.raises(KeyboardInterrupt): remote_client.watch(2)
+    assert [delay for delay,status in snapshots]==[2,4,2] and [status["failures"] for delay,status in snapshots]==[1,2,0]
+    assert snapshots[0][1]["next_retry"]>=snapshots[0][1]["failed_at"]+2 and snapshots[1][1]["next_retry"]>=snapshots[1][1]["failed_at"]+4 and not (tmp_path/"remote/last_error").exists()
+
+
+def test_doctor_reports_watch_failure_and_next_retry(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db")
+    monkeypatch.setattr("ai_convos_remote.request",transport(server))
+    monkeypatch.setattr(remote_client,"health",lambda cfg:{"ok":True})
+    monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(tmp_path/"client"))
+    setup_client("http://server","alice",root=tmp_path/"client")
+    remote_client.save_watch_status({"failures":3,"next_retry":123.0})
+    status=doctor_status()
+    assert "watch_failures=3" in status and "next_retry=123.0" in status
+
+
 def test_settled_state_is_payload_size_independent_and_contains_no_bodies(tmp_path,monkeypatch):
     def settled(root,size):
         server=server_connect(tmp_path/f"{root.name}.server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); cfg,_=setup_client("http://server","alice",root=root); ws=workspace(cfg,"Personal"); state=connect(root/"remote/state.db"); marker=f"settled-{size}-marker-"+"x"*size; eid=publish(cfg,state,ws,ledger_event(marker),root); pending=next((root/"remote/outbox").iterdir()); assert marker.encode() not in pending.read_bytes() and state.execute("SELECT COUNT(*) FROM outbox WHERE event=?",(eid,)).fetchone()[0]==1; upload(cfg,state,root); state.execute("PRAGMA wal_checkpoint(TRUNCATE)"); pages=state.execute("PRAGMA page_count").fetchone()[0]; columns={r[1] for table, in state.execute("SELECT name FROM sqlite_master WHERE type='table'") for r in state.execute(f"PRAGMA table_info({table})")}; counts=tuple(state.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("receipts","publication_heads","event_sequences")); state.close(); files=[root/"remote/state.db",root/"remote/state.db-wal"]
@@ -48,7 +85,7 @@ def test_settled_state_is_payload_size_independent_and_contains_no_bodies(tmp_pa
 
 def test_remote_scan_is_read_only_and_does_not_self_trigger(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); repo=root/"repo"; repo.mkdir(parents=True); subprocess.run(("git","-C",str(repo),"init","-q"),check=True); subprocess.run(("git","-C",str(repo),"config","user.email","a@b.c"),check=True); subprocess.run(("git","-C",str(repo),"config","user.name","A"),check=True); (repo/"a.py").write_text("one\n"); subprocess.run(("git","-C",str(repo),"add","."),check=True); subprocess.run(("git","-C",str(repo),"commit","-qm","initial"),check=True)
-    path=root/"data/convos.db"; path.parent.mkdir(); db=duckdb.connect(str(path)); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','provenance','2026-01-01','2026-01-01',NULL,?,NULL,NULL,'{}')",[str(repo)]); db.execute("INSERT INTO messages VALUES ('m','c','assistant','done',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.execute("INSERT INTO file_edits VALUES ('e','m',?,'write','one\n','2026-01-01',NULL)",[str(repo/"a.py")]); db.close(); capture_provenance(path); sync_once(root,True)
+    path=root/"data/convos.db"; path.parent.mkdir(); db=duckdb.connect(str(path)); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','provenance','2026-01-01','2026-01-01',NULL,?,NULL,NULL,'{}')",[str(repo)]); db.execute("INSERT INTO messages VALUES ('m','c','assistant','done',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.execute("INSERT INTO file_edits VALUES ('e','m',?,'write','one\n','2026-01-01',NULL)",[str(repo/"a.py")]); db.execute("INSERT INTO provenance.file_edit_evidence VALUES ('e','confirmed','test_fixture',NULL)"); db.close(); capture_provenance(path); sync_once(root,True)
     state=connect(root/"remote/state.db"); ws=workspace(load(root),"Personal"); generation=int(state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()[0]); state.close(); db=duckdb.connect(str(path),read_only=True); observed=db.execute("SELECT observed_at FROM provenance.repositories").fetchone()[0]; assert generation==archive_state(db)[1]; db.close(); count=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     sync_once(root); db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT observed_at FROM provenance.repositories").fetchone()[0]==observed; db.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count
 
@@ -116,7 +153,7 @@ def test_explicit_sync_repairs_interior_row_and_blob_loss(tmp_path,monkeypatch):
 
 
 def test_holder_refounds_lost_team_on_fresh_relay_without_excluded_member(tmp_path,monkeypatch):
-    old=server_connect(tmp_path/"old.db"); monkeypatch.setattr("ai_convos_remote.request",transport(old)); a,b=tmp_path/"alice",tmp_path/"bob"; alice,_=setup_client("http://old","alice",root=a); setup_client("http://old","bob",root=b); origin=create(alice,"Old Team","team",a); add_member(alice,origin,"bob",root=a); alice=load(a); path=a/"data/convos.db"; write_archive(path,"portable original"); repo=a/"repo"; repo.mkdir(); subprocess.run(("git","-C",str(repo),"init","-q"),check=True); subprocess.run(("git","-C",str(repo),"config","user.email","a@b.c"),check=True); subprocess.run(("git","-C",str(repo),"config","user.name","A"),check=True); (repo/"a.py").write_text("portable\n"); subprocess.run(("git","-C",str(repo),"add","."),check=True); subprocess.run(("git","-C",str(repo),"commit","-qm","initial"),check=True); db=duckdb.connect(str(path)); db.execute("UPDATE conversations SET cwd=?",[str(repo)]); db.execute("INSERT INTO messages VALUES ('m','c','user','portable child',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.execute("INSERT INTO file_edits VALUES ('e','m',?,'write','portable\n','2026-01-01',NULL)",[str(repo/"a.py")]); db.close(); capture_provenance(path); sa=connect(a/"remote/state.db"); core=duckdb.connect(str(path),read_only=True); records=scan(core,sa); core.close(); projection_module.attest_rows(path,alice,origin,records); envs=projection_module.row_replicas(path,alice,origin,records,{2:key(alice,origin,2)}); action(old,{"op":"replica_upload_many","envelopes":envs},alice["token"]); pull(load(b),connect(b/"remote/state.db"),b)
+    old=server_connect(tmp_path/"old.db"); monkeypatch.setattr("ai_convos_remote.request",transport(old)); a,b=tmp_path/"alice",tmp_path/"bob"; alice,_=setup_client("http://old","alice",root=a); setup_client("http://old","bob",root=b); origin=create(alice,"Old Team","team",a); add_member(alice,origin,"bob",root=a); alice=load(a); path=a/"data/convos.db"; write_archive(path,"portable original"); repo=a/"repo"; repo.mkdir(); subprocess.run(("git","-C",str(repo),"init","-q"),check=True); subprocess.run(("git","-C",str(repo),"config","user.email","a@b.c"),check=True); subprocess.run(("git","-C",str(repo),"config","user.name","A"),check=True); (repo/"a.py").write_text("portable\n"); subprocess.run(("git","-C",str(repo),"add","."),check=True); subprocess.run(("git","-C",str(repo),"commit","-qm","initial"),check=True); db=duckdb.connect(str(path)); db.execute("UPDATE conversations SET cwd=?",[str(repo)]); db.execute("INSERT INTO messages VALUES ('m','c','user','portable child',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.execute("INSERT INTO file_edits VALUES ('e','m',?,'write','portable\n','2026-01-01',NULL)",[str(repo/"a.py")]); db.execute("INSERT INTO provenance.file_edit_evidence VALUES ('e','confirmed','test_fixture',NULL)"); db.close(); capture_provenance(path); sa=connect(a/"remote/state.db"); core=duckdb.connect(str(path),read_only=True); records=scan(core,sa); core.close(); projection_module.attest_rows(path,alice,origin,records); envs=projection_module.row_replicas(path,alice,origin,records,{2:key(alice,origin,2)}); action(old,{"op":"replica_upload_many","envelopes":envs},alice["token"]); pull(load(b),connect(b/"remote/state.db"),b)
     fresh=server_connect(tmp_path/"fresh.db"); monkeypatch.setattr("ai_convos_remote.request",transport(fresh)); bob,_=rehome_client(load(b),"http://fresh",b); carol,_=setup_client("http://fresh","carol",root=tmp_path/"carol"); mallory,_=setup_client("http://fresh","mallory",root=tmp_path/"mallory"); replacement=create(bob,"Replacement","team",b); add_member(bob,replacement,"carol",root=b); bob=load(b); state=connect(b/"remote/state.db"); assert bind_origin(bob,state,replacement,origin,b)==2; state.close(); sync_once(b,True); sync_once(tmp_path/"carol",True)
     db=duckdb.connect(str(tmp_path/"carol/data/convos.db"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="portable original" and db.execute("SELECT content FROM messages").fetchone()[0]=="portable child" and db.execute("SELECT COUNT(*) FROM provenance.file_edit_files").fetchone()[0]==1 and db.execute("SELECT COUNT(*) FROM provenance.git_checkpoints").fetchone()[0]==1 and set(db.execute("SELECT workspace_id,authorization_workspace_id,author_user_id FROM remote.row_proofs").fetchall())=={(origin,origin,alice["user"])}; db.close(); assert fresh.execute("SELECT COUNT(*) FROM origin_bundles").fetchone()[0]==1 and fresh.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==len(records)
     with pytest.raises(PermissionError,match="access denied"): action(fresh,{"op":"origin_pull","workspace":replacement},mallory["token"])
@@ -165,15 +202,15 @@ def test_personal_sync_automatically_bridges_encrypted_memory_between_devices(tm
 
 
 def test_lost_semantic_replica_response_retries_without_resurrecting_forgotten_memory(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a=tmp_path/"a"; setup_client("http://server","alice",root=a); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("replica retry secret","global"); sync_once(a,True); memory_module.forget_data(created["id"],"global"); before=server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]; lost=[False]
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a=tmp_path/"a"; setup_client("http://server","alice",root=a); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("replica retry secret","global"); sync_once(a,True); memory_module.forget_data(created["id"],"global"); before=server.execute("SELECT COUNT(*) FROM semantic_replicas").fetchone()[0]; lost=[False]
     def request_lost(cfg,body,auth=True):
         result=direct(cfg,body,auth)
         if body["op"]=="replica_upload_many" and not lost[0]: lost[0]=True; raise ConnectionError("replica response lost")
         return result
     monkeypatch.setattr("ai_convos_remote.request",request_lost)
     with pytest.raises(ConnectionError,match="response lost"): sync_once(a,True)
-    assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==before+1
-    monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(a,True); assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==before+1; db=sqlite3.connect(a/"memory/state.db"); assert db.execute("SELECT state FROM remote_semantics").fetchall()==[("deleted",)]; db.close()
+    assert server.execute("SELECT COUNT(*) FROM semantic_replicas").fetchone()[0]==before+1
+    monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(a,True); assert server.execute("SELECT COUNT(*) FROM semantic_replicas").fetchone()[0]==before+1; db=sqlite3.connect(a/"memory/state.db"); assert db.execute("SELECT state FROM remote_semantics").fetchall()==[("deleted",)]; db.close()
 
 
 def test_same_device_rebuilds_lost_memory_ledger_and_can_revise_and_forget(tmp_path,monkeypatch):
@@ -196,7 +233,7 @@ def test_relay_cannot_fabricate_semantic_replica_or_mutate_memory(tmp_path,monke
 
 
 def test_later_uploader_copy_heals_poisoned_replica_across_pages(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); memory_module.remember_data("healed delivery copy","global"); sync_once(a,True); cfg=load(b); ws=workspace(cfg,"Personal"); poison_cursor,raw=server.execute("SELECT cursor,envelope FROM row_replicas ORDER BY cursor").fetchone(); original=json.loads(raw); body=open_replica(original,key(cfg,ws,original["epoch"])); repaired=seal_replica(body["row"],body["proof"],ws,original["epoch"],key(cfg,ws,original["epoch"]),cfg["device"]["id"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; server.execute("UPDATE row_replicas SET envelope=?",(json.dumps(original),)); server.commit()
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); memory_module.remember_data("healed delivery copy","global"); sync_once(a,True); cfg=load(b); ws=workspace(cfg,"Personal"); poison_cursor,raw=server.execute("SELECT cursor,envelope FROM semantic_replicas ORDER BY cursor").fetchone(); original=json.loads(raw); body=open_replica(original,key(cfg,ws,original["epoch"])); repaired=seal_replica(body["row"],body["proof"],ws,original["epoch"],key(cfg,ws,original["epoch"]),cfg["device"]["id"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; server.execute("UPDATE semantic_replicas SET envelope=?",(json.dumps(original),)); server.commit()
     def paged(cfg,request_,auth=True): return direct(cfg,request_|({"limit":1} if request_["op"]=="replica_pull" else {}),auth)
     monkeypatch.setattr("ai_convos_remote.request",paged); state=connect(b/"remote/state.db")
     with pytest.raises(ValueError,match="no valid delivery copy"): pull(cfg,state,b)
@@ -297,6 +334,32 @@ def test_team_future_only_complete_history_and_removal(tmp_path,monkeypatch):
 
 def test_future_only_recovered_device_reasserts_explicit_sharing_preference(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,_=setup_client("http://server","alice",root=a); bob,recovery=setup_client("http://server","bob","laptop",root=b); team=create(alice,"Team","team",a); add_member(alice,team,"bob",root=a); bob=load(b); refresh(bob,b); state=connect(b/"remote/state.db"); configure_sharing(bob,state,team,False,["edit"],b); state.close(); desktop,_=setup_client("http://server","bob","desktop",recovery,root=c); request_device(desktop,team,c,0); approve_device(load(b),team,desktop["device"]["id"],root=b); sync_once(c); state=connect(c/"remote/state.db"); assert sharing(state,team,desktop["user"])["auto_contribute"] is False and sharing(state,team,desktop["user"])["match"]==["edit"] and load(c)["sharing"][team]=={"auto_contribute":False,"match":["edit"]}
+
+
+def test_device_approval_does_not_republish_another_users_signed_preference(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db")
+    monkeypatch.setattr("ai_convos_remote.request",transport(server))
+    monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None)
+    a,b,c=tmp_path/"alice",tmp_path/"bob",tmp_path/"recovered"
+    alice,recovery=setup_client("http://server","alice","laptop",root=a)
+    bob,_=setup_client("http://server","bob",root=b)
+    recovered,_=setup_client("http://server","alice","recovered",recovery,root=c)
+    team=create(alice,"Team","team",a)
+    add_member(alice,team,"bob",root=a)
+    bob=load(b)
+    refresh(bob,b)
+    state=connect(b/"remote/state.db")
+    configure_sharing(bob,state,team,False,["edit"],b)
+    state.close()
+    sync_once(a)
+    request_device(recovered,team,c,0)
+    result=approve_device(load(a),team,recovered["device"]["id"],root=a)
+    assert result["approved"] and result["history"]>0
+    sync_once(c)
+    remove_device(load(a),team,recovered["device"]["id"],a)
+    sync_once(c)
+    current=load(c)
+    assert recovered["device"]["id"] in current["controls"][team]["removed"] and f"{team}:{current['workspaces'][team]['epoch']}" not in current["keys"]
 
 
 def test_epoch_preference_retention_resumes_after_rotation_crash(tmp_path,monkeypatch):
@@ -498,6 +561,31 @@ def test_replication_boundary_crash_matrix_converges_after_restart(tmp_path,monk
         with pytest.raises(ConnectionError,match="boundary crash"): sync_once(b,True)
         monkeypatch.setattr(remote_client,name,real); sync_once(b,True); db=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="crash matrix"; path=db.execute("SELECT path FROM attachments").fetchone()[0] if kind=="blob" else None; db.close(); assert path is None or Path(path).read_bytes()==payload
     assert fired[0] and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==(1 if kind=="row" else 3) and server.execute("SELECT COUNT(*) FROM blob_replicas").fetchone()[0]==(kind=="blob")
+
+
+def test_keyboard_interrupt_releases_sync_lease_and_retry_converges(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db")
+    direct=transport(server)
+    monkeypatch.setattr("ai_convos_remote.request",direct)
+    monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None)
+    root=tmp_path/"client"
+    setup_client("http://server","alice",root=root)
+    write_archive(root/"data/convos.db","interrupt safe")
+    fired=False
+    def interrupt(cfg,body,auth=True):
+        nonlocal fired
+        result=direct(cfg,body,auth)
+        if body["op"]=="replica_upload_many" and not fired:
+            fired=True
+            raise KeyboardInterrupt
+        return result
+    monkeypatch.setattr("ai_convos_remote.request",interrupt)
+    with pytest.raises(KeyboardInterrupt): sync_once(root,True)
+    monkeypatch.setattr("ai_convos_remote.request",direct)
+    sync_once(root,True)
+    state=connect(root/"remote/state.db")
+    assert fired and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]==1
+    state.close()
 
 
 def test_lost_upload_response_and_interrupted_pull_recover_idempotently(tmp_path,monkeypatch):

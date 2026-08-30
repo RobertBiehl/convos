@@ -122,13 +122,14 @@ class TestChatGPTAPI:
         def fake(url, *a, **k):
             if "/conversations?offset=0" in url: return {"items": [{"id": "c1", "title": "T", "create_time": None, "update_time": None}], "total": 1}
             if "/conversations?offset=" in url: return {"items": [], "total": 1}
-            return {"create_time": 1709294400, "update_time": 1709294500,
-                    "mapping": {"n1": {"message": {"author": {"role": "user"}, "content": {"parts": ["hi"]}, "create_time": 1709294400}}}}
+            return {"create_time": 1709294400, "update_time": 1709294500, "current_node":"n1",
+                    "mapping": {"n1": {"message": {"author": {"role": "assistant"}, "content": {"parts": ["hi"]}, "create_time": 1709294400,"status":"finished_successfully"}}}}
         monkeypatch.setattr(cli, "fetch_json", fake)
         r = cli.fetch_chatgpt("safari")
         assert len(r.convs) == 1
         assert r.convs[0]["created_at"] == cli.ts_from_epoch(1709294400)
         assert r.convs[0]["updated_at"] == cli.ts_from_epoch(1709294500)
+        assert json.loads(r.convs[0]["metadata"])["remote_complete"] is True
 
     def test_fetch_chatgpt_dates_fall_back_to_messages(self, monkeypatch):
         from ai_convos import cli
@@ -302,6 +303,16 @@ class TestClaudeAPI:
             return {"chat_messages":[]}
         monkeypatch.setattr(cli, "fetch_json", fake)
         with pytest.raises(TimeoutError, match="detail timeout"): cli.fetch_claude("safari")
+
+    def test_fetch_claude_keeps_structured_only_message_parents(self,monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"get_cookies",lambda *_:{"session":"x"})
+        def fake(url,*a,**k):
+            if url.endswith("/api/organizations"): return [{"uuid":"org"}]
+            if url.endswith("/chat_conversations"): return [{"uuid":"c","name":"structured"}]
+            return {"chat_messages":[{"uuid":"a","sender":"human","attachments":[{"file_name":"x.pdf"}],"content":[]},{"uuid":"t","sender":"assistant","content":[{"type":"tool_use","name":"lookup","input":{"q":"x"}}]}]}
+        monkeypatch.setattr(cli,"fetch_json",fake); result=cli.fetch_claude("safari"); mids={m["id"] for m in result.msgs}
+        assert len(result.msgs)==2 and result.attachs[0]["message_id"] in mids and result.tools[0]["message_id"] in mids
 
     @pytest.mark.integration
     def test_organizations_schema(self):
