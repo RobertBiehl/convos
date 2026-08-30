@@ -670,19 +670,18 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
 def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None) -> ParseResult:
     print("  claude listing...", flush=True)
     cookies,org_id,data=claude_listing(browser)
-    items=data if limit==0 else data[:limit]
-    if items: print(f"  claude total {len(items)}", flush=True)
+    listed=data if limit==0 else data[:limit]
+    items=[item for item in listed if not since or not (updated:=ts_from_iso(item.get("updated_at") or item.get("created_at"))) or updated>since]
+    if listed: print(f"  claude listed {len(listed)}; fetching {len(items)}", flush=True)
     def parse_message(cid,m):
         mid,ts,blocks,tools,attachs,text,msgs=(mid:=gen_id("claude",f"{cid}:{m.get('uuid','')}")),(ts:=ts_from_iso(m.get("created_at"))),(blocks:=m.get("content",[]) if isinstance(m.get("content"),list) else [{"type":"text","text":m.get("text","")}]),(tools:=[dict(id=gen_id("claude",f"{'tool' if b.get('type')=='tool_use' else 'toolres'}:{mid}:{i}"),message_id=mid,tool_name=b.get("name") if b.get("type")=="tool_use" else b.get("tool_use_id"),input=json.dumps(b.get("input",{})) if b.get("type")=="tool_use" else "{}",output="{}" if b.get("type")=="tool_use" else json.dumps(b.get("content","")),status="pending" if b.get("type")=="tool_use" else "complete",duration_ms=None,created_at=ts) for i,b in enumerate(blocks) if isinstance(b,dict) and b.get("type") in ("tool_use","tool_result")]),(attachs:=[dict(id=gen_id("claude",f"attach:{mid}:{i}"),message_id=mid,filename=a.get("file_name"),mime_type=a.get("file_type"),size=a.get("file_size"),path=None,url=a.get("url"),created_at=ts) for i,a in enumerate(m.get("attachments",[]))]),(text:="\n".join(b.get("text","") if isinstance(b,dict) and b.get("type")=="text" else b if isinstance(b,str) else "" for b in blocks).strip()),[dict(id=mid,conversation_id=cid,role="user" if m.get("sender")=="human" else m.get("sender","unknown"),content=text,thinking=None,created_at=ts,model=m.get("model"),metadata="{}",parent_id=None)] if text or tools or attachs else []
         return ParseResult(msgs=msgs,tools=tools,attachs=attachs)
     def parse_item(item):
-        updated=ts_from_iso(item.get("updated_at") or item.get("created_at"))
-        if since and updated and updated<=since: return None
         cid,project,conv,detail=(cid:=gen_id("claude",item["uuid"])),(project:=item.get("project_uuid")),dict(id=cid,source="claude",title=item.get("name"),created_at=ts_from_iso(item.get("created_at")),updated_at=ts_from_iso(item.get("updated_at")),model=item.get("model"),cwd=None,git_branch=None,project_id=project,metadata=json.dumps({"session_id":item["uuid"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"api",**({"project_uuid":project} if project else {})})),fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{item['uuid']}",cookies,_CLAUDE_HEADERS)
         return sum((parse_message(cid,m) for m in detail.get("chat_messages",[])),ParseResult(convs=[conv]))
     fetched,step,r=0,max(1,len(items)//10),ParseResult()
     for idx, item in enumerate(items):
-        if parsed:=parse_item(item): r,fetched=r+parsed,fetched+1
+        r,fetched=r+parse_item(item),fetched+1
         if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
     return r
 

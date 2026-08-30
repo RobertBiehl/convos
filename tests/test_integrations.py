@@ -314,6 +314,16 @@ class TestClaudeAPI:
         monkeypatch.setattr(cli,"fetch_json",fake); result=cli.fetch_claude("safari"); mids={m["id"] for m in result.msgs}
         assert len(result.msgs)==2 and result.attachs[0]["message_id"] in mids and result.tools[0]["message_id"] in mids
 
+    def test_fetch_claude_reports_incremental_plan(self,monkeypatch,capsys):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"get_cookies",lambda *_:{"session":"x"}); details=[]
+        def fake(url,*a,**k):
+            if url.endswith("/api/organizations"): return [{"uuid":"org"}]
+            if url.endswith("/chat_conversations"): return [{"uuid":str(i),"updated_at":f"2026-01-0{i}T00:00:00Z"} for i in range(1,5)]
+            details.append(url); return {"chat_messages":[]}
+        monkeypatch.setattr(cli,"fetch_json",fake); result=cli.fetch_claude("safari",since=cli.ts_from_iso("2026-01-03T00:00:00Z")); out=capsys.readouterr().out
+        assert len(result.convs)==len(details)==1 and "claude listed 4; fetching 1" in out and out.count("claude fetched")==1
+
     @pytest.mark.integration
     def test_organizations_schema(self):
         """Verify /api/organizations returns expected schema."""
