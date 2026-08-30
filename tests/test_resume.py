@@ -25,7 +25,7 @@ def archive(tmp_path,monkeypatch):
 
 def test_distribution_metadata_registration_and_help():
     project=tomllib.loads((Path(__file__).parents[1]/"apps/resume/pyproject.toml").read_text())["project"]; core=tomllib.loads((Path(__file__).parents[1]/"pyproject.toml").read_text())["project"]
-    assert project["dependencies"][:2]==["convos>=0.10,<0.11","convos-redact>=0.10,<0.11"] and project["entry-points"]["convos.commands"]=={"resume":"ai_convos_resume:register"} and "resume" not in core["optional-dependencies"]
+    assert project["dependencies"][:2]==["convos>=0.11,<0.12","convos-redact>=0.11,<0.12"] and project["entry-points"]["convos.commands"]=={"resume":"ai_convos_resume:register"} and "resume" not in core["optional-dependencies"]
     commands=typer.main.get_command(app()).commands; handoff,replay=commands["resume"],commands["replay"]; options=lambda command:{opt for param in command.params for opt in param.opts}
     assert "handoff" in handoff.help and {"--turns","--budget","--format"} <= options(handoff) and all(word in replay.help for word in ("messages","tool calls","edits")) and "--activity" in options(replay)
 
