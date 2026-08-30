@@ -21,13 +21,16 @@ def load_cases(path):
     if not cases: raise ValueError("Evaluation file has no cases")
     return cases
 def ground(cases):
-    drain_hooks(); db=get_db(read_only=True)
+    drain_hooks()
+    db=get_db(read_only=True)
     if db is None or not ensure_db_ready(db):
         if db: db.close()
         raise ValueError("Archive not ready. Run `convos init` or `convos sync`.")
     for prefix in sorted({x for case in cases for x in case["expect"]}):
         rows=db.execute("SELECT id FROM conversations WHERE starts_with(id,?) UNION ALL SELECT id FROM messages WHERE starts_with(id,?)",[prefix,prefix]).fetchall()
-        if len(rows)!=1: db.close(); raise ValueError(f"Expected ID prefix {prefix} is {'missing' if not rows else 'ambiguous'}")
+        if len(rows)!=1:
+            db.close()
+            raise ValueError(f"Expected ID prefix {prefix} is {'missing' if not rows else 'ambiguous'}")
     db.close()
 def _literal(case,k):
     args=["search",case["query"],"-n",str(k),"-f","json"]
@@ -46,7 +49,8 @@ def run(cases,mode="hybrid",limit=10):
             k=case.get("k",limit)
             try:
                 hits=hybrid_hits(case["query"],case.get("source"),case.get("days"),case.get("role"),k,local_only=True,cwd=case.get("cwd"),conversation=case.get("conversation")) if engine=="hybrid" else _literal(case,k)
-                rank=_rank(hits,case["expect"]); results.append(dict(name=case["name"],engine=engine,status="hit" if rank else "miss",rank=rank,k=k,returned=[dict(conversation_id=h["conversation_id"],message_id=h["message_id"],score=h["score"]) for h in hits],read=f"convos read {hits[rank-1]['conversation_id']} --around {hits[rank-1]['message_id']}" if rank else None))
+                rank=_rank(hits,case["expect"])
+                results.append(dict(name=case["name"],engine=engine,status="hit" if rank else "miss",rank=rank,k=k,returned=[dict(conversation_id=h["conversation_id"],message_id=h["message_id"],score=h["score"]) for h in hits],read=f"convos read {hits[rank-1]['conversation_id']} --around {hits[rank-1]['message_id']}" if rank else None))
             except Exception as e: results.append(dict(name=case["name"],engine=engine,status="error",error=str(e),rank=None,k=k,returned=[],read=None))
     engines={engine:(lambda rows:dict(runs=len(rows),hits=sum(r["rank"] is not None for r in rows),hit_rate=sum(r["rank"] is not None for r in rows)/len(rows),mrr=sum(1/r["rank"] if r["rank"] else 0 for r in rows)/len(rows),errors=sum(r["status"]=="error" for r in rows)))([r for r in results if r["engine"]==engine]) for engine in sorted({r["engine"] for r in results})}
     return dict(status="ready" if not any(r["status"]=="error" for r in results) else "errors",cases=len(cases),runs=len(results),engines=engines,results=results)
@@ -58,8 +62,13 @@ def eval_cmd(cases:Path,mode:str=typer.Option("hybrid","--mode"),limit:int=typer
     """Measure retrieval against private exact-ID relevance judgments."""
     if mode not in MODES: raise typer.BadParameter("must be hybrid, literal, or both","--mode")
     if fmt not in ("text","json"): raise typer.BadParameter("must be text or json","--format")
-    try: loaded=load_cases(cases); ground(loaded); data=run(loaded,mode,limit)
-    except (ValueError,json.JSONDecodeError) as e: typer.echo(str(e),err=True); raise typer.Exit(1)
+    try:
+        loaded=load_cases(cases)
+        ground(loaded)
+        data=run(loaded,mode,limit)
+    except (ValueError,json.JSONDecodeError) as e:
+        typer.echo(str(e),err=True)
+        raise typer.Exit(1)
     typer.echo(json.dumps(data)) if fmt=="json" else render(data)
     if data["status"]=="errors" or any(m["hit_rate"]<min_hit_rate for m in data["engines"].values()): raise typer.Exit(1)
 

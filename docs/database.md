@@ -249,9 +249,9 @@ injected skill and local-command wrapper messages are excluded from semantic
 candidates. A cwd filter includes the exact recorded path and descendants.
 
 On macOS, embeddings are produced by EmbeddingGemma (768d) with distinct query
-and document prefixes. On Linux, the default is the compact Model2Vec
-`potion-base-8M` model (256d). Both use L2-normalized vectors and character
-truncation — no chunking — at 1600 chars. The singleton `embedding_state` table
+and document prefixes, L2 normalization, and character truncation — no
+chunking — at 1600 chars. Linux has no default semantic runtime; its core,
+literal retrieval, and relay remain compiler-free. The singleton `embedding_state` table
 stores the exact backend, model revision, artifact hash, dimensions, pooling,
 normalization, truncation, and prefixes. A profile change clears incompatible
 vectors transactionally before rebuilding them.
@@ -270,7 +270,8 @@ output. Records retain full content plus exact message and conversation IDs.
 The `embedding` column is preserved across upserts when message `content`
 and the archive profile are unchanged, so only new or edited messages are
 queued again. Set `CONVOS_SEMANTIC=0` to keep sync and literal search active
-without loading or downloading a semantic model.
+without loading or downloading a semantic model. On non-macOS platforms,
+install `convos[semantic]` and set `CONVOS_SEMANTIC=llama` to opt in.
 
 ## ID Generation
 

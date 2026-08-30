@@ -20,11 +20,16 @@ _QUERIES={
 def _rows(cur): return [dict(zip((d[0] for d in cur.description),row)) for row in cur.fetchall()]
 def query(db,name,arg=None):
     if name=="checkpoint_diff":
-        before,after=arg.split("..",1); rows=[_rows(db.execute("SELECT repository,head,state_hash FROM provenance.git_checkpoints WHERE id=?",(x,))) for x in (before,after)]; a,b=(r[0] if r else None for r in rows)
+        before,after=arg.split("..",1)
+        rows=[_rows(db.execute("SELECT repository,head,state_hash FROM provenance.git_checkpoints WHERE id=?",(x,))) for x in (before,after)]
+        a,b=(r[0] if r else None for r in rows)
         if not a or not b or a["repository"]!=b["repository"]: raise ValueError("checkpoint ids must exist in one repository")
-        checkout=_rows(db.execute("SELECT root FROM provenance.repository_checkouts WHERE repository=? LIMIT 1",(a["repository"],))); available=bool(checkout and a["head"] and b["head"]); changed=_run(checkout[0]["root"],"diff","--name-status",a["head"],b["head"]).decode().splitlines() if available else None
+        checkout=_rows(db.execute("SELECT root FROM provenance.repository_checkouts WHERE repository=? LIMIT 1",(a["repository"],)))
+        available=bool(checkout and a["head"] and b["head"])
+        changed=_run(checkout[0]["root"],"diff","--name-status",a["head"],b["head"]).decode().splitlines() if available else None
         return [dict(repository=a["repository"],before=before,after=after,head_before=a["head"],head_after=b["head"],available=available,changed=changed,state_changed=a["state_hash"]!=b["state_hash"])]
     if name=="current_activity":
-        repo=repository(Path(arg or ".").resolve()); return query(db,"repository_activity",repo["id"] if repo else "")
+        return query(db,"repository_activity",repo["id"] if (repo:=repository(Path(arg or ".").resolve())) else "")
     if name not in _QUERIES: raise ValueError(f"unknown graph view {name}")
-    sql,column=_QUERIES[name]; return _rows(db.execute(f"SELECT * FROM ({sql}) q"+(f" WHERE {column}=?" if arg is not None else ""), (arg,) if arg is not None else ()))
+    sql,column=_QUERIES[name]
+    return _rows(db.execute(f"SELECT * FROM ({sql}) q"+(f" WHERE {column}=?" if arg is not None else ""),(arg,) if arg is not None else ()))

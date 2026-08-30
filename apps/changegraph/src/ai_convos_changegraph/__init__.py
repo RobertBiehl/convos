@@ -35,24 +35,30 @@ def replay(edits: list[dict]):
     text, prov = None, None
     for e in edits:
         if e["type"] == "write":
-            text = e["content"].splitlines(); prov = [e] * len(text)
+            text,prov=(text:=e["content"].splitlines()),[e]*len(text)
         elif e["type"] == "edit" and e["old"] and text is not None and e["old"] in (joined := "\n".join(text)):
-            pos = joined.find(e["old"]); start, old_n = joined[:pos].count("\n"), e["old"].count("\n") + 1
+            pos,start,old_n=(pos:=joined.find(e["old"])),joined[:pos].count("\n"),e["old"].count("\n")+1
             text = (joined[:pos] + e["content"] + joined[pos + len(e["old"]):]).splitlines()
             prov = prov[:start] + [e] * (len(text) - (len(prov) - old_n)) + prov[start + old_n:]
         else: text, prov = None, None
     return text, prov
 
-def _conn():
-    if (c := get_db(read_only=True)) is None: typer.echo("No database. Run `convos init` first.", err=True); raise typer.Exit(1)
-    return c
+def _fail(message,code=1):
+    typer.echo(message,err=True)
+    raise typer.Exit(code)
+def _conn(): return get_db(read_only=True) or _fail("No database. Run `convos init` first.")
+def _read(fn):
+    conn=_conn()
+    try: return fn(conn)
+    finally: conn.close()
 
 def _known_edits(file: str, at: str | None):
-    conn = _conn(); edits = cut(edits_for(conn, file), at); conn.close()
-    if not edits: typer.echo(f"No edits recorded for {file}", err=True); raise typer.Exit(1)
+    edits=cut(_read(lambda conn:edits_for(conn,file)),at)
+    if not edits: _fail(f"No edits recorded for {file}")
     text, prov = replay(edits)
     if text is None:
-        e = edits[-1]; typer.echo(f"content unknown: last edit is {e['type']} at {e['ts']} by conversation {e['conv']} ({e['source']})", err=True); raise typer.Exit(2)
+        e=edits[-1]
+        _fail(f"content unknown: last edit is {e['type']} at {e['ts']} by conversation {e['conv']} ({e['source']})",2)
     return text, prov
 
 def blame(file: str, line: Optional[int] = typer.Option(None, "--line"), at: Optional[str] = typer.Option(None, "--at"),
@@ -61,16 +67,16 @@ def blame(file: str, line: Optional[int] = typer.Option(None, "--line"), at: Opt
     text, prov = _known_edits(file, at)
     rows = [dict(line=i + 1, conv=e["conv"], source=e["source"], ts=str(e["ts"]), prompt=(e["prompt"] or "").split("\n")[0][:80], text=t)
             for i, (t, e) in enumerate(zip(text, prov)) if line is None or i + 1 == line]
-    if fmt != "text": typer.echo(json.dumps(rows, default=str)); return
+    if fmt != "text": return typer.echo(json.dumps(rows,default=str))
     [typer.echo(f"{r['line']:>5} {r['conv'][:8]} {r['source']:<11} {r['ts']} | {r['text']}") for r in rows]
 
 def timeline(file: str, fmt: str = typer.Option("text", "--format", "-f")):
     """Chronological edits to FILE across conversations and providers."""
-    conn = _conn(); edits = edits_for(conn, file); conn.close()
-    if not edits: typer.echo(f"No edits recorded for {file}", err=True); raise typer.Exit(1)
+    edits=_read(lambda conn:edits_for(conn,file))
+    if not edits: _fail(f"No edits recorded for {file}")
     rows = [dict(ts=str(e["ts"]), conv=e["conv"], source=e["source"], type=e["type"],
                  exact=e["type"] == "write" or bool(e["old"]), prompt=(e["prompt"] or "").split("\n")[0][:80]) for e in edits]
-    if fmt != "text": typer.echo(json.dumps(rows, default=str)); return
+    if fmt != "text": return typer.echo(json.dumps(rows,default=str))
     [typer.echo(f"{r['ts']} {r['conv'][:8]} {r['source']:<11} {r['type']:<9} {'exact' if r['exact'] else 'unknown'} | {r['prompt']}") for r in rows]
 
 def at(file: str, point: str):
@@ -80,7 +86,7 @@ def at(file: str, point: str):
 
 def graph(target: Optional[str] = typer.Argument(None), fmt: str = typer.Option("json", "--format", "-f")):
     """Emit the file <-> conversation <-> message edge set (json or dot), filtered by file path or conversation id substring."""
-    conn = _conn(); rows = conn.execute(_GQ).fetchall(); conn.close()
+    rows=_read(lambda conn:conn.execute(_GQ).fetchall())
     edges = [dict(file=f, conv=c, msg=m, source=s) for f, c, m, s in rows if target is None or target in f or target in c]
     if fmt == "dot": typer.echo("digraph convos {\n" + "\n".join(sorted({f'  "{e["conv"][:8]}" -> "{e["file"]}";' for e in edges})) + "\n}")
     else: typer.echo(json.dumps(edges, default=str))

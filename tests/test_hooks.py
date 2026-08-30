@@ -33,13 +33,13 @@ def test_explicit_drain_is_nonblocking_unless_requested(hooks,monkeypatch):
     calls=[]; monkeypatch.setattr(cli,"drain_hooks",lambda **kwargs:calls.append(kwargs)); runner=CliRunner(); assert runner.invoke(cli.app,["drain-hooks"]).exit_code==runner.invoke(cli.app,["drain-hooks","--block"]).exit_code==0 and calls==[{"block":False},{"block":True}]
 
 def test_incidental_drain_and_manual_sync_do_not_wait_for_worker(hooks, monkeypatch):
-    _,data=hooks; (data/"hook_inbox").mkdir(parents=True); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/"hook_inbox/.drain.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); monkeypatch.setattr(cli,"capture_provenance",lambda *a,**k:[])
+    _,data=hooks; (data/"hook_inbox").mkdir(parents=True); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/"hook_inbox/.drain.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); monkeypatch.setattr(cli,"capture_provenance",lambda *a,**k:[]); threads=[]
     try:
-        assert hold.stdout.readline().strip()=="ready"; started=time.monotonic(); assert cli.drain_hooks()==0; cli.sync(False,300,False,False,False,False,True); assert time.monotonic()-started<1
-        done=threading.Event(); waiter=threading.Thread(target=lambda:(cli.drain_hooks(block=True),done.set())); waiter.start(); assert not done.wait(.1); hold.stdin.write("\n"); hold.stdin.flush(); assert done.wait(5); waiter.join()
+        assert hold.stdout.readline().strip()=="ready"; done=threading.Event(); results=[]; threads.append(threading.Thread(target=lambda:(results.append(cli.drain_hooks()),cli.sync(False,300,False,False,False,False,True),done.set()))); threads[-1].start(); assert done.wait(10) and results==[0]; threads[-1].join()
+        done=threading.Event(); threads.append(threading.Thread(target=lambda:(cli.drain_hooks(block=True),done.set()))); threads[-1].start(); assert not done.wait(.1); hold.stdin.write("\n"); hold.stdin.flush(); assert done.wait(5); threads[-1].join()
     finally:
         if hold.poll() is None: hold.stdin.write("\n"); hold.stdin.flush()
-        hold.wait(timeout=5)
+        hold.wait(timeout=5); [thread.join(5) for thread in threads]
 
 def test_drain_releases_inbox_lock_before_parsing(hooks, monkeypatch):
     sessions,data=hooks; path=sessions/"s.jsonl"; transcript(path); enqueue(path); parse=cli.hook_result
@@ -64,11 +64,14 @@ def test_failed_only_drain_does_not_respawn_tight_loop(hooks,monkeypatch):
     assert cli.drain_hooks()==0 and not launched and json.loads((data/"hook_progress.json").read_text())["failed"]==1
 
 def test_concurrent_sync_exits_immediately_and_explicitly(hooks,capsys):
-    _,data=hooks; data.mkdir(); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/".sync.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+    _,data=hooks; data.mkdir(); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/".sync.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); done=threading.Event(); result=[]
+    def attempt():
+        try: cli.sync(False,300,False,False,False,False,True)
+        except BaseException as error: result.append(error)
+        finally: done.set()
     try:
-        assert hold.stdout.readline().strip()=="ready"; started=time.monotonic()
-        with pytest.raises(cli.typer.Exit): cli.sync(False,300,False,False,False,False,True)
-        assert time.monotonic()-started<1 and "Sync already running; no work was started" in capsys.readouterr().out
+        assert hold.stdout.readline().strip()=="ready"; thread=threading.Thread(target=attempt); thread.start(); assert done.wait(5); thread.join(); assert len(result)==1 and isinstance(result[0],cli.typer.Exit)
+        assert not (data/"convos.db").exists() and "Sync already running; no work was started" in capsys.readouterr().out
     finally: hold.stdin.write("\n"); hold.stdin.flush(); hold.wait(timeout=5)
 
 def test_retrieval_drains_idempotently_and_preserves_truncated_rewritten_history(hooks):

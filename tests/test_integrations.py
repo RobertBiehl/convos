@@ -38,6 +38,14 @@ def validate_schema(data, schema_name):
         return True, "OK"
     return False, f"Unknown schema type: {schema['type']}"
 
+def assert_live_import(result, source, tmp_path):
+    from ai_convos import cli
+    assert result.convs and all(c["source"] == source for c in result.convs)
+    with cli._core(tmp_path/"convos.db", ready=True) as db:
+        cli.upsert(db, result)
+        assert db.execute("SELECT COUNT(*) FROM conversations WHERE source=?", [source]).fetchone()[0] == len(result.convs)
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == len(result.msgs)
+
 # Skip all integration tests if SKIP_INTEGRATION is set
 pytestmark = pytest.mark.skipif(
     os.environ.get("SKIP_INTEGRATION", "0") == "1",
@@ -91,19 +99,11 @@ class TestChatGPTAPI:
         assert valid, f"Schema validation failed: {msg}"
 
     @pytest.mark.integration
-    def test_live_chatgpt_api(self, mock_cookies):
-        """Live test against ChatGPT API - requires valid cookies."""
-        pytest.skip("Requires real cookies - run manually with CHATGPT_TEST=1")
-
+    @pytest.mark.skipif(os.environ.get("CHATGPT_TEST") != "1", reason="Requires real cookies and CHATGPT_TEST=1")
+    def test_live_chatgpt_api(self, tmp_path):
+        """Fetch one ChatGPT conversation and ingest it into an isolated archive."""
         from ai_convos.cli import fetch_chatgpt
-        result = fetch_chatgpt("safari", limit=1)
-        assert len(result.convs) >= 0  # may be 0 if no conversations
-        # If we got conversations, verify structure
-        if result.convs:
-            conv = result.convs[0]
-            assert "id" in conv
-            assert "source" in conv
-            assert conv["source"] == "chatgpt"
+        assert_live_import(fetch_chatgpt("safari", limit=1), "chatgpt", tmp_path)
 
     def test_fetch_chatgpt_surfaces_total_failure(self, monkeypatch):
         """A fully failed fetch raises instead of returning empty (no silent 'success')."""
@@ -314,6 +314,16 @@ class TestClaudeAPI:
         monkeypatch.setattr(cli,"fetch_json",fake); result=cli.fetch_claude("safari"); mids={m["id"] for m in result.msgs}
         assert len(result.msgs)==2 and result.attachs[0]["message_id"] in mids and result.tools[0]["message_id"] in mids
 
+    def test_fetch_claude_reports_incremental_plan(self,monkeypatch,capsys):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"get_cookies",lambda *_:{"session":"x"}); details=[]
+        def fake(url,*a,**k):
+            if url.endswith("/api/organizations"): return [{"uuid":"org"}]
+            if url.endswith("/chat_conversations"): return [{"uuid":str(i),"updated_at":f"2026-01-0{i}T00:00:00Z"} for i in range(1,5)]
+            details.append(url); return {"chat_messages":[]}
+        monkeypatch.setattr(cli,"fetch_json",fake); result=cli.fetch_claude("safari",since=cli.ts_from_iso("2026-01-03T00:00:00Z")); out=capsys.readouterr().out
+        assert len(result.convs)==len(details)==1 and "claude listed 4; fetching 1" in out and out.count("claude fetched")==1
+
     @pytest.mark.integration
     def test_organizations_schema(self):
         """Verify /api/organizations returns expected schema."""
@@ -355,16 +365,11 @@ class TestClaudeAPI:
         assert valid, f"Schema validation failed: {msg}"
 
     @pytest.mark.integration
-    def test_live_claude_api(self):
-        """Live test against Claude API - requires valid cookies."""
-        pytest.skip("Requires real cookies - run manually with CLAUDE_TEST=1")
-
+    @pytest.mark.skipif(os.environ.get("CLAUDE_TEST") != "1", reason="Requires real cookies and CLAUDE_TEST=1")
+    def test_live_claude_api(self, tmp_path):
+        """Fetch one Claude conversation and ingest it into an isolated archive."""
         from ai_convos.cli import fetch_claude
-        result = fetch_claude("safari", limit=1)
-        assert len(result.convs) >= 0
-        if result.convs:
-            conv = result.convs[0]
-            assert conv["source"] == "claude"
+        assert_live_import(fetch_claude("safari", limit=1), "claude", tmp_path)
 
 
 # ---- Cookie Extraction Tests ----

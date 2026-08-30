@@ -18,6 +18,20 @@ lanes.
 
 The lane directories are mode `0700`. No host home, Convos archive, browser
 profile, provider credential, or recovery key is mounted into the container.
+The harness refuses any client root outside a reserved test user's
+`/home/<test-user>/convos-testbed` tree. Each lane has its own relay database,
+and every run verifies that it contains exactly the expected synthetic users,
+one personal workspace per test user, and only the explicitly created shared
+test workspace. An unexpected user or workspace aborts qualification.
+
+The personal Titan relay is not a test endpoint. Mac clients may participate in
+the same qualification topology only through a separately addressed test relay
+whose database lives inside this container. Give every Mac client a fresh
+`CONVOS_PROJECT_ROOT` under a disposable testbed directory and its own generated
+identity and sync state; never copy `~/.convos/remote/config.json`, a personal
+recovery key, or a personal archive into a test root. Supply the test relay URL
+explicitly from the test deployment and the workspace ID from lane evidence or
+the canary manifest; never discover either from personal client configuration.
 
 ## Provisioning
 
@@ -83,7 +97,7 @@ migration backups, and the plaintext-canary result.
 ## Clean-install contract
 
 Core plus the remote products install and run without `build-essential` on
-Linux. The default Linux semantic backend is Model2Vec `potion-base-8M`; macOS
-retains the existing llama.cpp backend. The wheel smoke lane verifies the Linux
-dependency set resolves as wheels, literal retrieval works with
-`CONVOS_SEMANTIC=0`, and semantic retrieval works without a compiler toolchain.
+Linux. Linux has no default client semantic runtime; macOS retains the existing
+llama.cpp backend. The wheel smoke lane verifies that Linux resolves only binary
+dependencies and that initialization and literal retrieval work without a
+compiler toolchain or semantic package.
