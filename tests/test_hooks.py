@@ -64,11 +64,14 @@ def test_failed_only_drain_does_not_respawn_tight_loop(hooks,monkeypatch):
     assert cli.drain_hooks()==0 and not launched and json.loads((data/"hook_progress.json").read_text())["failed"]==1
 
 def test_concurrent_sync_exits_immediately_and_explicitly(hooks,capsys):
-    _,data=hooks; data.mkdir(); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/".sync.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+    _,data=hooks; data.mkdir(); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/".sync.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); done=threading.Event(); result=[]
+    def attempt():
+        try: cli.sync(False,300,False,False,False,False,True)
+        except BaseException as error: result.append(error)
+        finally: done.set()
     try:
-        assert hold.stdout.readline().strip()=="ready"; started=time.monotonic()
-        with pytest.raises(cli.typer.Exit): cli.sync(False,300,False,False,False,False,True)
-        assert time.monotonic()-started<1 and "Sync already running; no work was started" in capsys.readouterr().out
+        assert hold.stdout.readline().strip()=="ready"; thread=threading.Thread(target=attempt); thread.start(); assert done.wait(5); thread.join(); assert len(result)==1 and isinstance(result[0],cli.typer.Exit)
+        assert not (data/"convos.db").exists() and "Sync already running; no work was started" in capsys.readouterr().out
     finally: hold.stdin.write("\n"); hold.stdin.flush(); hold.wait(timeout=5)
 
 def test_retrieval_drains_idempotently_and_preserves_truncated_rewritten_history(hooks):

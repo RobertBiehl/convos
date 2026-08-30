@@ -1209,6 +1209,7 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: str|None
     typer.echo(f"Exported to {output}")
 
 def _sync_leader(fn):
+    DATA_DIR.mkdir(parents=True,exist_ok=True)
     with (DATA_DIR/".sync.lock").open("w") as lock:
         try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
@@ -1218,9 +1219,7 @@ def _sync_leader(fn):
 
 def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch all sources and reconcile all provenance"), verbose: bool = typer.Option(False, "-v", "--verbose"), local_only: bool = typer.Option(False, "--local-only", help="Import local agent sessions and configured exports without contacting web sources.")):
     if sys.argv[1:2] == ["sync"]: signal.signal(signal.SIGINT, signal.SIG_DFL)
-    with _core(ready=True): pass
-    drain_hooks()
-    state,local,web,imports,chatgpt_ok,chatgpt_frontiers,offline={},{},{},{},{},{},local_only is True
+    state,local,web,imports,chatgpt_ok,chatgpt_frontiers,offline,ready={},{},{},{},{},{},local_only is True,False
     def set_state(section,key,val): state.setdefault(section,{})[key]=val
     def plan_local(name, path, parser, bindings, sink):
         if not path.exists(): return None
@@ -1265,7 +1264,11 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         mtime=latest_mtime(path) if path.is_dir() else path.stat().st_mtime
         return None if mtime<=imports.get(str(path),{}).get("mtime",0) else dict(name=f"import:{path}",label=f"import:{path}",func=lambda p=path:parse_source(p),state=("imports",str(path),{"mtime":mtime}))
     def run_sync():
-        nonlocal state,local,web,imports
+        nonlocal state,local,web,imports,ready
+        if not ready:
+            with _core(ready=True): pass
+            drain_hooks()
+            ready=True
         state,before,t0=(state:=load_state()),json.dumps(state,sort_keys=True),time.perf_counter()
         local,web,imports=state.setdefault("local",{}),state.setdefault("web",{}),state.setdefault("imports",{})
         chatgpt_ok.clear() or chatgpt_frontiers.clear()
