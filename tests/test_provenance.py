@@ -21,6 +21,10 @@ def core(path,cwd,edits):
 def graph(path):
     db=duckdb.connect(str(path)); init_schema(db); return db
 
+def test_manual_archive_backup_is_checkpointed_validated_and_private(tmp_path,monkeypatch,capsys):
+    path=tmp_path/"core.db"; db=graph(path); db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('kept','codex','{}')"); db.close(); monkeypatch.setattr(core_module,"DB_PATH",path); core_module.backup(); saved=next(tmp_path.glob("core.db.pre-manual-*.bak")); check=duckdb.connect(str(saved),read_only=True)
+    assert check.execute("SELECT id FROM conversations").fetchone()[0]=="kept" and saved.stat().st_mode&0o777==0o600 and str(saved) in capsys.readouterr().out; check.close()
+
 
 def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_path):
     a,b=repo(tmp_path/"a",content="new a\n"),repo(tmp_path/"b",content="new b\n"); clone=tmp_path/"clone"; subprocess.run(("git","clone","-q",str(a),str(clone)),check=True); assert repository(a)["id"]==repository(clone)["id"]
