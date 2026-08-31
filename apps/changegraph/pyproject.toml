@@ -1,6 +1,6 @@
 [project]
 name = "convos-changegraph"
-version = "0.11.0"
+version = "0.11.1"
 description = "Change graph over the convos DB: blame, timeline, time-travel, graph export"
 readme = "README.md"
 license = "MIT"
