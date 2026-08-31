@@ -721,6 +721,7 @@ def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
 
     turns=[(idx,i,e,(c:=extract_content(e["message"].get("content",e["message"].get("text","")))),ts_from_iso(e.get("timestamp")),gen_id(src,f"{cid}:{idx}")) for idx,(i,e) in enumerate(msg_events)]
     msgs=[dict(id=mid,conversation_id=cid,role="user" if e["type"] in ("human","user") else e["type"],content=c["text"],thinking=c["thinking"],created_at=ts,model=e["message"].get("model") if e["type"]=="assistant" else None,metadata=json.dumps({"provider_index":i}),parent_id=uuid2id.get(e.get("parentUuid"))) for idx,i,e,c,ts,mid in turns if c["text"] or c["tools"]]  # keep tool-only turns: tools/edits reference them
+    msgs=[{**m,"parent_id":m["parent_id"] if m["parent_id"] in mids else None} for m in msgs] if (mids:={x["id"] for x in msgs}) else []
     if not msgs: return None
     tools=[dict(id=gen_id(src,f"tool:{cid}:{t.get('id') or f'{idx}:{j}'}"),message_id=mid,tool_name=t["name"],input=json.dumps(t.get("input",{})),output=json.dumps((tool_results.get(t.get("id")) or {}).get("output","")),status="failed" if (tool_results.get(t.get("id")) or {}).get("error") else "complete" if t.get("id") in tool_results else "pending",duration_ms=None,created_at=ts) for idx,i,e,c,ts,mid in turns for j,t in enumerate(c["tools"]) if "name" in t]
     edit_calls=[(idx,ts,mid,j,t,tool_results.get(t.get("id"))) for idx,i,e,c,ts,mid in turns for j,t in enumerate(c["tools"]) if t.get("name") in ("Write","Edit","MultiEdit") and t.get("input",{}).get("file_path")]
@@ -815,6 +816,7 @@ def _history_row(table,row,payload):
     return historical
 def upsert(conn, r: ParseResult):
     required(not (conflict:=_id_conflict(r.convs,("source","cwd","git_branch","project_id","metadata")) or _id_conflict(r.msgs,("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"))),ValueError(f"divergent provider session in import batch: {conflict}"))
+    if uncertain:={v["file_edit_id"] for v in r.edit_evidence if v["status"]!="confirmed"}: r.edit_evidence=[v for v in r.edit_evidence if v["status"]=="confirmed" or v["file_edit_id"] in {e["id"] for e in r.edits}|{x[0] for x in conn.execute("SELECT id FROM file_edits WHERE id IN (SELECT UNNEST(?))",(list(uncertain),)).fetchall()}]
     _parse_result_refs(conn,r)
     quarantined={c["id"] for c in r.convs if c["source"]=="codex" and (meta:=json.loads(c["metadata"] or "{}")).get("session_kind")=="main" and not meta.get("parent_session_id") and any(m["conversation_id"]==c["id"] and m["role"]=="user" for m in r.msgs) and not any(m["conversation_id"]==c["id"] and m["role"]=="user" and not re.fullmatch(_INJECTED_RE,m["content"]) for m in r.msgs) and not any(m["conversation_id"]==c["id"] and m["role"]=="assistant" for m in r.msgs) and not any(x.get("conversation_id")==c["id"] or x.get("message_id") in {m["id"] for m in r.msgs if m["conversation_id"]==c["id"]} for x in [*r.tools,*r.attachs,*r.artifacts,*r.edits])}
     r.convs=[{**c,"metadata":json.dumps({**json.loads(c["metadata"] or "{}"),"capture_mode":"startup-stub-candidate"})} if c["id"] in quarantined else c for c in r.convs]
@@ -1208,6 +1210,10 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: str|None
                 csv.writer(stream).writerows([[d[0] for d in cur.description],*cur.fetchall()])
     typer.echo(f"Exported to {output}")
 
+def backup():
+    with _core(ready=True) as conn: path=_migration_backup(conn,datetime.now(timezone.utc).strftime("manual-%Y%m%dT%H%M%SZ"))
+    typer.echo(f"Archive backed up to {path}")
+
 def _sync_leader(fn):
     DATA_DIR.mkdir(parents=True,exist_ok=True)
     with (DATA_DIR/".sync.lock").open("w") as lock:
@@ -1334,7 +1340,7 @@ def sql(query: str, fmt: str = typer.Option("text", "-f", "--format")):
     if fmt!="text": return emit([dict(zip(cols,row)) for row in rows],fmt)
     typer.echo("\n".join([" | ".join(cols),*(" | ".join("" if value is None else str(value) for value in row) for row in rows),f"\n{len(rows)} rows"]))
 
-for _fn,_name,_hidden in ((capture,"hook",True),(capture,"capture",True),(drain_hooks_cmd,"drain-hooks",True),(init,None,False),(search,None,False),(read_cmd,"read",False),(query_cmd,"query",False),(embed_cmd,"embed",False),(doctor,None,False),(install_skills,None,False),(install_hooks,"install-hooks",False),(export,None,False),(sync,None,False),(sql,None,False)): app.command(_name,hidden=_hidden)(_fn)
+for _fn,_name,_hidden in ((capture,"hook",True),(capture,"capture",True),(drain_hooks_cmd,"drain-hooks",True),(init,None,False),(search,None,False),(read_cmd,"read",False),(query_cmd,"query",False),(embed_cmd,"embed",False),(doctor,None,False),(install_skills,None,False),(install_hooks,"install-hooks",False),(export,None,False),(backup,None,False),(sync,None,False),(sql,None,False)): app.command(_name,hidden=_hidden)(_fn)
 for _ep in entry_points(group="convos.commands"):
     try: _ep.load()(app)
     except Exception as _e: typer.echo(f"plugin {_ep.name} failed: {_e}", err=True)  # a broken plugin must not kill the CLI

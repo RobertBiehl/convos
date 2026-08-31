@@ -64,6 +64,12 @@ class TestClaudeCodeParser:
         assert by_content["Branch A"]["parent_id"] == by_content["Hi"]["id"]
         assert by_content["Branch B (regenerated)"]["parent_id"] == by_content["Hi"]["id"]
 
+    def test_filtered_parent_does_not_leave_dangling_message_reference(self,tmp_path):
+        import duckdb
+        from ai_convos import cli
+        root=tmp_path/".claude/projects/-test"; root.mkdir(parents=True); (root/"s.jsonl").write_text("\n".join(map(json.dumps,[{"type":"human","uuid":"empty","message":{"content":""}},{"type":"assistant","uuid":"kept","parentUuid":"empty","message":{"content":"done"}}]))); result=cli.parse_claude_code(tmp_path/".claude/projects"); db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,result)
+        assert len(result.msgs)==1 and result.msgs[0]["parent_id"] is None and db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==1
+
     def test_parse_thinking_blocks(self, tmp_path):
         """Parse session with thinking blocks."""
         from ai_convos.cli import parse_claude_code
@@ -300,6 +306,12 @@ class TestCodexParser:
         db=duckdb.connect(); cli.init_schema(db); db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('c','codex','{}'); INSERT INTO messages(id,conversation_id,role,metadata) VALUES ('m','c','assistant','{}'); INSERT INTO tool_calls(id,message_id,input,output) VALUES ('t','m','{}','{}'); INSERT INTO file_edits VALUES ('e','m','x.py','write','x',NULL,NULL); INSERT INTO provenance.file_edit_evidence VALUES ('e','unverified','source_unavailable',NULL)"); before=cli.archive_state(db)[1]; result=cli.ParseResult(edit_evidence=[dict(file_edit_id="e",status="invalid",reason="provider_failure",tool_call_id="t")]); cli.upsert(db,result)
         assert db.execute("SELECT COUNT(*) FROM file_edits WHERE id='e'").fetchone()[0]==1 and db.execute("SELECT status,reason,tool_call_id FROM provenance.file_edit_evidence WHERE file_edit_id='e'").fetchone()==("invalid","provider_failure","t") and cli.archive_state(db)[1]>before
         generation=cli.archive_state(db)[1]; cli.upsert(db,result); assert cli.archive_state(db)[1]==generation
+
+    def test_upsert_discards_unconfirmed_evidence_without_an_edit_row(self,tmp_path):
+        import duckdb
+        from ai_convos import cli
+        root=tmp_path/".codex/sessions"; root.mkdir(parents=True); (root/"s.jsonl").write_text("\n".join(map(json.dumps,[{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"try"}]}},{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"missing","arguments":json.dumps({"cmd":"echo x > a.py"})}}]))); result=cli.parse_codex(tmp_path/".codex"); db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,result)
+        assert len(result.tools)==1 and result.edits==[] and result.edit_evidence==[] and db.execute("SELECT (SELECT COUNT(*) FROM tool_calls),(SELECT COUNT(*) FROM file_edits),(SELECT COUNT(*) FROM provenance.file_edit_evidence)").fetchone()==(1,0,0)
 
     def test_input_images_become_bounded_durable_attachments(self,tmp_path,monkeypatch):
         import ai_convos.cli as cli
