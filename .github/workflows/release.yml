@@ -11,10 +11,6 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      CONVOS_PROJECT_ROOT: ${{ runner.temp }}/external-convos
-      CODEX_HOME: ${{ runner.temp }}/external-codex
-      CLAUDE_CONFIG_DIR: ${{ runner.temp }}/external-claude
     permissions:
       contents: read
     steps:
@@ -26,7 +22,15 @@ jobs:
           enable-cache: true
       - run: uv sync --extra dev
       - run: uv run pytest -m "not integration" -q
+        env:
+          CONVOS_PROJECT_ROOT: ${{ runner.temp }}/external-convos
+          CODEX_HOME: ${{ runner.temp }}/external-codex
+          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/external-claude
       - name: Verify test state isolation
+        env:
+          CONVOS_PROJECT_ROOT: ${{ runner.temp }}/external-convos
+          CODEX_HOME: ${{ runner.temp }}/external-codex
+          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/external-claude
         run: |
           for path in "$CONVOS_PROJECT_ROOT" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR"; do
             test ! -e "$path" || test -z "$(find "$path" -mindepth 1 -print -quit)"
