@@ -1,4 +1,4 @@
-import copy, json, os, shutil, sqlite3, subprocess
+import copy, json, os, shutil, sqlite3, subprocess, urllib.error
 from pathlib import Path
 
 import duckdb
@@ -36,6 +36,30 @@ def inject(cfg,state,server,ws,kind,payload_v=1):
 def test_upload_batches_bound_count_and_wire_size():
     row=lambda size:{"size":size}
     assert [len(x) for x in _upload_batches([row(1)]*501,1000)]==[500,1] and [len(x) for x in _upload_batches([row(6)]*2,10)]==[1,1]
+
+def test_replica_outbox_is_disk_and_request_bounded(tmp_path,monkeypatch):
+    root=tmp_path/"client"; monkeypatch.setattr(remote_client,"REPLICA_BATCH_BYTES",700); envs=[{"workspace":"w","replica":f"{i:064x}","epoch":1,"payload":"x"*120} for i in range(19)]; prepared=remote_client.prepare_replicas(root,envs); remote_client.publish_replicas(prepared); files=list((root/"remote/outbox").glob("replica-batch-*")); calls=[]
+    assert len(files)>1 and max(p.stat().st_size for p in files)<=700
+    def request(cfg,body,auth=True):
+        calls.append(len(json.dumps(body).encode())); return {"present":{rid:i+1 for i,rid in enumerate(body["replicas"])}} if body["op"]=="replica_reconcile" else {"replicas":[]}
+    monkeypatch.setattr(remote_client,"request",request); state=connect(root/"remote/state.db"); remote_client.upload_replicas({},state,root); assert max(calls)<=700 and state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]==len(envs) and not list((root/"remote/outbox").glob("replica-*")); state.close()
+
+def test_legacy_replica_batch_stream_splits_and_resumes(tmp_path,monkeypatch):
+    root=tmp_path/"client"; monkeypatch.setattr(remote_client,"REPLICA_BATCH_BYTES",700); envs=[{"workspace":"w","replica":f"{i:064x}","epoch":1,"payload":"x"*120} for i in range(19)]; path=remote_client.replica_file(root,envs,False); path.parent.mkdir(parents=True); path.write_text(json.dumps({"semantic":False,"envelopes":envs},separators=(",",":"))); real=Path.read_text
+    monkeypatch.setattr(Path,"read_text",lambda self,*a,**k:(_ for _ in ()).throw(AssertionError("batch loaded whole")) if self.name.startswith("replica-batch-") else real(self,*a,**k)); uploads=[0]
+    def failing(cfg,body,auth=True):
+        if body["op"]=="replica_reconcile": return {"present":{}}
+        uploads[0]+=1
+        if uploads[0]==2: raise ConnectionError("interrupted")
+        return {"replicas":[{"cursor":i+1} for i in range(len(body["envelopes"]))]}
+    monkeypatch.setattr(remote_client,"request",failing); state=connect(root/"remote/state.db")
+    with pytest.raises(ConnectionError,match="interrupted"): remote_client.upload_replicas({},state,root)
+    saved=state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]; assert 0<saved<len(envs) and 0<len(list((root/"remote/outbox").glob("replica-*")))<len(envs)
+    monkeypatch.setattr(remote_client,"request",lambda cfg,body,auth=True:{"present":{rid:i+100 for i,rid in enumerate(body["replicas"])}} if body["op"]=="replica_reconcile" else {"replicas":[]}); remote_client.upload_replicas({},state,root); assert state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]==len(envs) and not list((root/"remote/outbox").glob("replica-*")); state.close()
+
+def test_remote_timeout_names_operation(monkeypatch):
+    monkeypatch.setattr("urllib.request.urlopen",lambda *args,**kwargs:(_ for _ in ()).throw(urllib.error.URLError(TimeoutError("write timed out"))))
+    with pytest.raises(ConnectionError,match="replica_upload_many.*120s.*write timed out"): remote_client.request({"url":"http://localhost","token":"t"},{"op":"replica_upload_many","envelopes":[]})
 
 
 def test_sync_lease_is_nonblocking_and_separate_from_mutation_lease(tmp_path):
