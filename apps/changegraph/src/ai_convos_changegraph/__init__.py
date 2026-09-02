@@ -46,7 +46,7 @@ def replay(edits: list[dict]):
 def _fail(message,code=1):
     typer.echo(message,err=True)
     raise typer.Exit(code)
-def _conn(): return get_db(read_only=True) or _fail("No database. Run `convos init` first.")
+def _conn(): return get_db(read_only=True,purpose="changegraph") or _fail("No database. Run `convos init` first.")
 def _read(fn):
     conn=_conn()
     try: return fn(conn)

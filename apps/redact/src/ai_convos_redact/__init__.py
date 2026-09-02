@@ -110,16 +110,13 @@ def scan_data(cache=False):
             old=json.loads(saved.read_text())
             if old["key"]==list(before): return dict(old["data"],cached=True)
         except (OSError,ValueError,KeyError,TypeError): pass
-    db,findings=get_db(read_only=True),[]
+    db,findings=get_db(read_only=True,purpose="redact.scan"),[]
     try:
-        for table,fields in FIELDS.items():
-            for field in fields:
-                cursor=db.execute(f"SELECT id,CAST({field} AS VARCHAR) FROM {table} WHERE {field} IS NOT NULL AND regexp_matches(CAST({field} AS VARCHAR), ?, 'i')",[PREFILTER])
-                for rows in iter(lambda:cursor.fetchmany(64),[]):
-                    for row_id,value in rows:
-                        _,seen=inspect(value,f"$.{field}")
-                        findings.extend(dict(f,table=table,row_id=row_id,field=field) for f in seen)
+        candidates=[(table,field,*row) for table,fields in FIELDS.items() for field in fields for row in db.execute(f"SELECT id,CAST({field} AS VARCHAR) FROM {table} WHERE {field} IS NOT NULL AND regexp_matches(CAST({field} AS VARCHAR), ?, 'i')",[PREFILTER]).fetchall()]
     finally: db.close()
+    for table,field,row_id,value in candidates:
+        _,seen=inspect(value,f"$.{field}")
+        findings.extend(dict(f,table=table,row_id=row_id,field=field) for f in seen)
     data=dict(status="clean" if not findings else "secrets_found",total=len(findings),by_kind={kind:sum(f["kind"]==kind for f in findings) for kind in sorted({f["kind"] for f in findings})},findings=findings,cached=False)
     if cache and (str(DB_PATH.resolve()),DB_PATH.stat().st_mtime_ns,DB_PATH.stat().st_size)==before: _private_json(saved,{"key":before,"data":data})
     return data

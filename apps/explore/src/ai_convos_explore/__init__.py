@@ -14,7 +14,7 @@ def _fail(message):
     raise typer.Exit(1)
 def _db():
     from ai_convos.cli import get_db
-    try: db=get_db(read_only=True)
+    try: db=get_db(read_only=True,purpose="explore")
     except ValueError as e: _fail(str(e))
     if db is None: _fail("No database. Run `convos init` first.")
     return db

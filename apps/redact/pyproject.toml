@@ -1,6 +1,6 @@
 [project]
 name = "convos-redact"
-version = "0.11.3"
+version = "0.11.4"
 description = "Local secret scanning and safe team projection policy for convos"
 readme = "README.md"
 license = "MIT"

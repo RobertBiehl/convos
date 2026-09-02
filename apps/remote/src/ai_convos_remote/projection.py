@@ -151,7 +151,7 @@ def control_chain(controls):
     return ordered
 def stored_controls(db_path,origins):
     if not origins or not Path(db_path).is_file(): return []
-    with open_db(db_path,True) as db: return [json.loads(r[0]) for r in db.execute(f"SELECT CAST(control AS VARCHAR) FROM remote.workspace_controls WHERE workspace_id IN ({','.join('?'*len(origins))}) ORDER BY workspace_id,revision",list(origins)).fetchall()]
+    with open_db(db_path,True,purpose="remote.controls.read") as db: return [json.loads(r[0]) for r in db.execute(f"SELECT CAST(control AS VARCHAR) FROM remote.workspace_controls WHERE workspace_id IN ({','.join('?'*len(origins))}) ORDER BY workspace_id,revision",list(origins)).fetchall()]
 def event_support(value):
     if not isinstance(kind:=value["kind"],str) or not isinstance(version:=value["payload_v"],int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
     return "supported" if (kind,version) in CORE_EVENTS else "required"
@@ -177,41 +177,35 @@ def relocate_attachments(db_path,remote_root):
     db_path,remote_root=Path(db_path),Path(remote_root)
     if not db_path.is_file() or not remote_root.exists(): return 0
     if remote_root.is_symlink() or not remote_root.is_dir(): raise ValueError("legacy attachment root must be a regular directory")
-    db=open_db(db_path)
-    rows=db.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL").fetchall()
-    moved,target_root,begun=[],db_path.parent/"attachments",False
-    try:
-        for row_id,value,size in rows:
-            source=Path(value)
-            if not source.is_absolute(): continue
-            if not source.is_relative_to(remote_root.absolute()): continue
-            if source.is_symlink() or not source.is_file() or source.resolve()!=source or size is not None and source.stat().st_size!=size: raise ValueError("legacy attachment body is unsafe or inconsistent")
-            if target_root.is_symlink(): raise ValueError("archive attachment root must not be a symlink")
-            target_root.mkdir(parents=True,exist_ok=True)
-            os.chmod(target_root,0o700)
-            blob=file_hash(source)
-            target=target_root/blob
-            if target.exists():
-                if target.is_symlink() or not target.is_file() or target.stat().st_size!=source.stat().st_size or file_hash(target)!=blob: raise ValueError("archive attachment body conflicts")
-            else:
-                tmp=target.with_name(f".{target.name}.{os.getpid()}")
-                shutil.copyfile(source,tmp)
-                os.chmod(tmp,0o600)
-                _fsync(tmp)
-                os.replace(tmp,target)
-                _fsync(target_root)
-            os.chmod(target,0o600)
-            moved.append((row_id,source,target))
-        db.execute("BEGIN")
-        begun=True
-        [(set_attachment_path(db,row_id,target),index_attachment_body(db,row_id,target)) for row_id,source,target in moved]
-        db.execute("COMMIT")
-        begun=False
-    except BaseException:
-        if begun: db.execute("ROLLBACK")
-        raise
-    finally: db.close()
-    [source.unlink(missing_ok=True) for row_id,source,target in moved if source!=target]
+    with contextlib.closing(open_db(db_path,True,purpose="remote.attachments.plan")) as db: rows=db.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL").fetchall()
+    moved,target_root=[],db_path.parent/"attachments"
+    for row_id,value,size in rows:
+        source=Path(value)
+        if not source.is_absolute(): continue
+        if not source.is_relative_to(remote_root.absolute()): continue
+        if source.is_symlink() or not source.is_file() or source.resolve()!=source or size is not None and source.stat().st_size!=size: raise ValueError("legacy attachment body is unsafe or inconsistent")
+        if target_root.is_symlink(): raise ValueError("archive attachment root must not be a symlink")
+        target_root.mkdir(parents=True,exist_ok=True)
+        os.chmod(target_root,0o700)
+        blob=file_hash(source)
+        target=target_root/blob
+        if target.exists():
+            if target.is_symlink() or not target.is_file() or target.stat().st_size!=source.stat().st_size or file_hash(target)!=blob: raise ValueError("archive attachment body conflicts")
+        else:
+            tmp=target.with_name(f".{target.name}.{os.getpid()}")
+            shutil.copyfile(source,tmp)
+            os.chmod(tmp,0o600)
+            _fsync(tmp)
+            os.replace(tmp,target)
+            _fsync(target_root)
+        os.chmod(target,0o600)
+        moved.append((row_id,source,target,blob,source.stat().st_size,size))
+    if moved:
+        with contextlib.closing(open_db(db_path,purpose="remote.attachments.write")) as db,_transaction(db):
+            current={r[0]:r[1:] for r in db.execute("SELECT id,path,size FROM attachments WHERE id IN (SELECT UNNEST(?))",[[r[0] for r in moved]]).fetchall()}
+            required(all(current.get(row_id)==(str(source),size) for row_id,source,target,blob,actual,size in moved),RuntimeError("Archive changed during attachment relocation; retry"))
+            [(set_attachment_path(db,row_id,target),index_attachment_body(db,row_id,target,size,(blob,actual))) for row_id,source,target,blob,actual,size in moved]
+    [source.unlink(missing_ok=True) for row_id,source,target,blob,actual,size in moved if source!=target]
     return len(moved)
 def _records(core,state,blobs=True,changes=None):
     out,imported=[],set(core.execute("SELECT table_name,physical_row_id FROM remote.row_origins").fetchall())
@@ -315,40 +309,36 @@ def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,worksp
         p,k=r["payload"],r["kind"]
         if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits: keep.append(r)
     return keep
-def _store_proofs(db,proofs,signer):
+def _store_proofs(db_path,proofs,signer,controls,generation):
     if not proofs: return
-    with _transaction(db): project_row_proofs(db,proofs,signer["root_public"],signer["certificate"])
+    with contextlib.closing(open_db(db_path,purpose="remote.attest.write")) as db,_transaction(db):
+        required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
+        project_workspace_controls(db,controls)
+        project_row_proofs(db,proofs,signer["root_public"],signer["certificate"])
 def attest_rows(db_path,cfg,workspace,records,origins=(),generation=None):
     controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace)
     device=cfg["device"]
     signer=cfg["controls"][workspace]["devices"][device["id"]]
-    with contextlib.closing(open_db(db_path)) as db:
-        init_schema(db)
-        if generation is not None: required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
-        records=logical_records(db,records,cfg["user"])
-        selected=[r for r in records if r["kind"] in SIGNED]
-        ids=[r["payload"]["id"] if "id" in r["payload"] else r["payload"]["row"][0] if r["kind"] in TABLES else r["entity"] for r in selected]
-        made,batch=0,[]
-        with _transaction(db): project_workspace_controls(db,controls)
-        scopes=(workspace,*origins)
-        marks=','.join('?'*len(scopes))
-        heads={}
-        [heads.setdefault((r[1],r[2]),{}).setdefault(r[3],(r[0],r[3],r[4])) for r in sorted(db.execute(f"SELECT DISTINCT p.workspace_id,p.row_kind,p.source_row_id,p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id IN ({marks}) AND p.author_user_id=? AND p.source_row_id IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],ids)).fetchall() if selected else [],key=lambda r:(r[0]!=workspace,r[0]))]
-        for record in selected:
-            row=signed_row(record) if record["kind"] in TABLES else logical_fact(record)
-            found,current=list(heads.get((row["kind"],row["id"]),{}).values()),digest(row)
-            if any(h[2]==current for h in found): continue
-            if len(found)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
-            batch.append(row_proof(device,cfg["user"],found[0][0] if found else workspace,cfg["workspaces"][workspace]["epoch"],row,found[0][1] if found else None,workspace,current))
-            made+=1
-            if len(batch)==500:
-                _store_proofs(db,batch,signer)
-                batch=[]
-        _store_proofs(db,batch,signer)
-        return made
+    with contextlib.closing(open_db(db_path,purpose="remote.attest.schema")) as db: init_schema(db)
+    with contextlib.closing(open_db(db_path,True,purpose="remote.attest.plan")) as db: actual,aliases=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],{(table,physical):source for table,physical,source in db.execute("SELECT table_name,physical_row_id,source_row_id FROM remote.row_origins WHERE author_user_id=?",(cfg["user"],)).fetchall()}
+    if generation is not None: required(actual==generation,RuntimeError("Archive changed during Remote publication; retry"))
+    selected=[_logical_record(r,aliases) for r in records if r["kind"] in SIGNED]
+    rows=[signed_row(r) if r["kind"] in TABLES else logical_fact(r) for r in selected]
+    scopes,ids=(workspace,*origins),[r["id"] for r in rows]
+    with contextlib.closing(open_db(db_path,True,purpose="remote.attest.heads")) as db: found=db.execute(f"SELECT DISTINCT p.workspace_id,p.row_kind,p.source_row_id,p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id IN ({','.join('?'*len(scopes))}) AND p.author_user_id=? AND p.source_row_id IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],ids)).fetchall() if rows else []
+    heads={}
+    [heads.setdefault((r[1],r[2]),{}).setdefault(r[3],(r[0],r[3],r[4])) for r in sorted(found,key=lambda r:(r[0]!=workspace,r[0]))]
+    proofs=[]
+    for row in rows:
+        prior,current=list(heads.get((row["kind"],row["id"]),{}).values()),digest(row)
+        if any(h[2]==current for h in prior): continue
+        if len(prior)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
+        proofs.append(row_proof(device,cfg["user"],prior[0][0] if prior else workspace,cfg["workspaces"][workspace]["epoch"],row,prior[0][1] if prior else None,workspace,current))
+    [_store_proofs(db_path,proofs[i:i+500],signer,controls,actual) for i in range(0,len(proofs),500)]
+    return len(proofs)
 def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,inventory=None,retained=True,generation=None):
     fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
-    db=open_db(db_path,True)
+    db=open_db(db_path,True,purpose="remote.replicas.read")
     if generation is not None: required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
     records,bodies=logical_records(db,records,cfg["user"]),{}
     proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(fields,values))}
@@ -475,56 +465,51 @@ def _alias_plan(db,user,source,session,members,canonical):
     binding=db.execute("SELECT conversation_id FROM provider_sessions WHERE source=? AND session_id=?",(source,session)).fetchone()
     return rows,parent_map,member_physical,not binding or binding[0]!=member_physical[canonical]
 def reconcile_provider_aliases(db_path,cfg,workspace):
-    db=open_db(db_path)
-    init_schema(db)
     user=cfg["user"]
-    stored=[(oid,source,session,json.loads(members),canonical,json.loads(proof)) for oid,source,session,members,canonical,proof in db.execute("SELECT object_id,source,session_id,CAST(members AS VARCHAR),canonical_source_row_id,CAST(proof AS VARCHAR) FROM remote.provider_session_aliases WHERE author_user_id=? ORDER BY object_id,revision",(user,)).fetchall()]
+    with contextlib.closing(open_db(db_path,purpose="remote.alias.schema")) as db: init_schema(db)
+    with contextlib.closing(open_db(db_path,True,purpose="remote.alias.plan")) as db: stored=[(oid,source,session,json.loads(members),canonical,json.loads(proof)) for oid,source,session,members,canonical,proof in db.execute("SELECT object_id,source,session_id,CAST(members AS VARCHAR),canonical_source_row_id,CAST(proof AS VARCHAR) FROM remote.provider_session_aliases WHERE author_user_id=? ORDER BY object_id,revision",(user,)).fetchall()]
     groups={}
     [groups.setdefault(row[0],[]).append(row) for row in stored]
     result={"changed":0,"settled":0,"blocked":{}}
     controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace)
     signer=cfg["controls"][workspace]["devices"][cfg["device"]["id"]]
     backed_up=False
-    try:
-        for object_id,values in groups.items():
-            ancestors={a for value in values for a in value[5]["ancestors"]}
-            leaves=[value for value in values if value[5]["revision"] not in ancestors]
-            if len(leaves)!=1:
-                result["blocked"][object_id]="provider alias proof is not converged"
-                continue
-            _,source,session,members,canonical,_=leaves[0]
-            try:
-                rows,parent_map,member_physical,binding=_alias_plan(db,user,source,session,members,canonical)
-            except ValueError as e:
-                result["blocked"][object_id]=str(e)
-                continue
-            if not rows and not binding:
-                result["settled"]+=1
-                continue
-            if not backed_up:
-                _migration_backup(db,"provider-alias-reconciliation")
-                backed_up=True
-            db.execute("BEGIN")
-            try:
+    for object_id,values in groups.items():
+        ancestors={a for value in values for a in value[5]["ancestors"]}
+        leaves=[value for value in values if value[5]["revision"] not in ancestors]
+        if len(leaves)!=1:
+            result["blocked"][object_id]="provider alias proof is not converged"
+            continue
+        _,source,session,members,canonical,_=leaves[0]
+        try:
+            with contextlib.closing(open_db(db_path,True,purpose="remote.alias.rows")) as db: generation,plan=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],_alias_plan(db,user,source,session,members,canonical)
+            rows,parent_map,member_physical,binding=plan
+        except ValueError as e:
+            result["blocked"][object_id]=str(e)
+            continue
+        if not rows and not binding:
+            result["settled"]+=1
+            continue
+        if not backed_up:
+            with contextlib.closing(open_db(db_path,purpose="maintenance.remote.alias-backup")) as db: _migration_backup(db,"provider-alias-reconciliation")
+            backed_up=True
+        proofs=[row_proof(cfg["device"],user,head["workspace"],cfg["workspaces"][workspace]["epoch"],row,head["revision"],workspace) for row,head,native in rows]
+        try:
+            with contextlib.closing(open_db(db_path,purpose="remote.alias.write")) as db,_transaction(db):
+                required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during provider alias reconciliation; retry"))
                 project_workspace_controls(db,controls)
-                proofs=[row_proof(cfg["device"],user,head["workspace"],cfg["workspaces"][workspace]["epoch"],row,head["revision"],workspace) for row,head,native in rows]
                 ids=project_row_proofs(db,proofs,signer["root_public"],signer["certificate"])
                 project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native),proof,pid in zip(rows,proofs,ids)])
                 project_provider_bindings(db,source,session,member_physical[canonical],list(member_physical.values()))
-                db.execute("COMMIT")
-                result["changed"]+=1
-            except Exception as e:
-                db.execute("ROLLBACK")
-                result["blocked"][object_id]=str(e)
-        return result
-    finally:
-        db.close()
+            result["changed"]+=1
+        except Exception as e: result["blocked"][object_id]=str(e)
+    return result
 def blob_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,retained=True):
     if cfg["workspaces"][workspace]["kind"]!="personal": return []
     allowed={dict(zip(r["payload"]["columns"],r["payload"]["row"])).get("body_hash") for r in records if r["kind"]=="attachment.record" and r["payload"].get("state")!="deleted"}
     scopes=(workspace,*origins)
     marks=','.join('?'*len(scopes))
-    with contextlib.closing(open_db(db_path,True)) as db:
+    with contextlib.closing(open_db(db_path,True,purpose="remote.blobs.read")) as db:
         rows=db.execute(f"SELECT a.path,b.content_hash,b.size,p.workspace_id,p.authorization_workspace_id,p.authorization_epoch,o.proof_id IS NOT NULL FROM attachments a JOIN attachment_bodies b ON b.attachment_id=a.id LEFT JOIN remote.row_origins o ON o.table_name='attachments' AND o.physical_row_id=a.id LEFT JOIN remote.row_proofs q ON q.id=o.proof_id JOIN remote.row_proofs p ON p.row_kind='attachments' AND p.source_row_id=COALESCE(o.source_row_id,a.id) AND p.author_user_id=COALESCE(o.author_user_id,?) AND (o.proof_id IS NULL OR p.content_hash=q.content_hash) WHERE a.path IS NOT NULL AND p.workspace_id IN ({marks}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(cfg["user"],*scopes)).fetchall()
         if retained: rows+=db.execute(f"SELECT concat(?,'/',json_extract_string(c.body,'$.data.body_hash')),json_extract_string(c.body,'$.data.body_hash'),CAST(json_extract_string(c.body,'$.data.size') AS UINTEGER),p.workspace_id,p.authorization_workspace_id,p.authorization_epoch,TRUE FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks}) AND p.row_kind='attachments' AND p.state='active'",(str(Path(db_path).parent/"attachments"),*scopes)).fetchall()
     out=[]
@@ -572,7 +557,7 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
     names=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
     proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(names,values))}
     own=db is None
-    db=db or open_db(db_path)
+    db=db or open_db(db_path,purpose="remote.rows.project")
     if own: init_schema(db)
     try:
         with _transaction(db):
@@ -660,7 +645,7 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
     own=db is None
     if own:
         Path(db_path).parent.mkdir(parents=True,exist_ok=True)
-        db=open_db(db_path)
+        db=open_db(db_path,purpose="remote.provenance.project")
         init_schema(db)
     try:
         if own:
@@ -673,7 +658,7 @@ def project_many(db_path,state,items,local_device=None,root=None,commit=True,aut
     db=None
     if records:
         Path(db_path).parent.mkdir(parents=True,exist_ok=True)
-        db=open_db(db_path)
+        db=open_db(db_path,purpose="remote.provenance.project_many")
         init_schema(db)
     try:
         with _transaction(db) if db else contextlib.nullcontext(): [project(db_path,state,v,ws,local_device,db,root,True,authors,recover,local_user) for ws,v in items]

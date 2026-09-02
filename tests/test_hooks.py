@@ -258,9 +258,9 @@ cli.get_db=lambda *a,**k:C(); cli.init_schema=lambda _:None; cli.drain_hooks=lam
 cli.chatgpt_profiles=lambda _:[]; cli.get_cookies=lambda *_:{}
 def parsed(path):
  if path.name=="blocked.json" and os.environ.get("BLOCK")!="0": Path(os.environ["READY"]).touch(); hashlib.pbkdf2_hmac("sha256",b"x",b"y",500_000_000)
+ if path.name!="blocked.json": Path(os.environ["DONE"]).touch()
  return cli.ParseResult()
-def upsert(*_): Path(os.environ["DONE"]).touch(); return 0,0,0,0,0,0,0,{"m"}
-cli.parse_source=parsed; cli.upsert=upsert; sys.argv[1:]=["sync"]; cli.sync(False,300,False,False,False,False)'''
+cli.parse_source=parsed; sys.argv[1:]=["sync"]; cli.sync(False,300,False,False,False,False)'''
     root = tmp_path/"archive"; (root/"data").mkdir(parents=True); (root/"data/sync_state.json").write_text('{"sentinel":1}'); env = {**os.environ, "CONVOS_PROJECT_ROOT":str(root), "CONVOS_IMPORT_PATHS":f"{src},{blocked}", "READY":str(ready), "DONE":str(done)}; p = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         deadline = time.monotonic() + 5

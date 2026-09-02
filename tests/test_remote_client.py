@@ -290,8 +290,8 @@ def test_later_uploader_copy_heals_poisoned_origin_bundle(tmp_path,monkeypatch):
     fresh=server_connect(tmp_path/"fresh.db"); direct=transport(fresh); monkeypatch.setattr("ai_convos_remote.request",direct); bob,_=rehome_client(load(b),"http://fresh",b); setup_client("http://fresh","carol",root=c); replacement=create(bob,"Replacement","team",b); add_member(bob,replacement,"carol",root=b); bob=load(b); state=connect(b/"remote/state.db"); bind_origin(bob,state,replacement,origin,b); state.close(); carol=load(c); server_state=refresh(carol,c); raw=fresh.execute("SELECT envelope FROM origin_bundles").fetchone()[0]; original=json.loads(raw); body=open_origin(original,key(carol,replacement,original["epoch"])); repaired=seal_origin(body["controls"],replacement,original["epoch"],key(carol,replacement,original["epoch"]),carol["device"]["id"],body["rows"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; fresh.execute("UPDATE origin_bundles SET envelope=?",(json.dumps(original),)); fresh.commit(); action(fresh,{"op":"origin_upload","envelope":repaired},carol["token"]); state=connect(c/"remote/state.db"); ws=next(w for w in server_state["workspaces"] if w["id"]==replacement)
     real_core=remote_client._core
     @__import__("contextlib").contextmanager
-    def broken(root):
-        with real_core(root) as db:
+    def broken(root,**kwargs):
+        with real_core(root,**kwargs) as db:
             class Proxy:
                 def __getattr__(self,name): return getattr(db,name)
                 def execute(self,sql,*args):

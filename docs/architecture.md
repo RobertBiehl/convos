@@ -12,6 +12,9 @@ Normative product boundaries for archive ownership, replication, recovery, and
 provenance live in [Product invariants](invariants.md). Implementation plans and
 older design notes yield to those rules unless they are deliberately revised.
 Canonical public and internal names live in the [Naming contract](naming.md).
+All database access is governed by the normative [database connection and
+locking invariants](database-connections.md); the CI inventory rejects an
+unclassified production connection.
 
 ## Overview
 
@@ -94,7 +97,7 @@ Capture hooks use the same exact-state rule. Their managed command pins the
 root. Health requires one exact handler in each provider event, preventing an
 old tool path, duplicate, or misplaced lifecycle handler from masquerading as
 working capture.
-The total `src/ai_convos/` core remains under the 1200-line budget enforced by
+The total `src/ai_convos/` core remains under the 1300-line budget enforced by
 `tests/test_budget.py`; every application has its own honest product budget.
 
 ### ParseResult Normalization
@@ -163,7 +166,7 @@ leaving literal retrieval available, and the `semantic` extra plus
 
 1. **Fetch/Parse**: Read from API or file without holding the DuckDB lock
 2. **Upsert**: Acquire the writer briefly per completed `ParseResult`
-3. **Index**: Rebuild FTS under a short writer connection
+3. **Index**: Rebuild FTS as explicit, visibly labeled exclusive maintenance
 4. **Embed**: Compute vectors unlocked, then update each batch under a short writer connection
 
 ### Just-in-time local ingestion
