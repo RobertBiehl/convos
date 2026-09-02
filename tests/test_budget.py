@@ -21,11 +21,11 @@ def test_line_budget():
 
 
 def test_app_line_budgets():
-    """Budget products honestly; remote includes signed alias reconciliation; never split products to evade limits."""
+    """Budget products honestly; Remote includes signed aliases and its durable replica outbox; never split products to evade limits."""
     root = Path(__file__).resolve().parents[1]
     for src in sorted((root / "apps").glob("*/src")):
         loc = _loc(sorted(src.rglob("*.py")))
-        limit = {"changegraph": 400, "memory": 1000, "remote": 2200, "remote_server": 600}.get(src.parent.name, 200)
+        limit = {"changegraph": 400, "memory": 1000, "remote": 2250, "remote_server": 600}.get(src.parent.name, 200)
         assert loc < limit, f"App {src.parent.name} budget exceeded: {loc} >= {limit}"
 
 

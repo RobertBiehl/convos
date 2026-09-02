@@ -14,11 +14,11 @@ gate below are acceptance criteria, not additional tasks.
 
 | Status | Task |
 | --- | --- |
-| Done | Make `search` and `query` read-only and immediately bounded: no hook draining, FTS rebuild, or backlog embedding; add explicit bounded embedding and completeness warnings. |
-| Done | Make FTS freshness authoritative in DuckDB, exclude superseded history from retrieval, use a complete literal scan when stale, and reserve rebuilds for explicit `convos fts`. |
-| Done | Make local and migration backups complete by default: verify and include every retained attachment body before publishing the database backup filename. |
-| Done | Freeze `search` and `query` JSON/JSONL row fields and types; keep diagnostics on stderr and make strict incomplete retrieval fail nonzero. |
-| Done | Route core and Remote DuckDB opens through one canonical-path lock gateway that releases its advisory lock before native-lock backoff; keep relay inventory/network work outside DuckDB connections. |
+| Done | Make `search` and `query` read-only and immediately bounded: no hook draining, FTS rebuild, or backlog embedding; rank distinct conversations before applying limits; revalidate strict semantic coverage in the result snapshot. |
+| Done | Make FTS freshness authoritative in DuckDB, exclude superseded history from lexical and semantic retrieval, report the effective BM25-or-scan mode, and reserve rebuilds for explicit `convos fts`. |
+| Done | Make local and migration backups complete by default: include active, conflict-retained, and legacy attachment bodies; verify and fsync copied bytes; publish only a byte-identical database; make interrupted retries recoverable. |
+| Done | Freeze `search` and `query` JSON/JSONL row fields and types, including empty results; keep diagnostics on stderr and make unavailable archives, failed maintenance, missing backups, and strict incomplete retrieval fail nonzero. |
+| Done | Route core and Remote DuckDB opens through one canonical-path lock gateway; durably prepare encrypted replica batches outside DuckDB and atomically publish them under a final generation check; merge concurrent config refreshes, revalidate sharing before publication, and serialize SQLite state cutover. |
 | In review in PR #105 | Restore capture and manual-sync availability: use short inbox critical sections, make competing drains and syncs nonblocking, cap each drain worker by event count and elapsed time with visible progress and safe handoff, bound ordinary provenance work to touched conversations, edits, and repositories, and preserve full reconciliation behind `sync --full`. |
 | In review in PR #105 | Freeze the cross-provider conversation contract and audit real Codex and Claude imports. Define transcript and session identity, main-versus-subagent relationships, cwd, Git and model evidence, tools, attachments, and confirmed edits without deriving unavailable facts. |
 | In review in PR #105 | Install backed-up local native-session bindings without rewriting released physical IDs; preserve safe filename-to-native aliases, make a batch converge or fail before mutation, preserve foreign signed rows, structurally quarantine startup stubs, and keep migration commit independent of FTS rebuild. |
@@ -30,7 +30,7 @@ gate below are acceptance criteria, not additional tasks.
 | In review in PR #105 | Implement backed-up alias reconciliation and prove pre-existing and cross-device duplicate row successors/tombstones converge with retained v1 replicas. |
 | In review in PR #105 | Add an auditable file-edit evidence ledger, reclassify surviving provider transcripts, retain raw uncertain history, and exclude anything except confirmed edits from exact provenance and team sharing. |
 | In review in PR #105 | Harden remote synchronization: converge duplicate-root proof chains without hiding true forks, add observable exponential backoff, separate nonblocking sync and control-mutation leases, cover interruption recovery, and prove retained signed logical replicas remain ingestible. |
-| In review in PR #105 | Build and qualify the isolated Titan multi-user testbed with a destructive fresh synthetic lane and a persistent upgrade canary before declaring a stable release. |
+| Deferred | Build and qualify the isolated Titan multi-user testbed with a destructive fresh synthetic lane and a persistent upgrade canary; the current release uses isolated local databases and the existing Titan relay without mixing personal archive data. |
 
 Deferred after the current-use gate: a separate embeddings table, alternate
 Linux semantic backends, ANN/vector-index work, multi-account provider fixtures,
@@ -111,9 +111,10 @@ evidence register; remediation is represented by the work items above.
 
 ## Stable release gate
 
-A stable release requires every registered finding to be closed or explicitly blocked
-with user agreement, their regressions passing, complete input accounting, zero
-unexplained duplicate transcripts or orphaned rows, idempotent second sync, verified
-migration interruption recovery, bounded performance, a passing fresh Titan run, a
-passing persistent-canary upgrade, CI/build/install checks, and verification of the
-exact released commit and installed executable.
+A release requires every current-use blocker to be closed or explicitly deferred with
+user agreement, its regressions passing, complete input accounting, zero unexplained
+duplicate transcripts or orphaned rows, idempotent second sync, verified migration
+interruption recovery, bounded interactive work, isolated local multi-user/Remote
+coverage, CI/build/install checks, and verification of the exact released commit and
+installed executable. Fresh Titan and persistent-canary qualification remain required
+before claiming the broader multi-user testbed milestone, not for this release.

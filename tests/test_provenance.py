@@ -34,6 +34,23 @@ def test_manual_backup_does_not_silently_migrate_archive(tmp_path,monkeypatch):
     path=tmp_path/"core.db"; db=graph(path); db.execute("INSERT INTO conversations(id,source) VALUES ('c','test'); UPDATE core_schema SET version=8"); db.close(); monkeypatch.setattr(core_module,"DB_PATH",path); core_module.backup()
     db=duckdb.connect(str(path)); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==8; db.close()
 
+def test_backup_includes_conflict_retained_and_legacy_attachment_bodies(tmp_path):
+    path=tmp_path/"core.db"; body=b"conflict body"; body_hash=digest(body); managed=tmp_path/"attachments"/body_hash; managed.parent.mkdir(); managed.write_bytes(body); db=graph(path); row={"v":1,"kind":"attachments","id":"conflict","state":"active","data":{"body_hash":body_hash,"size":len(body)}}; db.execute("INSERT INTO remote.row_proofs VALUES ('p','w','w','attachments','conflict',1,?,'r',NULL,'active','u','d',1,'s')",[digest(row)]); db.execute("INSERT INTO remote.row_conflicts VALUES ('p',?)",[json.dumps(row)]); saved=core_module._migration_backup(db,"conflict"); db.close(); assert (saved.with_name(saved.name+".attachments")/body_hash).read_bytes()==body
+    legacy=tmp_path/"legacy-attachments.db"; source=tmp_path/"legacy-body"; source.write_bytes(b"legacy"); db=duckdb.connect(str(legacy)); db.execute("CREATE TABLE conversations(id VARCHAR,source VARCHAR,title VARCHAR,created_at TIMESTAMP,updated_at TIMESTAMP,model VARCHAR,cwd VARCHAR,git_branch VARCHAR,project_id VARCHAR,metadata JSON); CREATE TABLE attachments(id VARCHAR,message_id VARCHAR,filename VARCHAR,mime_type VARCHAR,size INTEGER,path VARCHAR,url VARCHAR,created_at TIMESTAMP); INSERT INTO conversations(id,source) VALUES ('c','x'); INSERT INTO attachments(id,message_id,size,path) VALUES ('a','m',6,?)",[str(source)]); core_module.init_schema(db); db.close(); backup=legacy.with_name("legacy-attachments.db.pre-v1.bak"); assert (backup.with_name(backup.name+".attachments")/digest(b"legacy")).read_bytes()==b"legacy"
+
+def test_backup_verifies_copied_bytes_and_reuses_durable_orphan(tmp_path,monkeypatch):
+    path,body=tmp_path/"core.db",tmp_path/"body"; body.write_bytes(b"retained"); db=graph(path); db.execute("INSERT INTO conversations(id,source) VALUES ('c','x'); INSERT INTO messages(id,conversation_id,role) VALUES ('m','c','user'); INSERT INTO attachments(id,message_id,path,size) VALUES ('a','m',?,8)",[str(body)]); core_module.index_attachment_body(db,"a",body,8); real=core_module._backup_copy
+    def corrupt(source,target): real(source,target); target.write_bytes(b"corrupt") if source==body else None
+    monkeypatch.setattr(core_module,"_backup_copy",corrupt)
+    with pytest.raises(ValueError,match="attachment backup verification failed"): core_module._migration_backup(db,"verify")
+    def corrupt_db(source,target): real(source,target); target.write_bytes(target.read_bytes()+b"corrupt") if source==path else None
+    monkeypatch.setattr(core_module,"_backup_copy",corrupt_db)
+    with pytest.raises(ValueError,match="archive backup verification failed"): core_module._migration_backup(db,"database")
+    monkeypatch.setattr(core_module,"_backup_copy",real); saved=core_module._migration_backup(db,"retry"); bundle=saved.with_name(saved.name+".attachments"); saved.unlink(); body.unlink(); assert core_module._migration_backup(db,"retry")==saved and saved.is_file() and bundle.is_dir(); db.close()
+
+def test_manual_backup_missing_archive_is_nonzero_without_creation(tmp_path,monkeypatch):
+    monkeypatch.setattr(core_module,"DB_PATH",tmp_path/"missing.db"); result=__import__("typer.testing",fromlist=["CliRunner"]).CliRunner().invoke(core_module.app,["backup"]); assert result.exit_code==1 and result.stdout=="" and "nothing was backed up" in result.stderr and not (tmp_path/"missing.db").exists()
+
 
 def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_path):
     a,b=repo(tmp_path/"a",content="new a\n"),repo(tmp_path/"b",content="new b\n"); clone=tmp_path/"clone"; subprocess.run(("git","clone","-q",str(a),str(clone)),check=True); assert repository(a)["id"]==repository(clone)["id"]

@@ -159,9 +159,7 @@ def _archive_touch(db,rows=()):
     if any(kind=="messages" for kind,_ in rows): db.execute("UPDATE retrieval_state SET messages_generation=messages_generation+1 WHERE singleton")
     return generation
 def archive_changes(db,since): return db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],db.execute("SELECT kind,entity FROM archive_changes WHERE generation>?",(since,)).fetchall()
-def archive_state(db):
-    (archive_id,generation),local=db.execute("SELECT archive_id::VARCHAR,generation FROM archive_state WHERE singleton").fetchone(),sum(db.execute(f"SELECT COUNT(*) FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name=? AND o.physical_row_id=x.id)",(table,)).fetchone()[0] for table in ARCHIVE_COLUMNS)
-    return archive_id,generation,local
+def archive_state(db): return (lambda state,local:(*state,local))(db.execute("SELECT archive_id::VARCHAR,generation FROM archive_state WHERE singleton").fetchone(),sum(db.execute(f"SELECT COUNT(*) FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name=? AND o.physical_row_id=x.id)",(table,)).fetchone()[0] for table in ARCHIVE_COLUMNS))
 def _git_run(root,*args): return subprocess.run(("git","-C",str(root),*args),capture_output=True,check=True).stdout
 def _git_maybe(root,*args):
     try: return _git_run(root,*args)
@@ -180,9 +178,7 @@ def _git_remotes(root): return sorted({remote for line in _git_run(root,"remote"
 def repository_evidence(value): return provenance_digest({"lineage":value["lineage"],"remotes":value["remotes"]}) if value["lineage"] else None
 def _checkout(root): return provenance_digest(f"{stat.st_dev}:{stat.st_ino}" if (stat:=next((p.stat() for p in [Path(root)/'.git'] if p.exists()),None)) else str(root))[:32]
 def _unborn(root): return provenance_digest(f"{stat.st_dev}:{stat.st_ino}:{getattr(stat,'st_birthtime_ns',stat.st_ctime_ns)}" if (stat:=next((p.stat() for p in [Path(root)/'.git/config',Path(root)/'.git'] if p.exists()),None)) else str(root))
-def _git_marker(path):
-    p=p if (p:=Path(path)).is_dir() else p.parent
-    return next(((str(root.resolve()),_checkout(root)) for root in (p,*p.parents) if (root/".git").exists()),(None,None))
+def _git_marker(path): return next(((str(root.resolve()),_checkout(root)) for raw in [Path(path)] for p in [raw if raw.is_dir() else raw.parent] for root in (p,*p.parents) if (root/".git").exists()),(None,None))
 @lru_cache(maxsize=256)
 def _repository(root): return (lambda root,roots,remotes,lineage:dict(id=provenance_digest({"lineage":lineage,"remotes":remotes}) if lineage else _unborn(root),lineage=lineage,root=str(root),roots=roots,remotes=remotes,checkout=_checkout(root)))(root:=Path(root),roots:=sorted(_git_maybe(root,"rev-list","--max-parents=0","HEAD").decode().split()),_git_remotes(root),provenance_digest({"git_roots":roots}) if roots else None)
 def repository_state(db): return {"roots":dict(db.execute("SELECT root,repository FROM provenance.repository_checkouts").fetchall()),"checkouts":dict(db.execute("SELECT id,repository FROM provenance.repository_checkouts").fetchall()),"checkout_roots":dict(db.execute("SELECT id,root FROM provenance.repository_checkouts").fetchall()),"lineages":dict(db.execute("SELECT id,lineage FROM provenance.repositories").fetchall()),"aliases":dict(db.execute("SELECT evidence,CASE WHEN COUNT(DISTINCT repository)=1 THEN MIN(repository) END FROM provenance.repository_aliases GROUP BY evidence").fetchall())}
@@ -190,9 +186,7 @@ def _refresh_repository(): (_git_root.cache_clear(),_repository.cache_clear())
 def repository(path,known=None,refresh=True): return (lambda value,state,evidence,bound,resolved:{**value,"id":resolved or value["id"],"alias":None if resolved or not evidence else evidence})(value:={**_repository(str(root)),"head":_git_maybe(root,"rev-parse","--verify","HEAD").decode().strip(),"branch":_git_maybe(root,"symbolic-ref","--short","HEAD").decode().strip()},state:=repository_state(known) if known is not None and hasattr(known,"execute") else known or {"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}},evidence:=repository_evidence(value),bound:=state["checkouts"].get(value["checkout"]),bound if value["lineage"] and state["lineages"].get(bound)==value["lineage"] else evidence and state["aliases"].get(evidence)) if (not refresh or _refresh_repository() is None) and (root:=_git_root(Path(path))) else None
 def _cached_repository(cache,root,known): return cache[key] if (key:=str(root)) in cache else cache.setdefault(key,repository(root,known,False))
 def _observe_checkout(db,repo):
-    db.execute("DELETE FROM provenance.repository_checkouts WHERE root=? AND id<>?",(repo["root"],repo["checkout"]))
-    db.execute("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET repository=excluded.repository,root=excluded.root,branch=excluded.branch,head=excluded.head",(repo["checkout"],repo["id"],repo["root"],repo["branch"],repo["head"]))
-    if repo["alias"]: db.execute("INSERT OR IGNORE INTO provenance.repository_aliases VALUES (?,?)",(repo["id"],repo["alias"]))
+    (db.execute("DELETE FROM provenance.repository_checkouts WHERE root=? AND id<>?",(repo["root"],repo["checkout"])),db.execute("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET repository=excluded.repository,root=excluded.root,branch=excluded.branch,head=excluded.head",(repo["checkout"],repo["id"],repo["root"],repo["branch"],repo["head"])),repo["alias"] and db.execute("INSERT OR IGNORE INTO provenance.repository_aliases VALUES (?,?)",(repo["id"],repo["alias"])))
 def capture_repository(path,db_path=None):
     with _core(db_path,ready=True) as db: known=repository_state(db)
     repo=repository(path,known)
@@ -206,21 +200,14 @@ def capture_repository(path,db_path=None):
 def _resolved(path,cwd=None): return str((Path(cwd)/p if not (p:=Path(path)).is_absolute() and cwd else p).expanduser().resolve())
 def pending_scopes(conversations):
     return [(conversation,resolved,None,root,f"pending:{checkout}" if checkout else None,captured) for captured in [datetime.now(timezone.utc)] for conversation,cwd in conversations for resolved in [_resolved(cwd) if cwd else None] for root,checkout in [_git_marker(resolved) if resolved else (None,None)]]
-def snapshot_scopes(conversations,known=None):
-    _refresh_repository()
-    return [(conversation,resolved,repo["id"] if repo else None,repo["root"] if repo else None,repo["checkout"] if repo else None,captured) for captured in [datetime.now(timezone.utc).isoformat().replace("+00:00","Z")] for conversation,cwd in conversations for resolved in [str(Path(cwd).expanduser().resolve()) if cwd else None] for repo in [repository(resolved,known,False) if resolved else None]]
+def snapshot_scopes(conversations,known=None): return (_refresh_repository(),[(conversation,resolved,repo["id"] if repo else None,repo["root"] if repo else None,repo["checkout"] if repo else None,captured) for captured in [datetime.now(timezone.utc).isoformat().replace("+00:00","Z")] for conversation,cwd in conversations for resolved in [str(Path(cwd).expanduser().resolve()) if cwd else None] for repo in [repository(resolved,known,False) if resolved else None]])[1]
 def _provenance_where(path,cwd,cache,known=None,frozen=False):
     p,repo=(p:=Path(path) if frozen else Path(_resolved(path,cwd))),_cached_repository(cache,root,known) if (root:=_git_root(p)) else None
     return (repo,p.relative_to(repo["root"]).as_posix(),"repository") if repo else (None,f"external/{provenance_digest(str(p))[:24]}/{p.name}","external")
 def pending_edit_scopes(edits):
     return [(e["id"],f"external/{provenance_digest(route)[:24]}/{Path(route).name}",None,root,f"pending:{checkout}" if checkout else None,route,captured) for captured in [datetime.now(timezone.utc)] for e in edits for route in [_resolved(e["path"],e["cwd"])] for root,checkout in [_git_marker(route)]]
-def snapshot_edit_scopes(edits,known=None):
-    _refresh_repository()
-    captured,cache=datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),{}
-    return [(e["id"],path,repo["id"] if repo else None,repo["root"] if repo else None,repo["checkout"] if repo else None,route,captured) for e in edits for route in [e.get("route") or _resolved(e["path"],e["cwd"])] for repo,path,_ in [_provenance_where(route,None,cache,known,True)]]
-def edit_scope_inputs(result):
-    conversations,messages={c["id"]:c["cwd"] for c in result.convs},{m["id"]:m["conversation_id"] for m in result.msgs}
-    return [{"id":e["id"],"path":e["file_path"],"cwd":conversations.get(messages.get(e["message_id"]))} for e in result.edits]
+def snapshot_edit_scopes(edits,known=None): return (_refresh_repository(),[(e["id"],path,repo["id"] if repo else None,repo["root"] if repo else None,repo["checkout"] if repo else None,route,captured) for captured,cache in [(datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),{})] for e in edits for route in [e.get("route") or _resolved(e["path"],e["cwd"])] for repo,path,_ in [_provenance_where(route,None,cache,known,True)]])[1]
+def edit_scope_inputs(result): return (lambda conversations,messages:[{"id":e["id"],"path":e["file_path"],"cwd":conversations.get(messages.get(e["message_id"]))} for e in result.edits])({c["id"]:c["cwd"] for c in result.convs},{m["id"]:m["conversation_id"] for m in result.msgs})
 def _checkpoint(repo,source): return (lambda paths,state:dict(id=provenance_digest({"repository":repo["id"],"head":repo["head"],"state":state}),repository=repo["id"],head=repo["head"],state_hash=state,paths=paths,capture_source=source))(sorted({x[3:].split(" -> ")[-1] for x in _git_run(repo["root"],"status","--porcelain=v1","-z").decode(errors="replace").split("\0") if len(x)>3}),provenance_digest((_git_maybe(repo["root"],"diff","--binary","HEAD")+_git_maybe(repo["root"],"diff","--binary","--cached","HEAD")) if repo["head"] else _git_run(repo["root"],"status","--porcelain=v1","-z")))
 def _provenance_record(kind,entity,payload,observed_at): return dict(kind=kind,entity=entity,payload=payload,observed_at=observed_at)
 def _repository_record(repo,observed): return _provenance_record("repository.observed",repo["id"],{k:repo[k] for k in ("id","lineage","roots","remotes","head")},observed)
@@ -294,9 +281,7 @@ def capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="syn
         if records: core.executemany("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",[(r["kind"],r["entity"]) for r in records])
         if scopes or touched: _archive_touch(core,[("conversations",r[0]) for r in scopes]+[("conversations",c) for c in touched])
     return records
-def project_archive_row(db,table,columns,values,origin=None,touch=True):
-    project_archive_rows(db,table,columns,[(values,origin)])
-    if touch: _archive_touch(db,[(table,values[0])])
+def project_archive_row(db,table,columns,values,origin=None,touch=True): return (project_archive_rows(db,table,columns,[(values,origin)]),touch and _archive_touch(db,[(table,values[0])]),None)[-1]
 def _insert_pages(db,target,rows,columns=None,conflict="",mode="",embedding=False):
     schema,columns,shape,norm,extra,source,pages=(schema:={r[0]:r[1] for r in db.execute(f"DESCRIBE {target}").fetchall()}),(columns:=columns or list(schema)),(shape:=json.dumps([{c:schema[c] for c in columns}])),(norm:=lambda c,v:json.loads(v) if schema[c]=="JSON" and isinstance(v,str) else v),",embedding" if embedding else "","SELECT x.*,m.embedding FROM UNNEST(from_json(?,?)) t(x) LEFT JOIN messages m ON m.id=x.id AND m.content IS NOT DISTINCT FROM x.content" if embedding else "SELECT x.* FROM UNNEST(from_json(?,?)) t(x)",[(json.dumps([{c:norm(c,v) for c,v in zip(columns,row)} for row in rows[i:i+500]],default=str,ensure_ascii=True,allow_nan=False),shape) for i in range(0,len(rows),500)]
     if pages: db.executemany(f"INSERT{mode} INTO {target} ({','.join(columns)}{extra}) {source}{conflict}",pages)
@@ -334,10 +319,7 @@ def project_file_edit_evidence(db,record):
     p=record.get("proof") if isinstance(record,dict) else None
     required(set(record)==set(fields) and isinstance(p,dict) and (p.get("workspace"),p.get("author_user_id"),p.get("object_id"),p.get("revision"))==tuple(record[k] for k in fields[:4]) and isinstance(p.get("ancestors"),list) and record["object_id"]=="file-edit-evidence:"+provenance_digest(record["source_edit_id"]) and record["status"] in {"confirmed","invalid","unknown","unverified"} and isinstance(record["reason"],str) and record["reason"] and isinstance(record["edit_revision"],str) and len(record["edit_revision"])==64 and ((record["source_tool_call_id"] is None and record["tool_revision"] is None) or all(isinstance(record[k],str) and record[k] for k in ("source_tool_call_id","tool_revision"))),ValueError("file edit evidence storage schema mismatch"))
     (_insert_pages(db,"remote.file_edit_evidence_proofs",[tuple(record[f] for f in fields)],fields,mode=" OR IGNORE"),_project_semantic_ancestors(db,"file-edit.evidence",record),_apply_signed_edit_evidence(db))
-def project_provider_bindings(db,source,session,conversation,members):
-    required(db.execute("SELECT 1 FROM conversations WHERE id=?",(conversation,)).fetchone() and all(isinstance(v,str) and v for v in (source,session,conversation,*members)),ValueError("provider binding target unavailable"))
-    if members: db.execute("UPDATE provider_sessions SET conversation_id=? WHERE conversation_id IN (SELECT UNNEST(?))",(conversation,members))
-    db.execute("INSERT OR REPLACE INTO provider_sessions VALUES (?,?,?)",(source,session,conversation))
+def project_provider_bindings(db,source,session,conversation,members): return (required(db.execute("SELECT 1 FROM conversations WHERE id=?",(conversation,)).fetchone() and all(isinstance(v,str) and v for v in (source,session,conversation,*members)),ValueError("provider binding target unavailable")),members and db.execute("UPDATE provider_sessions SET conversation_id=? WHERE conversation_id IN (SELECT UNNEST(?))",(conversation,members)),db.execute("INSERT OR REPLACE INTO provider_sessions VALUES (?,?,?)",(source,session,conversation)),None)[-1]
 def project_workspace_controls(db,controls):
     for value in controls:
         if not {"workspace","revision","epoch"}<=set(value) or not isinstance(value["revision"],int) or not isinstance(value["epoch"],int): raise ValueError("workspace control storage schema mismatch")
@@ -400,20 +382,27 @@ def _file_sha256(path):
     with Path(path).open("rb") as source: return hashlib.file_digest(source,"sha256").hexdigest()
 def _check_archive(path):
     with contextlib.closing(duckdb.connect(str(path),read_only=True)) as db: db.execute("SELECT COUNT(*) FROM conversations").fetchone()
-def _backup_attachments(conn,source,backup):
-    rows=conn.execute("SELECT b.content_hash,b.size,a.path FROM attachment_bodies b JOIN attachments a ON a.id=b.attachment_id").fetchall() if conn.execute("SELECT 1 FROM information_schema.tables WHERE table_name='attachment_bodies'").fetchone() else []
-    bodies={body_hash:(size,body) for body_hash,size,path in rows if path and (body:=Path(path)).is_file() and not body.is_symlink() and body.stat().st_size==size and _file_sha256(body)==body_hash}
-    required(len(bodies)==len({r[0] for r in rows}),ValueError("attachment body unavailable for backup"))
-    target=backup.with_name(f"{backup.name}.attachments")
-    if target.exists(): return required(target.is_dir() and not target.is_symlink() and all((target/h).is_file() and _file_sha256(target/h)==h for h in bodies) and (target/"manifest.json").is_file() and json.loads((target/"manifest.json").read_text())==dict(database=backup.name,database_sha256=_file_sha256(source),attachments={h:s for h,(s,_) in bodies.items()}),ValueError("attachment backup is incomplete")) and target
-    stage=Path(tempfile.mkdtemp(prefix=f".{target.name}.",dir=target.parent))
+def _backup_rows(conn): return (lambda tables:(lambda rows:rows+(conn.execute("SELECT concat('conflict:',c.proof_id),json_extract_string(c.body,'$.data.body_hash'),CAST(json_extract_string(c.body,'$.data.size') AS UINTEGER),NULL FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.row_kind='attachments' AND p.state='active'").fetchall() if {"row_conflicts","row_proofs"}<=tables else []))(conn.execute("SELECT concat('attachment:',b.attachment_id),b.content_hash,b.size,a.path FROM attachment_bodies b JOIN attachments a ON a.id=b.attachment_id").fetchall() if "attachment_bodies" in tables else [("attachment:"+row_id,None,size,path) for row_id,path,size in conn.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL").fetchall()] if "attachments" in tables else []))({r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables").fetchall()})
+def _bundle_valid(target,database,database_hash,rows):
+    try: return target.is_dir() and not target.is_symlink() and (manifest:=json.loads((target/"manifest.json").read_text())).get("version")==1 and manifest.get("database")==database and manifest.get("database_sha256")==database_hash and set(refs:=manifest["references"])=={r[0] for r in rows} and all(isinstance(refs[ref],list) and len(refs[ref])==2 and (body_hash is None or refs[ref][0]==body_hash) and (size is None or refs[ref][1]==size) for ref,body_hash,size,path in rows) and manifest["attachments"]=={v[0]:v[1] for v in refs.values()} and all((target/h).is_file() and not (target/h).is_symlink() and (target/h).stat().st_size==size and _file_sha256(target/h)==h for h,size in manifest["attachments"].items())
+    except (OSError,ValueError,KeyError,TypeError,AttributeError,json.JSONDecodeError): return False
+def _backup_attachments(conn,source,backup,database_hash):
+    target,rows=backup.with_name(f"{backup.name}.attachments"),_backup_rows(conn)
+    if target.exists() and _bundle_valid(target,backup.name,database_hash,rows): return target
+    bodies,refs={},{}
+    for ref,body_hash,size,path in rows:
+        candidates=([Path(path)] if path else [])+([source.parent/"attachments"/body_hash] if body_hash else [])
+        body=next((p for p in candidates if p.is_file() and not p.is_symlink() and (size is None or p.stat().st_size==size) and (not body_hash or _file_sha256(p)==body_hash)),None)
+        required(body,ValueError("attachment body unavailable for backup"))
+        body_hash,size=body_hash or _file_sha256(body),body.stat().st_size
+        bodies[body_hash]=(required(body_hash not in bodies or bodies[body_hash][0]==size,ValueError("attachment body metadata conflict")) and size,body)
+        refs[ref]=[body_hash,size]
+    stage=required(not target.exists(),ValueError("attachment backup is incomplete")) and Path(tempfile.mkdtemp(prefix=f".{target.name}.",dir=target.parent))
     try:
-        [(_backup_copy(source,stage/body_hash),os.chmod(stage/body_hash,0o600)) for body_hash,(size,source) in bodies.items()]
-        atomic_json(stage/"manifest.json",dict(database=backup.name,database_sha256=_file_sha256(source),attachments={h:s for h,(s,_) in bodies.items()}))
-        (os.replace(stage,target),_fsync(target.parent))
-    except BaseException:
-        shutil.rmtree(stage,ignore_errors=True)
-        raise
+        [(_backup_copy(body,stage/body_hash),os.chmod(stage/body_hash,0o600),required((stage/body_hash).stat().st_size==size and _file_sha256(stage/body_hash)==body_hash,ValueError("attachment backup verification failed")),_fsync(stage/body_hash)) for body_hash,(size,body) in bodies.items()]
+        atomic_json(stage/"manifest.json",dict(version=1,database=backup.name,database_sha256=database_hash,references=refs,attachments={h:s for h,(s,_) in bodies.items()}))
+        (_fsync(stage),os.replace(stage,target),_fsync(target.parent))
+    except BaseException as e: raise (shutil.rmtree(stage,ignore_errors=True) or e)
     return target
 def _migration_backup(conn,version=1):
     tables,current=(tables:={r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()}),(conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0] if "core_schema" in tables else 0
@@ -421,14 +410,14 @@ def _migration_backup(conn,version=1):
     path,label,backup=(path:=Path(next((r[2] for r in conn.execute("PRAGMA database_list").fetchall() if r[2]),""))),(label:=f"v{version}" if isinstance(version,int) else version),path.with_name(f"{path.name}.pre-{label}.bak") if path.name else None
     required(isinstance(label,str) and label and all(c.isalnum() or c in "-_" for c in label),ValueError("invalid backup label"))
     if not backup: return None
-    conn.execute("CHECKPOINT")
-    if backup.exists():
-        if backup.is_symlink() or not backup.is_file(): raise ValueError("core migration backup path is unsafe")
-        _,source=_check_archive(backup),(source:=_file_sha256(path))
-        if source==_file_sha256(backup): return (_backup_attachments(conn,path,backup),backup)[1]
-        backup=backup.with_name(f"{backup.name}.{source[:12]}")
-    _backup_attachments(conn,path,backup)
-    atomic_publish(backup,lambda tmp:(_backup_copy(path,tmp),_check_archive(tmp)))
+    source=(conn.execute("CHECKPOINT"),_file_sha256(path))[1]
+    if backup.exists() and (backup.is_symlink() or not backup.is_file()): raise ValueError("core migration backup path is unsafe")
+    if backup.exists() and source==_file_sha256(backup) and _bundle_valid(backup.with_name(backup.name+".attachments"),backup.name,source,_backup_rows(conn)): return backup
+    if not backup.exists() and _bundle_valid(backup.with_name(backup.name+".attachments"),backup.name,source,_backup_rows(conn)): return (atomic_publish(backup,lambda tmp:(_backup_copy(path,tmp),required(_file_sha256(tmp)==source,ValueError("archive backup verification failed")),_check_archive(tmp))),backup)[1]
+    if backup.exists() or backup.with_name(backup.name+".attachments").exists(): backup=backup.with_name(f"{backup.name}.{source[:12]}")
+    backup=backup.with_name(f"{backup.name}.{time.time_ns()}") if backup.exists() or backup.with_name(backup.name+".attachments").exists() else backup
+    _backup_attachments(conn,path,backup,source)
+    atomic_publish(backup,lambda tmp:(_backup_copy(path,tmp),required(_file_sha256(tmp)==source,ValueError("archive backup verification failed")),_check_archive(tmp)))
     return backup
 def _repository_alias_migration(conn):
     _refresh_repository()
@@ -515,8 +504,7 @@ def rebuild_fts_index(conn): conn.execute("PRAGMA create_fts_index('messages', '
 def ensure_db_ready(conn):
     tables={r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()}
     if "messages" in tables and "core_schema" in tables and (conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0]==CORE_VERSION and not conn.execute("SELECT 1 FROM core_migrations").fetchone(): return True
-    typer.echo("Database initialization or migration required. Run `convos sync`.")
-    return False
+    return typer.echo("Database initialization or migration required. Run `convos sync`.",err=True)
 
 def gen_id(source: str, oid: str) -> str: return hashlib.sha256(f"{source}:{oid}".encode()).hexdigest()[:16]
 def ts_from_epoch(t):
@@ -963,13 +951,14 @@ def _llama(local_only=False):
         try: _MODELS["llama"] = Llama(model_path=embedding_model_path(local_only), **cfg, verbose=False)
         finally: lc.llama_context_default_params=orig if nseq else lc.llama_context_default_params
     return _MODELS["llama"]
-def _activate_embedding_profile():
+def _activate_embedding_profile(limit=None):
     profile=embedding_profile()
-    with _core(ready=True) as conn:
-        old,changed,wrong=(old:=(conn.execute("SELECT CAST(profile AS VARCHAR) FROM embedding_state WHERE singleton").fetchone() or [None])[0]),old is not None and json.loads(old)!=profile,conn.execute("SELECT COUNT(*) FROM messages WHERE embedding IS NOT NULL AND len(embedding)<>?",(profile["dimensions"],)).fetchone()[0]
-        with _transaction(conn):
-            if changed or wrong: conn.execute("UPDATE messages SET embedding=NULL WHERE embedding IS NOT NULL AND (? OR len(embedding)<>?)",(changed,profile["dimensions"]))
-            conn.execute("INSERT OR REPLACE INTO embedding_state VALUES (TRUE,?)",(json.dumps(profile,sort_keys=True,separators=(",",":")),))
+    with _core(read_only=True) as conn: old,wrong=(conn.execute("SELECT CAST(profile AS VARCHAR) FROM embedding_state WHERE singleton").fetchone() or [None])[0],conn.execute("SELECT COUNT(*) FROM messages WHERE embedding IS NOT NULL AND len(embedding)<>?",(profile["dimensions"],)).fetchone()[0]
+    changed=old is not None and json.loads(old)!=profile
+    if limit and (changed or wrong): raise ValueError("Embedding profile reset requires full maintenance; rerun `convos embed` without --limit")
+    with _core(ready=True) as conn,_transaction(conn):
+        if changed or wrong: conn.execute("UPDATE messages SET embedding=NULL WHERE embedding IS NOT NULL AND (? OR len(embedding)<>?)",(changed,profile["dimensions"]))
+        conn.execute("INSERT OR REPLACE INTO embedding_state VALUES (TRUE,?)",(json.dumps(profile,sort_keys=True,separators=(",",":")),))
     return profile,changed or bool(wrong)
 def embed_texts(ss: list[str], doc: bool = False, local_only=False) -> list[list[float]]:
     profile=embedding_profile()
@@ -980,8 +969,8 @@ def embed_texts(ss: list[str], doc: bool = False, local_only=False) -> list[list
 def embed_text(s: str, doc: bool = False, local_only=False) -> list[float]: return embed_texts([s], doc, local_only)[0]
 def embed_pending(batch: int = 32, ids=None, local_only=False,limit=None):
     if ids == []: return
-    profile,reset=_activate_embedding_profile()
-    ids,Q,ps=(ids:=None if reset else ids),(Q:="FROM messages WHERE embedding IS NULL AND content IS NOT NULL AND content != ''"+_NOISE+(f" AND id IN ({','.join(['?']*len(ids))})" if ids is not None else "")),ids or []
+    profile,reset=_activate_embedding_profile(limit)
+    ids,Q,ps=(ids:=None if reset else ids),(Q:="FROM messages WHERE embedding IS NULL AND content IS NOT NULL AND content != '' AND json_extract_string(metadata,'$.history_of') IS NULL"+_NOISE+(f" AND id IN ({','.join(['?']*len(ids))})" if ids is not None else "")),ids or []
     with _core(read_only=True) as conn: n=min(conn.execute(f"SELECT COUNT(*) {Q}",ps).fetchone()[0],limit) if limit else conn.execute(f"SELECT COUNT(*) {Q}",ps).fetchone()[0]
     if not n: return
     typer.echo(f"Embedding {n} messages...",err=True)
@@ -999,17 +988,16 @@ def embed_pending(batch: int = 32, ids=None, local_only=False,limit=None):
     return done
 def _ro():
     try: c=get_db(read_only=True)
-    except ValueError as e: return typer.echo(str(e),err=True)
-    if c is None: return typer.echo("Database not found. Run `convos init` or `convos sync`.")
-    if not ensure_db_ready(c): return c.close()
+    except ValueError as e: raise typer.Exit(typer.echo(str(e),err=True) or 1)
+    if c is None: raise typer.Exit(typer.echo("Database not found. Run `convos init` or `convos sync`.",err=True) or 1)
+    if not ensure_db_ready(c): raise typer.Exit(c.close() or 1)
     return c
 def _fts_ro():
-    if (c:=_ro()) is None: return None
+    c=(c:=_ro()).execute("BEGIN TRANSACTION") and c
     state=c.execute("SELECT messages_generation,fts_generation,fts_definition_hash FROM retrieval_state WHERE singleton").fetchone()
     current=bool(state and state[0]==state[1] and state[2]==_FTS_DEF and c.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone())
-    if current:
-        try: load_fts(c)
-        except ValueError: current=False
+    try: current and load_fts(c)
+    except ValueError: current=False
     return c,"bm25" if current else "scan"
 def _filt(source, days, role, cwd=None, conversation=None):
     w,p=map(list,zip(*pairs)) if (pairs:=[(q,v) for v,q in ((source,"c.source = ?"),(datetime.now()-timedelta(days=days) if days else None,"m.created_at > ?"),(role,"m.role = ?")) if v]) else ([],[])
@@ -1021,10 +1009,11 @@ def _clip(s, n): return (s or "")[:n] + ("..." if s and len(s) > n else "")
 def _lexical_ids(conn,q,w,p,mode,n=50):
     where=f"json_extract_string(m.metadata,'$.history_of') IS NULL AND (m.content IS NOT NULL OR m.thinking IS NOT NULL){_NOISE}{' AND ' + ' AND '.join(w) if w else ''}"
     if mode=="bm25":
-        rows=conn.execute(f"SELECT m.id,fts_main_messages.match_bm25(m.id,?) score FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE {where} AND score IS NOT NULL ORDER BY score DESC LIMIT ?",[q]+p+[n]).fetchall()
-        return rows or _lexical_ids(conn,q,w,p,"scan",n)
+        rows=conn.execute(f"WITH scored AS (SELECT m.id,m.conversation_id,fts_main_messages.match_bm25(m.id,?) score FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE {where}),ranked AS (SELECT *,ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY score DESC,id) pick FROM scored WHERE score IS NOT NULL) SELECT id,score FROM ranked WHERE pick=1 ORDER BY score DESC LIMIT ?",[q]+p+[n]).fetchall()
+        return (rows,"bm25") if rows else _lexical_ids(conn,q,w,p,"scan",n)
     terms=list(dict.fromkeys(re.findall(r"\w+",q.lower())))
-    return conn.execute(f"SELECT m.id,CAST(1 AS DOUBLE) score FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE {where}{''.join(' AND contains(lower(coalesce(m.content,\'\')||\' \'||coalesce(m.thinking,\'\')),?)' for _ in terms)} ORDER BY m.created_at DESC NULLS LAST,m.id LIMIT ?",p+terms+[n]).fetchall() if terms else []
+    contains=" AND contains(lower(coalesce(m.content,'')||' '||coalesce(m.thinking,'')),?)"*len(terms)
+    return (conn.execute(f"SELECT id,score FROM (SELECT m.id,m.conversation_id,CAST(1 AS DOUBLE) score,ROW_NUMBER() OVER (PARTITION BY m.conversation_id ORDER BY m.created_at DESC NULLS LAST,m.id) pick FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE {where}{contains}) WHERE pick=1 ORDER BY id LIMIT ?",p+terms+[n]).fetchall() if terms else []),"scan"
 def _hit_rows(conn,ranked,limit):
     order,scores,rows=(order:={mid:i for i,(mid,_) in enumerate(ranked)}),dict(ranked),conn.execute("SELECT m.id,m.role,m.content,m.thinking,m.created_at,c.title,c.source,c.id,c.cwd FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id IN (SELECT UNNEST(?))",([*order],)).fetchall() if order else []
     seen=set()
@@ -1057,11 +1046,10 @@ def fts():
     typer.echo("FTS index ready")
 
 def search(query: str, source: str|None = typer.Option(None, "-s"), days: int|None = typer.Option(None, "-d"), role: str|None = typer.Option(None, "-r"), cwd: Path|None = typer.Option(None, "--cwd", "-w"), conversation: str|None = typer.Option(None, "--conversation"), thinking: bool = typer.Option(False, "--thinking", "-t"), limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
-    if not (opened:=_fts_ro()): return
-    conn,mode=opened
+    conn,mode=_fts_ro()
     with contextlib.closing(conn):
         w,p=_filt(source,days,role,cwd,conversation)
-        results=_hit_rows(conn,_lexical_ids(conn,query,w,p,mode,max(50,limit*5)),limit)
+        results,mode=(lambda ranked:(_hit_rows(conn,ranked[0],limit),ranked[1]))(_lexical_ids(conn,query,w,p,mode,limit))
     if mode=="scan": typer.echo("FTS index is stale; using a complete lexical scan. Run `convos fts` to restore BM25 ranking.",err=True)
     if fmt!="text": return emit([dict(message_id=mid,role=r,content=_clip(content,context),thinking=_clip(think,context) if thinking and think else None,created_at=ts,score=score,title=title,source=src,conversation_id=cid,cwd=cwd) for score,mid,r,content,think,ts,title,src,cid,cwd in results],fmt)
     if not results: return typer.echo("No results")
@@ -1081,7 +1069,7 @@ def read_cmd(conversation: str, limit: int = typer.Option(20, "-n", min=1), cont
     data = [dict(id=mid, role=role, content=_clip(content, context), thinking=_clip(think, context) if thinking and think else None, created_at=ts) for mid, role, content, think, ts in rows]
     if fmt!="text": return emit(data,fmt)
     typer.echo(f"[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid})")
-    for message in data: typer.echo(f"\n{message['role']} @ {message['created_at'] or '?'}\n{message['content']}{f'''\n[THINKING]\n{message['thinking']}''' if message['thinking'] else ''}")
+    for message in data: typer.echo("\n{} @ {}\n{}{}".format(message["role"],message["created_at"] or "?",message["content"],"\n[THINKING]\n{}".format(message["thinking"]) if message["thinking"] else ""))
     typer.echo(f"\n{len(data)} messages")
 
 def hybrid_hits(q,source=None,days=None,role=None,limit=10,local_only=False,cwd=None,conversation=None,status=None,require_complete=False):
@@ -1089,23 +1077,34 @@ def hybrid_hits(q,source=None,days=None,role=None,limit=10,local_only=False,cwd=
     profile,stored,error=None,None,None
     try: profile=embedding_profile()
     except ValueError as e: error=str(e)
-    if (conn:=_ro()) is None: raise ValueError("Archive retrieval is unavailable")
+    conn=_ro()
     with contextlib.closing(conn):
         stored=(conn.execute("SELECT CAST(profile AS VARCHAR) FROM embedding_state WHERE singleton").fetchone() or [None])[0]
         where=f"FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.content IS NOT NULL AND m.content!='' AND json_extract_string(m.metadata,'$.history_of') IS NULL{_NOISE}{' AND ' + ' AND '.join(w) if w else ''}"
-        eligible=conn.execute(f"SELECT COUNT(*) {where}",p).fetchone()[0]
-        valid=conn.execute(f"SELECT COUNT(*) {where} AND m.embedding IS NOT NULL AND len(m.embedding)=?",p+[profile["dimensions"]]).fetchone()[0] if profile and stored and json.loads(stored)==profile else 0
+        useful=bool(profile and stored and json.loads(stored)==profile and conn.execute(f"SELECT 1 {where} AND m.embedding IS NOT NULL AND len(m.embedding)=? LIMIT 1",p+[profile["dimensions"]]).fetchone())
     qv=None
-    if valid:
+    if useful:
         try: qv=embed_text(q,False,local_only)
         except Exception as e: error=f"Hybrid embedding unavailable: {e}"
-    if not (opened:=_fts_ro()): raise ValueError("Archive retrieval is unavailable")
-    conn,mode=opened
+    conn,mode=_fts_ro()
+    stored=(conn.execute("SELECT CAST(profile AS VARCHAR) FROM embedding_state WHERE singleton").fetchone() or [None])[0]
+    eligible=conn.execute(f"SELECT COUNT(*) {where}",p).fetchone()[0]
+    valid=conn.execute(f"SELECT COUNT(*) {where} AND m.embedding IS NOT NULL AND len(m.embedding)=?",p+[profile["dimensions"]]).fetchone()[0] if profile and stored and json.loads(stored)==profile else 0
+    if valid and qv is None and not error:
+        conn.close()
+        try: qv=embed_text(q,False,local_only)
+        except Exception as e: error=f"Hybrid embedding unavailable: {e}"
+        conn,mode=_fts_ro()
+        stored,eligible=(conn.execute("SELECT CAST(profile AS VARCHAR) FROM embedding_state WHERE singleton").fetchone() or [None])[0],conn.execute(f"SELECT COUNT(*) {where}",p).fetchone()[0]
+        valid=conn.execute(f"SELECT COUNT(*) {where} AND m.embedding IS NOT NULL AND len(m.embedding)=?",p+[profile["dimensions"]]).fetchone()[0] if profile and stored and json.loads(stored)==profile else 0
     with contextlib.closing(conn):
-        lexical=_lexical_ids(conn,q,w,p,mode)
-        vectors=conn.execute(f"SELECT m.id,list_cosine_similarity(m.embedding,?::FLOAT[]) score {where} AND m.embedding IS NOT NULL AND len(m.embedding)=? ORDER BY score DESC LIMIT 50",[qv]+p+[len(qv)]).fetchall() if qv else []
-        scores={mid:sum(1/(60+rank) for ranked in (lexical,vectors) for rank,(candidate,_) in enumerate(ranked,1) if candidate==mid) for mid in {x[0] for ranked in (lexical,vectors) for x in ranked}}
-        rows=_hit_rows(conn,sorted(scores.items(),key=lambda x:-x[1]),limit)
+        lexical,mode=_lexical_ids(conn,q,w,p,mode,limit)
+        vectors=conn.execute(f"WITH scored AS (SELECT m.id,m.conversation_id,list_cosine_similarity(m.embedding,?::FLOAT[]) score {where} AND m.embedding IS NOT NULL AND len(m.embedding)=?),ranked AS (SELECT *,ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY score DESC,id) pick FROM scored) SELECT id,score FROM ranked WHERE pick=1 ORDER BY score DESC LIMIT ?",[qv]+p+[len(qv),limit]).fetchall() if qv and valid else []
+        mids=[x[0] for ranked in (lexical,vectors) for x in ranked]
+        conversations=dict(conn.execute("SELECT id,conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[mids]).fetchall()) if mids else {}
+        scores={cid:sum(1/(60+rank) for ranked in (lexical,vectors) for rank,(mid,_) in enumerate(ranked,1) if conversations[mid]==cid) for cid in set(conversations.values())}
+        ranked=[(min((mid for source in (lexical,vectors) for mid,_ in source if conversations[mid]==cid),key=lambda mid:min(i for source in (lexical,vectors) for i,(candidate,_) in enumerate(source) if candidate==mid)),score) for cid,score in sorted(scores.items(),key=lambda x:-x[1])]
+        rows=_hit_rows(conn,ranked,limit)
     meta=dict(lexical_mode=mode,semantic_eligible=eligible,semantic_valid=valid,semantic_coverage=valid/eligible if eligible else 1.0,semantic_error=error)
     status is not None and status.update(meta)
     if require_complete and (mode!="bm25" or valid<eligible or error): raise ValueError(f"Retrieval is incomplete: lexical={mode}, semantic={valid}/{eligible}")
@@ -1114,8 +1113,8 @@ def query_cmd(q: str, source: str|None = typer.Option(None, "-s"), days: int|Non
     try: rows = hybrid_hits(q,source,days,role,limit,cwd=cwd,conversation=conversation,status=(status:={}),require_complete=require_complete)
     except ValueError as e: raise typer.Exit(typer.echo(str(e),err=True) or 1)
     [typer.echo(message,err=True) for condition,message in ((status["lexical_mode"]=="scan","FTS index is stale; using a complete lexical scan. Run `convos fts` to restore BM25 ranking."),(status["semantic_valid"]<status["semantic_eligible"],f"Semantic coverage is partial ({status['semantic_valid']}/{status['semantic_eligible']}); lexical recall remains complete. Run `convos embed` for full hybrid ranking."),(status["semantic_error"],status["semantic_error"])) if condition]
-    if not rows: return typer.echo("No results")
     if fmt!="text": return emit([{**r,"content":_clip(r["content"],context)} for r in rows],fmt)
+    if not rows: return typer.echo("No results")
     for x in rows: _fmt_hit(x["content"], x["created_at"], x["role"], x["title"], x["source"], x["conversation_id"], x["cwd"], q, context, f"score: {x['score']:.4f}")
     typer.echo(f"\n{len(rows)} results")
 
@@ -1124,7 +1123,7 @@ def embed_cmd(batch: int = typer.Option(32, "-b",min=1),limit: int|None = typer.
     try:
         with _locked(DATA_DIR/".embed.lock"): done=embed_pending(batch,limit=limit)
         typer.echo(f"Processed {done or 0} embedding candidates" if limit else "Embeddings ready")
-    except Exception as e: typer.echo(f"Embedding failed: {e}", err=True)
+    except Exception as e: raise typer.Exit(typer.echo(f"Embedding failed: {e}",err=True) or 1)
 
 def doctor(verbose: bool = typer.Option(False, "-v")):
     typer.echo(f"convos: {version('convos')}")
@@ -1209,6 +1208,7 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: str|None
     typer.echo(f"Exported to {output}")
 
 def backup():
+    if not DB_PATH.exists() or DB_PATH.is_symlink() or not DB_PATH.is_file(): raise typer.Exit(typer.echo("Archive not found; nothing was backed up.",err=True) or 1)
     with _core() as conn: path=_migration_backup(conn,datetime.now(timezone.utc).strftime("manual-%Y%m%dT%H%M%SZ"))
     typer.echo(f"Archive backed up to {path} with attachments at {path}.attachments")
 
