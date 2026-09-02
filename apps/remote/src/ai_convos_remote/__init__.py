@@ -21,16 +21,16 @@ def local_root(root=None): return Path(root or os.environ.get("CONVOS_PROJECT_RO
 def paths(root=None): return (base:=local_root(root)/"remote"),base/"config.json",base/"state.db"
 def core_path(root=None): return local_root(root)/"data"/"convos.db"
 @contextmanager
-def _core(root=None):
-    db=open_db(core_path(root))
+def _core(root=None,read_only=False,*,purpose):
+    db=open_db(core_path(root),read_only,purpose=purpose)
     try:
-        init_schema(db)
+        if not read_only: init_schema(db)
         yield db
     finally: db.close()
 def archive_info(root=None,create=False):
     if not (path:=core_path(root)).exists() and not create: return None
     path.parent.mkdir(parents=True,exist_ok=True)
-    with _core(root) as db: return core_archive_state(db)
+    with _core(root,not create,purpose="remote.archive_info") as db: return core_archive_state(db)
 def load(root=None):
     if not (path:=paths(root)[1]).exists(): raise ValueError("Remote is not configured. Run `convos remote setup`.")
     return json.loads(path.read_text())
@@ -43,7 +43,7 @@ def _provider_alias_value(row):
     return dict(row=body,proof=proof,previous=None,workspace=workspace,author=author)
 def provider_alias_records(root,user,workspace,kind):
     if kind!="personal" or not core_path(root).is_file(): return []
-    with _core(root) as db:
+    with _core(root,True,purpose="remote.provider_alias.read") as db:
         stored=[_provider_alias_value(r) for r in db.execute("SELECT workspace_id,author_user_id,object_id,revision,source,session_id,CAST(members AS VARCHAR),canonical_source_row_id,CAST(proof AS VARCHAR) FROM remote.provider_session_aliases WHERE author_user_id=? ORDER BY object_id,revision",(user,)).fetchall()]
         ancestors=set(db.execute("SELECT workspace_id,author_user_id,object_id,ancestor_revision FROM remote.semantic_ancestors WHERE object_kind='provider.session' AND author_user_id=?",(user,)).fetchall())
         leaves=[value for value in stored if (value["workspace"],value["author"],value["row"]["id"],value["proof"]["revision"]) not in ancestors]
@@ -62,7 +62,7 @@ def provider_alias_accept(root,row,proof,project=True):
     author=proof.get("author_user_id")
     verify_semantic_proof(proof,row,author)
     if set(row)!={"v","kind","id","state","data"} or row["v"]!=1 or row["kind"]!="provider.session" or row["state"]!="active" or set(data)!={"source","session_id","members","canonical"} or not all(isinstance(data[k],str) and data[k] for k in ("source","session_id","canonical")) or not isinstance(members,list) or len(members)<2 or members!=sorted(set(members)) or data["canonical"]!=members[0] or row["id"]!=provider_alias_id(data["source"],data["session_id"]): raise ValueError("Malformed provider session alias")
-    with _core(root) as db:
+    with _core(root,purpose="remote.provider_alias.write") as db:
         project_provider_alias(db,dict(workspace_id=proof["workspace"],author_user_id=author,object_id=row["id"],revision=proof["revision"],source=data["source"],session_id=data["session_id"],members=members,canonical_source_row_id=data["canonical"],proof=proof))
         values=[_provider_alias_value(r) for r in db.execute("SELECT workspace_id,author_user_id,object_id,revision,source,session_id,CAST(members AS VARCHAR),canonical_source_row_id,CAST(proof AS VARCHAR) FROM remote.provider_session_aliases WHERE author_user_id=? AND object_id=?",(author,row["id"])).fetchall()]
         ancestors=set(db.execute("SELECT workspace_id,author_user_id,object_id,ancestor_revision FROM remote.semantic_ancestors WHERE object_kind='provider.session' AND author_user_id=? AND object_id=?",(author,row["id"])).fetchall())
@@ -74,7 +74,7 @@ def _edit_evidence_value(row):
     return dict(row={"v":1,"kind":"file-edit.evidence","id":object_id,"state":"active","data":{"edit":edit,"edit_revision":edit_revision,"status":status,"reason":reason,"tool_call":tool,"tool_revision":tool_revision}},proof=json.loads(proof),previous=None,workspace=workspace,author=author)
 def edit_evidence_records(root,user,workspace,kind):
     if not core_path(root).is_file(): return []
-    with _core(root) as db:
+    with _core(root,True,purpose="remote.edit_evidence.read") as db:
         stored=[_edit_evidence_value(r) for r in db.execute("SELECT workspace_id,author_user_id,object_id,revision,source_edit_id,edit_revision,status,reason,source_tool_call_id,tool_revision,CAST(proof AS VARCHAR) FROM remote.file_edit_evidence_proofs WHERE workspace_id=? ORDER BY author_user_id,object_id,revision",(workspace,)).fetchall()]
         ancestors=set(db.execute("SELECT workspace_id,author_user_id,object_id,ancestor_revision FROM remote.semantic_ancestors WHERE object_kind='file-edit.evidence' AND workspace_id=?",(workspace,)).fetchall())
         leaves=[value for value in stored if (value["workspace"],value["author"],value["row"]["id"],value["proof"]["revision"]) not in ancestors]
@@ -94,7 +94,7 @@ def edit_evidence_accept(root,row,proof,project=True):
     data=row.get("data")
     verify_semantic_proof(proof,row,proof.get("author_user_id"))
     required(set(row)=={"v","kind","id","state","data"} and row["v"]==1 and row["kind"]=="file-edit.evidence" and row["state"]=="active" and isinstance(data,dict) and set(data)=={"edit","edit_revision","status","reason","tool_call","tool_revision"} and row["id"]==edit_evidence_id(data["edit"]) and data["status"] in {"confirmed","invalid","unknown","unverified"} and all(isinstance(data[k],str) and data[k] for k in ("edit","edit_revision","reason")) and ((data["tool_call"] is None and data["tool_revision"] is None) or all(isinstance(data[k],str) and data[k] for k in ("tool_call","tool_revision"))),ValueError("Malformed file edit evidence"))
-    with _core(root) as db:
+    with _core(root,purpose="remote.edit_evidence.write") as db:
         record=dict(workspace_id=proof["workspace"],author_user_id=proof["author_user_id"],object_id=row["id"],revision=proof["revision"],source_edit_id=data["edit"],edit_revision=data["edit_revision"],status=data["status"],reason=data["reason"],source_tool_call_id=data["tool_call"],tool_revision=data["tool_revision"],proof=proof)
         project_file_edit_evidence(db,record)
         count=db.execute("SELECT count(*) FROM remote.file_edit_evidence_proofs p WHERE workspace_id=? AND author_user_id=? AND object_id=? AND NOT EXISTS (SELECT 1 FROM remote.semantic_ancestors a WHERE a.object_kind='file-edit.evidence' AND (a.workspace_id,a.author_user_id,a.object_id,a.ancestor_revision)=(p.workspace_id,p.author_user_id,p.object_id,p.revision))",(proof["workspace"],proof["author_user_id"],row["id"])).fetchone()[0]
@@ -166,7 +166,7 @@ def stage_replicas(root,envelopes,semantic=False):
         raise
     return envelopes
 def validate_replicas(path,generation,prepared):
-    with closing(open_db(path,True)) as core:
+    with closing(open_db(path,True,purpose="remote.publish.validate")) as core:
         required(core.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
         publish_replicas(prepared)
 def upload_replicas(cfg,state,root=None,workspaces=None):
@@ -660,7 +660,7 @@ def pull_origins(cfg,state,root,ws):
             valid[identity]=(item,body,controls,origin)
             invalid.pop(identity,None)
     if invalid: raise ValueError(f"invalid origin bundle: no valid delivery copy for {len(invalid)} object(s)")
-    with _core(root) as core:
+    with _core(root,purpose="remote.origins.write") as core:
         core_committed=False
         core.execute("BEGIN")
         try:
@@ -681,7 +681,7 @@ def local_replica_ids(root,cfg,workspace,kind,epochs):
     found={(fingerprint(key(cfg,workspace,epoch),digest(value["proof"])),epoch) for value in bridge_records(root,cfg,workspace,kind) if value["proof"] for epoch in epochs}
     path=core_path(root)
     if not path.is_file(): return found
-    with closing(open_db(path,True)) as core:
+    with closing(open_db(path,True,purpose="remote.replica.inventory")) as core:
         cursor=core.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs")
         while rows:=cursor.fetchmany(5000): found.update((fingerprint(key(cfg,workspace,epoch),digest({"v":1,"kind":"row.proof",**dict(zip(PROOF_FIELDS,row))})),epoch) for row in rows for epoch in epochs)
     return found
@@ -758,7 +758,7 @@ def pull_blobs(cfg,state,root,ws,recover=None):
             state.commit()
             continue
         if not checked and result["blobs"]:
-            with closing(open_db(core_path(root),True)) as core: hashes=[r[0] for r in core.execute("SELECT content_hash FROM attachment_bodies").fetchall()]
+            with closing(open_db(core_path(root),True,purpose="remote.blob.inventory")) as core: hashes=[r[0] for r in core.execute("SELECT content_hash FROM attachment_bodies").fetchall()]
             epochs={r[1] for r in known}
             known&={(fingerprint(key(cfg,sid,epoch),body_hash),epoch) for body_hash in hashes for epoch in epochs}
             valid=set(known)
@@ -920,7 +920,7 @@ def sync_once(root=None,force=False):
             path,active=core_path(root),authorized
             generation=archive_info(root)[1] if path.is_file() else 0
             if path.is_file():
-                with closing(open_db(path,True)) as core: known=core_repository_state(core)
+                with closing(open_db(path,True,purpose="remote.routes")) as core: known=core_repository_state(core)
             else: known={"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}}
             with local_lock(root,"mutation",True):
                 current=load(root)
@@ -938,7 +938,7 @@ def sync_once(root=None,force=False):
             if scans:
                 routes={ws:sharing_routes(state,ws,cfg["user"],cfg.get("bindings",{}),known) for ws,meta,prior in scans}
                 batches=[]
-                with closing(open_db(path,True)) as core:
+                with closing(open_db(path,True,purpose="remote.scan")) as core:
                     for ws,meta,prior in scans:
                         repos,roots,match=routes[ws]
                         changes=None if prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone() else set(core_archive_changes(core,int(prior[0]))[1])
@@ -991,7 +991,7 @@ def sync_once(root=None,force=False):
         return cutover
 def bind_origin(cfg,state,ws,origin,root=None):
     root=local_root(root)
-    with closing(open_db(core_path(root),True)) as db:
+    with closing(open_db(core_path(root),True,purpose="remote.origin.bind")) as db:
         exists=db.execute("SELECT 1 FROM remote.row_proofs WHERE workspace_id=?",(origin,)).fetchone()
         dependencies={r[0] for r in db.execute("SELECT DISTINCT authorization_workspace_id FROM remote.row_proofs WHERE workspace_id=? AND authorization_workspace_id<>workspace_id",(origin,)).fetchall()}
         controls=stored_controls(core_path(root),{origin}|dependencies)
@@ -1168,7 +1168,7 @@ def refound_cmd(space:str,origin_workspace_id:str):
     typer.echo(f"Bound {count} signed origin controls")
 @remote.command("origins")
 def origins_cmd():
-    with closing(open_db(core_path(),True)) as db: values=[{"workspace":r[0],"rows":r[1]} for r in db.execute("SELECT workspace_id,COUNT(*) FROM remote.row_proofs GROUP BY workspace_id ORDER BY workspace_id").fetchall()]
+    with closing(open_db(core_path(),True,purpose="remote.status")) as db: values=[{"workspace":r[0],"rows":r[1]} for r in db.execute("SELECT workspace_id,COUNT(*) FROM remote.row_proofs GROUP BY workspace_id ORDER BY workspace_id").fetchall()]
     typer.echo(json.dumps(values))
 @remote.command("remove-device")
 @locked

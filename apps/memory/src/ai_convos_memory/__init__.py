@@ -220,7 +220,7 @@ def _archive_evidence(refs, scope):
     try:
         from ai_convos import cli
         cli.drain_hooks()
-        if not (db := cli.get_db(True)): raise ValueError("Conversation archive is unavailable; run convos sync first")
+        if not (db := cli.get_db(True,purpose="memory.context")): raise ValueError("Conversation archive is unavailable; run convos sync first")
         out = []
         for ref in dict.fromkeys(refs):
             rows = db.execute("""SELECT m.id,m.conversation_id,c.source,c.title,m.role,m.created_at,m.content,c.cwd FROM messages m JOIN conversations c ON c.id=m.conversation_id
@@ -644,7 +644,7 @@ def _evidence(db, canonical, digest):
     archive = None
     try:
         from ai_convos import cli
-        if not (archive:=cli.get_db(True)): raise ValueError
+        if not (archive:=cli.get_db(True,purpose="memory.status")): raise ValueError
         live={mid:_hash(body) for mid,body in archive.execute("SELECT id,COALESCE(content,'') FROM messages WHERE id IN (SELECT UNNEST(?)) AND json_extract_string(metadata,'$.history_of') IS NULL",[ [r["message"] for r in rows] ]).fetchall()}
         return [{**r,"status":"verified" if live.get(r["message"]) == r["content_hash"] else "changed" if r["message"] in live else "missing","read":f"convos read {r['conversation']} --around {r['message']}"} for r in rows]
     except Exception: return [{**r,"status":"unavailable","read":f"convos read {r['conversation']} --around {r['message']}"} for r in rows]

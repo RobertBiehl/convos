@@ -49,7 +49,7 @@ def test_trail_text_and_dot_keep_exact_evidence(tmp_path,monkeypatch):
     assert "Semantic trail from message seed0000" in text and "evidence: assistant" in text and "convos read near0000 --around nearmsg0" in text and "canonical..." in text
     assert dot.startswith("digraph trail {") and '"target000" -> "near0000"' in dot and "nearmsg0" in dot
 def test_explore_surfaces_locked_archive_without_traceback(tmp_path,monkeypatch):
-    app=archive(tmp_path,monkeypatch); monkeypatch.setattr(cli,"get_db",lambda read_only=False: (_ for _ in ()).throw(ValueError("Archive is locked.")))
+    app=archive(tmp_path,monkeypatch); monkeypatch.setattr(cli,"get_db",lambda read_only=False,**_: (_ for _ in ()).throw(ValueError("Archive is locked.")))
     for command in ("related","trail"):
         result=CliRunner().invoke(app,[command,"seed0000"]); assert result.exit_code==1 and "Archive is locked." in result.output and "Traceback" not in result.output
 def test_explore_distribution_and_registration():

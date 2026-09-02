@@ -42,7 +42,7 @@ def _relative(path,scope):
     try: return str(Path(path).resolve().relative_to(scope))
     except (OSError,ValueError): return None
 def _db():
-    if (db:=get_db(read_only=True)) is None: raise ValueError("Archive not found")
+    if (db:=get_db(read_only=True,purpose="resume.packet")) is None: raise ValueError("Archive not found")
     return db
 def _turns(raw,quota,context):
     shown,used,redactions=[],0,0
@@ -62,19 +62,19 @@ def packet_data(scope=".",days=None,limit=4,turns=6,context=1200,budget=16000):
         sessions=db.execute(f"""SELECT c.id,c.source,c.title,c.cwd,MAX(m.created_at) last_at FROM conversations c JOIN messages m ON m.conversation_id=c.id
             WHERE (c.cwd=? OR starts_with(c.cwd,?)) AND COALESCE(m.content,'')!='' AND json_extract_string(m.metadata,'$.history_of') IS NULL AND NOT regexp_matches(m.content,?){clause}
             GROUP BY c.id,c.source,c.title,c.cwd ORDER BY last_at DESC NULLS LAST,c.id LIMIT ?""",[params[0],params[1],NOISE,*params[2:]]).fetchall()
-        remaining,evidence,redactions,result=budget,0,0,[]
-        for index,(cid,source,title,cwd,last_at) in enumerate(sessions):
-            turn_clause=" AND created_at>=CURRENT_TIMESTAMP-(?*INTERVAL '1 day')" if days else ""
-            raw=db.execute(f"""SELECT m.id,m.role,m.content,m.created_at FROM messages m WHERE m.conversation_id=? AND COALESCE(m.content,'')!='' AND json_extract_string(m.metadata,'$.history_of') IS NULL AND NOT regexp_matches(m.content,?){turn_clause} ORDER BY {MESSAGE_ORDER_DESC} LIMIT ?""",[cid,NOISE,*([days] if days else []),turns]).fetchall()
-            quota=min(remaining,max(context,remaining//(len(sessions)-index))) if remaining else 0
-            shown,used,n=_turns(raw,quota,context)
-            remaining,evidence,redactions=remaining-used,evidence+used,redactions+n
-            files=[dict(path=relative,edits=count,last_at=at) for path,count,at in db.execute("""SELECT fe.file_path,COUNT(*),MAX(fe.created_at) FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN messages m ON m.id=fe.message_id WHERE m.conversation_id=? GROUP BY fe.file_path ORDER BY MAX(fe.created_at) DESC NULLS LAST,fe.file_path""",[cid]).fetchall() if (relative:=_relative(path,scope)) is not None][:8]
-            tools=[dict(name=name,status=status,created_at=at) for name,status,at in db.execute("""SELECT tc.tool_name,tc.status,tc.created_at FROM tool_calls tc JOIN messages m ON m.id=tc.message_id WHERE m.conversation_id=? ORDER BY tc.created_at DESC NULLS LAST,tc.id DESC LIMIT 5""",[cid]).fetchall()]
-            metadata,n=_safe(dict(source=source,recorded_cwd=cwd,files=files,tools=tools))
-            clean_title,title_redactions=_safe((title or "Untitled").replace("\n"," "))
-            redactions+=n+title_redactions
-            result.append(dict(conversation_id=cid,title=clean_title,last_at=last_at,last_role=raw[0][1] if raw else None,last_message_id=raw[0][0] if raw else None,turns=list(reversed(shown)),read=f"convos read {cid[:8]} --around {raw[0][0][:8]}" if raw else f"convos read {cid[:8]}",**metadata))
+        turn_clause=" AND created_at>=CURRENT_TIMESTAMP-(?*INTERVAL '1 day')" if days else ""
+        snapshots=[(session,db.execute(f"""SELECT m.id,m.role,m.content,m.created_at FROM messages m WHERE m.conversation_id=? AND COALESCE(m.content,'')!='' AND json_extract_string(m.metadata,'$.history_of') IS NULL AND NOT regexp_matches(m.content,?){turn_clause} ORDER BY {MESSAGE_ORDER_DESC} LIMIT ?""",[session[0],NOISE,*([days] if days else []),turns]).fetchall(),db.execute("""SELECT fe.file_path,COUNT(*),MAX(fe.created_at) FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN messages m ON m.id=fe.message_id WHERE m.conversation_id=? GROUP BY fe.file_path ORDER BY MAX(fe.created_at) DESC NULLS LAST,fe.file_path""",[session[0]]).fetchall(),db.execute("""SELECT tc.tool_name,tc.status,tc.created_at FROM tool_calls tc JOIN messages m ON m.id=tc.message_id WHERE m.conversation_id=? ORDER BY tc.created_at DESC NULLS LAST,tc.id DESC LIMIT 5""",[session[0]]).fetchall()) for session in sessions]
+    remaining,evidence,redactions,result=budget,0,0,[]
+    for index,((cid,source,title,cwd,last_at),raw,file_rows,tool_rows) in enumerate(snapshots):
+        quota=min(remaining,max(context,remaining//(len(sessions)-index))) if remaining else 0
+        shown,used,n=_turns(raw,quota,context)
+        remaining,evidence,redactions=remaining-used,evidence+used,redactions+n
+        files=[dict(path=relative,edits=count,last_at=at) for path,count,at in file_rows if (relative:=_relative(path,scope)) is not None][:8]
+        tools=[dict(name=name,status=status,created_at=at) for name,status,at in tool_rows]
+        metadata,n=_safe(dict(source=source,recorded_cwd=cwd,files=files,tools=tools))
+        clean_title,title_redactions=_safe((title or "Untitled").replace("\n"," "))
+        redactions+=n+title_redactions
+        result.append(dict(conversation_id=cid,title=clean_title,last_at=last_at,last_role=raw[0][1] if raw else None,last_message_id=raw[0][0] if raw else None,turns=list(reversed(shown)),read=f"convos read {cid[:8]} --around {raw[0][0][:8]}" if raw else f"convos read {cid[:8]}",**metadata))
     git=git_data(scope)
     redactions+=git.pop("redactions")
     safe_scope,n=_safe(str(scope))
@@ -90,8 +90,7 @@ def replay_data(ref,around="",limit=20,context=2000,activity=100):
         base=f"SELECT m.id,m.role,m.content,m.created_at,ROW_NUMBER() OVER (ORDER BY {MESSAGE_ORDER}) pos FROM messages m WHERE m.conversation_id=? AND json_extract_string(m.metadata,'$.history_of') IS NULL AND COALESCE(m.content,'')!=''"
         if around and len(mids:=db.execute("SELECT id FROM messages WHERE conversation_id=? AND starts_with(id,?) AND json_extract_string(metadata,'$.history_of') IS NULL LIMIT 2",[cid,around]).fetchall())!=1: raise ValueError("Message reference is missing or ambiguous")
         rows=db.execute(f"WITH b AS ({base}),t AS (SELECT pos FROM b WHERE id=?) SELECT id,role,content,created_at FROM (SELECT b.*,abs(b.pos-t.pos) d FROM b,t ORDER BY d,b.pos LIMIT ?) ORDER BY pos",[cid,mids[0][0],limit]).fetchall() if around else db.execute(f"SELECT id,role,content,created_at FROM ({base}) ORDER BY pos DESC LIMIT ?",[cid,limit]).fetchall()[::-1]
-        messages=[dict(id=mid,role=role,content=_clip(content,context),created_at=at) for mid,role,content,at in rows]
-        selected,event_rows=[m["id"] for m in messages],[]
+        selected,event_rows=[r[0] for r in rows],[]
         if selected and activity:
             values=",".join("(?,?)" for _ in selected)
             params=[x for i,mid in enumerate(selected) for x in (mid,i)]+[activity+1]
@@ -99,6 +98,7 @@ def replay_data(ref,around="",limit=20,context=2000,activity=100):
                 SELECT c.pos,'tool' kind,t.id,t.message_id,t.created_at,t.tool_name event_label,t.status,t.duration_ms,CAST(t.input AS VARCHAR) before_text,CAST(t.output AS VARCHAR) after_text,NULL evidence_status FROM tool_calls t JOIN chosen c ON c.id=t.message_id
                 UNION ALL SELECT c.pos,'edit',e.id,e.message_id,e.created_at,e.file_path,e.edit_type,NULL,e.old_content,e.content,COALESCE(v.status,'unverified') evidence_status FROM file_edits e JOIN chosen c ON c.id=e.message_id LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=e.id)
                 SELECT kind,id,message_id,created_at,event_label,status,duration_ms,before_text,after_text,evidence_status FROM events ORDER BY pos,created_at NULLS LAST,id LIMIT ?""",params).fetchall()
+    messages=[dict(id=mid,role=role,content=_clip(content,context),created_at=at) for mid,role,content,at in rows]
     shown=event_rows[:activity]
     events=[(mid,dict(kind=kind,id=eid,message_id=mid,created_at=str(at) if at else None,**(dict(name=label,status=status,duration_ms=duration,input=_clip(str(before),context) if before is not None else None,output=_clip(str(after),context) if after is not None else None) if kind=="tool" else dict(path=label,type=status,evidence_status=evidence_status,before=_clip(str(before),context) if before is not None else None,after=_clip(str(after),context) if after is not None else None)))) for kind,eid,mid,at,label,status,duration,before,after,evidence_status in shown]
     messages=[{**m,"activity":[e for mid,e in events if mid==m["id"]]} for m in messages]

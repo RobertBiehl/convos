@@ -216,7 +216,7 @@ def test_embedding_progress_keeps_stdout_clean(hybrid_db, monkeypatch, capsys):
 
 def test_read_commands_handle_locked_db(monkeypatch):
     """Read commands should print a friendly lock message instead of a traceback."""
-    monkeypatch.setattr(cli, "get_db", lambda read_only=False: (_ for _ in ()).throw(ValueError("Database is locked by another convos process.")))
+    monkeypatch.setattr(cli, "get_db", lambda read_only=False,**_: (_ for _ in ()).throw(ValueError("Database is locked by another convos process.")))
     r = CliRunner().invoke(cli.app, ["search", "x"])
     assert r.exit_code == 1
     assert "locked" in (r.output + (r.stderr if r.stderr_bytes is not None else ""))
