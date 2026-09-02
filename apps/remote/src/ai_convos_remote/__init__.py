@@ -610,8 +610,8 @@ def pull_origins(cfg,state,root,ws):
                 env=item["envelope"]
                 project_workspace_controls(core,controls)
                 state.execute(f"INSERT OR REPLACE INTO {'origin_bindings' if body['rows'] else 'control_dependencies'} VALUES (?,?,?,?,?)",(sid,origin,env["origin"],env["epoch"],item["cursor"]))
-            state.commit()
             core.execute("COMMIT")
+            state.commit()
         except BaseException:
             core.execute("ROLLBACK")
             state.rollback()

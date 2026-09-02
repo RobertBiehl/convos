@@ -397,9 +397,11 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
             return out
         delivery=lambda p:p["authorization_epoch"] if p["authorization_workspace"]==workspace else (origin_epochs or {})[p["workspace"]]
         candidates=[(row,p,content_hash,epoch,fingerprint(keys[epoch],digest(p))) for row,p,content_hash in bodies.values() for epoch in [delivery(p)] if epoch in keys]
+        db.close()
+        db=None
         known=set(inventory([(r[4],r[3]) for r in candidates])) if inventory else set(known)
         return [seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"],content_hash,lineage(p) if p["kind"]=="row.proof" else ()) for row,p,content_hash,epoch,replica in candidates if replica not in known]
-    finally: db.close()
+    finally: db and db.close()
 def _proof(values):
     return {"v":1,"kind":"row.proof",**dict(zip(PROOF_FIELDS,values))}
 def _heads(db,user,ids):

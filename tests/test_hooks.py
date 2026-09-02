@@ -74,16 +74,17 @@ def test_concurrent_sync_exits_immediately_and_explicitly(hooks,capsys):
         assert not (data/"convos.db").exists() and "Sync already running; no work was started" in capsys.readouterr().out
     finally: hold.stdin.write("\n"); hold.stdin.flush(); hold.wait(timeout=5)
 
-def test_retrieval_drains_idempotently_and_preserves_truncated_rewritten_history(hooks):
+def test_explicit_drain_is_idempotent_and_preserves_truncated_rewritten_history(hooks):
     sessions, data = hooks; path = sessions/"s.jsonl"; runner = CliRunner(); transcript(path); enqueue(path)
-    assert json.loads(runner.invoke(cli.app, ["search", "remember alpha", "-f", "json"]).output)[0]["source"] == "codex"
-    transcript(path, assistant="second answer"); enqueue(path); runner.invoke(cli.app, ["search", "second answer", "-f", "json"])
+    assert "Database not found" in runner.invoke(cli.app,["search","remember alpha"]).output and cli.drain_hooks()==1
+    assert json.loads(runner.invoke(cli.app, ["search", "remember alpha", "-f", "json"]).stdout)[0]["source"] == "codex"
+    transcript(path, assistant="second answer"); enqueue(path); assert cli.drain_hooks()==1
     conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2; updated = conn.execute("SELECT updated_at FROM conversations").fetchone()[0]; conn.close()
-    transcript(path); enqueue(path); runner.invoke(cli.app, ["search", "remember alpha"])
+    transcript(path); enqueue(path); assert cli.drain_hooks()==1
     conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2; assert conn.execute("SELECT updated_at FROM conversations").fetchone()[0] == updated; conn.close()
-    transcript(path, user="rewritten alpha"); enqueue(path); runner.invoke(cli.app, ["search", "rewritten alpha"])
+    transcript(path, user="rewritten alpha"); enqueue(path); assert cli.drain_hooks()==1
     conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3; assert conn.execute("SELECT COUNT(*) FROM messages WHERE content IN ('remember alpha','rewritten alpha')").fetchone()[0] == 2; meta = json.loads(conn.execute("SELECT metadata FROM messages WHERE content='remember alpha'").fetchone()[0]); assert meta["history_of"] and meta["superseded_at"]; conn.close()
-    enqueue(path); runner.invoke(cli.app, ["search", "rewritten alpha"]); conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3; conn.close()
+    enqueue(path); assert cli.drain_hooks()==0; conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3; conn.close()
 
 def test_enqueue_during_drain_survives_for_next_worker(hooks, monkeypatch):
     sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); original, raced = cli.upsert, {"done":False}
@@ -107,32 +108,30 @@ def test_stable_metadata_only_session_completes_until_changed(hooks):
     assert cli.drain_hooks() == 1 and not list((data/"hook_inbox").glob("*.json"))
     state = json.loads((data/"hook_state.json").read_text()); assert len(state) == 1 and next(iter(state.values())) == [path.stat().st_mtime_ns, path.stat().st_size]
 
-def test_orphaned_claim_forces_reindex_after_committed_upsert(hooks):
+def test_orphaned_claim_leaves_authoritative_fts_state_stale(hooks):
     sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); q = next((data/"hook_inbox").glob("*.json")); work = q.with_suffix(".work"); q.replace(work)
     conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); cli.upsert(conn, cli.hook_result("codex", path)); conn.close()
     assert cli.drain_hooks() == 1
-    assert (data/"hook_fts_dirty").exists(); assert cli.flush_fts()
-    conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()[0] == 1; conn.close()
+    conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT fts_generation IS NULL OR messages_generation<>fts_generation FROM retrieval_state").fetchone()[0]; conn.close()
 
-def test_hook_defers_fts_until_fresh_search(hooks):
+def test_hook_defers_fts_and_search_does_not_rebuild(hooks):
     sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); assert cli.drain_hooks() == 1
-    conn = duckdb.connect(str(data/"convos.db")); assert not conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone(); conn.close(); assert (data/"hook_fts_dirty").exists()
-    hits = json.loads(CliRunner().invoke(cli.app, ["search", "remember alpha", "-f", "json"]).output)
-    assert hits[0]["content"] == "remember alpha" and not (data/"hook_fts_dirty").exists()
+    conn = duckdb.connect(str(data/"convos.db")); assert not conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone(); conn.close()
+    result=CliRunner().invoke(cli.app,["search","remember alpha","-f","json"]); hits=json.loads(result.stdout)
+    assert hits[0]["content"]=="remember alpha" and "complete lexical scan" in result.stderr
+    conn=duckdb.connect(str(data/"convos.db")); assert not conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone(); conn.close()
 
-def test_search_uses_last_fts_snapshot_when_refresh_is_locked(hooks):
-    sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); runner = CliRunner(); assert json.loads(runner.invoke(cli.app,["search","remember alpha","-f","json"]).output)
+def test_search_scans_stale_archive_while_external_reader_is_open(hooks):
+    sessions,data=hooks; path=sessions/"s.jsonl"; transcript(path); enqueue(path); assert cli.drain_hooks()==1; runner=CliRunner()
     hold=POPEN([sys.executable,"-c","import duckdb,sys; c=duckdb.connect(sys.argv[1],read_only=True); print('ready',flush=True); sys.stdin.read()",str(data/"convos.db")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
-    try: assert hold.stdout.readline().strip()=="ready"; (data/"hook_fts_dirty").touch(); result=runner.invoke(cli.app,["search","remember alpha","-f","json"])
+    try: assert hold.stdout.readline().strip()=="ready"; result=runner.invoke(cli.app,["search","remember alpha","-f","json"])
     finally: hold.stdin.close(); hold.wait(timeout=5)
-    assert result.exit_code == 0 and json.loads(result.stdout)[0]["content"] == "remember alpha" and "using last indexed snapshot" in result.stderr and (data/"hook_fts_dirty").exists()
+    assert result.exit_code==0 and json.loads(result.stdout)[0]["content"]=="remember alpha" and "complete lexical scan" in result.stderr
 
 def test_core_connections_share_process_lock(hooks):
     _,data=hooks; data.mkdir(); db=duckdb.connect(str(data/"convos.db")); cli.init_schema(db); db.close(); env={**os.environ,"CONVOS_PROJECT_ROOT":str(data.parent)}; hold=POPEN([sys.executable,"-c","from ai_convos.cli import get_db; c=get_db(); print('ready',flush=True); input(); c.close()"],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); done=threading.Event()
     try:
-        assert hold.stdout.readline().strip()=="ready"; (data/"hook_fts_dirty").touch(); started=time.monotonic()
-        with pytest.raises(ValueError,match="0 seconds"): cli.flush_fts()
-        assert time.monotonic()-started<.5 and (data/"hook_fts_dirty").exists(); started=time.monotonic()
+        assert hold.stdout.readline().strip()=="ready"; started=time.monotonic()
         with pytest.raises(ValueError,match="0.05 seconds"): cli.get_db(True,wait=.05)
         assert time.monotonic()-started<.5; waiter=threading.Thread(target=lambda:(cli.get_db(True).close(),done.set())); waiter.start(); assert not done.wait(.1); hold.stdin.write("\n"); hold.stdin.flush(); assert done.wait(5); waiter.join()
     finally: hold.stdin.close(); hold.wait(timeout=5)
@@ -141,10 +140,10 @@ def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
     _, data = hooks; src = tmp_path/"import.json"; src.write_text("[]"); monkeypatch.setenv("CONVOS_IMPORT_PATHS", str(src)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json")
     result = cli.ParseResult(convs=[dict(id="sync-c", source="chatgpt", title="T", created_at=None, updated_at=None, model=None, cwd=None, git_branch=None, project_id=None, metadata="{}")], msgs=[dict(id="sync-m", conversation_id="sync-c", role="user", content="alpha", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None)])
     monkeypatch.setattr(cli, "parse_source", lambda _: result); monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: []); monkeypatch.setattr(cli, "get_cookies", lambda *_: {})
-    fail = lambda *_: (_ for _ in ()).throw(AssertionError("foreground consolidation")); monkeypatch.setattr(cli, "flush_fts", fail); monkeypatch.setattr(cli, "embed_hook_pending", fail); old = signal.getsignal(signal.SIGINT)
+    fail = lambda *_: (_ for _ in ()).throw(AssertionError("foreground consolidation")); monkeypatch.setattr(cli, "rebuild_fts_index", fail); monkeypatch.setattr(cli, "embed_pending", fail); old = signal.getsignal(signal.SIGINT)
     try: cli.sync(False, 300, False, False, False, False); assert signal.getsignal(signal.SIGINT) == old
     finally: signal.signal(signal.SIGINT, old)
-    assert (data/"hook_fts_dirty").exists() and json.loads((data/"hook_embeddings_dirty").read_text()) == ["sync-m"]
+    conn=duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT fts_generation IS NULL OR messages_generation<>fts_generation FROM retrieval_state").fetchone()[0] and conn.execute("SELECT embedding IS NULL FROM messages WHERE id='sync-m'").fetchone()[0]; conn.close()
 
 def test_sync_targets_provenance_but_full_reconciles_all(hooks, monkeypatch):
     _,data=hooks; monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); calls=[]; monkeypatch.setattr(cli,"capture_provenance",lambda *a,**k:calls.append((a,k)) or [])
@@ -211,7 +210,7 @@ def test_sync_checkpoints_chatgpt_pages_and_retries_only_unfinished(hooks, monke
         when = next(x["update_time"] for x in items if x["id"]==name)
         return {"mapping":{"m":{"parent":None,"message":{"author":{"role":"user"},"content":{"parts":[name]},"create_time":when}}}}
     monkeypatch.setattr(cli,"fetch_json",fetch); cli.sync(False,300,False,False,False,False)
-    conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert {r[0] for r in conn.execute("SELECT content FROM messages").fetchall()}=={f"ok{i}" for i in range(20)}; conn.close(); assert json.loads(cli.STATE_PATH.read_text())["web"]["chatgpt"]==old and (data/"hook_fts_dirty").exists() and len(json.loads((data/"hook_embeddings_dirty").read_text()))==20
+    conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert {r[0] for r in conn.execute("SELECT content FROM messages").fetchall()}=={f"ok{i}" for i in range(20)} and conn.execute("SELECT fts_generation IS NULL OR messages_generation<>fts_generation FROM retrieval_state").fetchone()[0]; conn.close(); assert json.loads(cli.STATE_PATH.read_text())["web"]["chatgpt"]==old
     fail["bad"] = False; cli.sync(False,300,False,False,False,False); conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert {r[0] for r in conn.execute("SELECT content FROM messages").fetchall()}=={*(f"ok{i}" for i in range(20)),"bad"}; conn.close()
     saved = json.loads(cli.STATE_PATH.read_text())["web"]["chatgpt"]
     assert details==[*(f"ok{i}" for i in range(20)),"bad","bad"] and saved["frontiers"]=={"default":{"account":"acct","updated":300,"id":"ok0"}} and len(saved["coverage"])==21 and cid0 in saved["coverage"]
@@ -242,7 +241,7 @@ def test_sync_rolls_back_interrupted_chatgpt_checkpoint(hooks, monkeypatch):
     def interrupted(conn,r): real(conn,r); raise RuntimeError("mid-upsert")
     monkeypatch.setattr(cli,"upsert",interrupted)
     cli.sync(False,300,False,False,False,False)
-    conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==0 and conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==0; conn.close(); assert json.loads(cli.STATE_PATH.read_text())["web"]["chatgpt"]==old and (data/"hook_fts_dirty").exists() and json.loads((data/"hook_embeddings_dirty").read_text())==[mid]
+    conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==0 and conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==0; conn.close(); assert json.loads(cli.STATE_PATH.read_text())["web"]["chatgpt"]==old
     monkeypatch.setattr(cli,"upsert",real); cli.sync(False,300,False,False,False,False); conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert conn.execute("SELECT content FROM messages").fetchall()==[("atomic",)]; conn.close()
 
 def test_sync_sigint_exits_during_blocked_source(tmp_path):
@@ -271,39 +270,14 @@ cli.parse_source=parsed; cli.upsert=upsert; sys.argv[1:]=["sync"]; cli.sync(Fals
         except subprocess.TimeoutExpired: p.kill(); p.wait(); pytest.fail("sync ignored Ctrl-C for more than 2 seconds")
         assert p.returncode == -signal.SIGINT and json.loads((root/"data/sync_state.json").read_text()) == {"sentinel":1}
         assert subprocess.run([sys.executable, "-c", code], env={**env, "BLOCK":"0"}, capture_output=True).returncode == 0
-        state = json.loads((root/"data/sync_state.json").read_text()); assert len(state["imports"]) == 2 and (root/"data/hook_fts_dirty").exists() and json.loads((root/"data/hook_embeddings_dirty").read_text()) == ["m"]
+        state = json.loads((root/"data/sync_state.json").read_text()); assert len(state["imports"]) == 2
     finally:
         if p.poll() is None: p.kill(); p.wait()
 
-def test_fts_claim_preserves_new_work(hooks, monkeypatch):
-    _, data = hooks; (data/"hook_inbox").mkdir(parents=True); (data/"hook_fts_dirty").touch(); conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); conn.close()
-    monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: (data/"hook_fts_dirty").touch()); assert cli.flush_fts()
-    assert (data/"hook_fts_dirty").exists() and not list(data.glob(".hook_fts_dirty.*"))
-
-@pytest.mark.parametrize("error", [RuntimeError("index failed"), KeyboardInterrupt()])
-def test_failed_fts_claim_is_restored(hooks, monkeypatch, error):
-    _, data = hooks; (data/"hook_inbox").mkdir(parents=True); (data/"hook_fts_dirty").touch()
-    monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: (_ for _ in ()).throw(error))
-    with pytest.raises(type(error)): cli.flush_fts()
-    assert (data/"hook_fts_dirty").exists() and not list(data.glob(".hook_fts_dirty.*"))
-
-def test_orphaned_fts_claim_is_retried(hooks, monkeypatch):
-    _, data = hooks; (data/"hook_inbox").mkdir(parents=True); (data/".hook_fts_dirty.dead").touch(); seen = []
-    monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: seen.append(True)); assert cli.flush_fts()
-    assert seen == [True] and not (data/"hook_fts_dirty").exists() and not list(data.glob(".hook_fts_dirty.*"))
-
-def test_embedding_claim_is_scoped_and_preserves_new_work(hooks, monkeypatch):
-    _, data = hooks; (data/"hook_inbox").mkdir(parents=True); cli.atomic_json(data/"hook_embeddings_dirty", ["old"]); seen = {}
-    def embed(batch, ids, local_only): seen.update(batch=batch, ids=ids, local_only=local_only); cli.atomic_json(data/"hook_embeddings_dirty", ["new"])
-    monkeypatch.setattr(cli, "embed_pending", embed); cli.embed_hook_pending(local_only=True)
-    assert seen == {"batch":32, "ids":["old"], "local_only":True} and json.loads((data/"hook_embeddings_dirty").read_text()) == ["new"]
-
-@pytest.mark.parametrize("error", [RuntimeError("model failed"), KeyboardInterrupt()])
-def test_failed_embedding_restores_claimed_ids(hooks, monkeypatch, error):
-    _, data = hooks; (data/"hook_inbox").mkdir(parents=True); cli.atomic_json(data/"hook_embeddings_dirty", ["old"])
-    monkeypatch.setattr(cli, "embed_pending", lambda *_: (_ for _ in ()).throw(error))
-    with pytest.raises(type(error)): cli.embed_hook_pending()
-    assert json.loads((data/"hook_embeddings_dirty").read_text()) == ["old"]
+def test_explicit_fts_rebuild_makes_generation_current_and_clears_legacy_hint(hooks):
+    _,data=hooks; data.mkdir(); conn=duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); conn.execute("INSERT INTO conversations(id,source) VALUES ('c','test')"); conn.execute("INSERT INTO messages(id,conversation_id,role,content) VALUES ('m','c','user','needle')"); cli._archive_touch(conn,[("messages","m")]); conn.close(); (data/"hook_fts_dirty").touch()
+    result=CliRunner().invoke(cli.app,["fts"]); assert result.exit_code==0 and not (data/"hook_fts_dirty").exists()
+    conn=duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT messages_generation=fts_generation FROM retrieval_state").fetchone()[0]; conn.close()
 
 def test_init_sets_up_core_and_installed_products(hooks, monkeypatch):
     called = []; monkeypatch.setattr(cli, "sync", lambda *args: called.append(("sync",args))); monkeypatch.setattr(cli, "install_skills", lambda: called.append("skills")); monkeypatch.setattr(cli, "install_hooks", lambda remove,status: called.append(("hooks",remove,status))); monkeypatch.setattr(cli, "entry_points", lambda group: [type("EP",(),{"load":lambda self:lambda: called.append("product") or "Product ready"})()] if group == "convos.init" else [])
@@ -335,8 +309,8 @@ def test_doctor_reports_archive_ingest_and_hook_health(hooks, monkeypatch):
     conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); conn.execute("INSERT INTO conversations VALUES ('c','codex','T',NULL,'2026-01-01',NULL,NULL,NULL,NULL,NULL)"); conn.execute("INSERT INTO messages VALUES ('m','c','user','hello',NULL,NULL,NULL,NULL,NULL,NULL),('noise','c','user','# AGENTS.md instructions for /repo',NULL,NULL,NULL,NULL,NULL,NULL)"); cli.rebuild_fts_index(conn); conn.close()
     cli.atomic_json(data/"hook_state.json", {"x":[1767225600000000000,1]}); cli.atomic_json(data/"hook_embeddings_dirty", ["m"]); cli.atomic_json(data/"hook_inbox/q.json", {"source":"codex"})
     r = CliRunner().invoke(cli.app, ["doctor"]); assert r.exit_code == 0
-    assert "convos:" in r.output and "archive: 1 convs, 2 msgs, 1 unembedded" in r.output and "schema=ready, fts=yes" in r.output and "repair: convos embed" in r.output
-    assert "ingest: pending=1, embedding_ids=1, embedding_claims=0, last=2026-01-01" in r.output and "skills: 0/2 current" in r.output and "repair: convos install-skills" in r.output and "codex: 0 hooks" in r.output and "repair: convos install-hooks" in r.output
+    assert "convos:" in r.output and "archive: 1 convs, 2 msgs, 1 unembedded" in r.output and "schema=ready, fts=current" in r.output and "repair: convos embed" in r.output
+    assert "ingest: pending=1, last=2026-01-01" in r.output and "skills: 0/2 current" in r.output and "repair: convos install-skills" in r.output and "codex: 0 hooks" in r.output and "repair: convos install-hooks" in r.output
 
 def test_doctor_detects_current_stale_and_symlinked_skills(hooks, tmp_path, monkeypatch):
     _, data = hooks; codex,claude=Path(os.environ["CODEX_HOME"]),tmp_path/"claude"; claude.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(claude)); monkeypatch.setattr(cli,"entry_points",lambda **_:[]); monkeypatch.setattr(cli,"safari_cookie_domains",lambda:[]); monkeypatch.setattr(cli,"chrome_cookie_domains",lambda:[]); runner=CliRunner()
@@ -349,7 +323,7 @@ def test_doctor_surfaces_schema_skew(hooks, monkeypatch):
     _, data = hooks; data.mkdir(); monkeypatch.setattr(cli, "safari_cookie_domains", lambda: []); monkeypatch.setattr(cli, "chrome_cookie_domains", lambda: [])
     conn = duckdb.connect(str(data/"convos.db")); conn.execute("CREATE TABLE messages (id VARCHAR, content VARCHAR)"); conn.close()
     r = CliRunner().invoke(cli.app, ["doctor"]); assert r.exit_code == 0
-    assert "schema=missing:" in r.output and "messages.embedding" in r.output and "fts=no" in r.output and "repair: convos init" in r.output
+    assert "schema=missing:" in r.output and "messages.embedding" in r.output and "fts=missing" in r.output and "repair: convos init" in r.output
 
 def test_hook_rejects_paths_outside_provider_root(hooks):
     _, data = hooks; data.mkdir(); path = data/"outside.jsonl"; transcript(path)

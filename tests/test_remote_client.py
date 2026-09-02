@@ -252,6 +252,20 @@ def test_later_uploader_copy_heals_poisoned_blob_across_pages(tmp_path,monkeypat
 def test_later_uploader_copy_heals_poisoned_origin_bundle(tmp_path,monkeypatch):
     old=server_connect(tmp_path/"old.db"); monkeypatch.setattr("ai_convos_remote.request",transport(old)); a,b,c=tmp_path/"alice",tmp_path/"bob",tmp_path/"carol"; alice,_=setup_client("http://old","alice",root=a); setup_client("http://old","bob",root=b); origin=create(alice,"Origin","team",a); add_member(alice,origin,"bob",root=a); replicate_conversation(a,origin); pull(load(b),connect(b/"remote/state.db"),b)
     fresh=server_connect(tmp_path/"fresh.db"); direct=transport(fresh); monkeypatch.setattr("ai_convos_remote.request",direct); bob,_=rehome_client(load(b),"http://fresh",b); setup_client("http://fresh","carol",root=c); replacement=create(bob,"Replacement","team",b); add_member(bob,replacement,"carol",root=b); bob=load(b); state=connect(b/"remote/state.db"); bind_origin(bob,state,replacement,origin,b); state.close(); carol=load(c); server_state=refresh(carol,c); raw=fresh.execute("SELECT envelope FROM origin_bundles").fetchone()[0]; original=json.loads(raw); body=open_origin(original,key(carol,replacement,original["epoch"])); repaired=seal_origin(body["controls"],replacement,original["epoch"],key(carol,replacement,original["epoch"]),carol["device"]["id"],body["rows"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; fresh.execute("UPDATE origin_bundles SET envelope=?",(json.dumps(original),)); fresh.commit(); action(fresh,{"op":"origin_upload","envelope":repaired},carol["token"]); state=connect(c/"remote/state.db"); ws=next(w for w in server_state["workspaces"] if w["id"]==replacement)
+    real_core=remote_client._core
+    @__import__("contextlib").contextmanager
+    def broken(root):
+        with real_core(root) as db:
+            class Proxy:
+                def __getattr__(self,name): return getattr(db,name)
+                def execute(self,sql,*args):
+                    if sql=="COMMIT": raise RuntimeError("commit failed")
+                    return db.execute(sql,*args)
+            yield Proxy()
+    monkeypatch.setattr(remote_client,"_core",broken)
+    with pytest.raises(RuntimeError,match="commit failed"): pull_origins(carol,state,c,ws)
+    assert not state.execute("SELECT 1 FROM origin_bindings WHERE workspace=?",(replacement,)).fetchone()
+    monkeypatch.setattr(remote_client,"_core",real_core)
     assert pull_origins(carol,state,c,ws)=={origin} and state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(replacement,)).fetchone()[0]==origin; state.close()
 
 
