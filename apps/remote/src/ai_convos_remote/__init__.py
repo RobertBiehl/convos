@@ -1,5 +1,5 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
-import fcntl, json, os, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
+import fcntl, hashlib, json, os, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
 from contextlib import closing, contextmanager
 from functools import wraps
 from pathlib import Path
@@ -16,7 +16,7 @@ from .protocol import (b64, certificate, digest, event, fingerprint, identity, o
                        recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
 
-remote=typer.Typer(help="End-to-end encrypted personal and team synchronization")
+remote,REPLICA_BATCH_BYTES,REPLICA_ITEM_BYTES=typer.Typer(help="End-to-end encrypted personal and team synchronization"),4*1024**2,48*1024**2
 def local_root(root=None): return Path(root or os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT))
 def paths(root=None): return (base:=local_root(root)/"remote"),base/"config.json",base/"state.db"
 def core_path(root=None): return local_root(root)/"data"/"convos.db"
@@ -143,17 +143,16 @@ def encrypted_file(root,event,value):
     durable_replace(tmp,path)
     return path,len(raw)
 def replica_file(root,envelopes,semantic): return paths(root)[0]/"outbox"/("replica-batch-"+digest(([(env["workspace"],env["replica"]) for env in envelopes],semantic))+".json")
-def prepare_replicas(root,envelopes,semantic=False):
-    if not envelopes: return []
-    required(len({env["workspace"] for env in envelopes})==1,ValueError("replica batch must contain one workspace"))
-    final=replica_file(root,envelopes,semantic)
-    final.parent.mkdir(parents=True,exist_ok=True)
+def _prepare_replica(root,envelopes,semantic):
+    (final:=replica_file(root,envelopes,semantic)).parent.mkdir(parents=True,exist_ok=True)
     required(not final.parent.is_symlink() and not final.is_symlink(),ValueError("encrypted outbox path must not be a symlink"))
-    raw=json.dumps({"semantic":semantic,"envelopes":envelopes},separators=(",",":")).encode()
-    tmp=final.with_name(f".{final.name}.{os.getpid()}.{time.time_ns()}")
+    raw,tmp=json.dumps({"semantic":semantic,"envelopes":envelopes},separators=(",",":")).encode(),final.with_name(f".{final.name}.{os.getpid()}.{time.time_ns()}")
     with tmp.open("xb") as handle: (handle.write(raw),handle.flush(),os.fsync(handle.fileno()))
-    os.chmod(tmp,0o600)
-    return [(tmp,final)]
+    return (os.chmod(tmp,0o600),(tmp,final))[1]
+def _replica_size(env): return len(json.dumps(env,separators=(",",":")).encode())+1
+def prepare_replicas(root,envelopes,semantic=False):
+    required(not envelopes or len({env["workspace"] for env in envelopes})==1,ValueError("replica batch must contain one workspace"))
+    return [] if not envelopes else [_prepare_replica(root,batch,semantic) for batch in _upload_batches(envelopes,REPLICA_BATCH_BYTES-256,_replica_size,REPLICA_ITEM_BYTES)]
 def publish_replicas(prepared):
     [durable_replace(tmp,final) for tmp,final in prepared]
 def discard_replicas(prepared):
@@ -169,18 +168,50 @@ def validate_replicas(path,generation,prepared):
     with closing(open_db(path,True,purpose="remote.publish.validate")) as core:
         required(core.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
         publish_replicas(prepared)
+def _replica_values(path):
+    if not path.name.startswith("replica-batch-"):
+        yield (value:=json.loads(path.read_text()))["semantic"],value["envelope"]
+        return
+    decoder,marker,buf=json.JSONDecoder(),'"envelopes":[',""
+    with path.open() as handle:
+        while marker not in buf:
+            buf+=required(handle.read(1024**2),ValueError("invalid encrypted replica outbox"))
+        prefix,buf=buf.split(marker,1)
+        required(set(header:=json.loads(prefix[:-1]+"}"))=={"semantic"} and isinstance(header["semantic"],bool),ValueError("invalid encrypted replica outbox"))
+        while True:
+            buf=buf.lstrip()
+            if buf.startswith("]}"):
+                return required(not (buf[2:]+handle.read()).strip(),ValueError("invalid encrypted replica outbox"))
+            if buf.startswith(","): buf=buf[1:].lstrip()
+            try: env,end=decoder.raw_decode(buf)
+            except json.JSONDecodeError:
+                required(chunk:=handle.read(1024**2),ValueError("invalid encrypted replica outbox"))
+                buf+=chunk
+                continue
+            yield header["semantic"],env
+            buf=buf[end:]
+def _replica_meta(root,path):
+    batch,h,ws,semantic,count,last=required(not path.is_symlink(),ValueError("invalid encrypted replica outbox")) and path.name.startswith("replica-batch-"),hashlib.sha256(b"[["),None,None,0,None
+    for sem,env in _replica_values(path):
+        (required(isinstance(env,dict) and isinstance(env["workspace"],str) and isinstance(env["replica"],str) and (semantic is None or semantic==sem) and (ws is None or ws==env["workspace"]),ValueError("invalid encrypted replica outbox")),h.update((b"," if count else b"")+json.dumps([env["workspace"],env["replica"]],separators=(",",":")).encode()))
+        ws,semantic,count,last=env["workspace"],sem,count+1,env
+    h.update(b"],"+(b"true" if semantic else b"false")+b"]")
+    required(count and (batch or count==1) and path==paths(root)[0]/"outbox"/(f"replica-batch-{h.hexdigest()}.json" if batch else "replica-"+digest((last["workspace"],last["replica"],semantic))+".json"),ValueError("invalid encrypted replica outbox"))
+    return ws,semantic,count
+def _replica_files(root):
+    outbox=paths(root)[0]/"outbox"
+    for path in sorted(outbox.glob("replica-*.json")):
+        ws,semantic,count=_replica_meta(root,path)
+        if path.stat().st_size>REPLICA_BATCH_BYTES and count>1:
+            typer.echo(f"  remote recovering {path.stat().st_size/1024**3:.1f} GiB legacy outbox")
+            for batch in _upload_batches((env for sem,env in _replica_values(path)),REPLICA_BATCH_BYTES-256,_replica_size,REPLICA_ITEM_BYTES): yield (stage_replicas(root,batch,semantic) and replica_file(root,batch,semantic)),ws,semantic,len(batch)
+            path.unlink()
+        else: yield path,ws,semantic,count
 def upload_replicas(cfg,state,root=None,workspaces=None):
-    groups,selected={},set()
-    for path in (paths(root)[0]/"outbox").glob("replica-*.json"):
-        value=json.loads(path.read_text())
-        envs,semantic=(value["envelopes"] if "envelopes" in value else [value["envelope"]]),value["semantic"]
-        expected=replica_file(root,envs,semantic) if "envelopes" in value else paths(root)[0]/"outbox"/("replica-"+digest((envs[0]["workspace"],envs[0]["replica"],semantic))+".json")
-        required(path==expected and not path.is_symlink() and isinstance(semantic,bool) and envs and len({env["workspace"] for env in envs})==1,ValueError("invalid encrypted replica outbox"))
-        if workspaces is None or envs[0]["workspace"] in workspaces:
-            selected.add(path)
-            for env in envs: groups.setdefault((env["workspace"],semantic),[]).append(env)
-    for (ws,semantic),items in groups.items():
-        for page in _upload_batches(items,48*1024**2,lambda env:len(json.dumps(env,separators=(",",":")).encode())):
+    total,done=(sum(row[3] for row in selected),0) if (selected:=[row for row in {row[0]:row for row in _replica_files(root)}.values() if workspaces is None or row[1] in workspaces]) else (0,0)
+    if total>=500: typer.echo(f"  remote replicas 0/{total}")
+    for path,ws,semantic,count in selected:
+        for page in _upload_batches((env for sem,env in _replica_values(path)),REPLICA_BATCH_BYTES-256,_replica_size,REPLICA_ITEM_BYTES):
             ids=[env["replica"] for env in page]
             present=request(cfg,{"op":"replica_reconcile","workspace":ws,"replicas":ids,"semantic":semantic})["present"]
             required(isinstance(present,dict) and set(present)<=set(ids) and all(isinstance(v,int) and not isinstance(v,bool) and v>0 for v in present.values()),ValueError("relay replica inventory mismatch"))
@@ -190,7 +221,8 @@ def upload_replicas(cfg,state,root=None,workspaces=None):
             cursors={**present,**{env["replica"]:ack["cursor"] for env,ack in zip(missing,uploaded)}}
             state.executemany("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",[(ws,env["replica"],env["epoch"],cursors[env["replica"]]) for env in page])
             state.commit()
-    for path in selected: path.unlink(missing_ok=True)
+        before,done=(path.unlink(missing_ok=True) or done),done+count
+        if total>=500 and (done==total or done//5000!=before//5000): typer.echo(f"  remote replicas {done}/{total}")
 def receipt(state,ws,value,cursor,epoch): state.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],cursor,value["author"],value["seq"],epoch,value["kind"],value["payload_v"],value["entity"],value["revision"],value["payload"].get("status") if isinstance(value["payload"],dict) and value["payload"].get("status") in ("active","deleted") else None))
 def safe_url(url):
     parsed=urllib.parse.urlparse(url)
@@ -199,9 +231,10 @@ def request(cfg,body,auth=True):
     safe_url(cfg["url"])
     headers={"Content-Type":"application/json"}
     if auth: headers["Authorization"]="Bearer "+cfg["token"]
-    req=urllib.request.Request(cfg["url"].rstrip("/")+"/v1",data=json.dumps(body).encode(),headers=headers,method="POST")
-    try: return json.loads(urllib.request.urlopen(req,timeout=10).read())
+    req=urllib.request.Request(cfg["url"].rstrip("/")+"/v1",data=json.dumps(body,separators=(",",":")).encode(),headers=headers,method="POST")
+    try: return json.loads(urllib.request.urlopen(req,timeout=(timeout:=120 if body["op"] in {"upload_many","replica_upload_many","blob_upload","origin_upload"} else 30)).read())
     except urllib.error.HTTPError as e: raise ValueError(json.loads(e.read())["error"]) from e
+    except (urllib.error.URLError,TimeoutError) as e: raise ConnectionError(f"Remote {body['op']} failed (socket timeout {timeout}s): {e}") from e
 def health(cfg):
     safe_url(cfg["url"])
     result=json.loads(urllib.request.urlopen(cfg["url"].rstrip("/")+"/v1/health",timeout=3).read())
@@ -560,13 +593,16 @@ def control_event(cfg,ws,action,target,root=None):
         value=cfg["controls"][ws]
         publish(cfg,state,ws,{"kind":"workspace.device","entity":f"device:{target}:{value['revision']}","payload":{"action":action,"device":target,"revision":value["revision"],"state":state_hash(value)}},root)
         upload(cfg,state,root)
-def _upload_batches(rows,limit=8*1024*1024,measure=lambda row:row["size"]):
+def _upload_batches(rows,limit=8*1024*1024,measure=lambda row:row["size"],maximum=None):
     batch,size=[],0
     for row in rows:
-        if (amount:=measure(row))>limit: raise ValueError("encrypted upload item exceeds byte limit")
+        if (amount:=measure(row))>(maximum or limit): raise ValueError("encrypted upload item exceeds byte limit")
         if batch and (len(batch)==500 or size+amount>limit):
             yield batch
             batch,size=[],0
+        if amount>limit:
+            yield [row]
+            continue
         batch.append(row)
         size+=amount
     if batch: yield batch
@@ -953,8 +989,7 @@ def sync_once(root=None,force=False):
                     attest_rows(path,cfg,ws,records,origins,generation)
                     keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}
                     known_replicas=set() if repair else {r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
-                    envelopes=[env for i in range(0,max(len(records),1),5000) for env in row_replicas(path,cfg,ws,records[i:i+5000],keys,known_replicas,origins,bindings,retained=repair and i==0,generation=generation)]
-                    prepared=prepare_replicas(root,envelopes)
+                    prepared=[pair for i in range(0,max(len(records),1),500) for pair in prepare_replicas(root,row_replicas(path,cfg,ws,records[i:i+500],keys,known_replicas,origins,bindings,retained=repair and i==0,generation=generation))]
                     try:
                         with local_lock(root,"mutation",True):
                             current=load(root)
@@ -1234,7 +1269,8 @@ def config_cmd(space:str,auto_contribute:Optional[bool]=typer.Option(None,"--aut
     typer.echo(json.dumps({k:result[k] for k in ("auto_contribute","effective_auto_contribute","match","conflict")}))
 @remote.command("sync")
 def sync_cmd():
-    result=sync_once(force=True)
+    try: result=sync_once(force=True)
+    except ConnectionError as e: raise typer.ClickException(f"{e}. Local sync progress was preserved; retry `convos remote sync`.") from e
     typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else ""))
 @remote.command("fetch")
 @locked
