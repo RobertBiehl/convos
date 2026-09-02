@@ -14,6 +14,11 @@ gate below are acceptance criteria, not additional tasks.
 
 | Status | Task |
 | --- | --- |
+| Done | Make `search` and `query` read-only and immediately bounded: no hook draining, FTS rebuild, or backlog embedding; add explicit bounded embedding and completeness warnings. |
+| Done | Make FTS freshness authoritative in DuckDB, exclude superseded history from retrieval, use a complete literal scan when stale, and reserve rebuilds for explicit `convos fts`. |
+| Done | Make local and migration backups complete by default: verify and include every retained attachment body before publishing the database backup filename. |
+| Done | Freeze `search` and `query` JSON/JSONL row fields and types; keep diagnostics on stderr and make strict incomplete retrieval fail nonzero. |
+| Done | Route core and Remote DuckDB opens through one canonical-path lock gateway that releases its advisory lock before native-lock backoff; keep relay inventory/network work outside DuckDB connections. |
 | In review in PR #105 | Restore capture and manual-sync availability: use short inbox critical sections, make competing drains and syncs nonblocking, cap each drain worker by event count and elapsed time with visible progress and safe handoff, bound ordinary provenance work to touched conversations, edits, and repositories, and preserve full reconciliation behind `sync --full`. |
 | In review in PR #105 | Freeze the cross-provider conversation contract and audit real Codex and Claude imports. Define transcript and session identity, main-versus-subagent relationships, cwd, Git and model evidence, tools, attachments, and confirmed edits without deriving unavailable facts. |
 | In review in PR #105 | Install backed-up local native-session bindings without rewriting released physical IDs; preserve safe filename-to-native aliases, make a batch converge or fail before mutation, preserve foreign signed rows, structurally quarantine startup stubs, and keep migration commit independent of FTS rebuild. |
@@ -26,6 +31,11 @@ gate below are acceptance criteria, not additional tasks.
 | In review in PR #105 | Add an auditable file-edit evidence ledger, reclassify surviving provider transcripts, retain raw uncertain history, and exclude anything except confirmed edits from exact provenance and team sharing. |
 | In review in PR #105 | Harden remote synchronization: converge duplicate-root proof chains without hiding true forks, add observable exponential backoff, separate nonblocking sync and control-mutation leases, cover interruption recovery, and prove retained signed logical replicas remain ingestible. |
 | In review in PR #105 | Build and qualify the isolated Titan multi-user testbed with a destructive fresh synthetic lane and a persistent upgrade canary before declaring a stable release. |
+
+Deferred after the current-use gate: a separate embeddings table, alternate
+Linux semantic backends, ANN/vector-index work, multi-account provider fixtures,
+and broader performance refactors without evidence of blocking current local or
+Remote use.
 
 ## Production evidence register
 

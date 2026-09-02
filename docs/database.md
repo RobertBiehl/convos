@@ -219,12 +219,18 @@ index.
 
 Existing core archives migrate automatically. Before schema N first mutates an
 archive, Convos checkpoints and validates a mode-0600
-`<database>.pre-vN.bak`; retries retain the same recovery copy. Relay and
+`<database>.pre-vN.bak`; retained bodies are included by hash under the sibling
+`<database>.pre-vN.bak.attachments/` bundle, and the database filename is
+published only after every required body is verified. Manual `convos backup`
+uses the same complete format without silently migrating the live archive. Relay and
 `state.db` remain rebuildable and are not migrated during this clean cutover.
 
 ## Full-Text Search
 
-FTS index on `messages` table covering `content` and `thinking` columns.
+FTS index on `messages` covering `content` and `thinking`. The singleton
+`retrieval_state` row binds it to the exact message generation and FTS
+definition. `convos fts` is the only retrieval command that rebuilds it;
+ordinary search falls back to a complete literal scan when it is stale.
 
 ```sql
 PRAGMA create_fts_index('messages', 'id', 'content', 'thinking', overwrite=1)
@@ -256,10 +262,10 @@ stores the exact backend, model revision, artifact hash, dimensions, pooling,
 normalization, truncation, and prefixes. A profile change clears incompatible
 vectors transactionally before rebuilding them.
 
-Use `convos embed` to backfill missing embeddings without fetching from web
-APIs. Hooks and `convos sync` queue new or changed messages for just-in-time
-embedding by `convos query`. Inference runs without a database lock; only each
-result batch update is locked.
+Use `convos embed [--limit N]` to backfill missing embeddings without fetching
+from web APIs. `convos query` never embeds rows implicitly. Inference runs
+without a database lock; only each content-hash-validated result batch update is
+locked, so a message changed during inference cannot receive a stale vector.
 
 Installed applications can call
 `ai_convos.cli.hybrid_hits(query, source, days, role, limit, local_only=False, cwd=None, conversation=None)`

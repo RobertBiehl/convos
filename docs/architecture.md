@@ -122,7 +122,10 @@ Web fetchers extract cookies from Safari or Chrome to authenticate with APIs. No
 
 ### FTS via DuckDB
 
-Full-text search uses DuckDB's FTS extension with BM25 scoring. The index covers `content` and `thinking` columns. Ingest marks it dirty and the next search rebuilds it.
+Full-text search uses DuckDB's FTS extension with BM25 scoring. The index covers
+`content` and `thinking`. `retrieval_state` records the message generation and
+the exact FTS definition/generation. A stale index is never queried as current:
+`search` and `query` use a complete literal scan until explicit `convos fts`.
 
 ### Hybrid Semantic Search
 
@@ -134,8 +137,9 @@ scale (tens of thousands of messages) this is fast enough that a vector index
 
 Pipeline: filtered BM25 top-50 ∪ cosine top-50 → Reciprocal Rank Fusion → one
 strongest message per conversation.
-The embedding model loads lazily, so users pay model startup/download cost only
-when using `convos query` or `convos embed`.
+The embedding model loads only for explicit `convos embed` or when `query` can
+actually rank existing compatible vectors. Missing vectors produce a coverage
+warning rather than implicit archive mutation.
 
 `hybrid_hits()` is the public in-process form of that pipeline for installed
 applications. It returns untruncated exact turn records and accepts
@@ -172,10 +176,10 @@ snapshot under a short writer connection, marks changed text for one coalesced
 FTS rebuild, and records the processed snapshot. New events cannot be deleted
 by an older in-flight claim, and orphaned claims are retried after a process crash.
 
-`search`, `query`, `read`, and `sql` drain pending records before opening their read
-connection. `search` and `query` rebuild FTS once when dirty, while `query`
-also atomically claims and embeds only dirty message ids;
-concurrent queries share an embedding lock without holding DuckDB open. Ingest
+`search` and `query` never drain hooks, rebuild FTS, or embed messages. They read
+the committed archive immediately; stale FTS falls back to a complete literal
+scan, and partial semantic coverage remains visible. Explicit `convos fts` and
+`convos embed [--limit N]` perform maintenance. Ingest
 is additive: missing records are never deleted, and rewritten records preserve
 the prior payload under a deterministic history id with provenance metadata.
 `sync` drains the same inbox before its normal local/web reconciliation.
