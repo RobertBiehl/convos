@@ -87,22 +87,30 @@ def cutover_state(path):
     files=[p for p in (path,Path(str(path)+"-wal"),Path(str(path)+"-shm")) if p.exists()]
     saved={}
     try:
-        for source in files:
-            if source.is_symlink() or not source.is_file(): raise ValueError("remote state backup source must be a regular file")
-            copy=stage/source.name
-            shutil.copyfile(source,copy)
+        if info["status"]=="incompatible":
+            copy=stage/path.name
+            with contextlib.closing(sqlite3.connect(path.resolve().as_uri()+"?mode=ro",uri=True)) as source,contextlib.closing(sqlite3.connect(copy)) as destination: source.backup(destination)
             os.chmod(copy,0o600)
-            saved[source.name]={"bytes":copy.stat().st_size,"sha256":file_hash(copy)}
-            if file_hash(source)!=saved[source.name]["sha256"]: raise ValueError("remote state backup verification failed")
+            saved[path.name]={"bytes":copy.stat().st_size,"sha256":file_hash(copy)}
+            migration_source,staged=copy,[copy]
+        else:
+            for source in files:
+                if source.is_symlink() or not source.is_file(): raise ValueError("remote state backup source must be a regular file")
+                copy=stage/source.name
+                shutil.copyfile(source,copy)
+                os.chmod(copy,0o600)
+                saved[source.name]={"bytes":copy.stat().st_size,"sha256":file_hash(copy)}
+                if file_hash(source)!=saved[source.name]["sha256"]: raise ValueError("remote state backup verification failed")
+            migration_source,staged=stage/path.name,[stage/p.name for p in files]
         report={"from":info["version"] or "legacy","to":int(STATE_VERSION),"backup":str(target),"files":saved}
         manifest=stage/"manifest.json"
         manifest.write_text(json.dumps(report,sort_keys=True,indent=2))
         os.chmod(manifest,0o600)
-        [_fsync(p) for p in [*(stage/p.name for p in files),manifest]]
+        [_fsync(p) for p in [*staged,manifest]]
         _fsync(stage)
         new=_connect(fresh,"DELETE")
         try:
-            migrate=migrate_state(path,new,info["version"])
+            migrate=migrate_state(migration_source,new,info["version"])
             new.execute("INSERT INTO meta VALUES ('state_schema',?),('state_cutover',?)",(STATE_VERSION,json.dumps({**report,"preserved":migrate},sort_keys=True)))
             new.commit()
             valid=new.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
@@ -310,12 +318,13 @@ def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,worksp
 def _store_proofs(db,proofs,signer):
     if not proofs: return
     with _transaction(db): project_row_proofs(db,proofs,signer["root_public"],signer["certificate"])
-def attest_rows(db_path,cfg,workspace,records,origins=()):
+def attest_rows(db_path,cfg,workspace,records,origins=(),generation=None):
     controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace)
     device=cfg["device"]
     signer=cfg["controls"][workspace]["devices"][device["id"]]
     with contextlib.closing(open_db(db_path)) as db:
         init_schema(db)
+        if generation is not None: required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
         records=logical_records(db,records,cfg["user"])
         selected=[r for r in records if r["kind"] in SIGNED]
         ids=[r["payload"]["id"] if "id" in r["payload"] else r["payload"]["row"][0] if r["kind"] in TABLES else r["entity"] for r in selected]
@@ -337,9 +346,10 @@ def attest_rows(db_path,cfg,workspace,records,origins=()):
                 batch=[]
         _store_proofs(db,batch,signer)
         return made
-def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,inventory=None,retained=True):
+def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,inventory=None,retained=True,generation=None):
     fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
     db=open_db(db_path,True)
+    if generation is not None: required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
     records,bodies=logical_records(db,records,cfg["user"]),{}
     proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(fields,values))}
     keep=lambda row,p,content_hash=None:bodies.setdefault(digest(p),(row,p,content_hash))
@@ -397,9 +407,11 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
             return out
         delivery=lambda p:p["authorization_epoch"] if p["authorization_workspace"]==workspace else (origin_epochs or {})[p["workspace"]]
         candidates=[(row,p,content_hash,epoch,fingerprint(keys[epoch],digest(p))) for row,p,content_hash in bodies.values() for epoch in [delivery(p)] if epoch in keys]
+        db.close()
+        db=None
         known=set(inventory([(r[4],r[3]) for r in candidates])) if inventory else set(known)
         return [seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"],content_hash,lineage(p) if p["kind"]=="row.proof" else ()) for row,p,content_hash,epoch,replica in candidates if replica not in known]
-    finally: db.close()
+    finally: db and db.close()
 def _proof(values):
     return {"v":1,"kind":"row.proof",**dict(zip(PROOF_FIELDS,values))}
 def _heads(db,user,ids):

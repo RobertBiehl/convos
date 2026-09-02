@@ -48,6 +48,42 @@ def test_sync_lease_is_nonblocking_and_separate_from_mutation_lease(tmp_path):
             with remote_client.sync_run(tmp_path): pass
     with pytest.raises(KeyboardInterrupt):
         with remote_client.sync_run(tmp_path): raise KeyboardInterrupt
+
+def test_sync_config_updates_cannot_overwrite_newer_control_or_unrelated_fields(tmp_path,monkeypatch):
+    root=tmp_path/"client"; current={"user":"u","marker":"keep","sharing":{"w":{"auto_contribute":False,"match":[]}},"controls":{"w":{"revision":2}},"workspaces":{"w":{"epoch":2}},"keys":{},"server_state":{}}; remote_client.save(current,root); stale=copy.deepcopy(current); stale.pop("marker"); stale["controls"]["w"]={"revision":1}; stale["server_state"]={"workspaces":[]}
+    with pytest.raises(RuntimeError,match="changed during sync"): remote_client.sync_save(stale,root)
+    assert load(root)==current
+    state=connect(root/"remote/state.db"); monkeypatch.setattr(remote_client,"archive_info",lambda *_:("archive",7,1)); remote_client.remember_archive(stale,state,root); saved=load(root); state.close(); assert saved["marker"]=="keep" and saved["sharing"]==current["sharing"] and saved["archive"]=={"id":"archive","generation":7}
+
+def test_row_replica_batch_is_atomically_published_inside_exact_core_snapshot(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); ws=workspace(cfg,"Personal"); path=root/"data/convos.db"; generation=write_archive(path,"snapshot")[1]; record=conversation("snapshot"); projection_module.attest_rows(path,cfg,ws,[record],generation=generation); active=[False]; real=remote_client.open_db
+    class Tracked:
+        def __init__(self,db): self.db=db; active[0]=True
+        def __getattr__(self,name): return getattr(self.db,name)
+        def close(self): active[0]=False; self.db.close()
+    keys={cfg["workspaces"][ws]["epoch"]:key(cfg,ws,cfg["workspaces"][ws]["epoch"])}; envs=projection_module.row_replicas(path,cfg,ws,[record],keys,generation=generation); prepared=remote_client.prepare_replicas(root,envs); published=[]; publish=remote_client.publish_replicas
+    monkeypatch.setattr(remote_client,"open_db",lambda *args,**kwargs:Tracked(real(*args,**kwargs))); monkeypatch.setattr(remote_client,"publish_replicas",lambda rows:(published.append(active[0]),publish(rows)))
+    remote_client.validate_replicas(path,generation,prepared)
+    assert envs and published==[True] and not active[0] and list((root/"remote/outbox").glob("replica-*.json"))
+    prepared=remote_client.prepare_replicas(root,envs)
+    with pytest.raises(RuntimeError,match="Archive changed"): remote_client.validate_replicas(path,generation+1,prepared)
+    remote_client.discard_replicas(prepared)
+
+def test_sync_revalidates_sharing_policy_before_publication(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","private until validated"); real=remote_client.sharing_routes; calls=[]
+    def changed(*args,**kwargs):
+        routes=real(*args,**kwargs); calls.append(routes); return routes if len(calls)==1 else (routes[0],routes[1],[] if routes[2] else ["cwd"])
+    monkeypatch.setattr(remote_client,"sharing_routes",changed)
+    with pytest.raises(RuntimeError,match="sharing configuration changed"): sync_once(root,True)
+    assert len(calls)==2 and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==0 and not list((root/"remote/outbox").glob("replica-*.json"))
+
+def test_sync_serializes_state_cutover_with_control_mutations(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); state=connect(root/"remote/state.db"); state.execute("UPDATE meta SET value='1' WHERE key='state_schema'"); state.commit(); state.close(); real=remote_client.cutover_state; seen=[]
+    def guarded(path):
+        with pytest.raises(RuntimeError,match="mutation already running"):
+            with remote_client.mutation_lock(root): pass
+        seen.append(True); return real(path)
+    monkeypatch.setattr(remote_client,"cutover_state",guarded); sync_once(root); assert seen==[True] and inspect_state(root/"remote/state.db")["status"]=="current"
     with remote_client.sync_run(tmp_path): pass
 
 
@@ -252,6 +288,25 @@ def test_later_uploader_copy_heals_poisoned_blob_across_pages(tmp_path,monkeypat
 def test_later_uploader_copy_heals_poisoned_origin_bundle(tmp_path,monkeypatch):
     old=server_connect(tmp_path/"old.db"); monkeypatch.setattr("ai_convos_remote.request",transport(old)); a,b,c=tmp_path/"alice",tmp_path/"bob",tmp_path/"carol"; alice,_=setup_client("http://old","alice",root=a); setup_client("http://old","bob",root=b); origin=create(alice,"Origin","team",a); add_member(alice,origin,"bob",root=a); replicate_conversation(a,origin); pull(load(b),connect(b/"remote/state.db"),b)
     fresh=server_connect(tmp_path/"fresh.db"); direct=transport(fresh); monkeypatch.setattr("ai_convos_remote.request",direct); bob,_=rehome_client(load(b),"http://fresh",b); setup_client("http://fresh","carol",root=c); replacement=create(bob,"Replacement","team",b); add_member(bob,replacement,"carol",root=b); bob=load(b); state=connect(b/"remote/state.db"); bind_origin(bob,state,replacement,origin,b); state.close(); carol=load(c); server_state=refresh(carol,c); raw=fresh.execute("SELECT envelope FROM origin_bundles").fetchone()[0]; original=json.loads(raw); body=open_origin(original,key(carol,replacement,original["epoch"])); repaired=seal_origin(body["controls"],replacement,original["epoch"],key(carol,replacement,original["epoch"]),carol["device"]["id"],body["rows"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; fresh.execute("UPDATE origin_bundles SET envelope=?",(json.dumps(original),)); fresh.commit(); action(fresh,{"op":"origin_upload","envelope":repaired},carol["token"]); state=connect(c/"remote/state.db"); ws=next(w for w in server_state["workspaces"] if w["id"]==replacement)
+    real_core=remote_client._core
+    @__import__("contextlib").contextmanager
+    def broken(root):
+        with real_core(root) as db:
+            class Proxy:
+                def __getattr__(self,name): return getattr(db,name)
+                def execute(self,sql,*args):
+                    if sql=="COMMIT": raise RuntimeError("commit failed")
+                    return db.execute(sql,*args)
+            yield Proxy()
+    monkeypatch.setattr(remote_client,"_core",broken)
+    with pytest.raises(RuntimeError,match="commit failed"): pull_origins(carol,state,c,ws)
+    assert not state.execute("SELECT 1 FROM origin_bindings WHERE workspace=?",(replacement,)).fetchone()
+    monkeypatch.setattr(remote_client,"_core",real_core)
+    class BrokenState:
+        def __getattr__(self,name): return getattr(state,name)
+        def commit(self): raise RuntimeError("state commit failed")
+    with pytest.raises(RuntimeError,match="state commit failed"): pull_origins(carol,BrokenState(),c,ws)
+    assert duckdb.connect(str(c/"data/convos.db"),read_only=True).execute("SELECT COUNT(*) FROM remote.workspace_controls").fetchone()[0]>0 and not state.execute("SELECT 1 FROM origin_bindings WHERE workspace=?",(replacement,)).fetchone()
     assert pull_origins(carol,state,c,ws)=={origin} and state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(replacement,)).fetchone()[0]==origin; state.close()
 
 

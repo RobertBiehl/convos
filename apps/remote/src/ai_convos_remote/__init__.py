@@ -105,6 +105,16 @@ def _private_json(path,value):
     os.chmod(path.parent,0o700)
     atomic_json(path,value)
 def save(cfg,root=None): _private_json(paths(root)[1],cfg)
+def sync_save(cfg,root=None):
+    with local_lock(root,"mutation",True):
+        current=load(root)
+        if any((saved:=current.get("controls",{}).get(ws)) and (saved.get("revision",0)>control.get("revision",0) or saved.get("revision")==control.get("revision") and saved!=control) for ws,control in cfg.get("controls",{}).items()): raise RuntimeError("Remote configuration changed during sync; retry")
+        current["server_state"]=cfg["server_state"]
+        for field in ("controls","workspaces","keys"): current.setdefault(field,{}).update(cfg.get(field,{}))
+        save(current,root)
+        cfg.clear()
+        cfg.update(current)
+    return cfg["server_state"]
 def save_watch_status(value,root=None):
     _private_json(paths(root)[0]/"watch.json",value)
 def rescue_bindings(cfg,state_path,root=None):
@@ -132,6 +142,55 @@ def encrypted_file(root,event,value):
     os.chmod(tmp,0o600)
     durable_replace(tmp,path)
     return path,len(raw)
+def replica_file(root,envelopes,semantic): return paths(root)[0]/"outbox"/("replica-batch-"+digest(([(env["workspace"],env["replica"]) for env in envelopes],semantic))+".json")
+def prepare_replicas(root,envelopes,semantic=False):
+    if not envelopes: return []
+    required(len({env["workspace"] for env in envelopes})==1,ValueError("replica batch must contain one workspace"))
+    final=replica_file(root,envelopes,semantic)
+    final.parent.mkdir(parents=True,exist_ok=True)
+    required(not final.parent.is_symlink() and not final.is_symlink(),ValueError("encrypted outbox path must not be a symlink"))
+    raw=json.dumps({"semantic":semantic,"envelopes":envelopes},separators=(",",":")).encode()
+    tmp=final.with_name(f".{final.name}.{os.getpid()}.{time.time_ns()}")
+    with tmp.open("xb") as handle: (handle.write(raw),handle.flush(),os.fsync(handle.fileno()))
+    os.chmod(tmp,0o600)
+    return [(tmp,final)]
+def publish_replicas(prepared):
+    [durable_replace(tmp,final) for tmp,final in prepared]
+def discard_replicas(prepared):
+    [tmp.unlink(missing_ok=True) for tmp,final in prepared]
+def stage_replicas(root,envelopes,semantic=False):
+    prepared=prepare_replicas(root,envelopes,semantic)
+    try: publish_replicas(prepared)
+    except BaseException:
+        discard_replicas(prepared)
+        raise
+    return envelopes
+def validate_replicas(path,generation,prepared):
+    with closing(open_db(path,True)) as core:
+        required(core.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
+        publish_replicas(prepared)
+def upload_replicas(cfg,state,root=None,workspaces=None):
+    groups,selected={},set()
+    for path in (paths(root)[0]/"outbox").glob("replica-*.json"):
+        value=json.loads(path.read_text())
+        envs,semantic=(value["envelopes"] if "envelopes" in value else [value["envelope"]]),value["semantic"]
+        expected=replica_file(root,envs,semantic) if "envelopes" in value else paths(root)[0]/"outbox"/("replica-"+digest((envs[0]["workspace"],envs[0]["replica"],semantic))+".json")
+        required(path==expected and not path.is_symlink() and isinstance(semantic,bool) and envs and len({env["workspace"] for env in envs})==1,ValueError("invalid encrypted replica outbox"))
+        if workspaces is None or envs[0]["workspace"] in workspaces:
+            selected.add(path)
+            for env in envs: groups.setdefault((env["workspace"],semantic),[]).append(env)
+    for (ws,semantic),items in groups.items():
+        for page in _upload_batches(items,48*1024**2,lambda env:len(json.dumps(env,separators=(",",":")).encode())):
+            ids=[env["replica"] for env in page]
+            present=request(cfg,{"op":"replica_reconcile","workspace":ws,"replicas":ids,"semantic":semantic})["present"]
+            required(isinstance(present,dict) and set(present)<=set(ids) and all(isinstance(v,int) and not isinstance(v,bool) and v>0 for v in present.values()),ValueError("relay replica inventory mismatch"))
+            missing=[env for env in page if env["replica"] not in present]
+            uploaded=request(cfg,{"op":"replica_upload_many","envelopes":missing,"semantic":semantic})["replicas"] if missing else []
+            required(len(uploaded)==len(missing) and all(isinstance(r.get("cursor"),int) and not isinstance(r["cursor"],bool) and r["cursor"]>0 for r in uploaded),ValueError("relay replica acknowledgement mismatch"))
+            cursors={**present,**{env["replica"]:ack["cursor"] for env,ack in zip(missing,uploaded)}}
+            state.executemany("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",[(ws,env["replica"],env["epoch"],cursors[env["replica"]]) for env in page])
+            state.commit()
+    for path in selected: path.unlink(missing_ok=True)
 def receipt(state,ws,value,cursor,epoch): state.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],cursor,value["author"],value["seq"],epoch,value["kind"],value["payload_v"],value["entity"],value["revision"],value["payload"].get("status") if isinstance(value["payload"],dict) and value["payload"].get("status") in ("active","deleted") else None))
 def safe_url(url):
     parsed=urllib.parse.urlparse(url)
@@ -228,8 +287,12 @@ def prepare_archive(cfg,state,root=None,create=True):
     return existing or mode
 def remember_archive(cfg,state,root=None):
     if info:=archive_info(root):
-        cfg["archive"]={"id":info[0],"generation":info[1]}
-        save(cfg,root)
+        with local_lock(root,"mutation",True):
+            current=load(root)
+            current["archive"]={"id":info[0],"generation":info[1]}
+            save(current,root)
+            cfg.clear()
+            cfg.update(current)
         state.execute("INSERT OR REPLACE INTO meta VALUES ('archive_id',?),('archive_generation',?)",(info[0],str(info[1])))
         state.execute("DELETE FROM meta WHERE key LIKE 'archive_mode:%' OR key LIKE 'archive_basis:%'")
 def next_boundary(cfg,ws,root=None):
@@ -254,7 +317,7 @@ def update_recovery(cfg,root=None):
     _,bundle=recovery_bundle({"root":cfg["root"],"keys":keys,"workspaces":cfg["workspaces"],"controls":{ws:v for ws,v in cfg["controls"].items() if ws in personal},"sharing":cfg.get("sharing",{})},unb64(cfg["recovery"]))
     request(cfg,sign_control(cfg["device"],{"op":"recovery","bundle":bundle}))
     save(cfg,root)
-def refresh(cfg,root=None):
+def refresh(cfg,root=None,concurrent=False):
     state=request(cfg,{"op":"state"})
     cfg["server_state"]=state
     changed,seen=False,set()
@@ -287,7 +350,7 @@ def refresh(cfg,root=None):
                 if not controls or digest(opened)!=controls[-1]["key_commitment"]: raise ValueError("workspace epoch key commitment mismatch")
                 cfg["keys"][name]=b64(opened)
                 changed=True
-    save(cfg,root)
+    sync_save(cfg,root) if concurrent else save(cfg,root)
     if changed: update_recovery(cfg,root)
     return state
 def create(cfg,name,kind="team",root=None):
@@ -507,8 +570,8 @@ def _upload_batches(rows,limit=8*1024*1024,measure=lambda row:row["size"]):
         batch.append(row)
         size+=amount
     if batch: yield batch
-def upload(cfg,state,root=None,workspaces=None):
-    active={w["id"] for w in refresh(cfg,root)["workspaces"] if workspaces is None or w["id"] in workspaces}
+def upload(cfg,state,root=None,workspaces=None,concurrent=False):
+    active={w["id"] for w in refresh(cfg,root,concurrent)["workspaces"] if workspaces is None or w["id"] in workspaces}
     rows=[r for r in state.execute("SELECT * FROM outbox ORDER BY workspace,seq").fetchall() if r["workspace"] in active]
     for batch in _upload_batches(rows):
         prepared,acknowledged=[],[]
@@ -539,17 +602,11 @@ def upload(cfg,state,root=None,workspaces=None):
             state.execute("DELETE FROM outbox WHERE workspace=? AND event=?",(row["workspace"],row["event"]))
         state.commit()
         for row,env,path,ack in delivered: path.unlink(missing_ok=True)
+    upload_replicas(cfg,state,root,active)
     upload_blobs(cfg,state,root,active)
 def reconcile_replicas(cfg,state,root,ws,envelopes,semantic=False):
-    for page in _upload_batches(envelopes,48*1024**2,lambda env:len(json.dumps(env,separators=(",",":")).encode())):
-        present=request(cfg,{"op":"replica_reconcile","workspace":ws,"replicas":(ids:=[e["replica"] for e in page]),"semantic":semantic})["present"]
-        if not isinstance(present,dict) or not set(present)<=set(ids) or any(not isinstance(v,int) or isinstance(v,bool) or v<1 for v in present.values()): raise ValueError("relay replica inventory mismatch")
-        missing=[env for env in page if env["replica"] not in present]
-        uploaded=request(cfg,{"op":"replica_upload_many","envelopes":missing,"semantic":semantic})["replicas"] if missing else []
-        if len(uploaded)!=len(missing) or any(not isinstance(r.get("cursor"),int) or isinstance(r["cursor"],bool) or r["cursor"]<1 for r in uploaded): raise ValueError("relay replica acknowledgement mismatch")
-        cursors={**present,**{env["replica"]:ack["cursor"] for env,ack in zip(missing,uploaded)}}
-        state.executemany("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",[(ws,env["replica"],env["epoch"],cursors[env["replica"]]) for env in page])
-        state.commit()
+    stage_replicas(root,envelopes,semantic)
+    upload_replicas(cfg,state,root,{ws})
 def replica_inventory(cfg,state,ws,candidates):
     found={}
     for rows in (candidates[i:i+500] for i in range(0,len(candidates),500)):
@@ -604,17 +661,20 @@ def pull_origins(cfg,state,root,ws):
             invalid.pop(identity,None)
     if invalid: raise ValueError(f"invalid origin bundle: no valid delivery copy for {len(invalid)} object(s)")
     with _core(root) as core:
+        core_committed=False
         core.execute("BEGIN")
         try:
             for item,body,controls,origin in valid.values():
                 env=item["envelope"]
                 project_workspace_controls(core,controls)
                 state.execute(f"INSERT OR REPLACE INTO {'origin_bindings' if body['rows'] else 'control_dependencies'} VALUES (?,?,?,?,?)",(sid,origin,env["origin"],env["epoch"],item["cursor"]))
-            state.commit()
             core.execute("COMMIT")
+            core_committed=True
+            state.commit()
         except BaseException:
-            core.execute("ROLLBACK")
-            state.rollback()
+            if not core_committed:
+                with __import__("contextlib").suppress(Exception): core.execute("ROLLBACK")
+            with __import__("contextlib").suppress(Exception): state.rollback()
             raise
     return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
 def local_replica_ids(root,cfg,workspace,kind,epochs):
@@ -730,9 +790,9 @@ def pull_blobs(cfg,state,root,ws,recover=None):
             if invalid: raise ValueError(f"invalid blob replica: no valid delivery copy for {len(invalid)} object(s)")
             return total
         if not result["blobs"]: raise ValueError("relay blob tail cannot be reached")
-def pull(cfg,state,root=None):
+def pull(cfg,state,root=None,concurrent=False):
     root=local_root(root)
-    server=refresh(cfg,root)
+    server=refresh(cfg,root,concurrent)
     summary={}
     for ws in server["workspaces"]:
         if not ws["device_authorized"]: continue
@@ -834,36 +894,43 @@ def sync_once(root=None,force=False):
         cutover=None
         relocate_attachments(core_path(root),paths(root)[0]/"attachments")
         if info["status"] in ("incompatible","invalid"):
-            refresh(cfg,root)
-            if info["status"]=="incompatible": rescue_bindings(cfg,state_path,root)
-            cutover=cutover_state(state_path)
+            with local_lock(root,"mutation",True):
+                cfg,info=load(root),inspect_state(state_path,force)
+                refresh(cfg,root)
+                if info["status"]=="incompatible": rescue_bindings(cfg,state_path,root)
+                cutover=cutover_state(state_path)
         state=connect(state_path)
         try:
             drain_hooks()
-            refresh(cfg,root)
+            refresh(cfg,root,True)
             ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
             if force:
                 for ws in ready: state.execute("INSERT OR REPLACE INTO meta VALUES (?,'1')",(f"replica_repair:{ws}",))
             state.commit()
-            upload(cfg,state,root,ready)
+            upload(cfg,state,root,ready,True)
             prepare_archive(cfg,state,root)
             baseline=archive_info(root)
             bound={r[0] for r in state.execute("SELECT DISTINCT workspace FROM origin_bindings").fetchall()}
-            pull(cfg,state,root)
+            pull(cfg,state,root,True)
             ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
             authorized={w["id"] for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
             aliases={ws:reconcile_provider_aliases(core_path(root),cfg,ws) for ws in ready&authorized if cfg["workspaces"].get(ws,{}).get("kind")=="personal"}
             for ws,value in aliases.items(): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"provider_aliases:{ws}",json.dumps(value,sort_keys=True)))
             state.commit()
-            settle_sharing(cfg,state,ready&authorized,root)
             path,active=core_path(root),authorized
             generation=archive_info(root)[1] if path.is_file() else 0
             if path.is_file():
                 with closing(open_db(path,True)) as core: known=core_repository_state(core)
             else: known={"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}}
-            promote_paths(cfg,state,known,root)
-            upgrade_repository_policies(cfg,state,known,root)
-            for ws in ready&active: retain_sharing(cfg,ws,root,state)
+            with local_lock(root,"mutation",True):
+                current=load(root)
+                required(all(current.get("controls",{}).get(ws,{}).get("revision",0)==control.get("revision",0) for ws,control in cfg.get("controls",{}).items()),RuntimeError("Remote configuration changed during sync; retry"))
+                cfg.clear()
+                cfg.update(current)
+                settle_sharing(cfg,state,ready&authorized,root)
+                promote_paths(cfg,state,known,root)
+                upgrade_repository_policies(cfg,state,known,root)
+                for ws in ready&active: retain_sharing(cfg,ws,root,state)
             if baseline and baseline[2]==0:
                 for ws in ready&active-bound: state.execute("INSERT OR IGNORE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation)))
             scans=[(ws,meta,state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()) for ws,meta in cfg["workspaces"].items() if path.is_file() and ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]]
@@ -883,17 +950,30 @@ def sync_once(root=None,force=False):
                     bindings={r[0]:r[1] for r in state.execute("SELECT origin,epoch FROM origin_bindings WHERE workspace=?",(ws,)).fetchall()}
                     origins=set(bindings)
                     repair=initial or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone())
-                    attest_rows(path,cfg,ws,records,origins)
+                    attest_rows(path,cfg,ws,records,origins,generation)
                     keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}
-                    known={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
-                    for i in range(0,max(len(records),1),5000): reconcile_replicas(cfg,state,root,ws,row_replicas(path,cfg,ws,records[i:i+5000],keys,known,origins,bindings,lambda ids:replica_inventory(cfg,state,ws,ids),repair and i==0))
+                    known_replicas=set() if repair else {r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
+                    envelopes=[env for i in range(0,max(len(records),1),5000) for env in row_replicas(path,cfg,ws,records[i:i+5000],keys,known_replicas,origins,bindings,retained=repair and i==0,generation=generation)]
+                    prepared=prepare_replicas(root,envelopes)
+                    try:
+                        with local_lock(root,"mutation",True):
+                            current=load(root)
+                            required(state_hash(current["controls"][ws])==state_hash(cfg["controls"][ws]) and sharing_routes(state,ws,current["user"],current.get("bindings",{}),known)==routes[ws],RuntimeError("Remote sharing configuration changed during publication; retry"))
+                            cfg.clear()
+                            cfg.update(current)
+                            validate_replicas(path,generation,prepared)
+                            heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}
+                            for record in records:
+                                if record["kind"] not in SIGNED: publish(cfg,state,ws,record,root,True,heads)
+                            state.execute("DELETE FROM team_scopes WHERE workspace=?",(ws,))
+                            state.executemany("INSERT INTO team_scopes VALUES (?,?)",[(ws,c) for c in scope])
+                            state.commit()
+                    except BaseException:
+                        discard_replicas(prepared)
+                        raise
+                    upload_replicas(cfg,state,root,{ws})
                     known_blobs={r[0] for r in state.execute("SELECT blob FROM blob_receipts WHERE workspace=? UNION SELECT blob FROM blob_outbox WHERE workspace=?",(ws,ws)).fetchall()}
                     reconcile_blobs(cfg,state,root,ws,blob_replicas(path,cfg,ws,records,keys,known_blobs,origins,bindings,repair))
-                    heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}
-                    for record in records:
-                        if record["kind"] not in SIGNED: publish(cfg,state,ws,record,root,True,heads)
-                    state.execute("DELETE FROM team_scopes WHERE workspace=?",(ws,))
-                    state.executemany("INSERT INTO team_scopes VALUES (?,?)",[(ws,c) for c in scope])
                 for ws,meta,prior in scans: state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation)))
             for ws,meta in cfg["workspaces"].items():
                 if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]:
@@ -902,8 +982,8 @@ def sync_once(root=None,force=False):
                     reconcile_replicas(cfg,state,root,ws,bridge_replicas(root,cfg,ws,meta["kind"],key(cfg,ws,meta["epoch"]),known,lambda ids:replica_inventory(cfg,state,ws,ids) if repair else set(known)),True)
             for ws in ready&active: state.execute("DELETE FROM meta WHERE key=?",(f"replica_repair:{ws}",))
             state.commit()
-            upload(cfg,state,root,ready)
-            pull(cfg,state,root)
+            upload(cfg,state,root,ready,True)
+            pull(cfg,state,root,True)
             remember_archive(cfg,state,root)
             state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))
             state.commit()

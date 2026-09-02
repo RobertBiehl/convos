@@ -260,8 +260,10 @@ convos search "decision" --cwd /path/to/repo       # exact project scope
 convos query "why did we choose this?" --conversation f2b9c5a9
 convos search "reasoning" --thinking
 convos read f2b9c5a9 -n 20 -f jsonl              # bounded recent context from one result
-convos embed                                      # backfill embeddings, no web sync
+convos embed --limit 1000                         # explicitly backfill a bounded batch
 convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings + RRF
+convos fts                                        # explicitly refresh BM25 after imports
+convos backup                                     # database plus retained attachment bodies
 ```
 
 Both discovery commands return the strongest matching message from each
@@ -271,10 +273,12 @@ plus `--conversation` for an exact conversation-ID prefix. These direct options
 replace the deferred custom query language.
 
 Semantic search is included by default. Run `convos embed` after install to
-backfill embeddings with a progress bar. Hooks and `convos sync` queue new or
-changed messages; `convos query` embeds that queue just in time. macOS uses the
-768-dimensional `embeddinggemma-300m-qat-q8_0` model through llama.cpp; Linux
-uses the 256-dimensional `potion-base-8M` Model2Vec model. The archive stores
+backfill embeddings with a progress bar. `search` and `query` never ingest,
+reindex, or embed as a side effect. When BM25 is stale they use a complete
+literal scan and warn on stderr; run `convos fts` for BM25 ranking and
+`convos embed` for semantic coverage. macOS uses the 768-dimensional
+`embeddinggemma-300m-qat-q8_0` model through llama.cpp; Linux has no default
+semantic runtime. The archive stores
 the exact active profile and atomically queues a full rebuild before a different
 model, revision, dimension, prefix, or normalization contract can be used.
 
@@ -325,10 +329,10 @@ show a recent `ingest: ... last=...` timestamp.
 
 Hooks enqueue only the local transcript path and file metadata, then return
 immediately. A coalescing background drain parses and upserts the transcript;
-`search` and `query` rebuild FTS once for all pending changes before reading.
-`query` also embeds only
-the changed hook messages, while `search` and `sql` avoid loading the embedding
-model. `sync` remains the reconciliation path for missed local events, web
+retrieval commands only read committed archive state. `convos fts` explicitly
+rebuilds BM25, and `convos embed [--limit N]` explicitly computes missing
+vectors without holding DuckDB during model inference. `sync` remains the
+reconciliation path for missed local events, web
 providers, pre-hook sessions, and imports rather than a routine local update.
 
 Check the complete local pipeline with `convos doctor`. It reports the running

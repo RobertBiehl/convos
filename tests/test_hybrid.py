@@ -1,6 +1,7 @@
 """Tests for the hybrid BM25 + vector RRF search pipeline."""
 import json
 import duckdb, pytest
+from pathlib import Path
 from typer.testing import CliRunner
 from ai_convos import cli
 
@@ -41,6 +42,7 @@ def hybrid_db(tmp_path, monkeypatch):
             "INSERT INTO messages VALUES (?, 'c1', 'user', ?, NULL, NULL, NULL, NULL, ?, NULL)",
             [mid, content, emb],
         )
+    conn.execute("INSERT OR REPLACE INTO embedding_state VALUES (TRUE,?)",[json.dumps(cli.embedding_profile())])
     cli.rebuild_fts_index(conn)
     conn.close()
     return db
@@ -68,20 +70,20 @@ def test_rrf_sql_formula():
 
 def test_query_pipeline_end_to_end(hybrid_db, monkeypatch):
     """Querying for 'apple' returns the strongest relevant message, not unrelated content."""
-    monkeypatch.setattr(cli, "embed_text", lambda s, doc=False: _emb(1))
+    monkeypatch.setattr(cli, "embed_text", lambda s, doc=False, local_only=False: _emb(1))
     r = CliRunner().invoke(cli.app, ["query", "apple", "-n", "5"])
     assert r.exit_code == 0, r.output
     out = r.output
-    assert "apple banana cherry" in out
+    assert "apple" in out
     assert "totally unrelated" not in out
 
 
 def test_query_returns_one_hit_per_conversation(hybrid_db, monkeypatch):
-    monkeypatch.setattr(cli, "embed_text", lambda s, doc=False: _emb(1))
+    monkeypatch.setattr(cli, "embed_text", lambda s, doc=False, local_only=False: _emb(1))
     r = CliRunner().invoke(cli.app, ["query", "apple", "-n", "5", "-c", "5", "-f", "json"])
     assert r.exit_code == 0
     hits = __import__("json").loads(r.output)
-    assert len(hits) == 1 and hits[0]["score"] > 0 and hits[0]["message_id"] in ("m1", "m3") and hits[0]["content"] == "apple..." and "rerank" not in hits[0]
+    assert len(hits) == 1 and set(hits[0])=={"score","message_id","role","content","created_at","title","source","conversation_id","cwd"} and isinstance(hits[0]["score"],float) and hits[0]["message_id"] in ("m1", "m3") and hits[0]["content"] == "apple..."
 
 
 def test_search_returns_one_hit_per_conversation(hybrid_db):
@@ -121,15 +123,15 @@ def test_query_filters_candidates_and_skips_injected_boilerplate(tmp_path, monke
     conn = duckdb.connect(str(db)); cli.init_schema(conn)
     conn.execute("INSERT INTO conversations VALUES ('noise','noise','N',NULL,NULL,NULL,NULL,NULL,NULL,NULL), ('target','target','T',NULL,NULL,NULL,NULL,NULL,NULL,NULL)")
     rows = [(f"n{i}", "noise", "user", "needle noise", _emb(1)) for i in range(55)] + [("skill", "target", "user", "Base directory for this skill: needle", _emb(1)),("agents","target","user","# AGENTS.md instructions for /repo needle",_emb(1)),("goal","target","user",'<codex_internal_context source="goal">needle',_emb(1)),("plugins","target","user","<recommended_plugins>needle",_emb(1)), ("wanted", "target", "user", "needle wanted", _emb(1))]
-    conn.executemany("INSERT INTO messages (id,conversation_id,role,content,embedding) VALUES (?,?,?,?,?)", rows); cli.rebuild_fts_index(conn); conn.close()
-    monkeypatch.setattr(cli, "embed_text", lambda s, doc=False: _emb(1))
+    conn.executemany("INSERT INTO messages (id,conversation_id,role,content,embedding) VALUES (?,?,?,?,?)", rows); conn.execute("INSERT OR REPLACE INTO embedding_state VALUES (TRUE,?)",[json.dumps(cli.embedding_profile())]); cli.rebuild_fts_index(conn); conn.close()
+    monkeypatch.setattr(cli, "embed_text", lambda s, doc=False, local_only=False: _emb(1))
     r = CliRunner().invoke(cli.app, ["query", "needle", "-s", "target", "-n", "5", "-f", "json"]); hits = __import__("json").loads(r.output)
     assert [h["content"] for h in hits] == ["needle wanted"]
 
 
 def test_search_and_query_have_direct_project_and_conversation_filters(hybrid_db,monkeypatch):
     conn=duckdb.connect(str(hybrid_db)); conn.execute("UPDATE conversations SET cwd='/repo/sub' WHERE id='c1'"); conn.execute("INSERT INTO conversations (id,source,title,cwd) VALUES ('c2','test','Other','/other')"); conn.execute("INSERT INTO messages (id,conversation_id,role,content,embedding) VALUES ('m6','c2','user','apple outside',?)",[_emb(1)]); cli.rebuild_fts_index(conn); conn.close()
-    monkeypatch.setattr(cli,"embed_text",lambda s,doc=False:_emb(1)); runner=CliRunner()
+    monkeypatch.setattr(cli,"embed_text",lambda s,doc=False,local_only=False:_emb(1)); runner=CliRunner()
     literal=__import__("json").loads(runner.invoke(cli.app,["search","apple","--cwd","/repo","-f","json"]).output); scoped=__import__("json").loads(runner.invoke(cli.app,["search","apple","--conversation","c2","-f","json"]).output)
     hybrid=__import__("json").loads(runner.invoke(cli.app,["query","apple","--cwd","/repo","-f","json"]).output); exact=__import__("json").loads(runner.invoke(cli.app,["query","apple","--conversation","c2","-f","json"]).output)
     assert {r["conversation_id"] for r in literal+hybrid}=={"c1"} and {r["conversation_id"] for r in scoped+exact}=={"c2"}
@@ -137,10 +139,9 @@ def test_search_and_query_have_direct_project_and_conversation_filters(hybrid_db
 
 def test_public_hybrid_hits_can_forbid_model_download(hybrid_db,monkeypatch):
     seen=[]
-    monkeypatch.setattr(cli,"drain_hooks",lambda *a,**k:seen.append(("drain",a,k)))
     monkeypatch.setattr(cli,"embed_text",lambda s,doc=False,local_only=False:seen.append(local_only) or _emb(1))
     rows=cli.hybrid_hits("apple",limit=2,local_only=True)
-    assert seen==[("drain",(),{"embed":True,"local_only":True}),True] and len(rows)==1 and rows[0]["content"].startswith("apple")
+    assert seen==[True] and len(rows)==1 and rows[0]["content"].startswith("apple")
 
 
 def test_embedding_model_path_is_revision_pinned_and_can_be_local_only(monkeypatch):
@@ -174,8 +175,7 @@ def test_semantic_runtime_can_be_disabled(monkeypatch):
     monkeypatch.setenv("CONVOS_SEMANTIC","llama"); assert cli.semantic_enabled() and cli.semantic_backend()=="llama"
 
 
-def test_query_no_embeddings_returns_friendly_error(tmp_path, monkeypatch):
-    """When no rows have embeddings, query_cmd prints a guidance message and exits cleanly."""
+def test_query_without_embeddings_returns_complete_lexical_results(tmp_path, monkeypatch):
     db = tmp_path / "test.db"
     monkeypatch.setattr(cli, "DB_PATH", db)
     monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
@@ -185,13 +185,12 @@ def test_query_no_embeddings_returns_friendly_error(tmp_path, monkeypatch):
     conn.execute("INSERT INTO messages VALUES ('m1', 'c1', 'user', 'hello', NULL, NULL, NULL, NULL, NULL, NULL)")
     cli.rebuild_fts_index(conn)
     conn.close()
+    monkeypatch.setattr(cli,"embed_text",lambda *_:(_ for _ in ()).throw(AssertionError("query loaded model without vectors")))
     r = CliRunner().invoke(cli.app, ["query", "hello"])
-    assert r.exit_code == 0
-    assert "No embeddings yet" in (r.output + (r.stderr if r.stderr_bytes is not None else ""))
+    assert r.exit_code == 0 and "hello" in r.stdout and "Semantic coverage is partial (0/1)" in r.stderr
 
 
-def test_query_migrates_old_db_before_embedding_check(tmp_path, monkeypatch):
-    """Old databases have no embedding column; query should migrate then print guidance."""
+def test_query_refuses_hidden_schema_migration(tmp_path, monkeypatch):
     db = tmp_path / "test.db"
     monkeypatch.setattr(cli, "DB_PATH", db)
     monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
@@ -202,10 +201,9 @@ def test_query_migrates_old_db_before_embedding_check(tmp_path, monkeypatch):
     conn.execute("INSERT INTO messages VALUES ('m1', 'c1', 'user', 'hello', NULL, NULL, NULL, NULL)")
     conn.close()
     r = CliRunner().invoke(cli.app, ["query", "hello"])
-    assert r.exit_code == 0
-    assert "No embeddings yet" in (r.output + (r.stderr if r.stderr_bytes is not None else ""))
+    assert r.exit_code == 1 and "Run `convos sync`" in r.output
     conn = duckdb.connect(str(db))
-    assert conn.execute("SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='embedding'").fetchone()
+    assert not conn.execute("SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='embedding'").fetchone()
     conn.close()
 
 
@@ -220,7 +218,7 @@ def test_read_commands_handle_locked_db(monkeypatch):
     """Read commands should print a friendly lock message instead of a traceback."""
     monkeypatch.setattr(cli, "get_db", lambda read_only=False: (_ for _ in ()).throw(ValueError("Database is locked by another convos process.")))
     r = CliRunner().invoke(cli.app, ["search", "x"])
-    assert r.exit_code == 0
+    assert r.exit_code == 1
     assert "locked" in (r.output + (r.stderr if r.stderr_bytes is not None else ""))
 
 
@@ -236,6 +234,98 @@ def test_db_waits_for_writer(tmp_path, monkeypatch, read_only):
     monkeypatch.setattr(cli.duckdb, "connect", connect)
     conn=cli.get_db(read_only=read_only); conn.close()
     assert calls["n"] == 3
+
+
+def test_db_retry_releases_path_lock_and_archives_do_not_share_it(tmp_path,monkeypatch):
+    events=[]; [p.touch() for p in (tmp_path/"a.db",tmp_path/"b.db")]
+    monkeypatch.setattr(cli,"_flock",lambda lock,*_:events.append(("lock",Path(lock.name).name)))
+    monkeypatch.setattr(cli.fcntl,"flock",lambda lock,op:events.append(("unlock",Path(lock.name).name)))
+    calls={}
+    def connect(path,read_only=False):
+        calls[path]=calls.get(path,0)+1
+        if path.endswith("a.db") and calls[path]==1: raise duckdb.IOException("Conflicting lock is held")
+        return type("Connection",(),{"close":lambda _:None})()
+    monkeypatch.setattr(cli.duckdb,"connect",connect); monkeypatch.setattr(cli.time,"sleep",lambda _:None)
+    cli.get_db(path=tmp_path/"a.db").close(); cli.get_db(path=tmp_path/"b.db").close()
+    assert events[:3]==[("lock",".a.db.lock"),("unlock",".a.db.lock"),("lock",".a.db.lock")] and events[-1]==("lock",".b.db.lock")
+
+
+def test_db_symlink_alias_uses_canonical_lock(tmp_path,monkeypatch):
+    db,alias=tmp_path/"archive.db",tmp_path/"alias.db"; db.touch(); alias.symlink_to(db); seen=[]
+    monkeypatch.setattr(cli,"_flock",lambda lock,*_:seen.append(Path(lock.name)))
+    monkeypatch.setattr(cli,"_open_db",lambda *_:type("Connection",(),{"close":lambda _:None})())
+    cli.get_db(path=alias).close(); assert seen==[tmp_path/".archive.db.lock"]
+
+
+def test_db_rejects_hardlink_aliases(tmp_path):
+    db,alias=tmp_path/"archive.db",tmp_path/"alias.db"; db.touch(); alias.hardlink_to(db)
+    with pytest.raises(ValueError,match="hardlink aliases are unsafe"): cli.get_db(path=alias)
+
+
+def test_search_and_query_never_run_ingest_or_maintenance(hybrid_db,monkeypatch):
+    monkeypatch.setattr(cli,"drain_hooks",lambda *_a,**_k:(_ for _ in ()).throw(AssertionError("retrieval drained hooks")))
+    monkeypatch.setattr(cli,"embed_text",lambda *_a,**_k:_emb(1))
+    runner=CliRunner(); assert runner.invoke(cli.app,["search","apple"]).exit_code==0 and runner.invoke(cli.app,["query","apple"]).exit_code==0
+
+
+def test_stale_fts_scans_complete_rows_excludes_history_and_keeps_json_clean(tmp_path,monkeypatch):
+    db=tmp_path/"test.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(cli,"DATA_DIR",tmp_path)
+    conn=duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations(id,source) VALUES ('c','test')"); conn.execute("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('old','c','user','old needle','{}')"); cli._archive_touch(conn,[("messages","old")]); cli.rebuild_fts_index(conn)
+    conn.execute("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('new','c','user','fresh needle','{}'),('history','c','user','hidden unique','{\"history_of\":\"old\"}')"); cli._archive_touch(conn,[("messages","new"),("messages","history")]); before=conn.execute("SELECT * FROM retrieval_state").fetchone(); conn.close()
+    runner=CliRunner(); result=runner.invoke(cli.app,["search","fresh","-f","json"]); rows=json.loads(result.stdout)
+    assert result.exit_code==0 and set(rows[0])=={"message_id","role","content","thinking","created_at","score","title","source","conversation_id","cwd"} and rows[0]["message_id"]=="new" and isinstance(rows[0]["score"],float) and "complete lexical scan" in result.stderr
+    assert json.loads(runner.invoke(cli.app,["search","unique","-f","json"]).stdout)==[]
+    conn=duckdb.connect(str(db)); assert conn.execute("SELECT * FROM retrieval_state").fetchone()==before; conn.close()
+
+
+def test_stale_search_can_match_thinking_only_rows(tmp_path,monkeypatch):
+    db=tmp_path/"test.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(cli,"DATA_DIR",tmp_path); conn=duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations(id,source) VALUES ('c','test'); INSERT INTO messages(id,conversation_id,role,thinking) VALUES ('m','c','assistant','private needle')"); cli._archive_touch(conn,[("messages","m")]); conn.close()
+    result=CliRunner().invoke(cli.app,["search","needle","--thinking","-f","json"]); assert json.loads(result.stdout)[0]["thinking"]=="private needle"
+
+
+def test_require_complete_fails_without_mutating_retrieval_state(tmp_path,monkeypatch):
+    db=tmp_path/"test.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(cli,"DATA_DIR",tmp_path)
+    conn=duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations(id,source) VALUES ('c','test')"); conn.execute("INSERT INTO messages(id,conversation_id,role,content) VALUES ('m','c','user','needle')"); cli._archive_touch(conn,[("messages","m")]); state=conn.execute("SELECT * FROM retrieval_state").fetchone(); conn.close()
+    result=CliRunner().invoke(cli.app,["query","needle","--require-complete"]); assert result.exit_code==1 and "Retrieval is incomplete" in result.stderr
+    conn=duckdb.connect(str(db)); assert conn.execute("SELECT * FROM retrieval_state").fetchone()==state; conn.close()
+
+
+def test_query_model_inference_does_not_hold_archive_lock(hybrid_db,monkeypatch):
+    def embed(*_args,**_kwargs):
+        with cli.get_db(path=hybrid_db,wait=0) as conn: conn.execute("UPDATE conversations SET title='unlocked' WHERE id='c1'")
+        return _emb(1)
+    monkeypatch.setattr(cli,"embed_text",embed); assert cli.hybrid_hits("apple")
+
+
+def test_bounded_embedding_rejects_content_changed_during_inference(tmp_path,monkeypatch,capsys):
+    db=tmp_path/"test.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(cli,"DATA_DIR",tmp_path)
+    conn=duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations(id,source) VALUES ('c','test')"); conn.execute("INSERT INTO messages(id,conversation_id,role,content) VALUES ('m','c','user','before')"); conn.close()
+    def embed(ss,doc=False,local_only=False):
+        with cli.get_db(path=db) as writer: writer.execute("UPDATE messages SET content='after' WHERE id='m'")
+        return [_emb(1) for _ in ss]
+    monkeypatch.setattr(cli,"embed_texts",embed); assert cli.embed_pending(limit=1)==1 and "1 messages remain unembedded" in capsys.readouterr().err
+    conn=duckdb.connect(str(db)); assert conn.execute("SELECT content,embedding IS NULL FROM messages").fetchone()==("after",True); conn.close()
+
+def test_candidate_limits_count_distinct_conversations(tmp_path,monkeypatch):
+    db=tmp_path/"test.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(cli,"DATA_DIR",tmp_path); conn=duckdb.connect(str(db)); cli.init_schema(conn)
+    conn.execute("INSERT INTO conversations(id,source) VALUES ('a','test'),('b','test')"); conn.executemany("INSERT INTO messages(id,conversation_id,role,content,embedding) VALUES (?,'a','user','needle',?)",[(f"a{i}",_emb(1)) for i in range(60)]); conn.execute("INSERT INTO messages(id,conversation_id,role,content,embedding) VALUES ('b','b','user','needle',?)",[_emb(1)]); conn.execute("INSERT OR REPLACE INTO embedding_state VALUES (TRUE,?)",[json.dumps(cli.embedding_profile())]); conn.close(); monkeypatch.setattr(cli,"embed_text",lambda *_a,**_k:_emb(1)); runner=CliRunner()
+    assert {r["conversation_id"] for r in json.loads(runner.invoke(cli.app,["search","needle","-n","2","-f","json"]).stdout)}=={"a","b"} and {r["conversation_id"] for r in json.loads(runner.invoke(cli.app,["query","needle","-n","2","-f","json"]).stdout)}=={"a","b"}
+
+def test_empty_machine_query_and_unavailable_archive_contracts(tmp_path,monkeypatch):
+    db=tmp_path/"test.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(cli,"DATA_DIR",tmp_path); conn=duckdb.connect(str(db)); cli.init_schema(conn); cli.rebuild_fts_index(conn); conn.close(); runner=CliRunner()
+    assert runner.invoke(cli.app,["query","missing","-f","json"]).stdout.strip()=="[]" and runner.invoke(cli.app,["query","missing","-f","jsonl"]).stdout==""
+    db.unlink(); result=runner.invoke(cli.app,["search","missing","-f","json"]); assert result.exit_code==1 and result.stdout=="" and "Database not found" in result.stderr
+
+def test_strict_query_revalidates_coverage_after_model_inference(hybrid_db,monkeypatch):
+    def embed(*_a,**_k):
+        with cli.get_db(path=hybrid_db) as conn: conn.execute("INSERT INTO messages(id,conversation_id,role,content) VALUES ('late','c1','user','apple late')"); cli._archive_touch(conn,[("messages","late")]); cli.rebuild_fts_index(conn)
+        return _emb(1)
+    monkeypatch.setattr(cli,"embed_text",embed); result=CliRunner().invoke(cli.app,["query","apple","--require-complete"]); assert result.exit_code==1 and "5/6" in result.stderr
+
+def test_limited_embedding_refuses_reset_and_skips_history(tmp_path,monkeypatch,capsys):
+    db=tmp_path/"test.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(cli,"DATA_DIR",tmp_path); conn=duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations(id,source) VALUES ('c','test'); INSERT INTO messages(id,conversation_id,role,content,metadata,embedding) VALUES ('current','c','user','now','{}',?),('history','c','user','old','{\"history_of\":\"current\"}',NULL)",[_emb(1)]); conn.execute("INSERT OR REPLACE INTO embedding_state VALUES (TRUE,'{\"backend\":\"old\"}')"); conn.close()
+    before=duckdb.connect(str(db),read_only=True).execute("SELECT count(*) FROM messages WHERE embedding IS NOT NULL").fetchone()[0]; result=CliRunner().invoke(cli.app,["embed","--limit","1"]); assert result.exit_code==1 and "requires full maintenance" in result.stderr and duckdb.connect(str(db),read_only=True).execute("SELECT count(*) FROM messages WHERE embedding IS NOT NULL").fetchone()[0]==before
+    conn=duckdb.connect(str(db)); conn.execute("DELETE FROM embedding_state; UPDATE messages SET embedding=NULL"); conn.close(); monkeypatch.setattr(cli,"embed_texts",lambda ss,**_k:[_emb(1) for _ in ss]); assert cli.embed_pending(limit=1)==1 and duckdb.connect(str(db),read_only=True).execute("SELECT id FROM messages WHERE embedding IS NOT NULL").fetchone()[0]=="current"
 
 
 def test_sql_select_and_blocks_writes(tmp_path, monkeypatch):
@@ -267,18 +357,18 @@ def test_json_output_formats(tmp_path, monkeypatch):
     out = CliRunner().invoke(cli.app, ["sql", "SELECT role FROM messages ORDER BY role", "-f", "jsonl"]).output
     objs = [_json.loads(l) for l in out.strip().splitlines() if l.strip()]
     assert [o["role"] for o in objs] == ["assistant", "user"]
-    sd = _json.loads(CliRunner().invoke(cli.app, ["search", "hello", "-f", "json"]).output)
+    sd = _json.loads(CliRunner().invoke(cli.app, ["search", "hello", "-f", "json"]).stdout)
     assert isinstance(sd, list)
 
 
-def test_search_rebuilds_missing_fts_index(tmp_path, monkeypatch):
+def test_search_scans_without_rebuilding_missing_fts_index(tmp_path, monkeypatch):
     db = tmp_path / "test.db"; monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
     conn = duckdb.connect(str(db)); cli.init_schema(conn)
     conn.execute("INSERT INTO conversations VALUES ('c1','test','T',NULL,NULL,NULL,NULL,NULL,NULL,NULL)")
     conn.execute("INSERT INTO messages VALUES ('m1','c1','user','recoverable',NULL,NULL,NULL,NULL,NULL,NULL)"); conn.close()
     r = CliRunner().invoke(cli.app, ["search", "recoverable", "-f", "json"])
-    assert r.exit_code == 0 and __import__("json").loads(r.output)[0]["conversation_id"] == "c1"
-    conn = duckdb.connect(str(db)); assert conn.execute("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()[0] == 1; conn.close()
+    assert r.exit_code == 0 and __import__("json").loads(r.stdout)[0]["conversation_id"] == "c1" and "complete lexical scan" in r.stderr
+    conn = duckdb.connect(str(db)); assert not conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone(); conn.close()
 
 
 def test_export_parameterizes_source_and_path(tmp_path, monkeypatch):
