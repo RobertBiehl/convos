@@ -21,7 +21,7 @@ from ai_convos import cli
 from typer.testing import CliRunner
 
 requirements = metadata("convos").get_all("Requires-Dist") or []
-assert version("convos") == "0.11.3"
+assert version("convos") == "0.11.4"
 assert not any("model2vec" in r or "sys_platform == \"linux\"" in r for r in requirements), requirements
 assert find_spec("model2vec") is None and find_spec("llama_cpp") is None and not cli.semantic_enabled()
 conn = duckdb.connect(str(cli.DB_PATH))
@@ -31,5 +31,5 @@ cli.rebuild_fts_index(conn); conn.close()
 result = CliRunner().invoke(cli.app, ["search", "native compiler", "-n", "1"])
 assert result.exit_code == 0 and "base installation needs no native compiler" in result.output, result.output
 assert Path(cli.PROJECT_ROOT).exists()
-print("clean wheel: convos 0.11.3, compiler-free Linux core and literal retrieval ready")
+print("clean wheel: convos 0.11.4, compiler-free Linux core and literal retrieval ready")
 PY
