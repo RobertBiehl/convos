@@ -1,6 +1,6 @@
 [project]
 name = "convos-memory"
-version = "0.11.6"
+version = "0.11.6b1"
 description = "Cross-provider memory revision tracking and agent-assisted synchronization for convos"
 readme = "README.md"
 license = "MIT"
