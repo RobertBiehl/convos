@@ -1,4 +1,4 @@
-import ast
+import ast, json, os, subprocess, sys
 from collections import Counter
 from pathlib import Path
 import pytest
@@ -54,12 +54,32 @@ def test_lock_diagnostics_name_waiter_and_holder(tmp_path,capsys):
     assert "remote attestation" in path.with_name(".archive.db.lock").read_text()
     try:
         try: cli.open_db(path,wait=.01,purpose="local sync")
-        except ValueError as error: message=str(error)
-        assert "local sync" in message and "remote attestation" in message and "pid " in message
-        holder.audit=(holder.audit[0],holder.audit[1],holder.audit[2]-6,holder.audit[3])
+        except cli.LockBusy as error: message=str(error)
+        assert "local sync" in message and "remote attestation" in message and "PID " in message
+        holder.audit=(holder.audit[0],holder.audit[1],holder.audit[2]-6,*holder.audit[3:])
     finally: holder.close()
     error=capsys.readouterr().err
-    assert "write lock held" in error and "remote attestation" in error and not path.with_name(".archive.db.lock").read_text()
+    assert "write lock held" in error and "remote attestation" in error and json.loads(path.with_name(".archive.db.lock").read_text())["stage"]=="finished"
+
+def test_shared_reader_diagnostics_are_identified_and_crash_records_are_pruned(tmp_path):
+    path=tmp_path/"archive.db"; writer=cli.open_db(path,purpose="fixture"); writer.close(); reader=cli.open_db(path,True,purpose="remote.scan"); reader.execute("SELECT 1")
+    sidecars=list(path.with_name(".archive.db.lock.readers").glob("*.json")); assert len(sidecars)==1 and (owner:=json.loads(sidecars[0].read_text()))["purpose"]=="remote.scan" and owner["stage"]=="query"
+    with pytest.raises(cli.LockBusy,match=r"local embed.*PID.*remote\.scan") as error: cli.open_db(path,wait=0,purpose="local embed")
+    assert "shared archive reader" not in str(error.value)
+    reader.close(); assert not list(path.with_name(".archive.db.lock.readers").glob("*.json"))
+    sidecars[0].write_text(json.dumps({"purpose":"stale"})); writer=cli.open_db(path,purpose="recovery"); writer.close(); assert not sidecars[0].exists()
+
+def test_all_process_locks_use_the_shared_contract_and_survive_crashes(tmp_path):
+    found=Counter((path,owner) for path,owner,node in calls() if isinstance(node.func,ast.Attribute) and isinstance(node.func.value,ast.Name) and (node.func.value.id,node.func.attr)==("fcntl","flock"))
+    assert found==Counter({("src/ai_convos/cli.py","_flock"):1,("src/ai_convos/cli.py","get_db"):1,("src/ai_convos/cli.py","operation_lock"):1})
+    path=tmp_path/"nested/work.lock"; child=subprocess.run([sys.executable,"-c","import os,sys; from pathlib import Path; from ai_convos.cli import operation_lock\nwith operation_lock(Path(sys.argv[1]),'test.crash'): os._exit(17)",str(path)])
+    assert child.returncode==17
+    with cli.operation_lock(path,"test.recovery") as pulse: pulse("verified")
+    owner=json.loads(path.read_text()); assert path.stat().st_mode&0o777==0o600 and owner["v"]==1 and owner["purpose"]=="test.recovery" and owner["pid"]==os.getpid() and owner["stage"]=="finished" and owner["started_at"]<=owner["heartbeat_at"]
+
+def test_external_duckdb_contention_uses_the_concise_lock_error(tmp_path,monkeypatch):
+    monkeypatch.setattr(cli,"_open_db",lambda *args:(_ for _ in ()).throw(cli.duckdb.IOException("Conflicting lock is held by external PID 12")))
+    with pytest.raises(cli.LockBusy,match="outside the Convos lock contract.*external PID 12"): cli.open_db(tmp_path/"archive.db",wait=0,purpose="test.external")
 
 def test_remote_signing_and_attachment_io_run_without_archive_lock(tmp_path,monkeypatch):
     from ai_convos_remote import projection
@@ -88,6 +108,15 @@ def test_remote_signing_and_attachment_io_run_without_archive_lock(tmp_path,monk
         return real_hash(value)
     monkeypatch.setattr(projection,"file_hash",hashed)
     assert projection.relocate_attachments(path,legacy)==1
+
+def test_remote_full_scan_releases_the_archive_between_bounded_pages(tmp_path):
+    from ai_convos_remote import projection
+    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[(str(i),) for i in range(3)]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); stages=[]
+    def progress(stage):
+        with cli.open_db(path,wait=0,purpose="concurrent page probe"): pass
+        stages.append(stage)
+    records=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); state.close()
+    assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages==["scanning archive 1","scanning archive 2","scanning archive 3"]
 
 def test_redaction_and_export_processing_run_without_archive_lock(monkeypatch):
     from ai_convos_redact import scan_data

@@ -294,15 +294,17 @@ Outgoing events:
 Outgoing plaintext is never written to `state.db`. Epoch rotation reopens a
 pending envelope in memory and reseals it.
 
-Incoming plaintext exists in memory only until DuckDB projection commits.
-Canonical archive rows and provenance facts use the same lifecycle with a
+Incoming plaintext is verified before DuckDB opens. Its proof and typed archive
+projection commit in one transaction. The projection is origin-owned and can
+change only through a verified newer revision from the same author. Archive rows and provenance facts use the same lifecycle with a
 repairable replica envelope keyed by an epoch-keyed opaque proof identity and uploader. After state loss, a peer
 advertises these identities in flat pages; the relay returns those already
 present, and only missing bodies are encrypted and uploaded directly in bounded
 pages. A lost response is reconciled idempotently on retry; SQLite retains only
-the acknowledged cursor. An imported row or provenance fact is reconstructed from its
-canonical DuckDB projection and retained origin proof, so any authorized holder
-can repair it without the author's key. Remote scanning never observes Git or
+the acknowledged cursor. A received row may be repaired from its typed projection
+only while that projection still matches its author proof. A mismatch is
+upload-blocked at row granularity; `remote repull` discards received projections
+and reconstructs them from the relay's current authorized signed rows. Remote scanning never observes Git or
 writes provenance; core ingestion and hooks capture those facts before Remote
 reads them.
 For a re-founded workspace, the old signed control chain is encrypted once as

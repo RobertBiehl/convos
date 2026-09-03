@@ -18,6 +18,21 @@ def test_remote_enable_removes_obsolete_wake_hooks(tmp_path,monkeypatch):
     remote={"type":"command","command":"mkdir -p /tmp/x && touch /tmp/x/wake # ai-convos remote hook"}; core={"type":"command","command":"/opt/convos capture claude-code","statusMessage":"Saving conversation to Convos"}; (claude/"settings.json").write_text(json.dumps({"keep":1,"hooks":{"Stop":[{"hooks":[core,remote]}],"SessionEnd":[{"hooks":[remote]}]}})); (codex/"hooks.json").write_text(json.dumps({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/opt/convos remote hook"}]}]}})); edit_hooks(); edit_hooks()
     c,x=json.loads((claude/"settings.json").read_text()),json.loads((codex/"hooks.json").read_text()); assert c=={"keep":1,"hooks":{"Stop":[{"hooks":[core]}]}} and x=={"hooks":{}} and not (tmp_path/"archive/remote/wake").exists()
 
+def test_remote_sync_contention_is_concise_and_identifies_holder(tmp_path,monkeypatch):
+    monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(tmp_path)); monkeypatch.setattr(remote_client,"MANUAL_WAIT",0); remote_client.save({"name":"alice","user":"user-id","device":{"name":"laptop","id":"device-id"}},tmp_path)
+    with remote_client.sync_run(tmp_path): result=CliRunner().invoke(remote_client.remote,["sync"],terminal_width=500)
+    output=" ".join(result.output.replace(chr(9474)," ").split())
+    assert result.exit_code==1 and "Could not start remote sync" in output and "remote user alice" in output and "PID " in output and "started " in output and "last activity " in output and "Traceback" not in output and "RuntimeError" not in output
+
+def test_remote_sync_expected_failure_is_concise(monkeypatch):
+    monkeypatch.setattr(remote_client,"sync_once",lambda **kwargs:(_ for _ in ()).throw(RuntimeError("Personal: row replica proof mismatch")))
+    result=CliRunner().invoke(remote_client.remote,["sync"]); output=" ".join(result.output.replace(chr(9474)," ").split())
+    assert result.exit_code==1 and "Personal: row replica proof mismatch" in output and "Traceback" not in output and "RuntimeError" not in output
+
+def test_remote_audit_is_machine_readable_and_fails_concisely(monkeypatch):
+    result={"totals":{"projection_mismatch":1,"projection_missing":0,"proof_missing":0},"tables":{"tool_calls":{"origins":2,"projection_match":1,"projection_mismatch":1,"projection_missing":0,"proof_missing":0}},"examples":[]}; monkeypatch.setattr(remote_client,"audit_rows",lambda path:result); runner=CliRunner(); failed=runner.invoke(remote_client.remote,["audit"]); machine=runner.invoke(remote_client.remote,["audit","--format","json"])
+    assert failed.exit_code==1 and "tool_calls: origins=2" in failed.output and "Signed-row integrity audit found 1 issue(s)" in failed.output and "Traceback" not in failed.output and machine.exit_code==0 and json.loads(machine.output)==result
+
 
 def test_background_services_preserve_custom_root(tmp_path,monkeypatch):
     home=tmp_path/"home"; root=tmp_path/"custom % archive"; calls=[]; attempts={"bootstrap":0}; binary=home/"custom % bin/convos"; monkeypatch.setenv("HOME",str(home)); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(home/"claude")); monkeypatch.setenv("CODEX_HOME",str(home/"codex"))

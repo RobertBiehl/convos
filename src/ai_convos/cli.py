@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, contextlib, csv, duckdb, fcntl, graphlib, hashlib, itertools, json, os, re, shlex, shutil, signal, site, sqlite3, ssl, struct, subprocess, sys, sysconfig, tempfile, time, typer, urllib.request, zipfile
+import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, os, re, shlex, shutil, signal, site, sqlite3, ssl, struct, subprocess, sys, sysconfig, tempfile, time, typer, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -12,45 +12,50 @@ from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remot
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT,DATA_DIR,DB_PATH,STATE_PATH=(root:=find_root()),(data:=root/"data"),data/"convos.db",data/"sync_state.json"
-HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,_FTS_DEF=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,4,9,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest()  # conservative web pacing stays below the observed ~200-detail failure point
+HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,4,9,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest()  # conservative web pacing stays below the observed ~200-detail failure point
 _CHATGPT_HOSTS,_BROWSER_UA,_CLAUDE_HEADERS=(("https://chatgpt.com",("chatgpt.com",)),("https://chat.openai.com",("chat.openai.com","openai.com"))),(ua:={"safari":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15","chrome":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}),{"Origin":"https://claude.ai","Referer":"https://claude.ai/","User-Agent":ua["safari"],"Accept":"application/json","Accept-Language":"en-US,en;q=0.9","anthropic-client-sha":"unknown","anthropic-client-version":"unknown"}
 _INJECTED_RE,MESSAGE_ORDER,MESSAGE_ORDER_DESC=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*","m.created_at NULLS FIRST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) NULLS LAST,m.id","m.created_at DESC NULLS LAST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) DESC NULLS LAST,m.id DESC"
 
-def _open_db(path,read_only=False):
-    path.parent.mkdir(parents=True,exist_ok=True)
-    return None if read_only and not path.exists() else duckdb.connect(str(path),read_only=read_only)
+def _open_db(path,read_only=False): return (path.parent.mkdir(parents=True,exist_ok=True),None if read_only and not path.exists() else duckdb.connect(str(path),read_only=read_only))[-1]
+class LockBusy(click.ClickException,RuntimeError): pass
+def lock_owner(purpose,identity=None): return dict(identity or {},v=1,purpose=purpose,pid=os.getpid(),process=Path(sys.argv[0]).name,host=os.uname().nodename,os_user=getpass.getuser(),started_at=(now:=time.time()),heartbeat_at=now,stage="started")
+def _lock_read(lock):
+    try: return json.loads((lock.seek(0),lock.read())[-1])
+    except (TypeError,ValueError): return {}
+def _reader_open(lock,purpose): return (os.chmod((directory:=Path(lock.name+".readers")).mkdir(exist_ok=True) or directory,0o700),(path:=directory/f"{os.uname().nodename}.{os.getpid()}.{time.time_ns()}.json"),(owner:=lock_owner(purpose)),atomic_json(path,owner),(reader:=path.open("r+")),(reader,owner))[-1]
+def lock_holder(owner):
+    if not owner: return "shared archive reader(s) or a pre-contract process; owner metadata unavailable"
+    return (lambda remote,started,activity:f"{remote}OS user {owner.get('os_user','unknown')}@{owner.get('host','unknown')}; PID {owner.get('pid','unknown')} ({owner.get('process','unknown')}); purpose {owner.get('purpose','unknown')}; started {started}; last activity {activity} ({owner.get('stage','unknown')})")(f"remote user {owner['remote_user']} ({owner.get('user_id','unknown')}); device {owner.get('device','unknown')} ({owner.get('device_id','unknown')}); " if owner.get("remote_user") else "",time.strftime("%Y-%m-%d %H:%M:%S %Z",time.localtime(owner["started_at"])) if isinstance(owner.get("started_at"),(int,float)) else "unknown",f"{max(0,time.time()-owner['heartbeat_at']):.0f}s ago" if isinstance(owner.get("heartbeat_at"),(int,float)) else "unknown")
 class _LockedDB:
-    def __init__(self,db,lock,purpose,read_only):
-        self.db,self.stack,self.audit=db,contextlib.ExitStack(),(purpose,read_only,time.monotonic(),lock)
-        [self.stack.callback(resource.close) for resource in (lock,db)]
-    def __getattr__(self,name): return getattr(self.db,name)
+    def __init__(self,db,lock,purpose,read_only,reader=None,owner=None):
+        self.db,self.stack,self.audit,_=db,(stack:=contextlib.ExitStack()),(purpose,read_only,time.monotonic(),lock,reader,owner),[stack.callback(fn) for fn in ([lock.close]+([reader.close,lambda:Path(reader.name).unlink(missing_ok=True)] if reader else [])+[db.close])]
+    def __getattr__(self,name): return (lambda *args,**kwargs:(value(*args,**kwargs),self.pulse("query"))[0]) if name in {"execute","executemany"} and callable(value:=getattr(self.db,name)) else getattr(self.db,name)
+    def pulse(self,stage): return self.audit[5] and (self.audit[5].update(heartbeat_at=time.time(),stage=stage) or _lock_note(self.audit[4] or self.audit[3],self.audit[5]))
     def __enter__(self): return self
     def __exit__(self,*_): self.close()
-    def close(self): return ((stack:=self.stack),setattr(self,"stack",None),not self.audit[1] and _lock_note(self.audit[3]),stack.close(),(held:=time.monotonic()-self.audit[2]),typer.echo(f"Database {'read' if self.audit[1] else 'write'} lock held {held:.1f}s: {self.audit[0]}",err=True) if held>5 else None)[-1] if self.stack else None
-def _lock_note(lock,value=""): return (lock.seek(0),lock.truncate(),value and lock.write(value),lock.flush())[-1]
-def _flock(lock,op,deadline,wait,purpose):
+    def close(self): return ((stack:=self.stack),setattr(self,"stack",None),self.pulse("finished"),stack.close(),(held:=time.monotonic()-self.audit[2]),typer.echo(f"Database {'read' if self.audit[1] else 'write'} lock held {held:.1f}s: {self.audit[0]}",err=True) if held>5 else None)[-1] if self.stack else None
+def _lock_note(lock,value=""): return (lock.seek(0),lock.truncate(),value and lock.write(json.dumps(value,separators=(",",":")) if isinstance(value,dict) else value),lock.flush())[-1]
+def _flock(lock,op,deadline,wait,purpose,identity=None):
     while True:
-        try: return (fcntl.flock(lock,op|fcntl.LOCK_NB),op!=fcntl.LOCK_EX or _lock_note(lock,f"pid {os.getpid()}, {purpose}"))[-1]
-        except BlockingIOError: time.sleep(min(.05,remaining)) if (remaining:=deadline-time.monotonic())>0 else (lock.seek(0),(_ for _ in ()).throw(ValueError(f"Database stayed locked by another convos process for {wait:g} seconds while starting {purpose}."+(f" Holder: {holder}." if (holder:=lock.read().strip()) else ""))))[-1]
+        try: return (fcntl.flock(lock,op|fcntl.LOCK_NB),(owner:=None if op!=fcntl.LOCK_EX else lock_owner(purpose,identity)),_lock_note(lock,owner or ""),owner)[-1]
+        except BlockingIOError: time.sleep(min(.05,remaining)) if (remaining:=deadline-time.monotonic())>0 else (_ for _ in ()).throw(LockBusy(f"Could not start {purpose}: another process still holds the lock after {wait:g}s. Holder: {'; '.join(map(lock_holder,readers)) if (readers:=[value for path in Path(lock.name+'.readers').glob('*.json') if (value:=json.loads(path.read_text()))]) else lock_holder(_lock_read(lock))}."))
 def get_db(read_only:bool=False,wait=30,path=None,deadline=None,*,purpose="direct database access"):
     path,deadline=(path:=Path(path or DB_PATH).expanduser().resolve()),deadline if deadline is not None else time.monotonic()+wait
     if read_only and not path.exists(): return None
     if path.exists() and path.stat().st_nlink>1: raise ValueError(f"Database hardlink aliases are unsafe: {path}")
-    lock=(path.parent.mkdir(parents=True,exist_ok=True) or path.with_name(f".{path.name}.lock").open("a+"))
+    lock=(os.chmod((lock:=path.parent.mkdir(parents=True,exist_ok=True) or path.with_name(f".{path.name}.lock").open("a+")).name,0o600),lock)[-1]
     try:
         while True:
-            _flock(lock,fcntl.LOCK_SH if read_only else fcntl.LOCK_EX,deadline,wait,purpose)
+            owner=_flock(lock,fcntl.LOCK_SH if read_only else fcntl.LOCK_EX,deadline,wait,purpose)
+            reader,owner=_reader_open(lock,purpose) if read_only else ((([p.unlink(missing_ok=True) for p in Path(lock.name+".readers").glob("*.json")] if Path(lock.name+".readers").is_dir() else None),None)[-1],owner)
             try: db=_open_db(path,read_only)
             except Exception as e:
-                if not read_only: _lock_note(lock)
-                fcntl.flock(lock,fcntl.LOCK_UN)
+                (reader and (Path(reader.name).unlink(missing_ok=True),reader.close()),not read_only and _lock_note(lock),fcntl.flock(lock,fcntl.LOCK_UN))
                 if "Conflicting lock is held" not in str(e): raise
-                if time.monotonic()>=deadline: raise ValueError(f"Database stayed locked by another process for {wait:g} seconds while starting {purpose}.") from e
+                if time.monotonic()>=deadline: raise LockBusy(f"Could not start {purpose}: DuckDB remained locked by a process outside the Convos lock contract after {wait:g}s. Details: {e}") from None
                 time.sleep(.05)
-            else: return _LockedDB(db,lock,purpose,read_only) if db is not None else (lock.close() or None)
-    except BaseException:
-        lock.close()
-        raise
+            else: return _LockedDB(db,lock,purpose,read_only,reader,owner) if db is not None else (reader and (Path(reader.name).unlink(missing_ok=True),reader.close()),lock.close(),None)[-1]
+    except BaseException as e: raise (lock.close(),e)[-1]
 def open_db(path=None,read_only=False,wait=30,deadline=None,*,purpose="direct database access"): return get_db(read_only,wait,path,deadline,purpose=purpose)
 @contextlib.contextmanager
 def _core(path=None,read_only=False,ready=False,wait=30,*,purpose):
@@ -58,10 +63,14 @@ def _core(path=None,read_only=False,ready=False,wait=30,*,purpose):
         if ready: init_schema(db)
         yield db
 @contextlib.contextmanager
-def _locked(path,op=fcntl.LOCK_EX):
-    with Path(path).open("w") as lock:
-        fcntl.flock(lock,op)
-        yield lock
+def operation_lock(path,purpose,wait=30,identity=None,mandatory=True):
+    with (Path(path).parent.mkdir(parents=True,exist_ok=True) or Path(path).open("a+")) as lock:
+        os.chmod(path,0o600)
+        try: owner=_flock(lock,fcntl.LOCK_EX,time.monotonic()+wait,wait,purpose,identity)
+        except LockBusy as error: return (yield None) if not mandatory else (_ for _ in ()).throw(error)
+        def pulse(stage): owner.update(heartbeat_at=time.time(),stage=stage) or _lock_note(lock,owner)
+        try: yield pulse
+        finally: pulse("finished") or fcntl.flock(lock,fcntl.LOCK_UN)
 @contextlib.contextmanager
 def _transaction(db):
     db.execute("BEGIN")
@@ -81,18 +90,14 @@ def atomic_write(path: Path, text):
     if path.is_symlink() or path.exists() and not path.is_file(): raise typer.Exit(typer.echo(f"Refusing unsafe managed file: {path}",err=True) or 1)
     return (path.parent.mkdir(parents=True,exist_ok=True),atomic_publish(path,lambda tmp:tmp.write_text(text),path.stat().st_mode&0o777 if path.exists() else 0o600))[-1]
 def atomic_json(path: Path, data): atomic_write(path, json.dumps(data))
-ATTACHMENT_LIMIT=32*1024**2
 def _fsync(path):
     fd=os.open(path,os.O_RDONLY)
     try: os.fsync(fd)
     finally: os.close(fd)
-def durable_replace(tmp,path):
-    tmp,path=map(Path,(tmp,path))
-    return (_fsync(tmp),os.replace(tmp,path),_fsync(path.parent))[-1]
+def durable_replace(tmp,path): return (_fsync(tmp:=Path(tmp)),os.replace(tmp,path:=Path(path)),_fsync(path.parent))[-1]
 def atomic_publish(path,write,mode=0o600):
     path,(fd,tmp)=(path:=Path(path)),tempfile.mkstemp(prefix=f".{path.name}.",dir=path.parent)
-    os.close(fd)
-    try: (write(Path(tmp)),os.chmod(tmp,mode),durable_replace(tmp,path))
+    try: (os.close(fd),write(Path(tmp)),os.chmod(tmp,mode),durable_replace(tmp,path))
     finally: Path(tmp).unlink(missing_ok=True)
 def attachment_body(data,root=None):
     if len(data)>ATTACHMENT_LIMIT: return None
@@ -104,11 +109,7 @@ def attachment_body(data,root=None):
         return (required(actual==blob,ValueError("attachment body conflicts with content hash")),os.chmod(path,0o600),path)[-1]
     return (atomic_publish(path,lambda tmp:tmp.write_bytes(data)),path)[-1]
 
-def detect_source(path: Path):
-    if path.is_dir(): return "codex" if (path / "sessions").exists() else "claude-code"
-    if path.suffix == ".zip" or "chatgpt" in path.name.lower(): return "chatgpt"
-    data=required(json.loads(path.read_text()),ValueError(f"Empty export: {path}"))
-    return "chatgpt" if "mapping" in data[0] else "claude" if "chat_messages" in data[0] else "chatgpt"
+def detect_source(path: Path): return "codex" if path.is_dir() and (path/"sessions").exists() else "claude-code" if path.is_dir() else "chatgpt" if path.suffix==".zip" or "chatgpt" in path.name.lower() else "claude" if "chat_messages" in (data:=required(json.loads(path.read_text()),ValueError(f"Empty export: {path}")))[0] else "chatgpt"
 
 def stat_mtime(path: Path): return st.st_mtime if (st:=safe_parse(f"path stat {path}",Path.stat,path)) else None
 def latest_mtime(path: Path, globs: tuple[str, ...] = ("*.jsonl", "*.json", "*.zip")): return max((m for g in globs for p in path.rglob(g) if (m := stat_mtime(p)) is not None), default=0)
@@ -276,6 +277,8 @@ def _insert_pages(db,target,rows,columns=None,conflict="",mode="",embedding=Fals
 def project_archive_rows(db,table,columns,rows):
     fields,values,origins,updates=(fields:=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at")),[r[0] for r in rows],[(table,v[0],*(o[k] for k in fields),o.get("proof_id")) for v,o in rows if o],_MSG_UPDATES if table=="messages" else ','.join(f"{c}=excluded.{c}" for c in columns[1:])
     required(table in ARCHIVE_COLUMNS and columns==ARCHIVE_COLUMNS[table] and not any(len(v)!=len(columns) or o and set(o) not in (set(fields),set(fields)|{"proof_id"}) for v,o in rows),ValueError("record schema/entity mismatch"))
+    ids,owned,occupied=(ids:=[v[0] for v,o in rows]),{r[0]:(r[1],r[2]) for r in db.execute("SELECT physical_row_id,author_user_id,source_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id IN (SELECT UNNEST(?))",(table,ids)).fetchall()},{r[0] for r in db.execute(f"SELECT id FROM {table} WHERE id IN (SELECT UNNEST(?))",(ids,)).fetchall()}
+    required(not (conflict:=next((v[0] for v,o in rows if v[0] in owned and (not o or owned[v[0]]!=(o["author_user_id"],o["source_row_id"])) or o and v[0] in occupied and v[0] not in owned),None)),ValueError(f"archive ownership conflict: {table}:{conflict}"))
     _insert_pages(db,table,values,columns,f" ON CONFLICT(id) DO UPDATE SET {updates}",embedding=table=="messages")
     if table=="file_edits":
         for mode,foreign in ((" OR REPLACE",True),(" OR IGNORE",False)): _insert_pages(db,"provenance.file_edit_evidence",[(v[0],"unverified","signed_replica_missing_evidence",None) for v,o in rows if bool(o)==foreign],mode=mode)
@@ -338,6 +341,9 @@ def project_logical_row(db,row,proof,proof_id,native=False,touch=True,parent_map
         db.execute("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)" if native else "INSERT OR REPLACE INTO remote.provenance_origins VALUES (?,?,?,?,?,?)",(table,physical) if native else (table,physical,proof["workspace"],proof["author_user_id"],source,proof_id))
         return physical
     if row["state"]=="deleted":
+        old=db.execute("SELECT author_user_id,source_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id=?",(table,physical)).fetchone()
+        required(not old or origin and old==(origin["author_user_id"],origin["source_row_id"]),ValueError(f"archive ownership conflict: {table}:{physical}"))
+        required(not origin or old or not db.execute(f"SELECT 1 FROM {table} WHERE id=?",(physical,)).fetchone(),ValueError(f"archive ownership conflict: {table}:{physical}"))
         db.execute(f"DELETE FROM {table} WHERE id=?",(physical,))
         for related in {"attachments":("attachment_bodies WHERE attachment_id",),"file_edits":("provenance.file_edit_evidence WHERE file_edit_id",)}.get(table,()): db.execute(f"DELETE FROM {related}=?",(physical,))
         (origin and db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,physical,*(origin[k] for k in ("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at","proof_id")))),table in ("file_edits","tool_calls") and _apply_signed_edit_evidence(db),touch and _archive_touch(db,[(table,physical)]))
@@ -348,12 +354,12 @@ def project_logical_row(db,row,proof,proof_id,native=False,touch=True,parent_map
 def set_attachment_path(db,row_id,path): db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),row_id))
 def attachment_index(path,size=None):
     path,actual=(path:=Path(path)),path.stat().st_size if path.is_file() and not path.is_symlink() else -1
-    if actual<0 or actual>ATTACHMENT_LIMIT or size is not None and actual!=size: return None
-    return _file_sha256(path),actual
+    return None if actual<0 or actual>ATTACHMENT_LIMIT or size is not None and actual!=size else (_file_sha256(path),actual)
 def index_attachment_body(db,row_id,path,size=None,prepared=None):
     if not (indexed:=prepared or attachment_index(path,size)): return None
     body_hash,actual=indexed
-    old=db.execute("SELECT content_hash,size FROM attachment_bodies WHERE attachment_id=?",(row_id,)).fetchone()
+    old,signed=db.execute("SELECT content_hash,size FROM attachment_bodies WHERE attachment_id=?",(row_id,)).fetchone(),db.execute("SELECT 1 FROM remote.row_origins WHERE table_name='attachments' AND physical_row_id=?",(row_id,)).fetchone()
+    if signed: return required(old==(body_hash,actual) and (size is None or size==actual),ValueError("signed attachment body conflicts with retained proof")) and body_hash
     if size is None: db.execute("UPDATE attachments SET size=? WHERE id=? AND size IS NULL",(actual,row_id))
     if old!=(body_hash,actual): (db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(row_id,body_hash,actual)),_archive_touch(db,[("attachments",row_id)]))
     return body_hash
@@ -407,6 +413,18 @@ def _migration_backup(conn,version=1):
     _backup_attachments(conn,path,backup,source)
     atomic_publish(backup,lambda tmp:(_backup_copy(path,tmp),required(_file_sha256(tmp)==source,ValueError("archive backup verification failed")),_check_archive(tmp)))
     return backup
+def reset_remote_projection(db,local_user):
+    db.execute("CREATE OR REPLACE TEMP TABLE core_repull_rows(kind VARCHAR,id VARCHAR,PRIMARY KEY(kind,id)); INSERT INTO core_repull_rows SELECT table_name,physical_row_id FROM remote.row_origins")
+    db.execute("INSERT OR IGNORE INTO core_repull_rows SELECT 'messages',m.id FROM messages m JOIN core_repull_rows p ON p.kind='conversations' AND p.id=m.conversation_id")
+    db.execute("INSERT OR IGNORE INTO core_repull_rows WITH RECURSIVE descendants(id) AS (SELECT id FROM core_repull_rows WHERE kind='messages' UNION SELECT m.id FROM messages m JOIN descendants p ON p.id=m.parent_id) SELECT 'messages',id FROM descendants")
+    [db.execute(f"INSERT OR IGNORE INTO core_repull_rows SELECT '{table}',x.id FROM {table} x JOIN core_repull_rows p ON p.kind='{parent}' AND p.id=x.{column}") for table,column,parent in (("tool_calls","message_id","messages"),("attachments","message_id","messages"),("file_edits","message_id","messages"),("artifacts","conversation_id","conversations"))]
+    counts={table:db.execute("SELECT count(*) FROM core_repull_rows WHERE kind=?",(table,)).fetchone()[0] for table in ARCHIVE_COLUMNS}
+    db.execute("DELETE FROM provider_sessions p USING core_repull_rows r WHERE r.kind='conversations' AND r.id=p.conversation_id; DELETE FROM provenance.conversation_scopes s USING core_repull_rows r WHERE r.kind='conversations' AND r.id=s.conversation; DELETE FROM attachment_bodies b USING core_repull_rows r WHERE r.kind='attachments' AND r.id=b.attachment_id; DELETE FROM provenance.file_edit_scopes s USING core_repull_rows r WHERE r.kind='file_edits' AND r.id=s.file_edit_id; DELETE FROM provenance.file_edit_files f USING core_repull_rows r WHERE r.kind='file_edits' AND r.id=f.file_edit_id; DELETE FROM provenance.file_edit_evidence e USING core_repull_rows r WHERE r.kind='file_edits' AND r.id=e.file_edit_id; DELETE FROM provenance.checkpoint_edits e USING core_repull_rows r WHERE r.kind='file_edits' AND r.id=e.file_edit_id")
+    [db.execute(f"DELETE FROM {table} x USING core_repull_rows r WHERE r.kind='{table}' AND r.id=x.id") for table in ("tool_calls","attachments","file_edits","messages","artifacts","conversations")]
+    db.execute("CREATE OR REPLACE TEMP TABLE core_repull_facts AS SELECT DISTINCT o.kind,o.physical_entity FROM remote.provenance_origins o WHERE NOT EXISTS (SELECT 1 FROM provenance.local_facts l WHERE (l.kind,l.entity)=(o.kind,o.physical_entity)); DELETE FROM provenance.checkpoint_edits x USING core_repull_facts r WHERE r.kind='checkpoint.link' AND r.physical_entity=sha256(json_object('checkpoint',x.checkpoint_id,'edit',x.file_edit_id)); DELETE FROM provenance.file_edit_files x USING core_repull_facts r WHERE r.kind='edit.observed' AND r.physical_entity=x.file_edit_id; DELETE FROM provenance.file_versions x USING core_repull_facts r WHERE r.kind='file.version' AND r.physical_entity=x.id; DELETE FROM provenance.git_checkpoints x USING core_repull_facts r WHERE r.kind='git.checkpoint' AND r.physical_entity=x.id AND NOT EXISTS (SELECT 1 FROM provenance.checkpoint_edits c WHERE c.checkpoint_id=x.id); DELETE FROM provenance.files x USING core_repull_facts r WHERE r.kind='file.observed' AND r.physical_entity=x.id AND NOT EXISTS (SELECT 1 FROM provenance.file_edit_files e WHERE e.file_id=x.id) AND NOT EXISTS (SELECT 1 FROM provenance.file_versions v WHERE v.file_id=x.id); DELETE FROM provenance.repositories x USING core_repull_facts r WHERE r.kind='repository.observed' AND r.physical_entity=x.id AND NOT EXISTS (SELECT 1 FROM provenance.files f WHERE f.repository=x.id) AND NOT EXISTS (SELECT 1 FROM provenance.git_checkpoints c WHERE c.repository=x.id) AND NOT EXISTS (SELECT 1 FROM provenance.repository_checkouts c WHERE c.repository=x.id)")
+    [db.execute(f"DELETE FROM {table} WHERE author_user_id<>?",(local_user,)) for table in ("remote.semantic_ancestors","remote.provider_session_aliases","remote.file_edit_evidence_proofs")]
+    db.execute("DELETE FROM archive_changes c USING core_repull_rows r WHERE (c.kind,c.entity)=(r.kind,r.id); DELETE FROM archive_changes c USING core_repull_facts r WHERE (c.kind,c.entity)=(r.kind,r.physical_entity); DELETE FROM remote.row_origins; DELETE FROM remote.provenance_origins; DELETE FROM remote.row_conflicts; UPDATE archive_state SET generation=generation+1 WHERE singleton")
+    return (counts["messages"] and db.execute("UPDATE retrieval_state SET messages_generation=messages_generation+1 WHERE singleton"),counts|{"provenance":db.execute("SELECT count(*) FROM core_repull_facts").fetchone()[0]})[1]
 def _repository_alias_migration(conn):
     _refresh_repository()
     ambiguous={rid for rid, in conn.execute("SELECT DISTINCT repository FROM provenance.repository_checkouts").fetchall() if len({repository_evidence(value) for root, in conn.execute("SELECT root FROM provenance.repository_checkouts WHERE repository=?",(rid,)).fetchall() if (git_root:=_git_root(root)) and (value:=_repository(str(git_root)))["lineage"]})>1}
@@ -507,11 +525,9 @@ def extract_content(content) -> dict:
 def _safari_records():
     paths=(Path.home()/"Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",Path.home()/"Library/Cookies/Cookies.binarycookies")
     if not (path:=next((p for p in paths if p.exists()),None)): return
-    data=path.read_bytes()
+    data,count=(data:=path.read_bytes()),struct.unpack(">I",data[4:8])[0] if data[:4]==b"cook" else 0
     if data[:4]!=b"cook": return
-    count=struct.unpack(">I",data[4:8])[0]
-    sizes=[struct.unpack(">I",data[8+i*4:12+i*4])[0] for i in range(count)]
-    pages=[data[start:start+size] for start,size in zip(itertools.accumulate([8+4*count,*sizes]),sizes)]
+    sizes,pages=(sizes:=[struct.unpack(">I",data[8+i*4:12+i*4])[0] for i in range(count)]),[data[start:start+size] for start,size in zip(itertools.accumulate([8+4*count,*sizes]),sizes)]
     yield from ((text(fields[0]),text(fields[1]),text(struct.unpack("<I",page[off+28:off+32])[0])) for page in pages if page[:4]==b"\0\0\1\0" for i in range(struct.unpack("<I",page[4:8])[0]) for off in [struct.unpack("<I",page[8+i*4:12+i*4])[0]] for fields,text in [(struct.unpack("<III",page[off+16:off+28]),lambda pos,page=page,off=off:page[off+pos:page.find(b"\0",off+pos)].decode(errors="ignore"))])
 def read_safari_cookies(domain: str) -> dict[str,str]:
     target=domain.lstrip(".").lower()
@@ -522,8 +538,7 @@ def _chrome_path(profile=None): return (lambda root:next((path for path in (root
 
 def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, str]:
     if not (db_path:=_chrome_path(profile)): return {}
-    result = subprocess.run(["security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage"], capture_output=True, text=True, timeout=10)
-    if result.returncode != 0: return {}
+    if (result:=subprocess.run(["security","find-generic-password","-w","-a","Chrome","-s","Chrome Safe Storage"],capture_output=True,text=True,timeout=10)).returncode: return {}
     key=hashlib.pbkdf2_hmac('sha1',result.stdout.strip().encode(),b'saltysalt',1003,16)
     with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro&nolock=1",uri=True)) as db:
         return {name:(value[32:] if not value[:32].isascii() else value).decode(errors="ignore") for name,encrypted,host in db.execute("SELECT name,encrypted_value,host_key FROM cookies WHERE host_key LIKE ?",(f"%{domain}%",)) if encrypted[:3]==b"v10" for decryptor in [Cipher(algorithms.AES(key),modes.CBC(b" "*16)).decryptor()] for decrypted in [decryptor.update(encrypted[3:])+decryptor.finalize()] for value in [decrypted[:-decrypted[-1]]]}
@@ -542,25 +557,20 @@ def chrome_profiles() -> list[str]: return [p.name for p in base.iterdir() if p.
 
 def chatgpt_profiles(browser: str) -> list[str | None]: return [None] if browser!="chrome" else [prof] if (prof:=os.environ.get("CONVOS_CHROME_PROFILE")) else chrome_profiles() or [None]
 
-def chatgpt_cookie_base(browser: str, hosts: list[tuple[str, list[str]]], profile: str | None):
-    if found:=next(((cookies,url) for url,domains in hosts if (cookies:=get_cookies_any(domains,browser,profile=profile))),None): return found
-    raise ValueError(f"No ChatGPT cookies found in {browser}" + (f" profile {profile}" if profile else ""))
+def chatgpt_cookie_base(browser: str, hosts: list[tuple[str, list[str]]], profile: str | None): return required(next(((cookies,url) for url,domains in hosts if (cookies:=get_cookies_any(domains,browser,profile=profile))),None),ValueError(f"No ChatGPT cookies found in {browser}"+(f" profile {profile}" if profile else "")))
 def claude_listing(browser):
-    cookies=required(get_cookies("claude.ai",browser),ValueError(f"No Claude cookies found in {browser}"))
-    org=required(fetch_json("https://claude.ai/api/organizations",cookies,_CLAUDE_HEADERS),ValueError("Could not get Claude org ID"))[0]["uuid"]
+    cookies,org=(cookies:=required(get_cookies("claude.ai",browser),ValueError(f"No Claude cookies found in {browser}"))),required(fetch_json("https://claude.ai/api/organizations",cookies,_CLAUDE_HEADERS),ValueError("Could not get Claude org ID"))[0]["uuid"]
     return cookies,org,fetch_json(f"https://claude.ai/api/organizations/{org}/chat_conversations",cookies,_CLAUDE_HEADERS)
 
 def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
     headers={"Origin":base,"Referer":f"{base}/","User-Agent":ua,"Accept":"application/json","Accept-Language":"en-US,en;q=0.9","Sec-Fetch-Site":"same-origin","Sec-Fetch-Mode":"cors","Sec-Fetch-Dest":"empty"}
     with contextlib.suppress(Exception):
-        session = fetch_json(f"{base}/api/auth/session", cookies, headers, timeout=10, retries=0, rate_limit_backoff=300)
-        headers.update({**({"Authorization":f"Bearer {token}"} if (token:=session.get("accessToken")) else {}),**({"ChatGPT-Account-ID":aid} if (aid:=session.get("account",{}).get("id")) else {})})
+        headers.update({**({"Authorization":f"Bearer {token}"} if (token:=(session:=fetch_json(f"{base}/api/auth/session", cookies, headers, timeout=10, retries=0, rate_limit_backoff=300)).get("accessToken")) else {}),**({"ChatGPT-Account-ID":aid} if (aid:=session.get("account",{}).get("id")) else {})})
         if debug_profile: typer.echo(f"  chatgpt chrome profile={debug_profile} user={session.get('user', {}).get('email')}", flush=True)
     return headers
 
 def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 15, retries: int = 1, before_request=None, rate_limit_backoff=None) -> dict:
-    parts=[s for k,v in cookies.items() for s in [f"{k}={v}"] if all(ord(c)<256 for c in s)]
-    cookie_str,hdrs,req=(cookie_str:="; ".join(parts)),(hdrs:={"Cookie":cookie_str,"User-Agent":"Mozilla/5.0","Accept":"application/json",**(headers or {})}),urllib.request.Request(url,headers=hdrs)
+    parts,cookie_str,hdrs,req=(parts:=[s for k,v in cookies.items() for s in [f"{k}={v}"] if all(ord(c)<256 for c in s)]),(cookie_str:="; ".join(parts)),(hdrs:={"Cookie":cookie_str,"User-Agent":"Mozilla/5.0","Accept":"application/json",**(headers or {})}),urllib.request.Request(url,headers=hdrs)
     for i in range(retries+1):
         before_request and before_request()
         try:
@@ -600,10 +610,8 @@ def safe_parse(context: str, fn, *args, **kwargs):
     except Exception as e: return log_parse_error(context,e)
 
 def parse_source(path: Path, source: str|None = None, bindings=None) -> ParseResult:
-    parsers = {"chatgpt": parse_chatgpt, "claude": parse_claude, "claude-code": parse_claude_code, "codex": parse_codex}
-    src = source or detect_source(path)
-    if src not in parsers: raise ValueError(f"Unknown source: {src}")
-    return parsers[src](path,bindings=bindings) if src in ("claude-code","codex") else parsers[src](path)
+    parsers,src={"chatgpt":parse_chatgpt,"claude":parse_claude,"claude-code":parse_claude_code,"codex":parse_codex},source or detect_source(path)
+    return (required(src in parsers,ValueError(f"Unknown source: {src}")),parsers[src](path,bindings=bindings) if src in ("claude-code","codex") else parsers[src](path))[1]
 
 def chatgpt_mapping(cid: str, mapping: dict) -> tuple[list, list, list]:
     tree_path=lambda nid:(*tree_path(parent),(mapping[parent].get("children") or [x for x in mapping if mapping[x].get("parent")==parent]).index(nid)) if (parent:=mapping[nid].get("parent")) in mapping else (tuple(mapping).index(nid),)
@@ -683,22 +691,16 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
 def parse_chatgpt(path: Path) -> ParseResult:
     data=json.load(zipfile.ZipFile(path).open("conversations.json")) if path.suffix==".zip" else json.loads(path.read_text())
     def parse_conv(c):
-        cid, gizmo = gen_id("chatgpt", c.get("id", "")), c.get("gizmo_id")
-        conv=dict(id=cid,source="chatgpt",title=c.get("title"),created_at=ts_any(c.get("create_time")),updated_at=ts_any(c.get("update_time")),model=c.get("default_model_slug"),cwd=None,git_branch=None,project_id=gizmo,metadata=json.dumps({"session_id":c.get("id", ""),"session_kind":"main","session_kind_evidence":"exact","capture_mode":"export",**({"gizmo_id":gizmo} if gizmo else {})}))
-        msgs, tools, attachs = chatgpt_mapping(cid, c.get("mapping", {}))
-        return ParseResult(convs=[conv],msgs=msgs,tools=tools,attachs=attachs)
+        cid,gizmo,conv=(cid:=gen_id("chatgpt",c.get("id",""))),(gizmo:=c.get("gizmo_id")),dict(id=cid,source="chatgpt",title=c.get("title"),created_at=ts_any(c.get("create_time")),updated_at=ts_any(c.get("update_time")),model=c.get("default_model_slug"),cwd=None,git_branch=None,project_id=gizmo,metadata=json.dumps({"session_id":c.get("id",""),"session_kind":"main","session_kind_evidence":"exact","capture_mode":"export",**({"gizmo_id":gizmo} if gizmo else {})}))
+        return ParseResult(convs=[conv],msgs=(parsed:=chatgpt_mapping(cid,c.get("mapping",{})))[0],tools=parsed[1],attachs=parsed[2])
     return sum((parsed for idx,c in enumerate(data) if (parsed:=safe_parse(f"chatgpt export conv {c.get('id') if isinstance(c,dict) else idx}",parse_conv,c))),ParseResult())
 
 def parse_claude(path: Path) -> ParseResult:
     data = json.loads(path.read_text())
     def parse_conv(c):
-        cid = gen_id("claude", c["uuid"] if "uuid" in c else c["id"])
-        msgs_data = c.get("chat_messages", [])
-        parsed=[(i,m,gen_id("claude",f"{cid}:{m['uuid'] if 'uuid' in m else m['id']}"),extract_content(m.get("text") or m.get("content", ""))) for i,m in enumerate(msgs_data)]
-        results={t["id"]:t for i,m,mid,ec in parsed for t in ec["tools"] if "output" in t and t.get("id")}
+        cid,msgs_data,parsed,results=(cid:=gen_id("claude",c["uuid"] if "uuid" in c else c["id"])),(msgs_data:=c.get("chat_messages",[])),(parsed:=[(i,m,gen_id("claude",f"{cid}:{m['uuid'] if 'uuid' in m else m['id']}"),extract_content(m.get("text") or m.get("content",""))) for i,m in enumerate(msgs_data)]),{t["id"]:t for i,m,mid,ec in parsed for t in ec["tools"] if "output" in t and t.get("id")}
         return {"conv":dict(id=cid,source="claude",title=c.get("name") or c.get("title"),created_at=ts_from_iso(c.get("created_at")),updated_at=ts_from_iso(c.get("updated_at")),model=c.get("model"),cwd=None,git_branch=None,project_id=None,metadata=json.dumps({"session_id":c["uuid"] if "uuid" in c else c["id"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"export"})),"msgs":[dict(id=mid,conversation_id=cid,role="user" if m.get("sender")=="human" else m.get("sender","unknown"),content=ec["text"],thinking=ec["thinking"],created_at=ts_from_iso(m.get("created_at")),model=m.get("model"),metadata=json.dumps({"provider_index":i}),parent_id=None) for i,m,mid,ec in parsed if ec["text"] or ec["tools"] or ec["attachments"] or m.get("attachments")],"tools":[dict(id=gen_id("claude",f"tool:{mid}:{t.get('id') or j}"),message_id=mid,tool_name=t["name"],input=json.dumps(t.get("input",{})),output=json.dumps((results.get(t.get("id")) or {}).get("output","")),status="failed" if (results.get(t.get("id")) or {}).get("error") else "complete" if t.get("id") in results else "pending",duration_ms=None,created_at=ts_from_iso(m.get("created_at"))) for i,m,mid,ec in parsed for j,t in enumerate(ec["tools"]) if "name" in t],"attachs":[dict(id=gen_id("claude",f"attach:{mid}:{j}"),message_id=mid,filename=a.get("name",a.get("file_name")),mime_type=a.get("content_type",a.get("file_type")),size=a.get("size",a.get("file_size")),path=None,url=a.get("asset_pointer",a.get("url")),created_at=ts_from_iso(m.get("created_at"))) for i,m,mid,ec in parsed for j,a in enumerate([*ec["attachments"],*m.get("attachments",[])])]}
-    parsed=[p for idx,c in enumerate(data) if (p:=safe_parse(f"claude export conv {c.get('uuid') if isinstance(c,dict) else idx}",parse_conv,c))]
-    return ParseResult(convs=[p["conv"] for p in parsed],msgs=[m for p in parsed for m in p["msgs"]],tools=[t for p in parsed for t in p["tools"]],attachs=[a for p in parsed for a in p["attachs"]])
+    return (lambda parsed:ParseResult(convs=[p["conv"] for p in parsed],msgs=[m for p in parsed for m in p["msgs"]],tools=[t for p in parsed for t in p["tools"]],attachs=[a for p in parsed for a in p["attachs"]]))([p for idx,c in enumerate(data) if (p:=safe_parse(f"claude export conv {c.get('uuid') if isinstance(c,dict) else idx}",parse_conv,c))])
 
 def iter_jsonl(path: Path):
     for i, line in enumerate(path.open(), start=1):
@@ -809,8 +811,19 @@ def _history_row(table,row,payload):
     historical[0]=gen_id("history",f"{table}:{row[0]}:{json.dumps(payload,default=str)}")
     if table=="messages": historical[7]=json.dumps({**json.loads(historical[7] or "{}"),"history_of":row[0],"superseded_at":datetime.now().isoformat()})
     return historical
+def _prune_remote_rows(conn,r):
+    candidates={"conversations":{v["id"] for v in r.convs}|{v["conversation_id"] for v in [*r.msgs,*r.artifacts]},"messages":{v["id"] for v in r.msgs}|{v["parent_id"] for v in r.msgs if v["parent_id"]}|{v["message_id"] for v in [*r.tools,*r.attachs,*r.edits]},"tool_calls":{v["id"] for v in r.tools}|{v["tool_call_id"] for v in r.edit_evidence if v["tool_call_id"]},"attachments":{v["id"] for v in r.attachs},"artifacts":{v["id"] for v in r.artifacts},"file_edits":{v["id"] for v in r.edits}|{v["file_edit_id"] for v in r.edit_evidence}}
+    owned={table:{v[0] for v in conn.execute("SELECT physical_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id IN (SELECT UNNEST(?))",(table,list(ids))).fetchall()} if ids else set() for table,ids in candidates.items()}
+    convs,msgs=owned["conversations"],owned["messages"]|{v["id"] for v in r.msgs if v["conversation_id"] in owned["conversations"]}
+    while extra:={v["id"] for v in r.msgs if v["parent_id"] in msgs}-msgs: msgs|=extra
+    tools,attachs,artifacts,edits=owned["tool_calls"]|{v["id"] for v in r.tools if v["message_id"] in msgs},owned["attachments"]|{v["id"] for v in r.attachs if v["message_id"] in msgs},owned["artifacts"]|{v["id"] for v in r.artifacts if v["conversation_id"] in convs},owned["file_edits"]|{v["id"] for v in r.edits if v["message_id"] in msgs}
+    before=sum(map(len,(r.convs,r.msgs,r.tools,r.attachs,r.artifacts,r.edits,r.edit_evidence)))
+    r.convs,r.msgs,r.tools,r.attachs,r.artifacts,r.edits=[v for v in r.convs if v["id"] not in convs],[v for v in r.msgs if v["id"] not in msgs],[v for v in r.tools if v["id"] not in tools],[v for v in r.attachs if v["id"] not in attachs],[v for v in r.artifacts if v["id"] not in artifacts],[v for v in r.edits if v["id"] not in edits]
+    r.edit_evidence=[v for v in r.edit_evidence if v["file_edit_id"] not in edits and v["tool_call_id"] not in tools]
+    if skipped:=before-sum(map(len,(r.convs,r.msgs,r.tools,r.attachs,r.artifacts,r.edits,r.edit_evidence))): typer.echo(f"  skipped {skipped} local row(s) owned by signed Remote data",err=True)
 def upsert(conn, r: ParseResult):
     required(not (conflict:=_id_conflict(r.convs,("source","cwd","git_branch","project_id","metadata")) or _id_conflict(r.msgs,("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"))),ValueError(f"divergent provider session in import batch: {conflict}"))
+    _prune_remote_rows(conn,r)
     if uncertain:={v["file_edit_id"] for v in r.edit_evidence if v["status"]!="confirmed"}: r.edit_evidence=[v for v in r.edit_evidence if v["status"]=="confirmed" or v["file_edit_id"] in {e["id"] for e in r.edits}|{x[0] for x in conn.execute("SELECT id FROM file_edits WHERE id IN (SELECT UNNEST(?))",(list(uncertain),)).fetchall()}]
     _parse_result_refs(conn,r)
     _quarantine_stubs(r)
@@ -873,12 +886,10 @@ def retry_hook(work, force=False):
     if force: atomic_json(target,{**json.loads(target.read_text()),"retry":True})
     work.unlink(missing_ok=True) if q.exists() else os.replace(work, q)
 def drain_hooks(embed=False, local_only=False,block=False):
-    HOOK_DIR.mkdir(parents=True,exist_ok=True)
     done,claims,failed,started=[],[],0,time.monotonic()
-    with (HOOK_DIR/".drain.lock").open("w") as drain:
-        try: fcntl.flock(drain,fcntl.LOCK_EX|(0 if block else fcntl.LOCK_NB))
-        except BlockingIOError: return 0
-        with _locked(HOOK_DIR/".lock"):
+    with operation_lock(HOOK_DIR/".drain.lock","hooks.drain",30 if block else 0,mandatory=block) as pulse:
+        if not pulse: return 0
+        with operation_lock(HOOK_DIR/".lock","hooks.queue"):
             state=json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}
             [done.append((work,work.stem,event["snap"],set(event["changed"]))) if "changed" in event else retry_hook(work,True) for work in HOOK_DIR.glob("*.work") for event in [json.loads(work.read_text())]]
             claims=[work for queue in sorted(HOOK_DIR.glob("*.json"),key=lambda p:(p.stat().st_mtime_ns,p.name))[:HOOK_DRAIN_EVENTS] for work in [queue.with_suffix(".work")] if os.replace(queue,work) is None]
@@ -887,13 +898,14 @@ def drain_hooks(embed=False, local_only=False,block=False):
         for n,work in enumerate(claims):
             if n and time.monotonic()-started>=HOOK_DRAIN_SECONDS: break
             try:
+                pulse(f"processing {work.name}")
                 e,path,key,st,snap=(e:=json.loads(work.read_text())),(path:=Path(e["path"])),work.stem,(st:=path.stat()),[st.st_mtime_ns,st.st_size]
                 if state.get(key)==snap:
                     work.unlink()
                     continue
                 r,st2=hook_result(e["source"],path,bindings),path.stat()
                 if snap!=[st2.st_mtime_ns,st2.st_size]:
-                    with _locked(HOOK_DIR/".lock"): retry_hook(work)
+                    with operation_lock(HOOK_DIR/".lock","hooks.queue"): retry_hook(work)
                     continue
                 if not r.convs:
                     done.append((work,key,snap,set()))
@@ -904,11 +916,11 @@ def drain_hooks(embed=False, local_only=False,block=False):
                 done.append((work,key,snap,changed))
             except FileNotFoundError: work.unlink(missing_ok=True)
             except Exception as error:
-                with _locked(HOOK_DIR/".lock"): retry_hook(work)
+                with operation_lock(HOOK_DIR/".lock","hooks.queue"): retry_hook(work)
                 failed+=1
                 log_parse_error(f"hook inbox {work}",error)
         if done:
-            with _locked(HOOK_DIR/".lock"):
+            with operation_lock(HOOK_DIR/".lock","hooks.queue"):
                 state.update((key,snap) for _,key,snap,_ in done)
                 atomic_json(HOOK_STATE,state)
                 for work,_,_,_ in done: work.unlink(missing_ok=True)
@@ -960,9 +972,9 @@ def embed_texts(ss: list[str], doc: bool = False, local_only=False) -> list[list
     required(all(len(v)==profile["dimensions"] for v in vectors),ValueError("Embedding runtime returned the wrong dimensions"))
     return vectors
 def embed_text(s: str, doc: bool = False, local_only=False) -> list[float]: return embed_texts([s], doc, local_only)[0]
-def embed_pending(batch: int = 32, ids=None, local_only=False,limit=None):
+def embed_pending(batch: int = 32, ids=None, local_only=False,limit=None,progress=None):
     if ids == []: return
-    profile,reset=_activate_embedding_profile(limit)
+    profile,reset=(progress and progress("checking profile"),_activate_embedding_profile(limit))[-1]
     ids,Q,ps=(ids:=None if reset else ids),(Q:="FROM messages WHERE embedding IS NULL AND content IS NOT NULL AND content != '' AND json_extract_string(metadata,'$.history_of') IS NULL"+_NOISE+(f" AND id IN ({','.join(['?']*len(ids))})" if ids is not None else "")),ids or []
     with _core(read_only=True,purpose="embedding.count") as conn: n=min(conn.execute(f"SELECT COUNT(*) {Q}",ps).fetchone()[0],limit) if limit else conn.execute(f"SELECT COUNT(*) {Q}",ps).fetchone()[0]
     if not n: return
@@ -972,7 +984,7 @@ def embed_pending(batch: int = 32, ids=None, local_only=False,limit=None):
         with _core(read_only=True,purpose="embedding.batch.read") as conn: rows=conn.execute(f"SELECT id,left(content,?),sha256(content) {Q} ORDER BY LEAST(length(content),?) LIMIT ?",[profile["character_limit"],*ps,profile["character_limit"],min(batch,n-done)]).fetchall()
         if not rows: break
         step=_MCFG["n_seq_max"] if profile["backend"]=="llama.cpp" else batch
-        updates=[(vector,mid,content_hash) for chunk in (rows[i:i+step] for i in range(0,len(rows),step)) for (mid,_,content_hash),vector in zip(chunk,embed_texts([content for _,content,_ in chunk],doc=True,local_only=local_only))]
+        updates=(progress and progress(f"embedding {done}/{n}"),[(vector,mid,content_hash) for chunk in (rows[i:i+step] for i in range(0,len(rows),step)) for (mid,_,content_hash),vector in zip(chunk,embed_texts([content for _,content,_ in chunk],doc=True,local_only=local_only))])[-1]
         with _core(purpose="embedding.batch.write") as conn,_transaction(conn): conn.executemany("UPDATE messages SET embedding=? WHERE id=? AND sha256(content)=? AND embedding IS NULL",updates)
         typer.echo(f"  {(done:=done+len(rows))}/{n}\r",nl=False,err=True)
     with _core(read_only=True,purpose="embedding.remaining") as conn: remaining=conn.execute(f"SELECT COUNT(*) {Q}",ps).fetchone()[0]
@@ -1026,17 +1038,11 @@ def drain_hooks_cmd(block:bool=typer.Option(False,"--block/--no-block",hidden=Tr
 
 def init():
     with _core(ready=True,purpose="maintenance.fts") as conn: rebuild_fts_index(conn)
-    HOOK_FTS_DIRTY.unlink(missing_ok=True)
-    sync(False,300,True,True,False,False,True)
-    install_skills()
-    install_hooks(False,False)
-    for ep in entry_points(group="convos.init"): typer.echo(ep.load()())
-    typer.echo(f"Database initialized at {DB_PATH}")
+    (HOOK_FTS_DIRTY.unlink(missing_ok=True),sync(False,300,True,True,False,False,True),install_skills(),install_hooks(False,False),[typer.echo(ep.load()()) for ep in entry_points(group="convos.init")],typer.echo(f"Database initialized at {DB_PATH}"))
 
 def fts():
     with _core(ready=True,purpose="maintenance.fts") as conn: rebuild_fts_index(conn)
-    HOOK_FTS_DIRTY.unlink(missing_ok=True)
-    typer.echo("FTS index ready")
+    (HOOK_FTS_DIRTY.unlink(missing_ok=True),typer.echo("FTS index ready"))
 
 def search(query: str, source: str|None = typer.Option(None, "-s"), days: int|None = typer.Option(None, "-d"), role: str|None = typer.Option(None, "-r"), cwd: Path|None = typer.Option(None, "--cwd", "-w"), conversation: str|None = typer.Option(None, "--conversation"), thinking: bool = typer.Option(False, "--thinking", "-t"), limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
     conn,mode=_fts_ro()
@@ -1114,7 +1120,7 @@ def query_cmd(q: str, source: str|None = typer.Option(None, "-s"), days: int|Non
 def embed_cmd(batch: int = typer.Option(32, "-b",min=1),limit: int|None = typer.Option(None,"--limit",min=1)):
     with _core(ready=True,purpose="schema.embedding"): pass
     try:
-        with _locked(DATA_DIR/".embed.lock"): done=embed_pending(batch,limit=limit)
+        with operation_lock(DATA_DIR/".embed.lock","embedding",wait=0) as pulse: done=embed_pending(batch,limit=limit,progress=pulse)
         typer.echo(f"Processed {done or 0} embedding candidates" if limit else "Embeddings ready")
     except Exception as e: raise typer.Exit(typer.echo(f"Embedding failed: {e}",err=True) or 1)
 
@@ -1159,8 +1165,7 @@ def install_skills():
         if old.is_file() and not old.is_symlink() and old.read_text()==legacy: typer.echo(f"Removed legacy {old}") if old.unlink() is None else None
 
 def _capture_command(source):
-    root=Path(os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT)).expanduser().resolve()
-    return f"{f'CONVOS_PROJECT_ROOT={shlex.quote(str(root))} ' if root!=Path.home()/'.convos' else ''}{shlex.quote(str(Path(sys.executable).with_name('convos')))} capture {source}"
+    return f"{f'CONVOS_PROJECT_ROOT={shlex.quote(str(root))} ' if (root:=Path(os.environ.get('CONVOS_PROJECT_ROOT',PROJECT_ROOT)).expanduser().resolve())!=Path.home()/'.convos' else ''}{shlex.quote(str(Path(sys.executable).with_name('convos')))} capture {source}"
 def _managed_hook(h, source): return h.get("command", "").endswith("convos remote hook") or h.get("command", "").endswith((f" hook {source}", f" capture {source}")) and h.get("statusMessage") in ("Updating conversation archive", "Saving conversation to Convos")
 def edit_hook_config(path, events, source, remove=False):
     data=json.loads(path.read_text()) if path.exists() else {}
@@ -1210,13 +1215,7 @@ def backup():
     typer.echo(f"Archive backed up to {path} with attachments at {path}.attachments")
 
 def _sync_leader(fn):
-    DATA_DIR.mkdir(parents=True,exist_ok=True)
-    with (DATA_DIR/".sync.lock").open("w") as lock:
-        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:
-            typer.echo("Sync already running; no work was started")
-            raise typer.Exit()
-        return fn()
+    with operation_lock(DATA_DIR/".sync.lock","sync",wait=0) as pulse: return fn(pulse)
 
 def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch all sources and reconcile all provenance"), verbose: bool = typer.Option(False, "-v", "--verbose"), local_only: bool = typer.Option(False, "--local-only", help="Import local agent sessions and configured exports without contacting web sources.")):
     if sys.argv[1:2] == ["sync"]: signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -1264,23 +1263,23 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if not path.exists(): return None
         mtime=latest_mtime(path) if path.is_dir() else path.stat().st_mtime
         return None if mtime<=imports.get(str(path),{}).get("mtime",0) else dict(name=f"import:{path}",label=f"import:{path}",func=lambda p=path:parse_source(p),state=("imports",str(path),{"mtime":mtime}))
-    def run_sync():
+    def run_sync(pulse):
         nonlocal state,local,web,imports,ready
         if not ready:
             with _core(ready=True,purpose="sync.schema"): pass
             drain_hooks()
             ready=True
-        state,before,t0=(state:=load_state()),json.dumps(state,sort_keys=True),time.perf_counter()
+        state,before,t0=(state:=pulse("planning") or load_state()),json.dumps(state,sort_keys=True),time.perf_counter()
         local,web,imports=state.setdefault("local",{}),state.setdefault("web",{}),state.setdefault("imports",{})
         chatgpt_ok.clear() or chatgpt_frontiers.clear()
         total,changed,jobs,newc,updc,provenance_edits,provenance_conversations,repair_attempted=[0]*5,set(),[],0,0,set(),set(),set()
         def checkpoint(r):
-            with _locked(HOOK_DIR/".lock"):
+            with operation_lock(HOOK_DIR/".lock","hooks.queue"):
                 out=commit_result(r,purpose="sync.ingest")
                 known.update({c["id"]:(u.timestamp() if (u:=ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"})
                 repair_attempted.update(c["id"] for c in r.convs if c["id"] in repair_order)
                 return (*out,getattr(r,"provenance_edits",set()),getattr(r,"provenance_conversations",set()))
-        with _core(read_only=True,purpose="sync.chatgpt.repair.plan") as conn: repairs=conn.execute("SELECT c.id,MIN(m.created_at),MAX(m.created_at) FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL) GROUP BY c.id").fetchall()
+        with _core(read_only=True,purpose="sync.chatgpt.repair.plan") as conn: repairs=conn.execute("SELECT c.id,MIN(m.created_at),MAX(m.created_at) FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL) AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) GROUP BY c.id").fetchall()
         if repairs:
             with _core(purpose="sync.chatgpt.repair.write") as conn,_transaction(conn): (conn.executemany("UPDATE conversations SET created_at=COALESCE(created_at,?),updated_at=COALESCE(updated_at,?) WHERE id=?",[(first,last,cid) for cid,first,last in repairs]),_archive_touch(conn,[("conversations",cid) for cid,_,_ in repairs]))
         with _core(read_only=True,purpose="sync.plan") as conn: cur,bindings,rows,candidates=counts_by_source(conn),session_bindings(conn),conn.execute(f"SELECT c.id,c.updated_at,json_extract_string(c.metadata,'$.remote_update_time'),json_extract_string(c.metadata,'$.remote_complete'),(SELECT role FROM messages m WHERE m.conversation_id=c.id ORDER BY {MESSAGE_ORDER_DESC} LIMIT 1) FROM conversations c WHERE source='chatgpt'").fetchall(),{r[0] for r in conn.execute("SELECT DISTINCT m.conversation_id FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.source='chatgpt' AND json_extract_string(m.metadata,'$.provider_index') IS NULL QUALIFY count(*) OVER (PARTITION BY m.conversation_id,m.created_at)>1").fetchall()}
@@ -1300,18 +1299,18 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
             with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as ex:
                 futs = {ex.submit(j["func"]): {**j, "t": time.perf_counter()} for j in jobs}
                 for fut in as_completed(futs):
-                    try: r=(j:=futs[fut]) and fut.result()
+                    try: r=(pulse(f"receiving {(j:=futs[fut])['name']}"),fut.result())[-1]
                     except Exception as e: r=typer.echo(f"{j['name']} failed: {e}")
                     if saved := j.get("saved"):
                         c,m,t,a,e,n,u,changed_ids,provenance_edits,provenance_conversations=(*[sum(s[i] for s in saved) for i in range(7)],set().union(*(s[7] for s in saved)),provenance_edits|set().union(*(s[8] for s in saved)),provenance_conversations|set().union(*(s[9] for s in saved)))
                     elif r is not None:
-                        with _locked(HOOK_DIR/".lock"): c,m,t,a,e,n,u,changed_ids=commit_result(r,purpose="sync.ingest")
+                        with operation_lock(HOOK_DIR/".lock","hooks.queue"): c,m,t,a,e,n,u,changed_ids=commit_result(r,purpose="sync.ingest")
                     else: continue
                     total,newc,updc,changed=[total[i]+v for i,v in enumerate([c,m,t,a,e])],newc+n,updc+u,changed|changed_ids
                     if r is not None: provenance_edits,provenance_conversations=provenance_edits|getattr(r,"provenance_edits",set()),provenance_conversations|getattr(r,"provenance_conversations",set())
                     if r is not None and (st:=j.get("state")): (j["name"]=="chatgpt" and st[2].update(coverage=sorted(known),order_repairs={cid:known[cid] for cid in ({cid for cid in candidates if prior_order.get(cid)==updated[cid]}|repair_attempted)}),set_state(*st))
                     if j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} processed){' before failure' if r is None else ''}{' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
-        capture_provenance() if full else capture_provenance(edit_ids=provenance_edits,conversation_ids=provenance_conversations)
+        (pulse("capturing provenance"),capture_provenance() if full else capture_provenance(edit_ids=provenance_edits,conversation_ids=provenance_conversations))
         if before!=json.dumps(state,sort_keys=True): atomic_json(STATE_PATH,state)
         verbose and typer.echo(f"Total sync time {time.perf_counter()-t0:.2f}s")
         return total, newc, updc
