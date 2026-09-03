@@ -1,20 +1,22 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
-import fcntl, hashlib, json, os, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
-from contextlib import closing, contextmanager
+import hashlib, json, os, shutil, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
+from contextlib import ExitStack, closing, contextmanager
+from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
 from typing import Optional
 
 import typer
 from ai_convos_redact import protect_all
-_pending=[]
+_pending,_leases,MANUAL_WAIT=[],ContextVar("remote_leases",default=()),5
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import PROJECT_ROOT, archive_changes as core_archive_changes, archive_state as core_archive_state, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, open_db, project_attachment_body, project_file_edit_evidence, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required
+from ai_convos.cli import PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, reset_remote_projection
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, row_replicas, scan, sequence, sharing, stored_controls, verify_history
+from .projection import PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
                        recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
+def cli_error(message): raise typer.Exit(typer.echo(f"Error: {message}",err=True) or 1)
 
 remote,REPLICA_BATCH_BYTES,REPLICA_ITEM_BYTES=typer.Typer(help="End-to-end encrypted personal and team synchronization"),4*1024**2,48*1024**2
 def local_root(root=None): return Path(root or os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT))
@@ -228,6 +230,7 @@ def safe_url(url):
     parsed=urllib.parse.urlparse(url)
     required(parsed.scheme=="https" or parsed.hostname in ("127.0.0.1","localhost","::1") or os.environ.get("CONVOS_REMOTE_INSECURE")=="1",ValueError("Remote URL must use HTTPS (set CONVOS_REMOTE_INSECURE=1 only on a trusted test network)"))
 def request(cfg,body,auth=True):
+    _progress(f"request {body['op']}")
     safe_url(cfg["url"])
     headers={"Content-Type":"application/json"}
     if auth: headers["Authorization"]="Bearer "+cfg["token"]
@@ -240,27 +243,41 @@ def health(cfg):
     result=json.loads(urllib.request.urlopen(cfg["url"].rstrip("/")+"/v1/health",timeout=3).read())
     required(result.get("version")==1,ValueError("relay protocol v1 required"))
     return result
+def _manual_waiting(root):
+    path=paths(root)[0]/"manual.lock"
+    with operation_lock(path,"remote background admission",0,_lock_identity(root),False) as pulse:
+        if pulse: return None
+    try: return json.loads(path.read_text())
+    except (OSError,ValueError): return {}
+def _progress(stage):
+    for pulse,root in _leases.get():
+        if root and (owner:=_manual_waiting(root)) is not None: raise InterruptedError(f"Background Remote sync yielded to a manual command. Holder: {lock_holder(owner)}.")
+        pulse(stage)
+def _lock_identity(root):
+    try: cfg=json.loads(paths(root)[1].read_text())
+    except (OSError,ValueError): cfg={}
+    return dict(remote_user=cfg.get("name"),user_id=cfg.get("user"),device=cfg.get("device",{}).get("name"),device_id=cfg.get("device",{}).get("id"))
 @contextmanager
 def local_lock(root,name="mutation",blocking=True):
     path=paths(root)[0]/f"{name}.lock"
-    path.parent.mkdir(parents=True,exist_ok=True)
-    handle=path.open("a+")
-    os.chmod(path,0o600)
-    try: fcntl.flock(handle,fcntl.LOCK_EX|(0 if blocking else fcntl.LOCK_NB))
-    except BlockingIOError:
-        handle.close()
-        raise RuntimeError(f"Remote {name} already running") from None
-    try:
-        handle.seek(0)
-        handle.truncate()
-        handle.write(str(os.getpid()))
-        handle.flush()
-        yield
-    finally:
-        fcntl.flock(handle,fcntl.LOCK_UN)
-        handle.close()
+    with operation_lock(path,f"remote {name}",30 if blocking else 0,_lock_identity(root)) as pulse:
+        lease=(pulse,None)
+        token=_leases.set((*_leases.get(),lease))
+        try: yield pulse
+        finally: _leases.reset(token)
 def mutation_lock(root): return local_lock(root,"mutation",False)
-def sync_run(root): return local_lock(root,"sync",False)
+@contextmanager
+def sync_run(root,manual=False,purpose="sync"):
+    root=local_root(root)
+    with ExitStack() as stack:
+        priority=stack.enter_context(operation_lock(paths(root)[0]/"manual.lock",f"remote {purpose} priority",0,_lock_identity(root))) if manual else None
+        if not manual and (owner:=_manual_waiting(root)) is not None: raise LockBusy(f"Could not start remote sync: a manual Remote command has priority. Holder: {lock_holder(owner)}.")
+        pulse=stack.enter_context(operation_lock(paths(root)[0]/"sync.lock",f"remote {purpose}",MANUAL_WAIT if manual else 0,_lock_identity(root)))
+        heartbeat=lambda stage:[p(stage) for p in (priority,pulse) if p]
+        lease=(heartbeat,None if manual else root)
+        token=_leases.set((*_leases.get(),lease))
+        try: yield heartbeat
+        finally: _leases.reset(token)
 def locked(fn):
     @wraps(fn)
     def call(*args,**kwargs):
@@ -713,24 +730,24 @@ def pull_origins(cfg,state,root,ws):
             with __import__("contextlib").suppress(Exception): state.rollback()
             raise
     return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
-def local_replica_ids(root,cfg,workspace,kind,epochs):
-    found={(fingerprint(key(cfg,workspace,epoch),digest(value["proof"])),epoch) for value in bridge_records(root,cfg,workspace,kind) if value["proof"] for epoch in epochs}
-    path=core_path(root)
+def local_replica_ids(root,cfg,workspace,kind,epochs,page=5000,progress=None):
+    found,path,after={(fingerprint(key(cfg,workspace,epoch),digest(value["proof"])),epoch) for value in bridge_records(root,cfg,workspace,kind) if value["proof"] for epoch in epochs},core_path(root),""
     if not path.is_file(): return found
-    with closing(open_db(path,True,purpose="remote.replica.inventory")) as core:
-        cursor=core.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs")
-        while rows:=cursor.fetchmany(5000): found.update((fingerprint(key(cfg,workspace,epoch),digest({"v":1,"kind":"row.proof",**dict(zip(PROOF_FIELDS,row))})),epoch) for row in rows for epoch in epochs)
-    return found
-def pull_row_replicas(cfg,state,root,ws,recover=None,origins=()):
+    while True:
+        with closing(open_db(path,True,purpose="remote.replica.inventory")) as core: rows=core.execute("SELECT id,workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id>? ORDER BY id LIMIT ?",(after,page)).fetchall()
+        if not rows: return found
+        found.update((fingerprint(key(cfg,workspace,epoch),digest({"v":1,"kind":"row.proof",**dict(zip(PROOF_FIELDS,row[1:]))})),epoch) for row in rows for epoch in epochs)
+        after=(rows[-1][0],progress and progress(rows[-1][0]))[0]
+def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
     sid,stamp=ws["id"],bridge_stamp(root)
     saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]
-    reset=saved!=stamp
+    reset=fresh or saved!=stamp
     after=0 if reset else int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0])
     dependencies={r[0] for r in state.execute("SELECT origin FROM control_dependencies WHERE workspace=?",(sid,)).fetchall()}
     controls=ws["controls"]+stored_controls(core_path(root),set(origins)|dependencies)
     known=set() if reset else {(r[0],r[1]) for r in state.execute("SELECT replica,epoch FROM replica_receipts WHERE workspace=?",(sid,)).fetchall()}
     repair=reset or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{sid}",)).fetchone())
-    if repair:
+    if repair and not fresh:
         epochs={r[1] for r in known} or {r["epoch"] for r in ws["keys"]}
         local=local_replica_ids(root,cfg,sid,ws["kind"],epochs)
         missing=known-local
@@ -768,9 +785,10 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=()):
         receipts=[(sid,item["envelope"]["replica"],item["envelope"]["epoch"],item["cursor"]) for item in received if (item["envelope"]["replica"],item["envelope"]["epoch"]) in known]
         if receipts: state.executemany("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",receipts)
         after=min(invalid.values())-1 if invalid else cursor
-        total+=len(received)
+        before,total=total,total+len(received)
         state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"replica_cursor:{sid}",str(after),f"replica_projection:{sid}",stamp))
         state.commit()
+        if fresh and (cursor>=tail or total//5000!=before//5000): typer.echo(f"  remote rows {cursor}/{tail}")
         if cursor>=tail:
             if invalid: raise ValueError(f"invalid row replica: no valid delivery copy for {len(invalid)} object(s)")
             return total
@@ -826,7 +844,7 @@ def pull_blobs(cfg,state,root,ws,recover=None):
             if invalid: raise ValueError(f"invalid blob replica: no valid delivery copy for {len(invalid)} object(s)")
             return total
         if not result["blobs"]: raise ValueError("relay blob tail cannot be reached")
-def pull(cfg,state,root=None,concurrent=False):
+def pull(cfg,state,root=None,concurrent=False,keep_going=False,fresh=False):
     root=local_root(root)
     server=refresh(cfg,root,concurrent)
     summary={}
@@ -861,7 +879,7 @@ def pull(cfg,state,root=None,concurrent=False):
         try:
             total=0
             origins=pull_origins(cfg,state,root,ws)
-            replicas=pull_row_replicas(cfg,state,root,ws,recover,origins)
+            replicas=pull_row_replicas(cfg,state,root,ws,recover,origins,fresh)
             blobs=pull_blobs(cfg,state,root,ws,recover)
             while True:
                 result=request(cfg,{"op":"pull","workspace":sid,"after":after,"limit":500})
@@ -898,8 +916,47 @@ def pull(cfg,state,root=None,concurrent=False):
             state.rollback()
             state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'blocked',COALESCE((SELECT tail FROM sync_states WHERE workspace=?),0),COALESCE((SELECT floor FROM sync_states WHERE workspace=?),0),?)",(sid,sid,sid,str(e)))
             state.commit()
-            raise
+            summary[sid]={"error":e}
+            if isinstance(e,InterruptedError) or not keep_going: raise
     return summary
+def reset_repull_state(state,workspaces):
+    for ws in workspaces:
+        [state.execute(f"DELETE FROM {table} WHERE workspace=?",(ws,)) for table in ("receipts","cursors","lazy_events","deferred_events","event_sequences","sequence_gaps","replica_receipts","blob_receipts","origin_bindings","control_dependencies","policies","policy_proofs","sharing_preferences","team_scopes","sync_states")]
+        [state.execute("DELETE FROM meta WHERE key=?",(f"{name}:{ws}",)) for name in ("boundary","replica_cursor","blob_cursor","replica_projection","replica_repair","replica_upload_blocked","history_from","key_from","provider_aliases","core_generation")]
+    state.commit()
+def repull_once(root=None):
+    with sync_run(root:=local_root(root),True,"repull"),closing(connect(paths(root)[2])) as state:
+        typer.echo("Remote repull: refreshing relay")
+        cfg=load(root)
+        server=refresh(cfg,root,True)
+        workspaces={ws["id"] for ws in server["workspaces"] if ws["device_authorized"]}
+        required(workspaces,ValueError("No authorized Remote workspace is available"))
+        path,backup=core_path(root),None
+        try:
+            typer.echo("Remote repull: backing up archive")
+            with closing(open_db(path,purpose="maintenance.remote.repull.backup")) as core:
+                init_schema(core)
+                backup=_migration_backup(core,f"remote-repull-{time.time_ns()}")
+            reset_repull_state(state,workspaces)
+            with closing(open_db(path,purpose="remote.repull.reset")) as core,_transaction(core): removed=reset_remote_projection(core,cfg["user"])
+            typer.echo(f"Remote repull: removed {sum(removed.values())} received row(s); downloading relay state")
+            failures={ws:value["error"] for ws,value in pull(cfg,state,root,True,True,True).items() if "error" in value}
+            if failures: raise RuntimeError("; ".join(f"{cfg['workspaces'].get(ws,{}).get('name',ws[:8])}: {error}" for ws,error in failures.items()))
+            typer.echo("Remote repull: auditing received rows")
+            audit=audit_rows(path,progress=_progress)
+            required(not sum(audit["totals"].get(key,0) for key in ("projection_mismatch","projection_missing","proof_missing")),ValueError("received-row audit is not clean after repull"))
+            state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))
+            state.commit()
+            if backup:
+                bundle=backup.with_name(backup.name+".attachments")
+                try:
+                    shutil.rmtree(bundle)
+                    backup.unlink()
+                except OSError as error: typer.echo(f"Remote repull completed, but temporary backup cleanup failed: {error}",err=True)
+            return removed,audit
+        except BaseException as error:
+            hint=f" Backup retained at {backup}." if backup else ""
+            raise RuntimeError(f"Remote repull did not complete; retry `convos remote repull`.{hint} Cause: {error}") from None
 def fetch_lazy(cfg,state,event_id=None,root=None):
     root=local_root(root)
     server=refresh(cfg,root)
@@ -923,11 +980,12 @@ def fetch_lazy(cfg,state,event_id=None,root=None):
     return len(rows)
 def sync_once(root=None,force=False):
     root=local_root(root)
-    with sync_run(root):
+    with sync_run(root,force):
         cfg=load(root)
         _,_,state_path=paths(root)
         info=inspect_state(state_path,force)
         cutover=None
+        _progress("relocating attachments")
         relocate_attachments(core_path(root),paths(root)[0]/"attachments")
         if info["status"] in ("incompatible","invalid"):
             with local_lock(root,"mutation",True):
@@ -947,7 +1005,7 @@ def sync_once(root=None,force=False):
             prepare_archive(cfg,state,root)
             baseline=archive_info(root)
             bound={r[0] for r in state.execute("SELECT DISTINCT workspace FROM origin_bindings").fetchall()}
-            pull(cfg,state,root,True)
+            failures={ws:value["error"] for ws,value in pull(cfg,state,root,True,True).items() if "error" in value}
             ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
             authorized={w["id"] for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
             aliases={ws:reconcile_provider_aliases(core_path(root),cfg,ws) for ws in ready&authorized if cfg["workspaces"].get(ws,{}).get("kind")=="personal"}
@@ -972,24 +1030,25 @@ def sync_once(root=None,force=False):
             scans=[(ws,meta,state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()) for ws,meta in cfg["workspaces"].items() if path.is_file() and ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]]
             scans=[(ws,meta,prior) for ws,meta,prior in scans if prior is None or int(prior[0])!=generation or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()]
             if scans:
+                _progress("scanning archive")
                 routes={ws:sharing_routes(state,ws,cfg["user"],cfg.get("bindings",{}),known) for ws,meta,prior in scans}
                 batches=[]
-                with closing(open_db(path,True,purpose="remote.scan")) as core:
-                    for ws,meta,prior in scans:
-                        repos,roots,match=routes[ws]
-                        changes=None if prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone() else set(core_archive_changes(core,int(prior[0]))[1])
-                        scope=set()
-                        records=scan(core,state,meta["kind"],repos,roots,changes,ws,scope,match=match,user=cfg["user"])
-                        records=protect_all(records,root,ws) if meta["kind"]=="team" else records
-                        batches.append((ws,records,scope,prior is None))
+                for ws,meta,prior in scans:
+                    repos,roots,match=routes[ws]
+                    full=prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()
+                    scope=set()
+                    records=scan_archive(path,state,meta["kind"],repos,roots,ws,scope,match,cfg["user"],generation,_progress,since=None if full else int(prior[0]))
+                    batches.append((ws,protect_all(records,root,ws) if meta["kind"]=="team" else records,scope,prior is None))
                 for ws,records,scope,initial in batches:
+                    _progress(f"preparing workspace {cfg['workspaces'][ws]['name']}")
                     bindings={r[0]:r[1] for r in state.execute("SELECT origin,epoch FROM origin_bindings WHERE workspace=?",(ws,)).fetchall()}
                     origins=set(bindings)
                     repair=initial or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone())
-                    attest_rows(path,cfg,ws,records,origins,generation)
+                    sum(attest_rows(path,cfg,ws,records[i:i+500],origins,generation) for i in range(0,len(records),500))
                     keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}
                     known_replicas=set() if repair else {r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
-                    prepared=[pair for i in range(0,max(len(records),1),500) for pair in prepare_replicas(root,row_replicas(path,cfg,ws,records[i:i+500],keys,known_replicas,origins,bindings,retained=repair and i==0,generation=generation))]
+                    upload_blocked=[]
+                    prepared=[pair for i in range(0,max(len(records),1),500) for pair in prepare_replicas(root,row_replicas(path,cfg,ws,records[i:i+500],keys,known_replicas,origins,bindings,lambda ids:replica_inventory(cfg,state,ws,ids) if repair else set(known_replicas),False,generation,upload_blocked))]+[pair for page in (retained_proof_pages(path,ws,origins,cfg["user"],generation) if repair else ()) for pair in prepare_replicas(root,row_replicas(path,cfg,ws,[],keys,known_replicas,origins,bindings,lambda ids:replica_inventory(cfg,state,ws,ids),page,generation,upload_blocked))]
                     try:
                         with local_lock(root,"mutation",True):
                             current=load(root)
@@ -1007,6 +1066,8 @@ def sync_once(root=None,force=False):
                         discard_replicas(prepared)
                         raise
                     upload_replicas(cfg,state,root,{ws})
+                    state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_upload_blocked:{ws}",json.dumps(sorted(set(upload_blocked))))) if upload_blocked else state.execute("DELETE FROM meta WHERE key=?",(f"replica_upload_blocked:{ws}",))
+                    if upload_blocked: typer.echo(f"Remote upload skipped {len(set(upload_blocked))} received row(s) whose local projection does not match the author's proof; run `convos remote repull` to restore them.",err=True)
                     known_blobs={r[0] for r in state.execute("SELECT blob FROM blob_receipts WHERE workspace=? UNION SELECT blob FROM blob_outbox WHERE workspace=?",(ws,ws)).fetchall()}
                     reconcile_blobs(cfg,state,root,ws,blob_replicas(path,cfg,ws,records,keys,known_blobs,origins,bindings,repair))
                 for ws,meta,prior in scans: state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation)))
@@ -1018,7 +1079,8 @@ def sync_once(root=None,force=False):
             for ws in ready&active: state.execute("DELETE FROM meta WHERE key=?",(f"replica_repair:{ws}",))
             state.commit()
             upload(cfg,state,root,ready,True)
-            pull(cfg,state,root,True)
+            failures.update({ws:value["error"] for ws,value in pull(cfg,state,root,True,True).items() if "error" in value})
+            if failures: raise next(iter(failures.values())) if len(authorized)==1 else (ConnectionError if all(isinstance(error,ConnectionError) for error in failures.values()) else RuntimeError)(f"Remote sync completed partially: {len(failures)} workspace error(s); workspaces were isolated and failed data was not accepted or acknowledged. "+"; ".join(f"{cfg['workspaces'].get(ws,{}).get('name',ws[:8])}: {error}" for ws,error in failures.items()))
             remember_archive(cfg,state,root)
             state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))
             state.commit()
@@ -1270,8 +1332,14 @@ def config_cmd(space:str,auto_contribute:Optional[bool]=typer.Option(None,"--aut
 @remote.command("sync")
 def sync_cmd():
     try: result=sync_once(force=True)
-    except ConnectionError as e: raise typer.ClickException(f"{e}. Local sync progress was preserved; retry `convos remote sync`.") from e
+    except ConnectionError as e: cli_error(f"{e}. Local sync progress was preserved; retry `convos remote sync`.")
+    except (ValueError,RuntimeError) as e: cli_error(e)
     typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else ""))
+@remote.command("repull")
+def repull_cmd():
+    try: removed,audit=repull_once()
+    except (ConnectionError,ValueError,RuntimeError) as error: cli_error(error)
+    typer.echo("Remote rows replaced from relay; "+", ".join(f"{kind}={count}" for kind,count in removed.items())+f"; verified={audit['totals'].get('projection_match',0)}")
 @remote.command("fetch")
 @locked
 def fetch_cmd(event_id:Optional[str]=None):
@@ -1320,14 +1388,24 @@ def doctor_status():
             last=(state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone() or ["never"])[0]
             backup=(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone() or [None])[0]
             alias_blocked=sum(len(json.loads(r[0])["blocked"]) for r in state.execute("SELECT value FROM meta WHERE key LIKE 'provider_aliases:%'").fetchall())
+            upload_blocked=sum(len(json.loads(r[0])) for r in state.execute("SELECT value FROM meta WHERE key LIKE 'replica_upload_blocked:%'").fetchall())
         finally:
             state.close()
         watch_path=paths()[0]/"watch.json"
         watch=json.loads(watch_path.read_text()) if watch_path.exists() else {"failures":0}
         retry=f", next_retry={watch['next_retry']}" if watch["failures"] else ""
-        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, alias_blocked={alias_blocked}, watch_failures={watch['failures']}{retry}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")
+        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, alias_blocked={alias_blocked}, upload_blocked={upload_blocked}, watch_failures={watch['failures']}{retry}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")
     except Exception as e: return f"remote: unavailable ({e})"
 @remote.command("doctor")
 def doctor_cmd(): typer.echo(doctor_status())
+@remote.command("audit")
+def audit_cmd(format:str=typer.Option("text","-f","--format")):
+    result=audit_rows(core_path(),progress=_progress)
+    if format=="json":
+        typer.echo(json.dumps(result,sort_keys=True))
+        return
+    [typer.echo(f"{kind}: origins={value['origins']}, projection={value['projection_match']} valid/{value['projection_mismatch']} mismatch/{value['projection_missing']} missing, proofs={value['proof_missing']} missing") for kind,value in sorted(result["tables"].items())]
+    bad=sum(result["totals"].get(key,0) for key in ("projection_mismatch","projection_missing","proof_missing"))
+    if bad: cli_error(f"Signed-row integrity audit found {bad} issue(s). Run `convos remote repull` to replace received rows from the relay.")
 for app in _pending: register(app)
 _pending.clear()

@@ -1,6 +1,6 @@
 import json, os, signal, subprocess, sys, threading, time
 from pathlib import Path
-import duckdb, pytest
+import duckdb, pytest, typer
 from typer.testing import CliRunner
 from ai_convos import cli
 POPEN=subprocess.Popen
@@ -64,15 +64,21 @@ def test_failed_only_drain_does_not_respawn_tight_loop(hooks,monkeypatch):
     assert cli.drain_hooks()==0 and not launched and json.loads((data/"hook_progress.json").read_text())["failed"]==1
 
 def test_concurrent_sync_exits_immediately_and_explicitly(hooks,capsys):
-    _,data=hooks; data.mkdir(); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/".sync.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); done=threading.Event(); result=[]
+    _,data=hooks; data.mkdir(); hold=POPEN([sys.executable,"-c","import sys; from pathlib import Path; from ai_convos.cli import operation_lock\nwith operation_lock(Path(sys.argv[1]),'sync'): print('ready',flush=True); input()",str(data/".sync.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); done=threading.Event(); result=[]
     def attempt():
         try: cli.sync(False,300,False,False,False,False,True)
         except BaseException as error: result.append(error)
         finally: done.set()
     try:
-        assert hold.stdout.readline().strip()=="ready"; thread=threading.Thread(target=attempt); thread.start(); assert done.wait(5); thread.join(); assert len(result)==1 and isinstance(result[0],cli.typer.Exit)
-        assert not (data/"convos.db").exists() and "Sync already running; no work was started" in capsys.readouterr().out
+        assert hold.stdout.readline().strip()=="ready"; thread=threading.Thread(target=attempt); thread.start(); assert done.wait(5); thread.join(); assert len(result)==1 and isinstance(result[0],typer.Exit)
+        assert not (data/"convos.db").exists() and "another process still holds the lock" in capsys.readouterr().err and result[0].exit_code==1
     finally: hold.stdin.write("\n"); hold.stdin.flush(); hold.wait(timeout=5)
+
+def test_concurrent_sync_cli_error_has_no_traceback(hooks):
+    _,data=hooks; data.mkdir()
+    with cli.operation_lock(data/".sync.lock","sync"):
+        result=CliRunner().invoke(cli.app,["sync","--local-only"])
+    assert result.exit_code==1 and "Could not start sync" in result.output and "PID " in result.output and "Traceback" not in result.output and "LockBusy" not in result.output
 
 def test_explicit_drain_is_idempotent_and_preserves_truncated_rewritten_history(hooks):
     sessions, data = hooks; path = sessions/"s.jsonl"; runner = CliRunner(); transcript(path); enqueue(path)
@@ -132,7 +138,7 @@ def test_core_connections_share_process_lock(hooks):
     _,data=hooks; data.mkdir(); db=duckdb.connect(str(data/"convos.db")); cli.init_schema(db); db.close(); env={**os.environ,"CONVOS_PROJECT_ROOT":str(data.parent)}; hold=POPEN([sys.executable,"-c","from ai_convos.cli import get_db; c=get_db(); print('ready',flush=True); input(); c.close()"],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); done=threading.Event()
     try:
         assert hold.stdout.readline().strip()=="ready"; started=time.monotonic()
-        with pytest.raises(ValueError,match="0.05 seconds"): cli.get_db(True,wait=.05)
+        with pytest.raises(cli.LockBusy,match="0.05s"): cli.get_db(True,wait=.05)
         assert time.monotonic()-started<.5; waiter=threading.Thread(target=lambda:(cli.get_db(True).close(),done.set())); waiter.start(); assert not done.wait(.1); hold.stdin.write("\n"); hold.stdin.flush(); assert done.wait(5); waiter.join()
     finally: hold.stdin.close(); hold.wait(timeout=5)
 

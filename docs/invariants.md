@@ -75,6 +75,12 @@ they do not depend on relay or `state.db` history.
 > intact object and origin proof. Delivery authority never permits replacing,
 > reinterpreting, or forging the original signature.
 
+> A peer that accepts a signed logical row stores its proof and projects it into
+> typed archive tables in one transaction. That projection is origin-owned:
+> ordinary ingestion, enrichment, and maintenance cannot update or delete it.
+> Only a verified newer revision from the same author and source row may
+> supersede it. A receiver never re-attests another author's row.
+
 > Randomized re-encryption creates a delivery replica, not new semantic
 > content. The relay attributes replicas to their authenticated uploader and
 > bounds them to one current envelope per `(row revision, epoch, uploader)`, so
@@ -176,6 +182,13 @@ they do not depend on relay or `state.db` history.
 > parents, while tools, edits, attachments, and other children reference their
 > owning row. A known missing reference may be shown as unavailable; unrelated
 > rows are never hidden while repair proceeds.
+
+> Repair inventories the relay before encrypting or uploading received rows. A
+> received projection is re-published only when it still hashes to its author
+> proof; otherwise that row is upload-blocked without suppressing healthy rows
+> or workspaces. `remote repull` removes received projections, replays the
+> relay's current authorized signed rows, and audits the result. It preserves
+> locally authored rows and deletes its temporary backup after success.
 
 > Attachment metadata is canonical. A retained attachment body is stored once
 > in the content-addressed body store and referenced by the archive; database

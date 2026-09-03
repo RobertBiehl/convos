@@ -1,4 +1,4 @@
-import ast
+import ast, json, os, re, subprocess, sys
 from collections import Counter
 from pathlib import Path
 import pytest
@@ -37,6 +37,13 @@ def test_archive_connections_are_gatewayed_and_purpose_labeled():
     assert Counter(direct)==Counter({("src/ai_convos/cli.py","_open_db"):1,("src/ai_convos/cli.py","_check_archive"):1})
     assert not missing,f"Archive connection lacks a literal purpose: {missing}"
 
+def test_connection_ledger_has_every_archive_and_sqlite_acquisition_once():
+    text=(ROOT/"docs/database-connection-ledger.md").read_text()
+    archive=Counter((path,owner,next(k.value.value for k in node.keywords if k.arg=="purpose")) for path,owner,node in calls() if (node.func.id if isinstance(node.func,ast.Name) else node.func.attr if isinstance(node.func,ast.Attribute) else None) in {"get_db","open_db","_core","commit_result"} and owner not in {"get_db","open_db","_core","commit_result"})
+    sqlite=Counter((path,owner) for path,owner,node in calls() if isinstance(node.func,ast.Attribute) and isinstance(node.func.value,ast.Name) and (node.func.value.id,node.func.attr)==("sqlite3","connect"))
+    assert Counter(re.findall(r"\| A\d+ \| `([^`]+)::([^`]+)` \| `([^`]+)` \|",text))==archive
+    assert Counter(re.findall(r"\| S\d+ \| `([^`]+)::([^`]+)` \|",text))==sqlite
+
 def test_database_drivers_cannot_hide_behind_import_aliases():
     hidden=[]
     for path in SOURCES:
@@ -54,12 +61,32 @@ def test_lock_diagnostics_name_waiter_and_holder(tmp_path,capsys):
     assert "remote attestation" in path.with_name(".archive.db.lock").read_text()
     try:
         try: cli.open_db(path,wait=.01,purpose="local sync")
-        except ValueError as error: message=str(error)
-        assert "local sync" in message and "remote attestation" in message and "pid " in message
-        holder.audit=(holder.audit[0],holder.audit[1],holder.audit[2]-6,holder.audit[3])
+        except cli.LockBusy as error: message=str(error)
+        assert "local sync" in message and "remote attestation" in message and "PID " in message
+        holder.audit=(holder.audit[0],holder.audit[1],holder.audit[2]-6,*holder.audit[3:])
     finally: holder.close()
     error=capsys.readouterr().err
-    assert "write lock held" in error and "remote attestation" in error and not path.with_name(".archive.db.lock").read_text()
+    assert "write lock held" in error and "remote attestation" in error and json.loads(path.with_name(".archive.db.lock").read_text())["stage"]=="finished"
+
+def test_shared_reader_diagnostics_are_identified_and_crash_records_are_pruned(tmp_path):
+    path=tmp_path/"archive.db"; writer=cli.open_db(path,purpose="fixture"); writer.close(); reader=cli.open_db(path,True,purpose="remote.scan"); reader.execute("SELECT 1")
+    sidecars=list(path.with_name(".archive.db.lock.readers").glob("*.json")); assert len(sidecars)==1 and (owner:=json.loads(sidecars[0].read_text()))["purpose"]=="remote.scan" and owner["stage"]=="query"
+    with pytest.raises(cli.LockBusy,match=r"local embed.*PID.*remote\.scan") as error: cli.open_db(path,wait=0,purpose="local embed")
+    assert "shared archive reader" not in str(error.value)
+    reader.close(); assert not list(path.with_name(".archive.db.lock.readers").glob("*.json"))
+    sidecars[0].write_text(json.dumps({"purpose":"stale"})); writer=cli.open_db(path,purpose="recovery"); writer.close(); assert not sidecars[0].exists()
+
+def test_all_process_locks_use_the_shared_contract_and_survive_crashes(tmp_path):
+    found=Counter((path,owner) for path,owner,node in calls() if isinstance(node.func,ast.Attribute) and isinstance(node.func.value,ast.Name) and (node.func.value.id,node.func.attr)==("fcntl","flock"))
+    assert found==Counter({("src/ai_convos/cli.py","_flock"):1,("src/ai_convos/cli.py","get_db"):1,("src/ai_convos/cli.py","operation_lock"):1})
+    path=tmp_path/"nested/work.lock"; child=subprocess.run([sys.executable,"-c","import os,sys; from pathlib import Path; from ai_convos.cli import operation_lock\nwith operation_lock(Path(sys.argv[1]),'test.crash'): os._exit(17)",str(path)])
+    assert child.returncode==17
+    with cli.operation_lock(path,"test.recovery") as pulse: pulse("verified")
+    owner=json.loads(path.read_text()); assert path.stat().st_mode&0o777==0o600 and owner["v"]==1 and owner["purpose"]=="test.recovery" and owner["pid"]==os.getpid() and owner["stage"]=="finished" and owner["started_at"]<=owner["heartbeat_at"]
+
+def test_external_duckdb_contention_uses_the_concise_lock_error(tmp_path,monkeypatch):
+    monkeypatch.setattr(cli,"_open_db",lambda *args:(_ for _ in ()).throw(cli.duckdb.IOException("Conflicting lock is held by external PID 12")))
+    with pytest.raises(cli.LockBusy,match="outside the Convos lock contract.*external PID 12"): cli.open_db(tmp_path/"archive.db",wait=0,purpose="test.external")
 
 def test_remote_signing_and_attachment_io_run_without_archive_lock(tmp_path,monkeypatch):
     from ai_convos_remote import projection
@@ -89,6 +116,23 @@ def test_remote_signing_and_attachment_io_run_without_archive_lock(tmp_path,monk
     monkeypatch.setattr(projection,"file_hash",hashed)
     assert projection.relocate_attachments(path,legacy)==1
 
+def test_remote_full_scan_releases_the_archive_between_bounded_pages(tmp_path):
+    from ai_convos_remote import projection
+    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[(str(i),) for i in range(3)]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); stages=[]
+    def progress(stage):
+        with cli.open_db(path,wait=0,purpose="concurrent page probe"): pass
+        stages.append(stage)
+    records=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); state.close()
+    assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages==["scanning archive 1","scanning archive 2","scanning archive 3"]
+
+def test_remote_repair_inventory_releases_the_archive_between_pages(tmp_path,monkeypatch):
+    import base64, ai_convos_remote
+    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO remote.row_proofs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",[(f"p{i}","w","w","conversations",f"c{i}",1,"h",f"r{i}",None,"active","u","d",1,"s") for i in range(2)]); db.close(); stages=[]; monkeypatch.setattr(ai_convos_remote,"bridge_records",lambda *_:[])
+    def progress(stage):
+        with cli.open_db(path,wait=0,purpose="concurrent inventory probe"): pass
+        stages.append(stage)
+    assert len(ai_convos_remote.local_replica_ids(tmp_path,{"keys":{"w:1":base64.b64encode(b"x"*32).decode()}},"w","team",{1},1,progress))==2 and stages==["p0","p1"]
+
 def test_redaction_and_export_processing_run_without_archive_lock(monkeypatch):
     from ai_convos_redact import scan_data
     import ai_convos_redact
@@ -104,6 +148,15 @@ def test_redaction_and_export_processing_run_without_archive_lock(monkeypatch):
             cli.open_db(wait=0,purpose="concurrent export probe").close()
             self.text=text
     output=Output(); cli.export(output,"json",None); assert '"id": "c"' in output.text
+
+def test_memory_scope_resolution_runs_without_archive_lock(tmp_path,monkeypatch):
+    import ai_convos_memory
+    path=tmp_path/"archive.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.execute("INSERT INTO conversations(id,source,cwd,metadata) VALUES ('c','codex','/repo','{}'); INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('m','c','user','evidence','{}')"); db.close(); monkeypatch.setattr(cli,"DB_PATH",path); monkeypatch.setattr(cli,"drain_hooks",lambda:0)
+    def scope(_):
+        with cli.open_db(path,wait=0,purpose="concurrent memory probe"): pass
+        return "/repo"
+    monkeypatch.setattr(ai_convos_memory,"_scope",scope)
+    assert ai_convos_memory._archive_evidence(["m"],"/repo")[0]["message"]=="m"
 
 def test_ingest_chunks_are_ordered_restart_safe_and_preserve_evidence(tmp_path,monkeypatch):
     path=tmp_path/"archive.db"; monkeypatch.setattr(cli,"DB_PATH",path); db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.close()

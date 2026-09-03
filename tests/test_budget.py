@@ -25,7 +25,7 @@ def test_app_line_budgets():
     root = Path(__file__).resolve().parents[1]
     for src in sorted((root / "apps").glob("*/src")):
         loc = _loc(sorted(src.rglob("*.py")))
-        limit = {"changegraph": 400, "memory": 1000, "remote": 2250, "remote_server": 600}.get(src.parent.name, 200)
+        limit = {"changegraph": 400, "memory": 1000, "remote": 2400, "remote_server": 600}.get(src.parent.name, 200)
         assert loc < limit, f"App {src.parent.name} budget exceeded: {loc} >= {limit}"
 
 
@@ -54,7 +54,7 @@ def test_installable_product_versions_are_aligned():
     files = [root/"pyproject.toml", *sorted((root/"apps").glob("*/pyproject.toml"))]
     projects = {f.parent.name:tomllib.loads(f.read_text())["project"] for f in files}
     assert {p["name"] for p in projects.values()} == {"convos","convos-changegraph","convos-explore","convos-memory","convos-redact","convos-remote","convos-remote-server","convos-resume"}, projects
-    assert {p["version"] for p in projects.values()} == {"0.11.5"}, projects
+    assert {p["version"] for p in projects.values()} == {"0.11.6b1"}, projects
     major,minor=map(int,next(iter({p["version"] for p in projects.values()})).split(".")[:2])
     constrained=[d for p in projects.values() for d in [*p["dependencies"],*(d for ds in p.get("optional-dependencies",{}).values() for d in ds)] if d.startswith("convos") and ">=" in d]
     assert constrained and {d[d.index(">="):] for d in constrained} == {f">={major}.{minor},<{major}.{minor+1}"}, constrained

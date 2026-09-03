@@ -10,7 +10,24 @@ read_when:
 
 These are product invariants, not implementation advice. `tests/test_database_connections.py`
 mechanically inventories production connection sites and fails when a new site is not
-classified.
+classified. The exhaustive per-acquisition report is `database-connection-ledger.md`.
+
+## Process lock contract
+
+Every Convos lock is an advisory `flock` on a stable `0600` file and uses the same
+core acquisition and error path. An exclusive holder writes one compact JSON object:
+`{"v":1,"purpose":"remote sync","pid":123,"process":"convos","host":"host","os_user":"alice","started_at":0.0,"heartbeat_at":0.0,"stage":"started"}`;
+Remote may add `remote_user`, `user_id`, `device`, and `device_id`. Long-lived operation
+leases update `heartbeat_at` and `stage` at phase boundaries. Contention is a concise CLI error naming the requested
+purpose and available holder identity, start time, and last activity. The kernel lock is
+authoritative: file existence or an old heartbeat never proves ownership, locks are released
+on process exit, and a successful exclusive acquisition removes stale diagnostics. Each shared
+archive reader has a unique `0600` sidecar carrying the same identity, timing, purpose, heartbeat,
+and stage fields; contention reports every recorded reader rather than pretending one owns the
+shared lock. Manual Remote sync and repull hold a priority lease: background syncs yield at the
+next request or phase boundary, and the manual command waits at most five seconds for the sync
+lease before reporting the blocking process. Tests inventory every production `flock` call through
+this contract.
 
 ## DuckDB archive
 
@@ -24,9 +41,8 @@ classified.
    only after revalidating the archive generation or the exact rows on which it depended.
 4. Read snapshots are materialized and closed before expensive Python processing. A read
    lock is not harmless: DuckDB cannot admit a writer from another process while it is open.
-5. A writer records its PID and purpose in the lock file. A waiter timeout names both its
-   requested purpose and the recorded writer. Any archive lock held longer than five seconds
-   emits its mode, duration, and purpose to stderr.
+5. Archive locks follow the process lock contract above. Any archive lock held longer than
+   five seconds emits its mode, duration, and purpose to stderr.
 6. Long exclusive scopes are allowed only for explicit maintenance whose consistency
    requires exclusion: schema migration and its pre-migration backup, manual backup, FTS
    rebuild, and an embedding-profile reset. They must have a `maintenance.*` or `schema.*`
@@ -43,7 +59,7 @@ read-only mode to validate it. It is not the live archive and takes no archive l
 | Provenance | Read plan, Git/filesystem inspection unlocked, bounded commit |
 | Embedding | Short candidate read, inference unlocked, bounded batch write |
 | Search, read, SQL, export, resume, redact, changegraph, explore, memory | Read-only snapshot; presentation, export writing, and secret inspection after close |
-| Remote publication | Bounded change scans normally; an initial/rebaseline scan is a visible full read snapshot; signing, encryption, relay inventory, and upload happen after close |
+| Remote publication and audit | Full/incremental discovery, repair inventory, retained-replica reconstruction, and received-row audit use generation-checked 5,000-record pages and release the reader between pages; signing, encryption, relay inventory, and upload happen after close |
 | Remote receive | Verify/decrypt before opening DuckDB; bounded projection transaction |
 | Attachment relocation | Read plan, hash/copy/fsync unlocked, exact-row revalidation and bounded metadata write |
 | Backup and migration | Explicit maintenance exception; consistent checkpoint/backup precedes mutation |

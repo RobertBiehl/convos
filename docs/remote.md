@@ -332,14 +332,21 @@ active device and history proposals.
 ```bash
 convos doctor
 convos remote doctor
+convos remote audit                 # verify signed proofs against typed projections
+convos remote repull                # replace received rows from the relay
 convos remote fetch                 # materialize deferred large events
 convos remote sync                  # explicit repair/backfill only
 ```
 
 The worker writes errors to `<root>/remote/last_error` (by default,
 `~/.convos/remote/last_error`). Queries never wait for the server. `doctor`
-reports connectivity, identity, workspaces, epochs, pending uploads, deferred
-events, and last successful synchronization.
+reports connectivity, identity, workspaces, epochs, upload-blocked rows, pending
+uploads, deferred events, and last successful synchronization. `remote audit`
+recomputes proof-to-projection integrity and exits nonzero on any gap. `remote
+repull` preserves locally authored rows, removes all received Remote projections
+including relay orphans and their derived children, replays the complete current
+authorized relay state, and audits it. Its validated temporary backup is deleted
+after success and retained with its path in the error after failure.
 
 ## Backup and restore
 
