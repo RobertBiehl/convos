@@ -10,9 +10,9 @@ import typer
 from ai_convos_redact import protect_all
 _pending,_leases,MANUAL_WAIT=[],ContextVar("remote_leases",default=()),5
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_changes as core_archive_changes, archive_state as core_archive_state, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, reset_remote_projection
+from ai_convos.cli import PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, reset_remote_projection
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
+from .projection import PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
                        recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
@@ -730,14 +730,14 @@ def pull_origins(cfg,state,root,ws):
             with __import__("contextlib").suppress(Exception): state.rollback()
             raise
     return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
-def local_replica_ids(root,cfg,workspace,kind,epochs):
-    found={(fingerprint(key(cfg,workspace,epoch),digest(value["proof"])),epoch) for value in bridge_records(root,cfg,workspace,kind) if value["proof"] for epoch in epochs}
-    path=core_path(root)
+def local_replica_ids(root,cfg,workspace,kind,epochs,page=5000,progress=None):
+    found,path,after={(fingerprint(key(cfg,workspace,epoch),digest(value["proof"])),epoch) for value in bridge_records(root,cfg,workspace,kind) if value["proof"] for epoch in epochs},core_path(root),""
     if not path.is_file(): return found
-    with closing(open_db(path,True,purpose="remote.replica.inventory")) as core:
-        cursor=core.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs")
-        while rows:=cursor.fetchmany(5000): found.update((fingerprint(key(cfg,workspace,epoch),digest({"v":1,"kind":"row.proof",**dict(zip(PROOF_FIELDS,row))})),epoch) for row in rows for epoch in epochs)
-    return found
+    while True:
+        with closing(open_db(path,True,purpose="remote.replica.inventory")) as core: rows=core.execute("SELECT id,workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id>? ORDER BY id LIMIT ?",(after,page)).fetchall()
+        if not rows: return found
+        found.update((fingerprint(key(cfg,workspace,epoch),digest({"v":1,"kind":"row.proof",**dict(zip(PROOF_FIELDS,row[1:]))})),epoch) for row in rows for epoch in epochs)
+        after=(rows[-1][0],progress and progress(rows[-1][0]))[0]
 def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
     sid,stamp=ws["id"],bridge_stamp(root)
     saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]
@@ -943,7 +943,7 @@ def repull_once(root=None):
             failures={ws:value["error"] for ws,value in pull(cfg,state,root,True,True,True).items() if "error" in value}
             if failures: raise RuntimeError("; ".join(f"{cfg['workspaces'].get(ws,{}).get('name',ws[:8])}: {error}" for ws,error in failures.items()))
             typer.echo("Remote repull: auditing received rows")
-            audit=audit_rows(path)
+            audit=audit_rows(path,progress=_progress)
             required(not sum(audit["totals"].get(key,0) for key in ("projection_mismatch","projection_missing","proof_missing")),ValueError("received-row audit is not clean after repull"))
             state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))
             state.commit()
@@ -1037,22 +1037,18 @@ def sync_once(root=None,force=False):
                     repos,roots,match=routes[ws]
                     full=prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()
                     scope=set()
-                    if full: records=scan_archive(path,state,meta["kind"],repos,roots,ws,scope,match,cfg["user"],generation,_progress)
-                    else:
-                        with closing(open_db(path,True,purpose="remote.scan.changes")) as core:
-                            changes=set(core_archive_changes(core,int(prior[0]))[1])
-                            records=scan(core,state,meta["kind"],repos,roots,changes,ws,scope,match=match,user=cfg["user"])
+                    records=scan_archive(path,state,meta["kind"],repos,roots,ws,scope,match,cfg["user"],generation,_progress,since=None if full else int(prior[0]))
                     batches.append((ws,protect_all(records,root,ws) if meta["kind"]=="team" else records,scope,prior is None))
                 for ws,records,scope,initial in batches:
                     _progress(f"preparing workspace {cfg['workspaces'][ws]['name']}")
                     bindings={r[0]:r[1] for r in state.execute("SELECT origin,epoch FROM origin_bindings WHERE workspace=?",(ws,)).fetchall()}
                     origins=set(bindings)
                     repair=initial or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone())
-                    attest_rows(path,cfg,ws,records,origins,generation)
+                    sum(attest_rows(path,cfg,ws,records[i:i+500],origins,generation) for i in range(0,len(records),500))
                     keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}
                     known_replicas=set() if repair else {r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
                     upload_blocked=[]
-                    prepared=[pair for i in range(0,max(len(records),1),500) for pair in prepare_replicas(root,row_replicas(path,cfg,ws,records[i:i+500],keys,known_replicas,origins,bindings,lambda ids:replica_inventory(cfg,state,ws,ids) if repair else set(known_replicas),retained=repair and i==0,generation=generation,blocked=upload_blocked))]
+                    prepared=[pair for i in range(0,max(len(records),1),500) for pair in prepare_replicas(root,row_replicas(path,cfg,ws,records[i:i+500],keys,known_replicas,origins,bindings,lambda ids:replica_inventory(cfg,state,ws,ids) if repair else set(known_replicas),False,generation,upload_blocked))]+[pair for page in (retained_proof_pages(path,ws,origins,cfg["user"],generation) if repair else ()) for pair in prepare_replicas(root,row_replicas(path,cfg,ws,[],keys,known_replicas,origins,bindings,lambda ids:replica_inventory(cfg,state,ws,ids),page,generation,upload_blocked))]
                     try:
                         with local_lock(root,"mutation",True):
                             current=load(root)
@@ -1404,7 +1400,7 @@ def doctor_status():
 def doctor_cmd(): typer.echo(doctor_status())
 @remote.command("audit")
 def audit_cmd(format:str=typer.Option("text","-f","--format")):
-    result=audit_rows(core_path())
+    result=audit_rows(core_path(),progress=_progress)
     if format=="json":
         typer.echo(json.dumps(result,sort_keys=True))
         return

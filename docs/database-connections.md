@@ -10,7 +10,7 @@ read_when:
 
 These are product invariants, not implementation advice. `tests/test_database_connections.py`
 mechanically inventories production connection sites and fails when a new site is not
-classified.
+classified. The exhaustive per-acquisition report is `database-connection-ledger.md`.
 
 ## Process lock contract
 
@@ -59,7 +59,7 @@ read-only mode to validate it. It is not the live archive and takes no archive l
 | Provenance | Read plan, Git/filesystem inspection unlocked, bounded commit |
 | Embedding | Short candidate read, inference unlocked, bounded batch write |
 | Search, read, SQL, export, resume, redact, changegraph, explore, memory | Read-only snapshot; presentation, export writing, and secret inspection after close |
-| Remote publication | Bounded change scans normally; initial/rebaseline scans use generation-checked 5,000-record pages and release the reader between pages; signing, encryption, relay inventory, and upload happen after close |
+| Remote publication and audit | Full/incremental discovery, repair inventory, retained-replica reconstruction, and received-row audit use generation-checked 5,000-record pages and release the reader between pages; signing, encryption, relay inventory, and upload happen after close |
 | Remote receive | Verify/decrypt before opening DuckDB; bounded projection transaction |
 | Attachment relocation | Read plan, hash/copy/fsync unlocked, exact-row revalidation and bounded metadata write |
 | Backup and migration | Explicit maintenance exception; consistent checkpoint/backup precedes mutation |

@@ -221,10 +221,12 @@ def _archive_evidence(refs, scope):
         from ai_convos import cli
         cli.drain_hooks()
         if not (db := cli.get_db(True,purpose="memory.context")): raise ValueError("Conversation archive is unavailable; run convos sync first")
-        out = []
-        for ref in dict.fromkeys(refs):
-            rows = db.execute("""SELECT m.id,m.conversation_id,c.source,c.title,m.role,m.created_at,m.content,c.cwd FROM messages m JOIN conversations c ON c.id=m.conversation_id
-                WHERE starts_with(m.id,?) AND json_extract_string(m.metadata,'$.history_of') IS NULL AND COALESCE(m.content,'')<>'' LIMIT 2""", [ref]).fetchall()
+        values=[(ref,db.execute("""SELECT m.id,m.conversation_id,c.source,c.title,m.role,m.created_at,m.content,c.cwd FROM messages m JOIN conversations c ON c.id=m.conversation_id
+                WHERE starts_with(m.id,?) AND json_extract_string(m.metadata,'$.history_of') IS NULL AND COALESCE(m.content,'')<>'' LIMIT 2""", [ref]).fetchall()) for ref in dict.fromkeys(refs)]
+        db.close()
+        db=None
+        out=[]
+        for ref,rows in values:
             if len(rows) != 1: raise ValueError(f"Archived message is {'missing' if not rows else 'ambiguous'}: {ref}")
             mid,cid,source,title,role,created,body,cwd = rows[0]
             if cwd and _scope(cwd) != scope: raise ValueError(f"Archived message is outside memory scope: {mid}")

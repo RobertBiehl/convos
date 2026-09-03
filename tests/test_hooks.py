@@ -1,6 +1,6 @@
 import json, os, signal, subprocess, sys, threading, time
 from pathlib import Path
-import duckdb, pytest
+import duckdb, pytest, typer
 from typer.testing import CliRunner
 from ai_convos import cli
 POPEN=subprocess.Popen
@@ -70,8 +70,8 @@ def test_concurrent_sync_exits_immediately_and_explicitly(hooks,capsys):
         except BaseException as error: result.append(error)
         finally: done.set()
     try:
-        assert hold.stdout.readline().strip()=="ready"; thread=threading.Thread(target=attempt); thread.start(); assert done.wait(5); thread.join(); assert len(result)==1 and isinstance(result[0],cli.LockBusy)
-        assert not (data/"convos.db").exists() and "another process still holds the lock" in str(result[0]) and "purpose sync" in str(result[0])
+        assert hold.stdout.readline().strip()=="ready"; thread=threading.Thread(target=attempt); thread.start(); assert done.wait(5); thread.join(); assert len(result)==1 and isinstance(result[0],typer.Exit)
+        assert not (data/"convos.db").exists() and "another process still holds the lock" in capsys.readouterr().err and result[0].exit_code==1
     finally: hold.stdin.write("\n"); hold.stdin.flush(); hold.wait(timeout=5)
 
 def test_concurrent_sync_cli_error_has_no_traceback(hooks):

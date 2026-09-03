@@ -21,6 +21,10 @@ def core(path,cwd,edits):
 def graph(path):
     db=duckdb.connect(str(path)); init_schema(db); return db
 
+def test_targeted_checkpoint_links_do_not_require_an_archive_wide_read(tmp_path):
+    db=graph(tmp_path/"archive.db"); db.executemany("INSERT INTO provenance.checkpoint_edits VALUES (?,?,'exact')",[("c1","e1"),("c2","e2")]); wanted=digest({"checkpoint":"c2","edit":"e2"}); rows=core_module.provenance_records(db,{("checkpoint.link",wanted)})
+    assert [(r["entity"],r["payload"]["checkpoint"],r["payload"]["edit"]) for r in rows]==[(wanted,"c2","e2")]; db.close()
+
 def test_local_ingest_cannot_overwrite_a_signed_remote_projection(tmp_path):
     path=tmp_path/"archive.db"; body=tmp_path/"body"; body.write_bytes(b"new"); db=graph(path); db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('c','codex','{}'); INSERT INTO messages(id,conversation_id,role,metadata) VALUES ('m','c','assistant','{}'); INSERT INTO tool_calls VALUES ('t','m','shell','{}','\"pending\"','pending',NULL,NULL),('local','m','shell','{}','\"local\"','complete',NULL,NULL); INSERT INTO attachments(id,message_id,size) VALUES ('a','m',3); INSERT INTO attachment_bodies VALUES ('a','old',3); INSERT INTO remote.row_origins(table_name,physical_row_id,workspace_id,author_user_id,author_device_id,source_row_id,source_event_id,content_key) VALUES ('tool_calls','t','w','u','d','source','event','tool_calls:source'),('attachments','a','w','u','d','attachment','event','attachments:attachment')")
     incoming=core_module.ParseResult(tools=[dict(id=id,message_id="m",tool_name="shell",input="{}",output='"done"',status="complete",duration_ms=None,created_at=None) for id in ("t","fresh")])

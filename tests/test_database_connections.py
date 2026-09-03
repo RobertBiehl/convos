@@ -1,4 +1,4 @@
-import ast, json, os, subprocess, sys
+import ast, json, os, re, subprocess, sys
 from collections import Counter
 from pathlib import Path
 import pytest
@@ -36,6 +36,13 @@ def test_archive_connections_are_gatewayed_and_purpose_labeled():
             if not isinstance(purpose,ast.Constant) or not isinstance(purpose.value,str) or not purpose.value: missing.append((path,owner,node.lineno))
     assert Counter(direct)==Counter({("src/ai_convos/cli.py","_open_db"):1,("src/ai_convos/cli.py","_check_archive"):1})
     assert not missing,f"Archive connection lacks a literal purpose: {missing}"
+
+def test_connection_ledger_has_every_archive_and_sqlite_acquisition_once():
+    text=(ROOT/"docs/database-connection-ledger.md").read_text()
+    archive=Counter((path,owner,next(k.value.value for k in node.keywords if k.arg=="purpose")) for path,owner,node in calls() if (node.func.id if isinstance(node.func,ast.Name) else node.func.attr if isinstance(node.func,ast.Attribute) else None) in {"get_db","open_db","_core","commit_result"} and owner not in {"get_db","open_db","_core","commit_result"})
+    sqlite=Counter((path,owner) for path,owner,node in calls() if isinstance(node.func,ast.Attribute) and isinstance(node.func.value,ast.Name) and (node.func.value.id,node.func.attr)==("sqlite3","connect"))
+    assert Counter(re.findall(r"\| A\d+ \| `([^`]+)::([^`]+)` \| `([^`]+)` \|",text))==archive
+    assert Counter(re.findall(r"\| S\d+ \| `([^`]+)::([^`]+)` \|",text))==sqlite
 
 def test_database_drivers_cannot_hide_behind_import_aliases():
     hidden=[]
@@ -118,6 +125,14 @@ def test_remote_full_scan_releases_the_archive_between_bounded_pages(tmp_path):
     records=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); state.close()
     assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages==["scanning archive 1","scanning archive 2","scanning archive 3"]
 
+def test_remote_repair_inventory_releases_the_archive_between_pages(tmp_path,monkeypatch):
+    import base64, ai_convos_remote
+    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO remote.row_proofs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",[(f"p{i}","w","w","conversations",f"c{i}",1,"h",f"r{i}",None,"active","u","d",1,"s") for i in range(2)]); db.close(); stages=[]; monkeypatch.setattr(ai_convos_remote,"bridge_records",lambda *_:[])
+    def progress(stage):
+        with cli.open_db(path,wait=0,purpose="concurrent inventory probe"): pass
+        stages.append(stage)
+    assert len(ai_convos_remote.local_replica_ids(tmp_path,{"keys":{"w:1":base64.b64encode(b"x"*32).decode()}},"w","team",{1},1,progress))==2 and stages==["p0","p1"]
+
 def test_redaction_and_export_processing_run_without_archive_lock(monkeypatch):
     from ai_convos_redact import scan_data
     import ai_convos_redact
@@ -133,6 +148,15 @@ def test_redaction_and_export_processing_run_without_archive_lock(monkeypatch):
             cli.open_db(wait=0,purpose="concurrent export probe").close()
             self.text=text
     output=Output(); cli.export(output,"json",None); assert '"id": "c"' in output.text
+
+def test_memory_scope_resolution_runs_without_archive_lock(tmp_path,monkeypatch):
+    import ai_convos_memory
+    path=tmp_path/"archive.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.execute("INSERT INTO conversations(id,source,cwd,metadata) VALUES ('c','codex','/repo','{}'); INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('m','c','user','evidence','{}')"); db.close(); monkeypatch.setattr(cli,"DB_PATH",path); monkeypatch.setattr(cli,"drain_hooks",lambda:0)
+    def scope(_):
+        with cli.open_db(path,wait=0,purpose="concurrent memory probe"): pass
+        return "/repo"
+    monkeypatch.setattr(ai_convos_memory,"_scope",scope)
+    assert ai_convos_memory._archive_evidence(["m"],"/repo")[0]["message"]=="m"
 
 def test_ingest_chunks_are_ordered_restart_safe_and_preserve_evidence(tmp_path,monkeypatch):
     path=tmp_path/"archive.db"; monkeypatch.setattr(cli,"DB_PATH",path); db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.close()

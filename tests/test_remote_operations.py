@@ -30,7 +30,7 @@ def test_remote_sync_expected_failure_is_concise(monkeypatch):
     assert result.exit_code==1 and "Personal: row replica proof mismatch" in output and "Traceback" not in output and "RuntimeError" not in output
 
 def test_remote_audit_is_machine_readable_and_fails_concisely(monkeypatch):
-    result={"totals":{"projection_mismatch":1,"projection_missing":0,"proof_missing":0},"tables":{"tool_calls":{"origins":2,"projection_match":1,"projection_mismatch":1,"projection_missing":0,"proof_missing":0}},"examples":[]}; monkeypatch.setattr(remote_client,"audit_rows",lambda path:result); runner=CliRunner(); failed=runner.invoke(remote_client.remote,["audit"]); machine=runner.invoke(remote_client.remote,["audit","--format","json"])
+    result={"totals":{"projection_mismatch":1,"projection_missing":0,"proof_missing":0},"tables":{"tool_calls":{"origins":2,"projection_match":1,"projection_mismatch":1,"projection_missing":0,"proof_missing":0}},"examples":[]}; monkeypatch.setattr(remote_client,"audit_rows",lambda *args,**kwargs:result); runner=CliRunner(); failed=runner.invoke(remote_client.remote,["audit"]); machine=runner.invoke(remote_client.remote,["audit","--format","json"])
     assert failed.exit_code==1 and "tool_calls: origins=2" in failed.output and "Signed-row integrity audit found 1 issue(s)" in failed.output and "Traceback" not in failed.output and machine.exit_code==0 and json.loads(machine.output)==result
 
 

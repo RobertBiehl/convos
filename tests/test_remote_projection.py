@@ -234,6 +234,19 @@ def test_retained_replica_inventories_before_skipping_a_drifted_projection(tmp_p
     blocked=[]; repaired=[open_replica(env,key_) for env in row_replicas(path,cfg,"w",[],{1:key_},inventory=lambda ids:set(),blocked=blocked)]
     assert blocked==[("tool_calls","t")] and {body["row"]["kind"] for body in repaired}=={"conversations","messages","file_edits"}
 
+def test_remote_audit_releases_the_archive_between_pages(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"archive.db"; assert apply_row_replicas(path,bodies,"w",[control],local_user="receiver")==[True]*4; db=core_module.open_db(path,purpose="fixture"); db.execute("INSERT INTO provenance.files VALUES ('f',NULL,'x','external')"); db.executemany("INSERT INTO remote.row_proofs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",[(f"p{i}",f"w{i}",f"w{i}","file.observed",f"s{i}",1,"h",f"r{i}",None,"active",f"u{i}","d",1,"s") for i in range(2)]); db.executemany("INSERT INTO remote.provenance_origins VALUES ('file.observed','f',?,?,?,?)",[(f"w{i}",f"u{i}",f"s{i}",f"p{i}") for i in range(2)]); db.close(); stages=[]
+    def progress(stage):
+        with core_module.open_db(path,wait=0,purpose="concurrent audit probe"): pass
+        stages.append(stage)
+    result=audit_rows(path,1,progress)
+    assert result["totals"]["origins"]==6 and len(stages)==12
+
+def test_retained_replica_pages_release_the_archive_reader(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"archive.db"; assert apply_row_replicas(path,bodies,"w",[control],local_user="receiver")==[True]*4; pages=iter(projection_module.retained_proof_pages(path,"w",author="receiver",page=1)); found=set(next(pages))
+    with core_module.open_db(path,wait=0,purpose="test.writer") as writer: writer.execute("SELECT 1")
+    assert len(found|set().union(*pages))==4
+
 
 def test_legacy_physical_archive_migrates_then_accepts_unchanged_v1_relay_replica(tmp_path):
     root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":certificate(root,user,device),"history":True}; control=lambda ws:{"workspace":ws,"revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; row=logical_row("conversations",fields,["c","codex","legacy","2026-01-01","2026-01-01",None,None,None,None,"{}"]); proofs={ws:row_proof(device,user,ws,1,row) for ws in ("old-workspace","relay-workspace")}; path=tmp_path/"db"; db=duckdb.connect(str(path)); init_schema(db); pid=project_row_proof(db,proofs["old-workspace"],root["sign_public"],entry["certificate"]); old=provenance_digest(f"old-workspace:{user}:conversations:c")[:16]; db.execute("INSERT INTO conversations VALUES (?,'codex','legacy','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')",[old]); db.execute("INSERT INTO remote.row_origins VALUES ('conversations',?,'old-workspace',?,'device','c',?,'conversations:c',NULL,?)",[old,user,proofs["old-workspace"]["revision"],pid]); db.execute("UPDATE core_schema SET version=1"); db.close(); db=duckdb.connect(str(path)); init_schema(db); db.close()
