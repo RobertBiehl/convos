@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, os, re, shlex, shutil, signal, site, sqlite3, ssl, struct, subprocess, sys, sysconfig, tempfile, time, typer, urllib.request, zipfile
+import base64, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, os, re, shlex, shutil, signal, site, sqlite3, ssl, struct, subprocess, sys, sysconfig, tempfile, time, typer, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -17,7 +17,7 @@ _CHATGPT_HOSTS,_BROWSER_UA,_CLAUDE_HEADERS=(("https://chatgpt.com",("chatgpt.com
 _INJECTED_RE,MESSAGE_ORDER,MESSAGE_ORDER_DESC=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*","m.created_at NULLS FIRST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) NULLS LAST,m.id","m.created_at DESC NULLS LAST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) DESC NULLS LAST,m.id DESC"
 
 def _open_db(path,read_only=False): return (path.parent.mkdir(parents=True,exist_ok=True),None if read_only and not path.exists() else duckdb.connect(str(path),read_only=read_only))[-1]
-class LockBusy(click.ClickException,RuntimeError): pass
+class LockBusy(RuntimeError): pass
 def lock_owner(purpose,identity=None): return dict(identity or {},v=1,purpose=purpose,pid=os.getpid(),process=Path(sys.argv[0]).name,host=os.uname().nodename,os_user=getpass.getuser(),started_at=(now:=time.time()),heartbeat_at=now,stage="started")
 def _lock_read(lock):
     try: return json.loads((lock.seek(0),lock.read())[-1])
@@ -1314,7 +1314,9 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if before!=json.dumps(state,sort_keys=True): atomic_json(STATE_PATH,state)
         verbose and typer.echo(f"Total sync time {time.perf_counter()-t0:.2f}s")
         return total, newc, updc
-    def do_sync(): return _sync_leader(run_sync)
+    def do_sync():
+        try: return _sync_leader(run_sync)
+        except LockBusy as error: raise typer.Exit(typer.echo(str(error),err=True) or 1)
     if watch: typer.echo(f"Daemon mode (interval: {interval}s)")
     while watch:
         r,n,u=do_sync()

@@ -1,5 +1,5 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
-import click, hashlib, json, os, shutil, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
+import hashlib, json, os, shutil, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
 from contextlib import ExitStack, closing, contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -16,6 +16,7 @@ from .projection import PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
                        recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
+def cli_error(message): raise typer.Exit(typer.echo(f"Error: {message}",err=True) or 1)
 
 remote,REPLICA_BATCH_BYTES,REPLICA_ITEM_BYTES=typer.Typer(help="End-to-end encrypted personal and team synchronization"),4*1024**2,48*1024**2
 def local_root(root=None): return Path(root or os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT))
@@ -1335,13 +1336,13 @@ def config_cmd(space:str,auto_contribute:Optional[bool]=typer.Option(None,"--aut
 @remote.command("sync")
 def sync_cmd():
     try: result=sync_once(force=True)
-    except ConnectionError as e: raise click.ClickException(f"{e}. Local sync progress was preserved; retry `convos remote sync`.") from None
-    except (ValueError,RuntimeError) as e: raise click.ClickException(str(e)) from None
+    except ConnectionError as e: cli_error(f"{e}. Local sync progress was preserved; retry `convos remote sync`.")
+    except (ValueError,RuntimeError) as e: cli_error(e)
     typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else ""))
 @remote.command("repull")
 def repull_cmd():
     try: removed,audit=repull_once()
-    except (ConnectionError,ValueError,RuntimeError) as error: raise click.ClickException(str(error)) from None
+    except (ConnectionError,ValueError,RuntimeError) as error: cli_error(error)
     typer.echo("Remote rows replaced from relay; "+", ".join(f"{kind}={count}" for kind,count in removed.items())+f"; verified={audit['totals'].get('projection_match',0)}")
 @remote.command("fetch")
 @locked
@@ -1409,6 +1410,6 @@ def audit_cmd(format:str=typer.Option("text","-f","--format")):
         return
     [typer.echo(f"{kind}: origins={value['origins']}, projection={value['projection_match']} valid/{value['projection_mismatch']} mismatch/{value['projection_missing']} missing, proofs={value['proof_missing']} missing") for kind,value in sorted(result["tables"].items())]
     bad=sum(result["totals"].get(key,0) for key in ("projection_mismatch","projection_missing","proof_missing"))
-    if bad: raise click.ClickException(f"Signed-row integrity audit found {bad} issue(s). Run `convos remote repull` to replace received rows from the relay.")
+    if bad: cli_error(f"Signed-row integrity audit found {bad} issue(s). Run `convos remote repull` to replace received rows from the relay.")
 for app in _pending: register(app)
 _pending.clear()
