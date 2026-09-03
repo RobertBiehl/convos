@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, index_attachment_body, init_schema, open_db, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, required, set_attachment_path
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, index_attachment_body, init_schema, open_db, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, required, set_attachment_path
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
@@ -140,7 +140,7 @@ def connect(path):
     return db
 @lru_cache(maxsize=1)
 def bridges():
-    if (result:=[entry.load()() for entry in entry_points(group="convos.remote")]) and any(set(b)!={"v","schema","objects","records","accept"} or b["v"]!=3 or isinstance(b["v"],bool) or not isinstance(b["schema"],int) or isinstance(b["schema"],bool) or b["schema"]<1 or any(not callable(b[k]) for k in ("records","accept")) or not isinstance(b["objects"],set) or not b["objects"] or any(not isinstance(v,str) or not v for v in b["objects"]) for b in result) or len([v for b in result for v in b["objects"]])!=len({v for b in result for v in b["objects"]}): raise ValueError("Unsupported remote bridge")
+    if (result:=[entry.load()() for entry in entry_points(group="convos.remote")]) and any(not {"v","schema","objects","records","accept"}<=set(b)<={"v","schema","objects","records","accept","accept_many"} or b["v"]!=3 or isinstance(b["v"],bool) or not isinstance(b["schema"],int) or isinstance(b["schema"],bool) or b["schema"]<1 or any(not callable(b[k]) for k in ("records","accept")+(("accept_many",) if "accept_many" in b else ())) or not isinstance(b["objects"],set) or not b["objects"] or any(not isinstance(v,str) or not v for v in b["objects"]) for b in result) or len([v for b in result for v in b["objects"]])!=len({v for b in result for v in b["objects"]}): raise ValueError("Unsupported remote bridge")
     return result
 def control_chain(controls):
     ordered,previous=sorted(controls,key=lambda c:c["revision"]),None
@@ -161,7 +161,7 @@ def audit_rows(db_path,page=5000,progress=None):
             rows=db.execute(sql,(after[0],after[0],after[1],after[1],after[2],page)).fetchall()
         if not rows: break
         origins,after=origins+rows,(rows[-1][0],rows[-1][1],rows[-1][4] or "")
-        progress and progress(f"audit inventory {len(origins)}")
+        (progress and progress(f"audit inventory {len(origins)}"),archive_yield(db_path))
     mapped,tables,examples={(kind,physical,user):source for kind,physical,source,user,pid,expected,state in origins if kind in COLUMNS},{},[]
     for at in range(0,len(origins),page):
         batch,found,facts=origins[at:at+page],{},{}
@@ -189,7 +189,7 @@ def audit_rows(db_path,page=5000,progress=None):
             stat=tables.setdefault(kind,dict(origins=0,projection_match=0,projection_mismatch=0,projection_missing=0,proof_missing=0))
             for key,value in (("origins",1),("proof_missing",expected is None),("projection_missing",row is None),("projection_match",projection),("projection_mismatch",row is not None and expected is not None and not projection)): stat[key]+=value
             if len(examples)<20 and not projection: examples.append(dict(kind=kind,id=source,projection="missing" if row is None else "mismatch"))
-        progress and progress(f"audit rows {min(at+page,len(origins))}")
+        (progress and progress(f"audit rows {min(at+page,len(origins))}"),archive_yield(db_path))
     return (lambda keys:dict(totals={key:sum(value[key] for value in tables.values()) for key in keys},tables=tables,examples=examples))(next(iter(tables.values())).keys() if tables else ())
 def event_support(value):
     if not isinstance(kind:=value["kind"],str) or not isinstance(version:=value["payload_v"],int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
@@ -197,12 +197,16 @@ def event_support(value):
 def bridge_records(root,cfg,workspace,kind): return [record for bridge in bridges() for record in bridge["records"](root,cfg["user"],workspace,kind)]
 def bridge_stamp(root): return digest({kind:(bridge["v"],bridge["schema"]) for bridge in bridges() for kind in bridge["objects"]})
 def bridge_accept(root,row,proof,project=True): return bool((found:=[bridge for bridge in bridges() if row["kind"] in bridge["objects"]]) and found[0]["accept"](root,row,proof,project))
+def bridge_accept_many(root,values,project=True):
+    groups=[(bridge,selected) for bridge in bridges() if (selected:=[(i,value) for i,value in enumerate(values) if value[0]["kind"] in bridge["objects"]])]
+    batches=[(selected,bridge["accept_many"](root,[value for _,value in selected],project) if "accept_many" in bridge else [bridge["accept"](root,*value,project) for _,value in selected]) for bridge,selected in groups]
+    mapped=(required(all(len(selected)==len(answers) for selected,answers in batches),ValueError("Remote bridge batch result mismatch")),{i:bool(answer) for selected,answers in batches for (i,_),answer in zip(selected,answers)})[-1]
+    return [mapped.get(i,False) for i in range(len(values))]
 def bridge_replicas(root,cfg,workspace,kind,key_,known=(),inventory=None):
-    for value in bridge_records(root,cfg,workspace,kind):
-        if value["proof"] is None:
-            proof=semantic_proof(cfg["root"],cfg["user"],cfg["device"]["id"],workspace,cfg["workspaces"][workspace]["epoch"],value["row"],value["previous"])
-            bridge_accept(root,value["row"],proof,False)
-    values=[(value,fingerprint(key_,digest(value["proof"]))) for value in bridge_records(root,cfg,workspace,kind) if value["proof"]]
+    values=bridge_records(root,cfg,workspace,kind)
+    fresh=[(value["row"],value["proof"]) for value in values if value["proof"] is None and not value.__setitem__("proof",semantic_proof(cfg["root"],cfg["user"],cfg["device"]["id"],workspace,cfg["workspaces"][workspace]["epoch"],value["row"],value["previous"]))]
+    bridge_accept_many(root,fresh,False)
+    values=[(value,fingerprint(key_,digest(value["proof"]))) for value in values if value["proof"]]
     present=set(inventory([(replica,cfg["workspaces"][workspace]["epoch"]) for value,replica in values])) if inventory else set(known)
     return [seal_replica(value["row"],value["proof"],workspace,cfg["workspaces"][workspace]["epoch"],key_,cfg["device"]["id"]) for value,replica in values if replica not in present]
 def clean(v):
@@ -360,19 +364,17 @@ def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspac
             batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,new_scope,match,user) if changes else []
         out+=batch
         if not changes: return out
-        after,done=changes[-1],done+len(changes)
-        progress and progress(f"scanning archive {done}")
+        after,done,_=changes[-1],done+len(changes),(progress and progress(f"scanning archive {done+len(changes)}"),archive_yield(db_path))
 def _store_proofs(db_path,proofs,signer,controls,generation):
-    if not proofs: return
     with contextlib.closing(open_db(db_path,purpose="remote.attest.write")) as db,_transaction(db):
         required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
         project_workspace_controls(db,controls)
         project_row_proofs(db,proofs,signer["root_public"],signer["certificate"])
+    archive_yield(db_path)
 def attest_rows(db_path,cfg,workspace,records,origins=(),generation=None):
     controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace)
     device=cfg["device"]
     signer=cfg["controls"][workspace]["devices"][device["id"]]
-    with contextlib.closing(open_db(db_path,purpose="remote.attest.schema")) as db: init_schema(db)
     wanted={value for r in records if r["kind"] in TABLES and r["payload"].get("state")!="deleted" for column,value in zip(r["payload"]["columns"],r["payload"]["row"]) if value is not None and (column=="id" or column in dict(FKS.get(r["payload"]["table"],())))}
     with contextlib.closing(open_db(db_path,True,purpose="remote.attest.plan")) as db: actual,aliases=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],{(table,physical):source for table,physical,source in db.execute("SELECT table_name,physical_row_id,source_row_id FROM remote.row_origins WHERE author_user_id=? AND physical_row_id IN (SELECT UNNEST(?))",(cfg["user"],list(wanted))).fetchall()}
     if generation is not None: required(actual==generation,RuntimeError("Archive changed during Remote publication; retry"))
@@ -397,6 +399,7 @@ def retained_proof_pages(db_path,workspace,origins=(),author=None,generation=Non
         with contextlib.closing(open_db(db_path,True,purpose="remote.replicas.page")) as db: rows=(required(generation is None or db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry")),db.execute(sql,(*scopes,author,list(TABLES.values()),*scopes,*scopes,*scopes,after,page)).fetchall())[1]
         if not rows: return
         yield (after:=rows[-1][0]) and {r[0] for r in rows}
+        archive_yield(db_path)
 def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,inventory=None,retained=True,generation=None,blocked=None):
     if retained is True: return list({(env["replica"],env["epoch"]):env for env in [*row_replicas(db_path,cfg,workspace,records,keys,known,origins,origin_epochs,inventory,False,generation,blocked),*(env for page in retained_proof_pages(db_path,workspace,origins,cfg["user"],generation) for env in row_replicas(db_path,cfg,workspace,[],keys,known,origins,origin_epochs,inventory,page,generation,blocked))]}.values())
     fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
@@ -466,6 +469,7 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
         candidates=[(row,p,content_hash,epoch,fingerprint(keys[epoch],digest(p))) for row,p,content_hash in bodies.values() for epoch in [delivery(p)] if epoch in keys]
         db.close()
         db=None
+        archive_yield(db_path)
         known=set(inventory([(r[4],r[3]) for r in candidates])) if inventory else set(known)
         def seal(row,p,content_hash,epoch):
             if content_hash is None and digest(row)!=p["content_hash"]:
@@ -621,17 +625,19 @@ def verified_replica(body,workspace,controls,user):
         if expected is not None: raise ValueError("incomplete row proof lineage")
     return row,proof,signer_,verified
 def temp_rows(db,name,columns,rows): db.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT x.* FROM UNNEST(from_json(?,?)) t(x)",(json.dumps([dict(zip(columns,row)) for row in rows]),json.dumps([{c:"VARCHAR" for c in columns}])))
-def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None,root=None):
+def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None,root=None,ready=True):
     if not bodies: return []
     values=[verified_replica(body,workspace,controls,local_user) for body in bodies]
-    semantic={i:bridge_accept(root,value[0],value[1]) for i,value in enumerate(values) if value[1]["kind"]=="semantic.proof"}
+    if ready and Path(db_path).is_file() and any(value[1]["kind"]=="semantic.proof" for value in values):
+        with contextlib.closing(open_db(db_path,purpose="schema.remote.rows")) as schema: ready=(init_schema(schema),False)[-1]
+    semantic_ids,semantic=(semantic_ids:=[i for i,value in enumerate(values) if value[1]["kind"]=="semantic.proof"]),dict(zip(semantic_ids,bridge_accept_many(root,[(values[i][0],values[i][1]) for i in semantic_ids])))
     indexes=[i for i in range(len(values)) if i not in semantic]
     if not indexes: return list(semantic.values())
     names=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
     proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(names,values))}
     own=db is None
     db=db or open_db(db_path,purpose="remote.rows.project")
-    if own: init_schema(db)
+    if own and ready and not semantic_ids: init_schema(db)
     try:
         with _transaction(db):
             items=[values[i] for i in indexes]
@@ -725,13 +731,13 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
         return project_provenance(db,value,lambda table,old:old if native else foreign_id(user,table,old))
     finally:
         if own: db.close()
-def project_many(db_path,state,items,local_device=None,root=None,commit=True,authors=None,recover=None,local_user=None):
+def project_many(db_path,state,items,local_device=None,root=None,commit=True,authors=None,recover=None,local_user=None,ready=True):
     records=any(v["kind"] in PROVENANCE and (v["author"]!=local_device or recover and author_user(v,authors)==local_user) for _,v in items)
     db=None
     if records:
         Path(db_path).parent.mkdir(parents=True,exist_ok=True)
         db=open_db(db_path,purpose="remote.provenance.project_many")
-        init_schema(db)
+        if ready: init_schema(db)
     try:
         with _transaction(db) if db else contextlib.nullcontext(): [project(db_path,state,v,ws,local_device,db,root,True,authors,recover,local_user) for ws,v in items]
         commit and state.commit()

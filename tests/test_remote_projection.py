@@ -1,4 +1,5 @@
 import json, os, subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
@@ -46,6 +47,14 @@ def test_signed_edit_evidence_preserves_status_and_tool_binding_across_replica(t
     target=duckdb.connect(str(receiver/"data/convos.db"),read_only=True); assert target.execute("SELECT v.status,v.reason,v.tool_call_id=t.id FROM provenance.file_edit_evidence v JOIN tool_calls t ON t.id=v.tool_call_id").fetchone()==("confirmed","test_fixture",True); target.close()
     core=duckdb.connect(str(path)); core.execute("UPDATE provenance.file_edit_evidence SET status='invalid',reason='provider_failure' WHERE file_edit_id='e'"); core.close(); update=next(v for v in edit_evidence_records(sender,user,"personal","personal") if v["proof"] is None); revised=semantic_proof(root,user,device["id"],"personal",1,update["row"],update["previous"]); semantic=open_replica(seal_replica(update["row"],revised,"personal",1,key_,device["id"]),key_); apply_row_replicas(receiver/"data/convos.db",[semantic],"personal",[control],local_user="receiver",root=receiver)
     target=duckdb.connect(str(receiver/"data/convos.db"),read_only=True); assert target.execute("SELECT status,reason FROM provenance.file_edit_evidence").fetchone()==("invalid","provider_failure") and target.execute("SELECT count(*) FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed'").fetchone()[0]==0; target.close()
+
+def test_edit_evidence_inventory_is_set_based_not_per_edit(tmp_path,monkeypatch):
+    root=tmp_path/"archive"; path=root/"data/convos.db"; db=core_module.open_db(path,purpose="fixture"); init_schema(db); rows=[(f"p{i}","w","w","file_edits",f"e{i}",1,"h",f"{i:064x}",None,"active","u","d",1,"s") for i in range(40)]; db.executemany("INSERT INTO remote.row_proofs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",rows); db.executemany("INSERT INTO provenance.file_edit_evidence VALUES (?,'confirmed','test',NULL)",[(f"e{i}",) for i in range(40)]); db.close(); opened=[]; real=remote_client._core
+    @contextmanager
+    def counted(*args,purpose,**kwargs):
+        opened.append(purpose)
+        with real(*args,purpose=purpose,**kwargs) as db: yield db
+    monkeypatch.setattr(remote_client,"_core",counted); assert len(edit_evidence_records(root,"u","w","personal"))==40 and opened.count("remote.edit_evidence.read")==1
 
 def test_signed_edit_evidence_tracks_exact_row_heads_reorder_tombstones_and_forks(tmp_path):
     root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); archive=tmp_path/"archive"; path=archive/"data/convos.db"; apply=lambda values:apply_row_replicas(path,values,"w",[control],local_user="receiver",root=archive); state=lambda:duckdb.connect(str(path),read_only=True).execute("SELECT status,reason,tool_call_id IS NOT NULL FROM provenance.file_edit_evidence").fetchone()
@@ -259,6 +268,13 @@ def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
     bridges.cache_clear(); monkeypatch.setattr(projection_module,"entry_points",lambda **_:[Entry()])
     with pytest.raises(ValueError,match="Unsupported remote bridge"): bridges()
     bridges.cache_clear()
+
+def test_bridge_collection_runs_once_and_persists_new_proofs_in_bulk(tmp_path,monkeypatch):
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); calls={"records":0,"accepted":[]}
+    def records(*_): calls["records"]+=1; return [dict(row={"v":1,"kind":"x","id":str(i),"state":"active","data":{}},proof=None,previous=None) for i in range(2)]
+    def accept_many(_,values,project): calls["accepted"].append((values,project)); return [True]*len(values)
+    monkeypatch.setattr(projection_module,"bridges",lambda:[{"v":3,"schema":1,"objects":{"x"},"records":records,"accept":lambda *_:None,"accept_many":accept_many}]); cfg={"root":root,"user":user,"device":device,"workspaces":{"w":{"epoch":1}}}
+    assert len(bridge_replicas(tmp_path,cfg,"w","personal",bytes(range(32))))==2 and calls["records"]==1 and len(calls["accepted"])==1 and len(calls["accepted"][0][0])==2 and calls["accepted"][0][1] is False
 
 
 def test_provider_session_alias_converges_one_author_and_separates_authors(tmp_path):

@@ -72,7 +72,7 @@ def test_sync_lease_is_nonblocking_and_separate_from_mutation_lease(tmp_path):
         pulse("uploading replicas")
         owner=json.loads((tmp_path/"remote/sync.lock").read_text())
         assert owner["remote_user"]=="alice" and owner["user_id"]=="user-id" and owner["device"]=="laptop" and owner["pid"]==os.getpid() and owner["started_at"]<=owner["heartbeat_at"] and owner["stage"]=="uploading replicas"
-        with pytest.raises(core_module.LockBusy,match=r"remote user alice.*device laptop.*OS user.*PID .*started .*last activity .*uploading replicas"):
+        with pytest.raises(core_module.LockBusy,match=r"remote user alice.*device laptop.*OS user.*PID .*started .*last progress .*uploading replicas"):
             with remote_client.sync_run(tmp_path): pass
     with pytest.raises(KeyboardInterrupt):
         with remote_client.sync_run(tmp_path): raise KeyboardInterrupt
@@ -100,7 +100,7 @@ def test_manual_repull_fails_fast_against_a_noncooperative_background_sync(tmp_p
     monkeypatch.setattr(remote_client,"MANUAL_WAIT",.05)
     with remote_client.sync_run(tmp_path):
         started=time.monotonic()
-        with pytest.raises(core_module.LockBusy,match=r"remote repull.*after 0.05s.*purpose remote sync"):
+        with pytest.raises(core_module.LockBusy,match=r"remote repull.*for 0.05s.*purpose remote sync"):
             with remote_client.sync_run(tmp_path,True,"repull"): pass
         assert time.monotonic()-started<.5
 
