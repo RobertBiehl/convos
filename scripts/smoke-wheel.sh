@@ -10,18 +10,19 @@ trap 'rm -rf "$sandbox"' EXIT
 uv venv --python 3.12 "$sandbox/venv"
 uv pip install --python "$sandbox/venv/bin/python" --only-binary :all: "$wheel"
 export CONVOS_PROJECT_ROOT="$sandbox/root" CODEX_HOME="$sandbox/codex" CLAUDE_CONFIG_DIR="$sandbox/claude"
+export EXPECTED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
 "$sandbox/venv/bin/convos" init
 
 "$sandbox/venv/bin/python" <<'PY'
 from importlib.metadata import metadata, version
 from importlib.util import find_spec
 from pathlib import Path
-import duckdb
+import duckdb, os
 from ai_convos import cli
 from typer.testing import CliRunner
 
 requirements = metadata("convos").get_all("Requires-Dist") or []
-assert version("convos") == "0.11.6"
+assert version("convos") == os.environ["EXPECTED_VERSION"]
 assert not any("model2vec" in r or "sys_platform == \"linux\"" in r for r in requirements), requirements
 assert find_spec("model2vec") is None and find_spec("llama_cpp") is None and not cli.semantic_enabled()
 conn = duckdb.connect(str(cli.DB_PATH))
@@ -31,5 +32,5 @@ cli.rebuild_fts_index(conn); conn.close()
 result = CliRunner().invoke(cli.app, ["search", "native compiler", "-n", "1"])
 assert result.exit_code == 0 and "base installation needs no native compiler" in result.output, result.output
 assert Path(cli.PROJECT_ROOT).exists()
-print("clean wheel: convos 0.11.6, compiler-free Linux core and literal retrieval ready")
+print(f"clean wheel: convos {version('convos')}, compiler-free Linux core and literal retrieval ready")
 PY
