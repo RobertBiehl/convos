@@ -1,7 +1,8 @@
-import ast, json, os, re, subprocess, sys
+import ast, json, os, re, subprocess, sys, time
 from collections import Counter
 from pathlib import Path
 import pytest
+from typer.testing import CliRunner
 
 from ai_convos import cli
 
@@ -15,6 +16,21 @@ SQLITE=Counter({
     ("apps/remote/src/ai_convos_remote/__init__.py","rescue_bindings"):1,("apps/remote/src/ai_convos_remote/migrations.py","migrate_state"):1,
     ("apps/remote/src/ai_convos_remote/projection.py","_connect"):1,("apps/remote/src/ai_convos_remote/projection.py","read_state"):1,("apps/remote/src/ai_convos_remote/projection.py","inspect_state"):1,("apps/remote/src/ai_convos_remote/projection.py","cutover_state"):2,
 })
+HOLDER="""import sys,time
+from ai_convos.cli import open_db,operation_lock
+with operation_lock(sys.argv[2],sys.argv[3]) as pulse:
+ db=open_db(sys.argv[1],bool(int(sys.argv[4])),purpose='holder database'); print('ready',flush=True)
+ if (duration:=float(sys.argv[5])):
+  end=time.monotonic()+duration; i=0
+  while time.monotonic()<end: time.sleep(.02); i+=1; pulse(f'page {i}')
+ else: sys.stdin.readline()
+ db.close()
+"""
+def holder(path,purpose,read_only=False,duration=0):
+    lock=path.parent/f"{purpose.replace(' ','.')}.lock"; child=subprocess.Popen([sys.executable,"-c",HOLDER,str(path),str(lock),purpose,str(int(read_only)),str(duration)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True); assert child.stdout.readline()=="ready\n",child.stderr.read(); return child,lock
+def release(child):
+    if child.poll() is None: child.stdin.write("\n"); child.stdin.flush()
+    assert child.wait(5)==0,child.stderr.read()
 
 def calls():
     for path in SOURCES:
@@ -57,36 +73,95 @@ def test_sqlite_connection_inventory_is_complete():
     assert found==SQLITE
 
 def test_lock_diagnostics_name_waiter_and_holder(tmp_path,capsys):
-    path=tmp_path/"archive.db"; holder=cli.open_db(path,purpose="remote attestation")
-    assert "remote attestation" in path.with_name(".archive.db.lock").read_text()
+    path=tmp_path/"archive.db"; child,lock=holder(path,"remote attestation")
+    assert "remote attestation" in lock.read_text()
     try:
-        try: cli.open_db(path,wait=.01,purpose="local sync")
-        except cli.LockBusy as error: message=str(error)
-        assert "local sync" in message and "remote attestation" in message and "PID " in message
-        holder.audit=(holder.audit[0],holder.audit[1],holder.audit[2]-6,*holder.audit[3:])
-    finally: holder.close()
+        with pytest.raises(cli.LockBusy) as error: cli.open_db(path,wait=.01,purpose="local sync")
+        assert "local sync" in str(error.value) and "remote attestation" in str(error.value) and "PID " in str(error.value) and "last progress" in str(error.value)
+    finally: release(child)
+    owned=cli.open_db(path,purpose="fixture"); owned.audit=(owned.audit[0],owned.audit[1],owned.audit[2]-6); owned.close()
     error=capsys.readouterr().err
-    assert "write lock held" in error and "remote attestation" in error and json.loads(path.with_name(".archive.db.lock").read_text())["stage"]=="finished"
+    assert "write connection held" in error and "fixture" in error and json.loads(lock.read_text())["stage"]=="finished" and not path.with_name(".archive.db.lock").exists()
 
-def test_shared_reader_diagnostics_are_identified_and_crash_records_are_pruned(tmp_path):
-    path=tmp_path/"archive.db"; writer=cli.open_db(path,purpose="fixture"); writer.close(); reader=cli.open_db(path,True,purpose="remote.scan"); reader.execute("SELECT 1")
-    sidecars=list(path.with_name(".archive.db.lock.readers").glob("*.json")); assert len(sidecars)==1 and (owner:=json.loads(sidecars[0].read_text()))["purpose"]=="remote.scan" and owner["stage"]=="query"
-    with pytest.raises(cli.LockBusy,match=r"local embed.*PID.*remote\.scan") as error: cli.open_db(path,wait=0,purpose="local embed")
-    assert "shared archive reader" not in str(error.value)
-    reader.close(); assert not list(path.with_name(".archive.db.lock.readers").glob("*.json"))
-    sidecars[0].write_text(json.dumps({"purpose":"stale"})); writer=cli.open_db(path,purpose="recovery"); writer.close(); assert not sidecars[0].exists()
+def test_native_reader_contention_is_diagnosed_without_fast_path_sidecars(tmp_path):
+    path=tmp_path/"archive.db"; cli.open_db(path,purpose="fixture").close(); child,_=holder(path,"remote.scan",True)
+    try:
+        with pytest.raises(cli.LockBusy,match=r"local embed.*PID.*remote\.scan") as error: cli.open_db(path,wait=0,purpose="local embed")
+        assert "last progress" in str(error.value) and not path.with_name(".archive.db.lock.readers").exists()
+    finally: release(child)
 
-def test_all_process_locks_use_the_shared_contract_and_survive_crashes(tmp_path):
+def test_all_process_flocks_are_inventoried_and_survive_crashes(tmp_path):
     found=Counter((path,owner) for path,owner,node in calls() if isinstance(node.func,ast.Attribute) and isinstance(node.func.value,ast.Name) and (node.func.value.id,node.func.attr)==("fcntl","flock"))
-    assert found==Counter({("src/ai_convos/cli.py","_flock"):1,("src/ai_convos/cli.py","get_db"):1,("src/ai_convos/cli.py","operation_lock"):1})
+    assert found==Counter({("src/ai_convos/cli.py","_flock"):1,("src/ai_convos/cli.py","operation_lock"):1,("src/ai_convos/cli.py","_waiter"):1,("src/ai_convos/cli.py","_waiting"):1})
     path=tmp_path/"nested/work.lock"; child=subprocess.run([sys.executable,"-c","import os,sys; from pathlib import Path; from ai_convos.cli import operation_lock\nwith operation_lock(Path(sys.argv[1]),'test.crash'): os._exit(17)",str(path)])
     assert child.returncode==17
     with cli.operation_lock(path,"test.recovery") as pulse: pulse("verified")
     owner=json.loads(path.read_text()); assert path.stat().st_mode&0o777==0o600 and owner["v"]==1 and owner["purpose"]=="test.recovery" and owner["pid"]==os.getpid() and owner["stage"]=="finished" and owner["started_at"]<=owner["heartbeat_at"]
+    archive=tmp_path/"archive.db"; child=subprocess.run([sys.executable,"-c","import os,sys; from ai_convos.cli import _waiter\n_waiter(__import__('pathlib').Path(sys.argv[1])); os._exit(17)",str(archive)])
+    markers=list(archive.with_name(".archive.db.waiters").glob("*.lock")); assert child.returncode==17 and len(markers)==1
+    started=time.monotonic(); cli.archive_yield(archive); assert time.monotonic()-started<.2 and not markers[0].exists()
 
 def test_external_duckdb_contention_uses_the_concise_lock_error(tmp_path,monkeypatch):
     monkeypatch.setattr(cli,"_open_db",lambda *args:(_ for _ in ()).throw(cli.duckdb.IOException("Conflicting lock is held by external PID 12")))
-    with pytest.raises(cli.LockBusy,match="outside the Convos lock contract.*external PID 12"): cli.open_db(tmp_path/"archive.db",wait=0,purpose="test.external")
+    with pytest.raises(cli.LockBusy,match=r"test\.external.*stayed busy.*PID 12.*external PID 12"): cli.open_db(tmp_path/"archive.db",wait=0,purpose="test.external")
+
+def test_unhandled_lock_errors_are_concise_cli_errors(tmp_path,monkeypatch):
+    monkeypatch.setattr(cli,"DB_PATH",tmp_path/"archive.db"); cli.DB_PATH.touch(); monkeypatch.setattr(cli,"get_db",lambda *args,**kwargs:(_ for _ in ()).throw(cli.LockBusy("archive busy; holder PID 12")))
+    result=CliRunner().invoke(cli.app,["backup"]); assert result.exit_code==1 and "archive busy; holder PID 12" in result.output and "Traceback" not in result.output and "LockBusy" not in result.output
+
+def test_native_wait_extends_only_while_holder_reports_progress(tmp_path):
+    path=tmp_path/"archive.db"; child,_=holder(path,"progressing sync",duration=.18); started=time.monotonic()
+    try: cli.open_db(path,wait=.05,purpose="manual embed").close()
+    finally: release(child)
+    assert time.monotonic()-started>=.12
+
+def test_native_waiter_notice_exists_only_during_actual_contention(tmp_path):
+    path=tmp_path/"archive.db"; owner=cli.open_db(path,purpose="page owner"); child=subprocess.Popen([sys.executable,"-c","import sys; from ai_convos.cli import open_db; open_db(sys.argv[1],purpose='waiting writer').close()",str(path)]); directory=path.with_name(".archive.db.waiters")
+    try:
+        for _ in range(100):
+            if list(directory.glob("*.lock")): break
+            time.sleep(.01)
+        assert list(directory.glob("*.lock"))
+    finally: owner.close()
+    cli.archive_yield(path)
+    assert child.wait(5)==0 and not list(directory.glob("*.lock"))
+
+def test_cooperative_multi_writer_pages_complete_without_starvation(tmp_path):
+    path=tmp_path/"archive.db"; db=cli.open_db(path,purpose="fixture"); db.execute("CREATE TABLE turns(actor INT,page INT,PRIMARY KEY(actor,page))"); db.close(); code="""import sys
+from ai_convos.cli import archive_yield,open_db
+for page in range(12):
+ db=open_db(sys.argv[1],wait=5,purpose=f'actor {sys.argv[2]} page {page}'); db.execute('INSERT INTO turns VALUES (?,?)',(int(sys.argv[2]),page)); db.close(); archive_yield(sys.argv[1])
+"""; actors=[subprocess.Popen([sys.executable,"-c",code,str(path),str(actor)],stderr=subprocess.PIPE,text=True) for actor in range(4)]
+    assert [actor.wait(15) for actor in actors]==[0]*4,[actor.stderr.read() for actor in actors]
+    db=cli.open_db(path,True,purpose="fixture.read"); assert db.execute("SELECT count(*),count(DISTINCT actor) FROM turns").fetchone()==(48,4); db.close()
+
+def test_manual_sync_progress_uses_existing_operation_events(tmp_path,monkeypatch,capsys):
+    import ai_convos_remote
+    monkeypatch.setattr(cli,"DATA_DIR",tmp_path/"local"); monkeypatch.setattr(cli.sys.stderr,"isatty",lambda:True)
+    assert cli._sync_leader(lambda progress:progress("parsing codex 20/40")) is None
+    with ai_convos_remote.sync_run(tmp_path/"remote",True): ai_convos_remote._progress("receiving rows 500/1000")
+    output=capsys.readouterr().err
+    assert "Local sync: parsing codex 20/40" in output and "Remote 0s | receiving rows 500/1000" in output and output.endswith("\n")
+
+def test_remote_progress_replaces_one_line_and_throttles_same_stage(tmp_path,monkeypatch,capsys):
+    import ai_convos_remote
+    monkeypatch.setattr(ai_convos_remote.sys.stderr,"isatty",lambda:True)
+    with ai_convos_remote.sync_run(tmp_path,True):
+        ai_convos_remote._progress("receiving rows 500/1000")
+        ai_convos_remote._progress("receiving rows 1000/1000")
+        ai_convos_remote._progress("request state")
+    output=capsys.readouterr().err
+    assert output.count("\r\033[2KRemote ")==2 and "receiving rows 1000/1000" not in output and output.endswith("\n")
+
+def test_remote_internal_requests_heartbeat_without_rendering(tmp_path,monkeypatch,capsys):
+    import ai_convos_remote
+    monkeypatch.setattr(ai_convos_remote.sys.stderr,"isatty",lambda:True); monkeypatch.setattr(ai_convos_remote.urllib.request,"urlopen",lambda *a,**k:type("Response",(),{"read":lambda self:b"{}"})())
+    with ai_convos_remote.sync_run(tmp_path,True): ai_convos_remote._progress("preparing rows 500/1000"); ai_convos_remote.request({"url":"http://localhost","token":"t"},{"op":"replica_reconcile"})
+    output=capsys.readouterr().err; assert output.count("\r\033[2KRemote ")==1 and "request replica_reconcile" not in output
+
+def test_signed_evidence_reconciliation_is_always_targeted():
+    tree=ast.parse((ROOT/"src/ai_convos/cli.py").read_text()); calls=[node for node in ast.walk(tree) if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=="_apply_signed_edit_evidence"]
+    assert len(calls)==3 and all(len(node.args)>1 or any(k.arg in {"edits","tools"} for k in node.keywords) for node in calls)
 
 def test_remote_signing_and_attachment_io_run_without_archive_lock(tmp_path,monkeypatch):
     from ai_convos_remote import projection
@@ -101,14 +176,14 @@ def test_remote_signing_and_attachment_io_run_without_archive_lock(tmp_path,monk
     monkeypatch.setattr(projection,"row_proof",proof)
     record=dict(kind="conversation.record",entity="conversations:c",payload=dict(table="conversations",columns=cli.ARCHIVE_COLUMNS["conversations"],row=["c","codex",None,None,None,None,None,None,None,"{}"]))
     assert projection.attest_rows(path,cfg,"w",[record])==1
-    db=cli.open_db(path,purpose="fixture"); db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('d','codex','{}')"); generation=cli.archive_state(db)[1]; cli._archive_touch(db,[("conversations","d")]); generation=cli.archive_state(db)[1]; db.close(); changed=False
+    db=cli.open_db(path,purpose="fixture"); db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('d','codex','{}')"); cli._archive_touch(db,[("conversations","d")]); db.close(); changed=False
     def changing_proof(*args,**kwargs):
         nonlocal changed
         if not changed:
             writer=cli.open_db(path,wait=0,purpose="concurrent archive change"); writer.execute("UPDATE conversations SET title='changed' WHERE id='d'"); cli._archive_touch(writer,[("conversations","d")]); writer.close(); changed=True
         return real_proof(*args,**kwargs)
     monkeypatch.setattr(projection,"row_proof",changing_proof); other={**record,"entity":"conversations:d","payload":{**record["payload"],"row":["d","codex",None,None,None,None,None,None,None,"{}"]}}
-    with pytest.raises(RuntimeError,match="Archive changed"): projection.attest_rows(path,cfg,"w",[other],generation=generation)
+    assert projection.attest_rows(path,cfg,"w",[other])==1 and changed
     legacy=tmp_path/"legacy"; legacy.mkdir(); body=legacy/"body"; body.write_bytes(b"content"); db=cli.open_db(path,purpose="fixture"); db.execute("INSERT INTO attachments VALUES ('a','m','body',NULL,7,?,NULL,NULL)",[str(body)]); db.close(); real_hash=projection.file_hash
     def hashed(value):
         cli.open_db(path,wait=0,purpose="concurrent attachment probe").close()
@@ -123,7 +198,16 @@ def test_remote_full_scan_releases_the_archive_between_bounded_pages(tmp_path):
         with cli.open_db(path,wait=0,purpose="concurrent page probe"): pass
         stages.append(stage)
     records=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); state.close()
-    assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages==["scanning archive 1","scanning archive 2","scanning archive 3"]
+    assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages[0]=="scanning archive 1" and stages[-1]=="scanning archive 3" and len(stages)>=2
+
+def test_remote_scan_defers_changes_after_its_watermark(tmp_path):
+    from ai_convos_remote import projection
+    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[("c",),("d",)]); cli._archive_touch(db,[("conversations","c"),("conversations","d")]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); changed=[]
+    def progress(stage):
+        if not changed:
+            with cli.open_db(path,purpose="concurrent archive change") as db: db.execute("UPDATE conversations SET title='later' WHERE id='d'"); cli._archive_touch(db,[("conversations","d")]); changed.append(cli.archive_state(db)[1])
+    first=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); second=projection.scan_archive(path,state,generation=changed[0],page=1,since=generation); state.close()
+    assert [r["payload"]["row"][0] for r in first]==["c"] and [(r["payload"]["row"][0],r["payload"]["row"][2]) for r in second]==[("d","later")]
 
 def test_remote_repair_inventory_releases_the_archive_between_pages(tmp_path,monkeypatch):
     import base64, ai_convos_remote
@@ -131,7 +215,7 @@ def test_remote_repair_inventory_releases_the_archive_between_pages(tmp_path,mon
     def progress(stage):
         with cli.open_db(path,wait=0,purpose="concurrent inventory probe"): pass
         stages.append(stage)
-    assert len(ai_convos_remote.local_replica_ids(tmp_path,{"keys":{"w:1":base64.b64encode(b"x"*32).decode()}},"w","team",{1},1,progress))==2 and stages==["p0","p1"]
+    assert len(ai_convos_remote.local_replica_ids(tmp_path,{"keys":{"w:1":base64.b64encode(b"x"*32).decode()}},"w","team",{1},1,progress))==2 and stages==["scanning local proofs 1","scanning local proofs 2"]
 
 def test_redaction_and_export_processing_run_without_archive_lock(monkeypatch):
     from ai_convos_redact import scan_data

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, os, re, shlex, shutil, signal, site, sqlite3, ssl, struct, subprocess, sys, sysconfig, tempfile, time, typer, urllib.request, zipfile
+import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, os, random, re, shlex, shutil, signal, site, sqlite3, ssl, struct, subprocess, sys, sysconfig, tempfile, threading, time, typer, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -12,50 +12,65 @@ from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remot
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT,DATA_DIR,DB_PATH,STATE_PATH=(root:=find_root()),(data:=root/"data"),data/"convos.db",data/"sync_state.json"
-HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,4,9,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest()  # conservative web pacing stays below the observed ~200-detail failure point
+HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,4,11,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest()  # conservative web pacing stays below the observed ~200-detail failure point
 _CHATGPT_HOSTS,_BROWSER_UA,_CLAUDE_HEADERS=(("https://chatgpt.com",("chatgpt.com",)),("https://chat.openai.com",("chat.openai.com","openai.com"))),(ua:={"safari":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15","chrome":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}),{"Origin":"https://claude.ai","Referer":"https://claude.ai/","User-Agent":ua["safari"],"Accept":"application/json","Accept-Language":"en-US,en;q=0.9","anthropic-client-sha":"unknown","anthropic-client-version":"unknown"}
 _INJECTED_RE,MESSAGE_ORDER,MESSAGE_ORDER_DESC=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*","m.created_at NULLS FIRST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) NULLS LAST,m.id","m.created_at DESC NULLS LAST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) DESC NULLS LAST,m.id DESC"
 
 def _open_db(path,read_only=False): return (path.parent.mkdir(parents=True,exist_ok=True),None if read_only and not path.exists() else duckdb.connect(str(path),read_only=read_only))[-1]
-class LockBusy(RuntimeError): pass
+class LockBusy(click.ClickException,RuntimeError): pass
 def lock_owner(purpose,identity=None): return dict(identity or {},v=1,purpose=purpose,pid=os.getpid(),process=Path(sys.argv[0]).name,host=os.uname().nodename,os_user=getpass.getuser(),started_at=(now:=time.time()),heartbeat_at=now,stage="started")
 def _lock_read(lock):
-    try: return json.loads((lock.seek(0),lock.read())[-1])
-    except (TypeError,ValueError): return {}
-def _reader_open(lock,purpose): return (os.chmod((directory:=Path(lock.name+".readers")).mkdir(exist_ok=True) or directory,0o700),(path:=directory/f"{os.uname().nodename}.{os.getpid()}.{time.time_ns()}.json"),(owner:=lock_owner(purpose)),atomic_json(path,owner),(reader:=path.open("r+")),(reader,owner))[-1]
+    try: return json.loads((lock.seek(0),lock.read())[-1] if hasattr(lock,"read") else Path(lock).read_text())
+    except (OSError,TypeError,ValueError): return {}
 def lock_holder(owner):
     if not owner: return "shared archive reader(s) or a pre-contract process; owner metadata unavailable"
-    return (lambda remote,started,activity:f"{remote}OS user {owner.get('os_user','unknown')}@{owner.get('host','unknown')}; PID {owner.get('pid','unknown')} ({owner.get('process','unknown')}); purpose {owner.get('purpose','unknown')}; started {started}; last activity {activity} ({owner.get('stage','unknown')})")(f"remote user {owner['remote_user']} ({owner.get('user_id','unknown')}); device {owner.get('device','unknown')} ({owner.get('device_id','unknown')}); " if owner.get("remote_user") else "",time.strftime("%Y-%m-%d %H:%M:%S %Z",time.localtime(owner["started_at"])) if isinstance(owner.get("started_at"),(int,float)) else "unknown",f"{max(0,time.time()-owner['heartbeat_at']):.0f}s ago" if isinstance(owner.get("heartbeat_at"),(int,float)) else "unknown")
-class _LockedDB:
-    def __init__(self,db,lock,purpose,read_only,reader=None,owner=None):
-        self.db,self.stack,self.audit,_=db,(stack:=contextlib.ExitStack()),(purpose,read_only,time.monotonic(),lock,reader,owner),[stack.callback(fn) for fn in ([lock.close]+([reader.close,lambda:Path(reader.name).unlink(missing_ok=True)] if reader else [])+[db.close])]
-    def __getattr__(self,name): return (lambda *args,**kwargs:(value(*args,**kwargs),self.pulse("query"))[0]) if name in {"execute","executemany"} and callable(value:=getattr(self.db,name)) else getattr(self.db,name)
-    def pulse(self,stage): return self.audit[5] and (self.audit[5].update(heartbeat_at=time.time(),stage=stage) or _lock_note(self.audit[4] or self.audit[3],self.audit[5]))
-    def __enter__(self): return self
+    return (lambda remote,started,progress:f"{remote}OS user {owner.get('os_user','unknown')}@{owner.get('host','unknown')}; PID {owner.get('pid','unknown')} ({owner.get('process','unknown')}); purpose {owner.get('purpose','unknown')}; started {started}; last progress {progress} ({owner.get('stage','unknown')})")(f"remote user {owner['remote_user']} ({owner.get('user_id','unknown')}); device {owner.get('device','unknown')} ({owner.get('device_id','unknown')}); " if owner.get("remote_user") else "",time.strftime("%Y-%m-%d %H:%M:%S %Z",time.localtime(owner["started_at"])) if isinstance(owner.get("started_at"),(int,float)) else "unknown",f"{max(0,time.time()-owner['heartbeat_at']):.0f}s ago" if isinstance(owner.get("heartbeat_at"),(int,float)) else "unknown")
+class _LockedDB(contextlib.AbstractContextManager):
+    def __init__(self,db,purpose,read_only): self.db,self.audit=db,(purpose,read_only,time.monotonic())
+    def __getattr__(self,name): return getattr(self.db,name)
     def __exit__(self,*_): self.close()
-    def close(self): return ((stack:=self.stack),setattr(self,"stack",None),self.pulse("finished"),stack.close(),(held:=time.monotonic()-self.audit[2]),typer.echo(f"Database {'read' if self.audit[1] else 'write'} lock held {held:.1f}s: {self.audit[0]}",err=True) if held>5 else None)[-1] if self.stack else None
+    def close(self): return ((db:=self.db),setattr(self,"db",None),db.close(),(held:=time.monotonic()-self.audit[2]),typer.echo(f"Database {'read' if self.audit[1] else 'write'} connection held {held:.1f}s: {self.audit[0]}",err=True) if held>5 else None)[-1] if self.db else None
 def _lock_note(lock,value=""): return (lock.seek(0),lock.truncate(),value and lock.write(json.dumps(value,separators=(",",":")) if isinstance(value,dict) else value),lock.flush())[-1]
 def _flock(lock,op,deadline,wait,purpose,identity=None):
+    delay,progress=.01,None
     while True:
         try: return (fcntl.flock(lock,op|fcntl.LOCK_NB),(owner:=None if op!=fcntl.LOCK_EX else lock_owner(purpose,identity)),_lock_note(lock,owner or ""),owner)[-1]
-        except BlockingIOError: time.sleep(min(.05,remaining)) if (remaining:=deadline-time.monotonic())>0 else (_ for _ in ()).throw(LockBusy(f"Could not start {purpose}: another process still holds the lock after {wait:g}s. Holder: {'; '.join(map(lock_holder,readers)) if (readers:=[value for path in Path(lock.name+'.readers').glob('*.json') if (value:=json.loads(path.read_text()))]) else lock_holder(_lock_read(lock))}."))
+        except BlockingIOError:
+            owner,pulse=(owner:=_lock_read(lock)),owner.get("heartbeat_at")
+            if pulse is not None and pulse!=progress: progress,deadline=pulse,time.monotonic()+wait
+            if (remaining:=deadline-time.monotonic())<=0: raise LockBusy(f"Could not start {purpose}: another operation {'is already running' if not wait else f'made no recorded progress for {wait:g}s'}. Holder: {lock_holder(owner)}.")
+            delay=(time.sleep(random.uniform((pause:=min(delay,remaining))/2,pause)),min(delay*2,5))[-1]
+_DUCKDB_PID=re.compile(r"(?:\(PID |PID )(\d+)\)?")
+def _duckdb_owner(path,error):
+    text,pid,root=str(error),(int(found.group(1)) if (found:=_DUCKDB_PID.search(str(error))) else None),path.parent.parent if path.parent.name=="data" else path.parent
+    return (lambda base:max([value for directory in (path.parent,path.parent/"hook_inbox",root/"remote") if directory.is_dir() for item in directory.glob("*.lock") if item!=path.with_name(f".{path.name}.lock") and (value:=_lock_read(item)) and value.get("pid")==pid and value.get("stage")!="finished"],key=lambda value:value.get("heartbeat_at",0),default=base))(dict(pid=pid,process=(Path(found.group(1)).name if (found:=re.search(r"held in (.+?) \(PID",text)) else "unknown"),os_user=(found.group(1) if (found:=re.search(r"by user ([^.\n]+)",text)) else "unknown"),host=os.uname().nodename,purpose="external DuckDB access",stage="unknown"))
+def _waiter(path): return (lambda directory,lock:(os.chmod(directory,0o700),os.chmod(lock.name,0o600),fcntl.flock(lock,fcntl.LOCK_EX),lock)[-1])((directory:=path.with_name(f".{path.name}.waiters")),(directory.mkdir(exist_ok=True) or directory/f"{os.uname().nodename}.{os.getpid()}.{time.time_ns()}.lock").open("a+"))
+def _waiter_close(lock): return (Path(lock.name).unlink(missing_ok=True),lock.close())[-1] if lock else None
+def _waiting(marker):
+    lock=marker.open("a+")
+    try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError: return lock.close() or True
+    return (marker.unlink(missing_ok=True),lock.close(),False)[-1]
+def archive_yield(path=None):
+    directory,end=(path:=Path(path or DB_PATH).expanduser().resolve()).with_name(f".{path.name}.waiters"),time.monotonic()+1.1
+    while time.monotonic()<end and any(map(_waiting,directory.glob("*.lock") if directory.is_dir() else ())): time.sleep(random.uniform(.01,.05))
 def get_db(read_only:bool=False,wait=30,path=None,deadline=None,*,purpose="direct database access"):
     path,deadline=(path:=Path(path or DB_PATH).expanduser().resolve()),deadline if deadline is not None else time.monotonic()+wait
     if read_only and not path.exists(): return None
     if path.exists() and path.stat().st_nlink>1: raise ValueError(f"Database hardlink aliases are unsafe: {path}")
-    lock=(os.chmod((lock:=path.parent.mkdir(parents=True,exist_ok=True) or path.with_name(f".{path.name}.lock").open("a+")).name,0o600),lock)[-1]
+    delay,progress,notice,started,reported=.01,None,None,time.monotonic(),None
     try:
         while True:
-            owner=_flock(lock,fcntl.LOCK_SH if read_only else fcntl.LOCK_EX,deadline,wait,purpose)
-            reader,owner=_reader_open(lock,purpose) if read_only else ((([p.unlink(missing_ok=True) for p in Path(lock.name+".readers").glob("*.json")] if Path(lock.name+".readers").is_dir() else None),None)[-1],owner)
             try: db=_open_db(path,read_only)
             except Exception as e:
-                (reader and (Path(reader.name).unlink(missing_ok=True),reader.close()),not read_only and _lock_note(lock),fcntl.flock(lock,fcntl.LOCK_UN))
                 if "Conflicting lock is held" not in str(e): raise
-                if time.monotonic()>=deadline: raise LockBusy(f"Could not start {purpose}: DuckDB remained locked by a process outside the Convos lock contract after {wait:g}s. Details: {e}") from None
-                time.sleep(.05)
-            else: return _LockedDB(db,lock,purpose,read_only,reader,owner) if db is not None else (reader and (Path(reader.name).unlink(missing_ok=True),reader.close()),lock.close(),None)[-1]
-    except BaseException as e: raise (lock.close(),e)[-1]
+                notice,owner=notice or _waiter(path),_duckdb_owner(path,e)
+                if (pulse:=owner.get("heartbeat_at")) is not None and pulse!=progress: progress,deadline=pulse,time.monotonic()+wait
+                if time.monotonic()-started>=1 and (identity:=(owner.get("pid"),owner.get("purpose")))!=reported: reported=(typer.echo(f"Waiting to start {purpose}. Holder: {lock_holder(owner)}.",err=True),identity)[-1]
+                if (remaining:=deadline-time.monotonic())<=0: raise LockBusy(f"Could not start {purpose}: archive {'holder made no recorded progress' if pulse is not None else 'stayed busy'} for {wait:g}s. Holder: {lock_holder(owner)}. DuckDB: {e}") from None
+                delay=(time.sleep(random.uniform((pause:=min(delay,remaining))/2,pause)),min(delay*2,1))[-1]
+            else: return (_waiter_close(notice),_LockedDB(db,purpose,read_only) if db is not None else None)[-1]
+    except BaseException as e: raise (_waiter_close(notice),e)[-1]
 def open_db(path=None,read_only=False,wait=30,deadline=None,*,purpose="direct database access"): return get_db(read_only,wait,path,deadline,purpose=purpose)
 @contextlib.contextmanager
 def _core(path=None,read_only=False,ready=False,wait=30,*,purpose):
@@ -65,19 +80,18 @@ def _core(path=None,read_only=False,ready=False,wait=30,*,purpose):
 @contextlib.contextmanager
 def operation_lock(path,purpose,wait=30,identity=None,mandatory=True):
     with (Path(path).parent.mkdir(parents=True,exist_ok=True) or Path(path).open("a+")) as lock:
-        os.chmod(path,0o600)
+        guard=(os.chmod(path,0o600),threading.Lock())[-1]
         try: owner=_flock(lock,fcntl.LOCK_EX,time.monotonic()+wait,wait,purpose,identity)
         except LockBusy as error: return (yield None) if not mandatory else (_ for _ in ()).throw(error)
-        def pulse(stage): owner.update(heartbeat_at=time.time(),stage=stage) or _lock_note(lock,owner)
+        def pulse(stage):
+            with guard: return owner.update(heartbeat_at=time.time(),stage=stage) or _lock_note(lock,owner)
         try: yield pulse
         finally: pulse("finished") or fcntl.flock(lock,fcntl.LOCK_UN)
 @contextlib.contextmanager
 def _transaction(db):
     db.execute("BEGIN")
     try: yield
-    except BaseException:
-        db.execute("ROLLBACK")
-        raise
+    except BaseException as error: raise (db.execute("ROLLBACK"),error)[-1]
     else: db.execute("COMMIT")
 def required(value,error): return value if value else (_ for _ in ()).throw(error)
 def secure_dir(path,mode=0o700): return (required(not (path:=Path(path)).is_symlink(),ValueError("managed directory must not be a symlink")),path.mkdir(parents=True,exist_ok=True),os.chmod(path,mode),path)[-1]
@@ -101,8 +115,7 @@ def atomic_publish(path,write,mode=0o600):
     finally: Path(tmp).unlink(missing_ok=True)
 def attachment_body(data,root=None):
     if len(data)>ATTACHMENT_LIMIT: return None
-    root=secure_dir(Path(root or DATA_DIR)/"attachments")
-    blob,path=(blob:=hashlib.sha256(data).hexdigest()),root/blob
+    root,blob,path=(root:=secure_dir(Path(root or DATA_DIR)/"attachments")),(blob:=hashlib.sha256(data).hexdigest()),root/blob
     if path.exists():
         if path.is_symlink() or not path.is_file() or path.stat().st_size!=len(data): raise ValueError("attachment body conflicts with content hash")
         with path.open("rb") as source: actual=hashlib.file_digest(source,"sha256").hexdigest()
@@ -166,12 +179,8 @@ def _git_maybe(root,*args):
 def _git_root(path):
     if not (probe:=(probe if (probe:=Path(path)).is_dir() else probe.parent)).exists(): return None
     try: return Path(_git_run(probe,"rev-parse","--show-toplevel").decode().strip()).resolve()
-    except subprocess.CalledProcessError as e:
-        if b"not a git repository" in e.stderr.lower(): return None
-        raise
-def _remote(url):
-    p,port=(p:=__import__("urllib.parse").parse.urlparse(re.sub(r"^(?:[^/@]+@)?([^:/]+):",r"ssh://\1/",url) if "://" not in url else url)),p.port
-    return f"https://{p.hostname.lower()}{f':{port}' if port and port!={'ssh':22,'https':443,'http':80}.get(p.scheme.lower()) else ''}/{p.path.strip('/').removesuffix('.git')}" if p.hostname and p.path else None
+    except subprocess.CalledProcessError as e: return None if b"not a git repository" in e.stderr.lower() else (_ for _ in ()).throw(e)
+def _remote(url): return (lambda p,port:f"https://{p.hostname.lower()}{f':{port}' if port and port!={'ssh':22,'https':443,'http':80}.get(p.scheme.lower()) else ''}/{p.path.strip('/').removesuffix('.git')}" if p.hostname and p.path else None)(p:=__import__("urllib.parse").parse.urlparse(re.sub(r"^(?:[^/@]+@)?([^:/]+):",r"ssh://\1/",url) if "://" not in url else url),p.port)
 def _git_remotes(root): return sorted({remote for line in _git_run(root,"remote","-v").decode(errors="replace").splitlines() if "\t" in line and not (url:=line.split("\t",1)[1].rsplit(" ",1)[0]).startswith(("/","file:")) and (remote:=_remote(url))})
 def repository_evidence(value): return provenance_digest({"lineage":value["lineage"],"remotes":value["remotes"]}) if value["lineage"] else None
 def _checkout(root): return provenance_digest(f"{stat.st_dev}:{stat.st_ino}" if (stat:=next((p.stat() for p in [Path(root)/'.git'] if p.exists()),None)) else str(root))[:32]
@@ -225,8 +234,8 @@ def _observe_provenance(edits,source="sync",known=None,conversations=(),cache=No
 def observe_provenance(core): return _observe_provenance(_provenance_edits(core),known=repository_state(core))[0]
 def provenance_records(db,only=None):
     ids=lambda kind:[entity for k,entity in only or () if k==kind]
-    rows=lambda kind,sql,column="id":[] if only is not None and not ids(kind) else db.execute(sql+(f" WHERE {column} IN (SELECT UNNEST(?))" if only is not None else ""),[ids(kind)] if only is not None else []).fetchall()
-    return [*[_provenance_record("repository.observed",r[0],dict(id=r[0],lineage=r[1],roots=json.loads(r[2]),remotes=json.loads(r[3]),head=r[4]),r[5]) for r in rows("repository.observed","SELECT id,lineage,CAST(roots AS VARCHAR),CAST(remotes AS VARCHAR),last_head,observed_at FROM provenance.repositories")],*[_provenance_record("file.observed",r[0],dict(zip(("id","repository","path","kind"),r)),None) for r in rows("file.observed","SELECT * FROM provenance.files")],*[_provenance_record("file.version",r[0],dict(zip(("id","file","content_hash"),r[:3])),r[3]) for r in rows("file.version","SELECT * FROM provenance.file_versions")],*[_provenance_record("edit.observed",r[0],dict(zip(("id","turn","file","repository","old_content_hash","new_content_hash","evidence"),r)),None) for r in rows("edit.observed","SELECT x.file_edit_id,fe.message_id,x.file_id,f.repository,x.old_content_hash,x.new_content_hash,x.evidence FROM provenance.file_edit_files x LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=x.file_edit_id JOIN file_edits fe ON fe.id=x.file_edit_id JOIN provenance.files f ON f.id=x.file_id AND (v.status='confirmed' OR EXISTS (SELECT 1 FROM remote.provenance_origins o WHERE o.kind='edit.observed' AND o.physical_entity=x.file_edit_id))","x.file_edit_id")],*[_provenance_record("git.checkpoint",r[0],dict(id=r[0],repository=r[1],head=r[2],state_hash=r[3],paths=json.loads(r[4]),capture_source=r[6]),r[5]) for r in rows("git.checkpoint","SELECT id,repository,head,state_hash,CAST(paths AS VARCHAR),observed_at,capture_source FROM provenance.git_checkpoints")],*[_provenance_record("checkpoint.link",provenance_digest({"checkpoint":r[0],"edit":r[1]}),dict(zip(("checkpoint","edit","evidence"),r)),None) for r in db.execute("SELECT * FROM provenance.checkpoint_edits"+(" WHERE sha256(json_object('checkpoint',checkpoint_id,'edit',file_edit_id)) IN (SELECT UNNEST(?))" if only is not None else ""),[ids("checkpoint.link")] if only is not None else []).fetchall()]]
+    rows=lambda kind,sql,column="id":[] if only is not None and not ids(kind) else db.execute(sql+(f" WHERE {column} IN (SELECT json_extract_string(value,'$') FROM json_each(?))" if only is not None else ""),[json.dumps(ids(kind),separators=(",",":"))] if only is not None else []).fetchall()
+    return [*[_provenance_record("repository.observed",r[0],dict(id=r[0],lineage=r[1],roots=json.loads(r[2]),remotes=json.loads(r[3]),head=r[4]),r[5]) for r in rows("repository.observed","SELECT id,lineage,CAST(roots AS VARCHAR),CAST(remotes AS VARCHAR),last_head,observed_at FROM provenance.repositories")],*[_provenance_record("file.observed",r[0],dict(zip(("id","repository","path","kind"),r)),None) for r in rows("file.observed","SELECT * FROM provenance.files")],*[_provenance_record("file.version",r[0],dict(zip(("id","file","content_hash"),r[:3])),r[3]) for r in rows("file.version","SELECT * FROM provenance.file_versions")],*[_provenance_record("edit.observed",r[0],dict(zip(("id","turn","file","repository","old_content_hash","new_content_hash","evidence"),r)),None) for r in rows("edit.observed","SELECT x.file_edit_id,fe.message_id,x.file_id,f.repository,x.old_content_hash,x.new_content_hash,x.evidence FROM provenance.file_edit_files x LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=x.file_edit_id JOIN file_edits fe ON fe.id=x.file_edit_id JOIN provenance.files f ON f.id=x.file_id AND (v.status='confirmed' OR EXISTS (SELECT 1 FROM remote.provenance_origins o WHERE o.kind='edit.observed' AND o.physical_entity=x.file_edit_id))","x.file_edit_id")],*[_provenance_record("git.checkpoint",r[0],dict(id=r[0],repository=r[1],head=r[2],state_hash=r[3],paths=json.loads(r[4]),capture_source=r[6]),r[5]) for r in rows("git.checkpoint","SELECT id,repository,head,state_hash,CAST(paths AS VARCHAR),observed_at,capture_source FROM provenance.git_checkpoints")],*[_provenance_record("checkpoint.link",provenance_digest({"checkpoint":r[0],"edit":r[1]}),dict(zip(("checkpoint","edit","evidence"),r)),None) for r in rows("checkpoint.link","SELECT * FROM provenance.checkpoint_edits","sha256(json_object('checkpoint',checkpoint_id,'edit',file_edit_id))")]]
 def project_provenance(db,value,map_id=lambda table,value:value,touch=True):
     p,k,observed=value["payload"],value["kind"],value["observed_at"]
     if k not in PROVENANCE_KINDS: return False
@@ -283,7 +292,7 @@ def project_archive_rows(db,table,columns,rows):
     if table=="file_edits":
         for mode,foreign in ((" OR REPLACE",True),(" OR IGNORE",False)): _insert_pages(db,"provenance.file_edit_evidence",[(v[0],"unverified","signed_replica_missing_evidence",None) for v,o in rows if bool(o)==foreign],mode=mode)
     if origins: _insert_pages(db,"remote.row_origins",origins,mode=" OR REPLACE")
-    if table in ("file_edits","tool_calls"): _apply_signed_edit_evidence(db)
+    if table in ("file_edits","tool_calls"): _apply_signed_edit_evidence(db,[v[0] for v in values] if table=="file_edits" else (),[v[0] for v in values] if table=="tool_calls" else ())
 def project_row_proofs(db,proofs,root_public,certificate):
     if not proofs: return []
     fields,expected,signer,packed,columns=(fields:=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")),{"v","kind",*fields},(proofs[0]["author_user_id"],proofs[0]["author_device_id"]),json.dumps(certificate,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False),("workspace_id","authorization_workspace_id","row_kind","source_row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
@@ -298,17 +307,17 @@ def _project_semantic_ancestors(db,kind,record): return _insert_pages(db,"remote
 def project_provider_alias(db,record):
     fields=("workspace_id","author_user_id","object_id","revision","source","session_id","members","canonical_source_row_id","proof")
     required(set(record)==set(fields) and isinstance(p:=record["proof"],dict) and (p.get("workspace"),p.get("author_user_id"),p.get("object_id"),p.get("revision"))==tuple(record[k] for k in fields[:4]) and isinstance(p.get("ancestors"),list) and record["object_id"]=="provider-session:"+provenance_digest([record["source"],record["session_id"]]) and isinstance(record["members"],list) and record["members"] and all(isinstance(x,str) and x for x in record["members"]) and record["members"]==sorted(set(record["members"])) and record["canonical_source_row_id"]==record["members"][0],ValueError("provider alias storage schema mismatch"))
-    _insert_pages(db,"remote.provider_session_aliases",[tuple(record[f] for f in fields)],fields,mode=" OR IGNORE")
-    _project_semantic_ancestors(db,"provider.session",record)
-def _apply_signed_edit_evidence(db):
-    db.execute("""CREATE OR REPLACE TEMP TABLE core_signed_edit_evidence AS WITH leaves AS (SELECT p.*,count(*) OVER (PARTITION BY workspace_id,author_user_id,object_id) n FROM remote.file_edit_evidence_proofs p WHERE NOT EXISTS (SELECT 1 FROM remote.semantic_ancestors a WHERE a.object_kind='file-edit.evidence' AND (a.workspace_id,a.author_user_id,a.object_id,a.ancestor_revision)=(p.workspace_id,p.author_user_id,p.object_id,p.revision))), foreign_edits AS (SELECT fe.id file_edit_id,p.workspace_id,p.author_user_id,p.source_row_id,p.revision FROM file_edits fe JOIN remote.row_origins o ON o.table_name='file_edits' AND o.physical_row_id=fe.id JOIN remote.row_proofs p ON p.id=o.proof_id AND p.state='active'), matches AS (SELECT f.file_edit_id,s.revision semantic_revision,s.n,s.status,s.reason,tc.id tool_call_id FROM foreign_edits f JOIN leaves s ON (s.workspace_id,s.author_user_id,s.source_edit_id,s.edit_revision)=(f.workspace_id,f.author_user_id,f.source_row_id,f.revision) LEFT JOIN remote.row_proofs tp ON (tp.workspace_id,tp.author_user_id,tp.row_kind,tp.source_row_id,tp.revision,tp.state)=(s.workspace_id,s.author_user_id,'tool_calls',s.source_tool_call_id,s.tool_revision,'active') LEFT JOIN remote.row_origins tor ON tor.table_name='tool_calls' AND tor.proof_id=tp.id LEFT JOIN tool_calls tc ON tc.id=tor.physical_row_id WHERE s.source_tool_call_id IS NULL OR tc.id IS NOT NULL) SELECT f.file_edit_id,CASE WHEN max(m.n)>1 THEN 'unverified' WHEN count(m.semantic_revision)=1 THEN max(m.status) ELSE 'unverified' END status,CASE WHEN max(m.n)>1 THEN 'signed_evidence_conflict' WHEN count(m.semantic_revision)=1 THEN max(m.reason) ELSE 'signed_replica_missing_evidence' END reason,CASE WHEN max(m.n)=1 AND count(m.semantic_revision)=1 THEN max(m.tool_call_id) END tool_call_id FROM foreign_edits f LEFT JOIN matches m USING(file_edit_id) GROUP BY f.file_edit_id""")
+    return (_insert_pages(db,"remote.provider_session_aliases",[tuple(record[f] for f in fields)],fields,mode=" OR IGNORE"),_project_semantic_ancestors(db,"provider.session",record))[-1]
+def _apply_signed_edit_evidence(db,edits=(),tools=(),source=False):
+    where,args=(" AND p.source_row_id IN (SELECT UNNEST(?))",[list(edits)]) if edits and source else (" AND fe.id IN (SELECT UNNEST(?))",[list(edits)]) if edits else (" AND EXISTS (SELECT 1 FROM leaves s JOIN remote.row_origins tor ON tor.table_name='tool_calls' AND (tor.author_user_id,tor.source_row_id)=(s.author_user_id,s.source_tool_call_id) WHERE (s.workspace_id,s.author_user_id,s.source_edit_id,s.edit_revision)=(p.workspace_id,p.author_user_id,p.source_row_id,p.revision) AND tor.physical_row_id IN (SELECT UNNEST(?)))",[list(tools)]) if tools else required(False,ValueError("signed edit evidence target required"))
+    db.execute("""CREATE OR REPLACE TEMP TABLE core_signed_edit_evidence AS WITH leaves AS (SELECT p.*,count(*) OVER (PARTITION BY workspace_id,author_user_id,object_id) n FROM remote.file_edit_evidence_proofs p WHERE NOT EXISTS (SELECT 1 FROM remote.semantic_ancestors a WHERE a.object_kind='file-edit.evidence' AND (a.workspace_id,a.author_user_id,a.object_id,a.ancestor_revision)=(p.workspace_id,p.author_user_id,p.object_id,p.revision))), foreign_edits AS (SELECT fe.id file_edit_id,p.workspace_id,p.author_user_id,p.source_row_id,p.revision FROM file_edits fe JOIN remote.row_origins o ON o.table_name='file_edits' AND o.physical_row_id=fe.id JOIN remote.row_proofs p ON p.id=o.proof_id AND p.state='active'"""+where+"""), matches AS (SELECT f.file_edit_id,s.revision semantic_revision,s.n,s.status,s.reason,tc.id tool_call_id FROM foreign_edits f JOIN leaves s ON (s.workspace_id,s.author_user_id,s.source_edit_id,s.edit_revision)=(f.workspace_id,f.author_user_id,f.source_row_id,f.revision) LEFT JOIN remote.row_proofs tp ON (tp.workspace_id,tp.author_user_id,tp.row_kind,tp.source_row_id,tp.revision,tp.state)=(s.workspace_id,s.author_user_id,'tool_calls',s.source_tool_call_id,s.tool_revision,'active') LEFT JOIN remote.row_origins tor ON tor.table_name='tool_calls' AND tor.proof_id=tp.id LEFT JOIN tool_calls tc ON tc.id=tor.physical_row_id WHERE s.source_tool_call_id IS NULL OR tc.id IS NOT NULL) SELECT f.file_edit_id,CASE WHEN max(m.n)>1 THEN 'unverified' WHEN count(m.semantic_revision)=1 THEN max(m.status) ELSE 'unverified' END status,CASE WHEN max(m.n)>1 THEN 'signed_evidence_conflict' WHEN count(m.semantic_revision)=1 THEN max(m.reason) ELSE 'signed_replica_missing_evidence' END reason,CASE WHEN max(m.n)=1 AND count(m.semantic_revision)=1 THEN max(m.tool_call_id) END tool_call_id FROM foreign_edits f LEFT JOIN matches m USING(file_edit_id) GROUP BY f.file_edit_id""",args)
     touched=db.execute("SELECT x.file_edit_id FROM core_signed_edit_evidence x LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=x.file_edit_id WHERE (v.status,v.reason,v.tool_call_id) IS DISTINCT FROM (x.status,x.reason,x.tool_call_id)").fetchall()
     if touched: (db.execute("INSERT OR REPLACE INTO provenance.file_edit_evidence SELECT * FROM core_signed_edit_evidence"),_archive_touch(db,[("file_edits",r[0]) for r in touched]))
-def project_file_edit_evidence(db,record):
+def project_file_edit_evidence_many(db,records,apply=True):
     fields=("workspace_id","author_user_id","object_id","revision","source_edit_id","edit_revision","status","reason","source_tool_call_id","tool_revision","proof")
-    p=record.get("proof") if isinstance(record,dict) else None
-    required(set(record)==set(fields) and isinstance(p,dict) and (p.get("workspace"),p.get("author_user_id"),p.get("object_id"),p.get("revision"))==tuple(record[k] for k in fields[:4]) and isinstance(p.get("ancestors"),list) and record["object_id"]=="file-edit-evidence:"+provenance_digest(record["source_edit_id"]) and record["status"] in {"confirmed","invalid","unknown","unverified"} and isinstance(record["reason"],str) and record["reason"] and isinstance(record["edit_revision"],str) and len(record["edit_revision"])==64 and ((record["source_tool_call_id"] is None and record["tool_revision"] is None) or all(isinstance(record[k],str) and record[k] for k in ("source_tool_call_id","tool_revision"))),ValueError("file edit evidence storage schema mismatch"))
-    (_insert_pages(db,"remote.file_edit_evidence_proofs",[tuple(record[f] for f in fields)],fields,mode=" OR IGNORE"),_project_semantic_ancestors(db,"file-edit.evidence",record),_apply_signed_edit_evidence(db))
+    valid=lambda record:(p:=record.get("proof") if isinstance(record,dict) else None) and set(record)==set(fields) and isinstance(p,dict) and (p.get("workspace"),p.get("author_user_id"),p.get("object_id"),p.get("revision"))==tuple(record[k] for k in fields[:4]) and isinstance(p.get("ancestors"),list) and record["object_id"]=="file-edit-evidence:"+provenance_digest(record["source_edit_id"]) and record["status"] in {"confirmed","invalid","unknown","unverified"} and isinstance(record["reason"],str) and record["reason"] and isinstance(record["edit_revision"],str) and len(record["edit_revision"])==64 and ((record["source_tool_call_id"] is None and record["tool_revision"] is None) or all(isinstance(record[k],str) and record[k] for k in ("source_tool_call_id","tool_revision")))
+    return (required(all(map(valid,records)),ValueError("file edit evidence storage schema mismatch")),_insert_pages(db,"remote.file_edit_evidence_proofs",[tuple(record[f] for f in fields) for record in records],fields,mode=" OR IGNORE"),_insert_pages(db,"remote.semantic_ancestors",[("file-edit.evidence",record["workspace_id"],record["author_user_id"],record["object_id"],record["revision"],ancestor) for record in records for ancestor in record["proof"]["ancestors"]],mode=" OR IGNORE"),apply and _apply_signed_edit_evidence(db,[record["source_edit_id"] for record in records],source=True))[-1]
+def project_file_edit_evidence(db,record,apply=True): return project_file_edit_evidence_many(db,[record],apply)
 def project_provider_bindings(db,source,session,conversation,members): return (required(db.execute("SELECT 1 FROM conversations WHERE id=?",(conversation,)).fetchone() and all(isinstance(v,str) and v for v in (source,session,conversation,*members)),ValueError("provider binding target unavailable")),members and db.execute("UPDATE provider_sessions SET conversation_id=? WHERE conversation_id IN (SELECT UNNEST(?))",(conversation,members)),db.execute("INSERT OR REPLACE INTO provider_sessions VALUES (?,?,?)",(source,session,conversation)),None)[-1]
 def project_workspace_controls(db,controls):
     for value in controls:
@@ -329,9 +338,7 @@ def project_logical_rows(db,items):
     for table in ARCHIVE_COLUMNS:
         if rows := [(values,origin) for kind,physical,values,origin,data in logical if kind==table]: project_archive_rows(db,table,ARCHIVE_COLUMNS[table],rows)
     if bodies:=[(physical,data["body_hash"],data["size"]) for table,physical,values,origin,data in logical if table=="attachments" and data["body_hash"]]: _insert_pages(db,"attachment_bodies",bodies,mode=" OR REPLACE")
-    out.extend((item[0]["kind"],project_logical_row(db,*item[:4],touch=False,parent_map=item[4] if len(item)>4 else None)) for item in delayed)
-    if out: _archive_touch(db,out)
-    return out
+    return (out.extend((item[0]["kind"],project_logical_row(db,*item[:4],touch=False,parent_map=item[4] if len(item)>4 else None)) for item in delayed),out and _archive_touch(db,out),out)[-1]
 def project_logical_row(db,row,proof,proof_id,native=False,touch=True,parent_map=None):
     table,source,mapped,physical,origin=_logical_parts(row,proof,proof_id,native,parent_map)
     if table in PROVENANCE_KINDS:
@@ -346,26 +353,22 @@ def project_logical_row(db,row,proof,proof_id,native=False,touch=True,parent_map
         required(not origin or old or not db.execute(f"SELECT 1 FROM {table} WHERE id=?",(physical,)).fetchone(),ValueError(f"archive ownership conflict: {table}:{physical}"))
         db.execute(f"DELETE FROM {table} WHERE id=?",(physical,))
         for related in {"attachments":("attachment_bodies WHERE attachment_id",),"file_edits":("provenance.file_edit_evidence WHERE file_edit_id",)}.get(table,()): db.execute(f"DELETE FROM {related}=?",(physical,))
-        (origin and db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,physical,*(origin[k] for k in ("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at","proof_id")))),table in ("file_edits","tool_calls") and _apply_signed_edit_evidence(db),touch and _archive_touch(db,[(table,physical)]))
+        (origin and db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,physical,*(origin[k] for k in ("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at","proof_id")))),table in ("file_edits","tool_calls") and _apply_signed_edit_evidence(db,[physical] if table=="file_edits" else (),[physical] if table=="tool_calls" else ()),touch and _archive_touch(db,[(table,physical)]))
         return physical
     table,physical,values,origin,data=_logical_archive(row,proof,proof_id,native,parent_map)
     (project_archive_row(db,table,ARCHIVE_COLUMNS[table],values,origin,touch),table=="attachments" and data["body_hash"] and db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(physical,data["body_hash"],data["size"])))
     return physical
 def set_attachment_path(db,row_id,path): db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),row_id))
-def attachment_index(path,size=None):
-    path,actual=(path:=Path(path)),path.stat().st_size if path.is_file() and not path.is_symlink() else -1
-    return None if actual<0 or actual>ATTACHMENT_LIMIT or size is not None and actual!=size else (_file_sha256(path),actual)
+def attachment_index(path,size=None): return (lambda path,actual:None if actual<0 or actual>ATTACHMENT_LIMIT or size is not None and actual!=size else (_file_sha256(path),actual))(path:=Path(path),path.stat().st_size if path.is_file() and not path.is_symlink() else -1)
 def index_attachment_body(db,row_id,path,size=None,prepared=None):
     if not (indexed:=prepared or attachment_index(path,size)): return None
-    body_hash,actual=indexed
-    old,signed=db.execute("SELECT content_hash,size FROM attachment_bodies WHERE attachment_id=?",(row_id,)).fetchone(),db.execute("SELECT 1 FROM remote.row_origins WHERE table_name='attachments' AND physical_row_id=?",(row_id,)).fetchone()
+    body_hash,actual,old,signed=(*indexed,db.execute("SELECT content_hash,size FROM attachment_bodies WHERE attachment_id=?",(row_id,)).fetchone(),db.execute("SELECT 1 FROM remote.row_origins WHERE table_name='attachments' AND physical_row_id=?",(row_id,)).fetchone())
     if signed: return required(old==(body_hash,actual) and (size is None or size==actual),ValueError("signed attachment body conflicts with retained proof")) and body_hash
     if size is None: db.execute("UPDATE attachments SET size=? WHERE id=? AND size IS NULL",(actual,row_id))
     if old!=(body_hash,actual): (db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(row_id,body_hash,actual)),_archive_touch(db,[("attachments",row_id)]))
     return body_hash
 def project_attachment_body(db_path,data,body_hash):
-    required(provenance_digest(data)==body_hash,ValueError("attachment body hash mismatch"))
-    path=attachment_body(data,Path(db_path).parent)
+    path=(required(provenance_digest(data)==body_hash,ValueError("attachment body hash mismatch")),attachment_body(data,Path(db_path).parent))[-1]
     with _core(db_path,purpose="attachment.project") as db:
         rows=db.execute("SELECT b.attachment_id,a.path FROM attachment_bodies b JOIN attachments a ON a.id=b.attachment_id WHERE b.content_hash=?",(body_hash,)).fetchall()
         if rows and path and (ids:=[row_id for row_id,old in rows if old!=str(path)]):
@@ -435,7 +438,7 @@ def _schema_migrate(conn,version,fn):
         with _transaction(conn): fn()
 def init_schema(conn):
     tables,current=(tables:={r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()}),(conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0] if "core_schema" in tables else 0
-    scope,_=remote_id_migration_scope(conn,remote_id) if current<2 else set(),_migration_backup(conn)
+    scope,_=remote_id_migration_scope(conn,remote_id) if required(current<=CORE_VERSION,ValueError(f"Archive schema {current} is newer than this Convos build ({CORE_VERSION}); upgrade Convos before writing.")) and current<2 else set(),_migration_backup(conn)
     current==1 and scope and ("core_migrations" not in tables or not conn.execute("SELECT 1 FROM core_migrations WHERE name='remote_ids'").fetchone()) and _migration_backup(conn,2)
     v3_backup=_migration_backup(conn,3) if current==2 else None
     if current==2 and (foreign:=[r[0] for r in conn.execute("SELECT x.file_edit_id FROM (SELECT file_edit_id FROM provenance.file_edit_files GROUP BY file_edit_id HAVING count(*)>1) x LEFT JOIN provenance.local_facts l ON (l.kind,l.entity)=('edit.observed',x.file_edit_id) WHERE l.entity IS NULL OR EXISTS (SELECT 1 FROM remote.provenance_origins o WHERE (o.kind,o.physical_entity)=('edit.observed',x.file_edit_id))").fetchall()]): raise ValueError(f"v3 migration refused to rewrite ambiguous foreign signed edit {foreign[0]}; archive preserved and backed up at {v3_backup}")
@@ -492,7 +495,7 @@ def init_schema(conn):
     _schema_migrate(conn,6,lambda:((legacy:=conn.execute("SELECT id FROM file_edits fe WHERE NOT EXISTS (SELECT 1 FROM provenance.file_edit_evidence v WHERE v.file_edit_id=fe.id)").fetchall()),legacy and conn.executemany("INSERT INTO provenance.file_edit_evidence VALUES (?,'unverified','source_unavailable',NULL)",legacy),legacy and _archive_touch(conn,[("file_edits",r[0]) for r in legacy]),conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,6)")))
     _schema_migrate(conn,7,lambda:conn.execute("CREATE TABLE provenance.file_edit_evidence_v7(file_edit_id VARCHAR PRIMARY KEY,status VARCHAR NOT NULL CHECK(status IN ('confirmed','invalid','unknown','unverified')),reason VARCHAR NOT NULL,tool_call_id VARCHAR); INSERT INTO provenance.file_edit_evidence_v7 SELECT file_edit_id,CASE status WHEN 'legacy_unverified' THEN 'unverified' ELSE status END,reason,tool_call_id FROM provenance.file_edit_evidence; DROP TABLE provenance.file_edit_evidence; ALTER TABLE provenance.file_edit_evidence_v7 RENAME TO file_edit_evidence; INSERT OR REPLACE INTO core_schema VALUES (TRUE,7)"))
     _schema_migrate(conn,8,lambda:conn.execute("""ALTER TABLE messages ALTER embedding TYPE FLOAT[]; INSERT OR IGNORE INTO remote.semantic_ancestors SELECT kind,workspace_id,author_user_id,object_id,revision,json_extract_string(a.value,'$') FROM (SELECT 'provider.session' kind,workspace_id,author_user_id,object_id,revision,proof FROM remote.provider_session_aliases UNION ALL SELECT 'file-edit.evidence',workspace_id,author_user_id,object_id,revision,proof FROM remote.file_edit_evidence_proofs),json_each(proof,'$.ancestors') a; INSERT OR REPLACE INTO core_schema VALUES (TRUE,8); INSERT OR REPLACE INTO embedding_state SELECT TRUE,? WHERE EXISTS (SELECT 1 FROM messages WHERE embedding IS NOT NULL)""",(json.dumps(_EPROFILES["llama"],sort_keys=True,separators=(",",":")),)))
-    _schema_migrate(conn,9,lambda:(conn.execute("INSERT OR REPLACE INTO retrieval_state SELECT TRUE,generation,NULL,? FROM archive_state",(_FTS_DEF,)),conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,9)")))
+    [_schema_migrate(conn,v,fn) for v,fn in ((9,lambda:(conn.execute("INSERT OR REPLACE INTO retrieval_state SELECT TRUE,generation,NULL,? FROM archive_state",(_FTS_DEF,)),conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,9)"))),(10,lambda:conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,10)")),(11,lambda:conn.execute("DROP TABLE IF EXISTS remote.row_bodies; INSERT OR REPLACE INTO core_schema VALUES (TRUE,11)")))]
     with _transaction(conn): conn.execute("""CREATE OR REPLACE TEMP TABLE core_legacy_conflicts AS SELECT x.file_edit_id edit,x.file_id old_id,f.path,sha256(json_object('path',f.path,'repository',NULL)) new_id FROM provenance.file_edit_files x JOIN provenance.files f ON f.id=x.file_id WHERE x.evidence='legacy_scope_conflict' AND EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='edit.observed' AND l.entity=x.file_edit_id) AND NOT EXISTS(SELECT 1 FROM remote.provenance_origins o WHERE o.kind='edit.observed' AND o.physical_entity=x.file_edit_id) AND (x.file_id<>sha256(json_object('path',f.path,'repository',NULL)) OR NOT EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind='file.observed' AND l.entity=sha256(json_object('path',f.path,'repository',NULL)))); INSERT OR IGNORE INTO provenance.files SELECT new_id,NULL,path,'external' FROM core_legacy_conflicts; UPDATE provenance.file_edit_files x SET file_id=c.new_id FROM core_legacy_conflicts c WHERE x.file_edit_id=c.edit; INSERT OR IGNORE INTO provenance.local_facts SELECT 'file.observed',new_id FROM core_legacy_conflicts; DELETE FROM provenance.local_facts l USING core_legacy_conflicts c WHERE l.kind='file.observed' AND l.entity=c.old_id AND c.old_id<>c.new_id; DELETE FROM provenance.files f USING core_legacy_conflicts c WHERE f.id=c.old_id AND c.old_id<>c.new_id AND NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_id=f.id) AND NOT EXISTS (SELECT 1 FROM provenance.file_versions v WHERE v.file_id=f.id) AND NOT EXISTS (SELECT 1 FROM remote.provenance_origins o WHERE o.kind='file.observed' AND o.physical_entity=f.id); UPDATE archive_state SET generation=generation+1 WHERE singleton AND EXISTS(SELECT 1 FROM core_legacy_conflicts); INSERT OR REPLACE INTO archive_changes SELECT kind,entity,generation FROM archive_state,(SELECT 'file_edits' kind,edit entity FROM core_legacy_conflicts UNION ALL SELECT 'edit.observed',edit FROM core_legacy_conflicts UNION ALL SELECT 'file.observed',new_id FROM core_legacy_conflicts) WHERE singleton; DROP TABLE core_legacy_conflicts""")
 
 def counts_by_source(conn):
@@ -523,8 +526,7 @@ def extract_content(content) -> dict:
     return {"text":"\n".join(b.get("text","") or b.get("thinking","") if b.get("type") in ("text",None) else "" for b in blocks).strip() or "\n".join(str(b) for b in content if isinstance(b,str)).strip(),"thinking":"\n".join(b["thinking"] for b in blocks if b.get("type")=="thinking" and b.get("thinking")).strip() or None,"tools":[{"name":b["name"],"input":b.get("input",{}),"id":b.get("id")} for b in blocks if b.get("type")=="tool_use"]+[{"id":b.get("tool_use_id"),"output":b.get("content","") ,"error":b.get("is_error",False)} for b in blocks if b.get("type")=="tool_result"],"attachments":[{"filename":b.get("name",b.get("file_name")),"mime_type":b.get("content_type",b.get("file_type")),"size":b.get("size",b.get("file_size")),"url":b.get("asset_pointer",b.get("url"))} for b in blocks if b.get("type") in ("image_asset_pointer","file") or b.get("content_type") in ("image_asset_pointer","file")]}
 
 def _safari_records():
-    paths=(Path.home()/"Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",Path.home()/"Library/Cookies/Cookies.binarycookies")
-    if not (path:=next((p for p in paths if p.exists()),None)): return
+    if not (path:=next((p for p in (Path.home()/"Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",Path.home()/"Library/Cookies/Cookies.binarycookies") if p.exists()),None)): return
     data,count=(data:=path.read_bytes()),struct.unpack(">I",data[4:8])[0] if data[:4]==b"cook" else 0
     if data[:4]!=b"cook": return
     sizes,pages=(sizes:=[struct.unpack(">I",data[8+i*4:12+i*4])[0] for i in range(count)]),[data[start:start+size] for start,size in zip(itertools.accumulate([8+4*count,*sizes]),sizes)]
@@ -596,9 +598,7 @@ class ParseResult:
     provenance_conversations: set = field(default_factory=set)
     attachment_indexes: dict = field(default_factory=dict)
 
-    def __iadd__(self,other):
-        for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence"): getattr(self,name).extend(getattr(other,name))
-        return self
+    def __iadd__(self,other): return ([getattr(self,name).extend(getattr(other,name)) for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence")],self)[-1]
     def __add__(self,other): return ParseResult(**{name:[*getattr(self,name),*getattr(other,name)] for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence")})
 
 def log_parse_error(context: str, err: Exception): typer.echo(f"  parse error ({context}): {type(err).__name__}: {err}", err=True)
@@ -727,8 +727,7 @@ def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
     return {"conv":dict(id=cid,source=src,title=f"{jsonl.parent.name.replace('-Users-','~/').replace('-','/')} ({jsonl.stem[:8]})",created_at=timestamps[0] if timestamps else None,updated_at=timestamps[-1] if timestamps else None,model=next((m["model"] for m in msgs if m["model"] and m["model"]!="<synthetic>"),None),cwd=system.get("cwd") or next((e.get("cwd") for e in events if e.get("cwd")),None),git_branch=system.get("gitBranch") or next((e.get("gitBranch") for e in events if e.get("gitBranch")),None),project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":agent_id or root_session,"parent_session_id":parent,"session_kind":kind,"session_kind_evidence":"exact" if explicit_agent or sidechain else "inferred","agent_id":agent_id,"agent_name":next((e.get("agentName") for e in events if e.get("agentName")),None),"agent_role":next((e.get("agentType") for e in events if e.get("agentType")),None),"agent_depth":next((e.get("agentDepth") for e in events if e.get("agentDepth") is not None),None),"originator":system.get("entrypoint"),"client_version":system.get("version"),"capture_mode":"transcript"}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[],"edits":edits,"edit_evidence":evidence}
 
 def _parse_sessions(paths,parser,bindings):
-    bound={} if bindings is None else bindings
-    sessions=[(bound.setdefault((s["conv"]["source"],m["session_id"]),s["conv"]["id"]),s)[1] if (m:=json.loads(s["conv"]["metadata"] or "{}")).get("session_id") else s for path in sorted(paths) if (s:=safe_parse(f"{parser.__name__.removeprefix('parse_').replace('_session','').replace('_','-')} session {path}",parser,path,bound))]
+    sessions=[(bound.setdefault((s["conv"]["source"],m["session_id"]),s["conv"]["id"]),s)[1] if (m:=json.loads(s["conv"]["metadata"] or "{}")).get("session_id") else s for bound in [{} if bindings is None else bindings] for path in sorted(paths) if (s:=safe_parse(f"{parser.__name__.removeprefix('parse_').replace('_session','').replace('_','-')} session {path}",parser,path,bound))]
     return ParseResult(convs=[s["conv"] for s in sessions],msgs=[m for s in sessions for m in s["msgs"]],tools=[t for s in sessions for t in s["tools"]],attachs=[a for s in sessions for a in s["attachs"]],edits=[e for s in sessions for e in s["edits"]],edit_evidence=[v for s in sessions for v in s["edit_evidence"]])
 def parse_claude_code(projects_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult: return _parse_sessions(files or projects_dir.rglob("*.jsonl"),parse_claude_code_session,bindings)
 
@@ -864,11 +863,12 @@ def ingest_parts(r,size=500):
     prepared,valid,blank,scopes,edit_scopes,chunks,byid=prepare_result(r),required(not (conflict:=_id_conflict(r.convs,("source","cwd","git_branch","project_id","metadata")) or _id_conflict(r.msgs,("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"))),ValueError(f"divergent provider session in import batch: {conflict}")),lambda **values:ParseResult(**{"scopes":[],"edit_scopes":[],**values}),{v[0]:v for v in r.scopes},{v[0]:v for v in r.edit_scopes},lambda rows:[rows[i:i+size] for i in range(0,len(rows),size)],{m["id"]:m for m in r.msgs}
     rank,messages=(rank:={mid:i for i,mid in enumerate(graphlib.TopologicalSorter({mid:{m["parent_id"]}&byid.keys() for mid,m in byid.items()}).static_order())}),sorted(r.msgs,key=lambda m:rank[m["id"]])
     return [*[blank(convs=v,scopes=[scopes[c["id"]] for c in v if c["id"] in scopes]) for v in chunks(r.convs)],*[blank(msgs=v) for v in chunks(messages)],*[blank(tools=v) for v in chunks(r.tools)],*[blank(attachs=v,attachment_indexes={a["id"]:r.attachment_indexes[a["id"]] for a in v if a.get("path")}) for v in chunks(r.attachs)],*[blank(artifacts=v) for v in chunks(r.artifacts)],*[blank(edits=v,edit_scopes=[edit_scopes[e["id"]] for e in v if e["id"] in edit_scopes]) for v in chunks(r.edits)],*[blank(edit_evidence=v) for v in chunks(r.edit_evidence)]]
-def commit_result(r,purpose):
+def commit_result(r,purpose,progress=None,parts=None):
     total,changed,newids=[0]*7,set(),set()
-    for part in (p for p in ingest_parts(r) if any((p.convs,p.msgs,p.tools,p.attachs,p.artifacts,p.edits,p.edit_evidence))):
+    for part in (p for p in (ingest_parts(r) if parts is None else parts) if any((p.convs,p.msgs,p.tools,p.attachs,p.artifacts,p.edits,p.edit_evidence))):
         with _core(purpose=purpose) as conn,_transaction(conn): out=(newids.update({c["id"] for c in part.convs}-{x[0] for x in conn.execute("SELECT id FROM conversations WHERE id IN (SELECT UNNEST(?))",[[c["id"] for c in part.convs]]).fetchall()}) if part.convs else None,upsert(conn,part))[-1]
-        (total.__setitem__(slice(None),[total[i]+out[i] for i in range(7)]),changed.update(out[7]),total.__setitem__(slice(5,7),[len(newids),len({m["conversation_id"] for m in r.msgs if m["id"] in changed}-newids)]),r.provenance_edits.update(part.provenance_edits),r.provenance_conversations.update(part.provenance_conversations))
+        (total.__setitem__(slice(None),[total[i]+out[i] for i in range(7)]),changed.update(out[7]),total.__setitem__(slice(5,7),[len(newids),len({m["conversation_id"] for m in r.msgs if m["id"] in changed}-newids)]),r.provenance_edits.update(part.provenance_edits),r.provenance_conversations.update(part.provenance_conversations),progress and progress(f"{purpose} {sum(total[:5])} rows"))
+        archive_yield(DB_PATH)
     return (*total,changed)
 
 def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
@@ -910,7 +910,7 @@ def drain_hooks(embed=False, local_only=False,block=False):
                 if not r.convs:
                     done.append((work,key,snap,set()))
                     continue
-                changed=commit_result(r,purpose="hooks.ingest")[-1]|({m["id"] for m in r.msgs} if e.get("retry") else set())
+                changed=commit_result(r,purpose="hooks.ingest",progress=pulse)[-1]|({m["id"] for m in r.msgs} if e.get("retry") else set())
                 capture_provenance(edit_ids=[x["id"] for x in r.edits],conversation_ids=[x["id"] for x in r.convs],source=f"{e['source']}.hook")
                 atomic_json(work,{**e,"snap":snap,"changed":sorted(changed)})
                 done.append((work,key,snap,changed))
@@ -986,6 +986,7 @@ def embed_pending(batch: int = 32, ids=None, local_only=False,limit=None,progres
         step=_MCFG["n_seq_max"] if profile["backend"]=="llama.cpp" else batch
         updates=(progress and progress(f"embedding {done}/{n}"),[(vector,mid,content_hash) for chunk in (rows[i:i+step] for i in range(0,len(rows),step)) for (mid,_,content_hash),vector in zip(chunk,embed_texts([content for _,content,_ in chunk],doc=True,local_only=local_only))])[-1]
         with _core(purpose="embedding.batch.write") as conn,_transaction(conn): conn.executemany("UPDATE messages SET embedding=? WHERE id=? AND sha256(content)=? AND embedding IS NULL",updates)
+        archive_yield(DB_PATH)
         typer.echo(f"  {(done:=done+len(rows))}/{n}\r",nl=False,err=True)
     with _core(read_only=True,purpose="embedding.remaining") as conn: remaining=conn.execute(f"SELECT COUNT(*) {Q}",ps).fetchone()[0]
     if remaining: typer.echo(f"{remaining} messages remain unembedded; rerun `convos embed` or use lexical `convos search`.",err=True)
@@ -1164,8 +1165,7 @@ def install_skills():
         if atomic_write(dest,text) is None: typer.echo(f"Installed {dest}")
         if old.is_file() and not old.is_symlink() and old.read_text()==legacy: typer.echo(f"Removed legacy {old}") if old.unlink() is None else None
 
-def _capture_command(source):
-    return f"{f'CONVOS_PROJECT_ROOT={shlex.quote(str(root))} ' if (root:=Path(os.environ.get('CONVOS_PROJECT_ROOT',PROJECT_ROOT)).expanduser().resolve())!=Path.home()/'.convos' else ''}{shlex.quote(str(Path(sys.executable).with_name('convos')))} capture {source}"
+def _capture_command(source): return f"{f'CONVOS_PROJECT_ROOT={shlex.quote(str(root))} ' if (root:=Path(os.environ.get('CONVOS_PROJECT_ROOT',PROJECT_ROOT)).expanduser().resolve())!=Path.home()/'.convos' else ''}{shlex.quote(str(Path(sys.executable).with_name('convos')))} capture {source}"
 def _managed_hook(h, source): return h.get("command", "").endswith("convos remote hook") or h.get("command", "").endswith((f" hook {source}", f" capture {source}")) and h.get("statusMessage") in ("Updating conversation archive", "Saving conversation to Convos")
 def edit_hook_config(path, events, source, remove=False):
     data=json.loads(path.read_text()) if path.exists() else {}
@@ -1215,18 +1215,18 @@ def backup():
     typer.echo(f"Archive backed up to {path} with attachments at {path}.attachments")
 
 def _sync_leader(fn):
-    with operation_lock(DATA_DIR/".sync.lock","sync",wait=0) as pulse: return fn(pulse)
+    with operation_lock(DATA_DIR/".sync.lock","sync",wait=0) as pulse: return fn(lambda stage:(pulse(stage),sys.stderr.isatty() and (now:=time.monotonic())-getattr(pulse,"shown",0)>=1 and (setattr(pulse,"shown",now),typer.echo(f"  Local sync: {stage}",err=True)))[0])
 
 def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch all sources and reconcile all provenance"), verbose: bool = typer.Option(False, "-v", "--verbose"), local_only: bool = typer.Option(False, "--local-only", help="Import local agent sessions and configured exports without contacting web sources.")):
     if sys.argv[1:2] == ["sync"]: signal.signal(signal.SIGINT, signal.SIG_DFL)
     state,local,web,imports,chatgpt_ok,chatgpt_frontiers,offline,ready={},{},{},{},{},{},local_only is True,False
     def set_state(section,key,val): state.setdefault(section,{})[key]=val
-    def plan_local(name, path, parser, bindings, sink):
+    def plan_local(name, path, parser, bindings, sink, progress):
         if not path.exists(): return None
         if name in ("codex", "claude-code"):
             prev,mt=local.get(name,{}).get("files",{}),{str(p):m for p in path.rglob("*.jsonl") if (m:=stat_mtime(p)) is not None}
             if not (chg:=list(map(Path,mt)) if full or local.get(name,{}).get("parser")!=PARSER_EPOCH else [Path(p) for p,m in mt.items() if m>prev.get(p,0)]): return None
-            saved,run=[],lambda p=path,fs=chg:saved.extend(sink(parser(p,fs[i:i+20],bindings)) for i in range(0,len(fs),20)) or ParseResult()
+            saved,run=[],lambda p=path,fs=chg:saved.extend((value:=sink(parser(p,fs[i:i+20],bindings)),progress(f"parsing {name} {min(i+20,len(fs))}/{len(fs)}"),value)[-1] for i in range(0,len(fs),20)) or ParseResult()
             return dict(name=name,label=name.replace("-"," ").title(),source=name,func=run,saved=saved,state=("local",name,{"parser":PARSER_EPOCH,"files":mt}))
         mtime = latest_mtime(path)
         return None if not full and mtime<=local.get(name,{}).get("mtime",0) else dict(name=name,label=name.replace("-"," ").title(),source=name,func=lambda p=path:parser(p),state=("local",name,{"mtime":mtime}))
@@ -1274,10 +1274,10 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         chatgpt_ok.clear() or chatgpt_frontiers.clear()
         total,changed,jobs,newc,updc,provenance_edits,provenance_conversations,repair_attempted=[0]*5,set(),[],0,0,set(),set(),set()
         def checkpoint(r):
-            with operation_lock(HOOK_DIR/".lock","hooks.queue"):
-                out=commit_result(r,purpose="sync.ingest")
-                known.update({c["id"]:(u.timestamp() if (u:=ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"})
-                repair_attempted.update(c["id"] for c in r.convs if c["id"] in repair_order)
+            parts=ingest_parts(r)
+            with operation_lock(HOOK_DIR/".lock","hooks.queue") as queue:
+                out=commit_result(r,purpose="sync.ingest",progress=lambda stage:(pulse(stage),queue(stage))[-1],parts=parts)
+                (known.update({c["id"]:(u.timestamp() if (u:=ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"}),repair_attempted.update(c["id"] for c in r.convs if c["id"] in repair_order))
                 return (*out,getattr(r,"provenance_edits",set()),getattr(r,"provenance_conversations",set()))
         with _core(read_only=True,purpose="sync.chatgpt.repair.plan") as conn: repairs=conn.execute("SELECT c.id,MIN(m.created_at),MAX(m.created_at) FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL) AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) GROUP BY c.id").fetchall()
         if repairs:
@@ -1288,7 +1288,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
             jobs+=start("imports") or [j for p in paths if (j:=plan_import(p))]
         for name,label,enabled,p,parser in (("claude-code","Claude Code",claude_code,Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))/"projects",parse_claude_code),("codex","Codex",codex,Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),parse_codex)):
-            if enabled and p.exists(): start(label,name) or schedule(plan_local(name,p,parser,bindings,checkpoint))
+            if enabled and p.exists(): start(label,name) or schedule(plan_local(name,p,parser,bindings,checkpoint,pulse))
         if not offline:
             start("ChatGPT"+(f", provider order={len(candidates)-len(repair_order)} attempted/{len(candidates)} unresolved" if candidates else ""),"chatgpt")
             schedule(plan_web("chatgpt",fetch_chatgpt,probe_chatgpt,{} if full else known,checkpoint,legacy,not repair_order))
@@ -1304,7 +1304,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     if saved := j.get("saved"):
                         c,m,t,a,e,n,u,changed_ids,provenance_edits,provenance_conversations=(*[sum(s[i] for s in saved) for i in range(7)],set().union(*(s[7] for s in saved)),provenance_edits|set().union(*(s[8] for s in saved)),provenance_conversations|set().union(*(s[9] for s in saved)))
                     elif r is not None:
-                        with operation_lock(HOOK_DIR/".lock","hooks.queue"): c,m,t,a,e,n,u,changed_ids=commit_result(r,purpose="sync.ingest")
+                        c,m,t,a,e,n,u,changed_ids,*_=checkpoint(r)
                     else: continue
                     total,newc,updc,changed=[total[i]+v for i,v in enumerate([c,m,t,a,e])],newc+n,updc+u,changed|changed_ids
                     if r is not None: provenance_edits,provenance_conversations=provenance_edits|getattr(r,"provenance_edits",set()),provenance_conversations|getattr(r,"provenance_conversations",set())

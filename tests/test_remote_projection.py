@@ -1,4 +1,5 @@
 import json, os, subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
@@ -46,6 +47,14 @@ def test_signed_edit_evidence_preserves_status_and_tool_binding_across_replica(t
     target=duckdb.connect(str(receiver/"data/convos.db"),read_only=True); assert target.execute("SELECT v.status,v.reason,v.tool_call_id=t.id FROM provenance.file_edit_evidence v JOIN tool_calls t ON t.id=v.tool_call_id").fetchone()==("confirmed","test_fixture",True); target.close()
     core=duckdb.connect(str(path)); core.execute("UPDATE provenance.file_edit_evidence SET status='invalid',reason='provider_failure' WHERE file_edit_id='e'"); core.close(); update=next(v for v in edit_evidence_records(sender,user,"personal","personal") if v["proof"] is None); revised=semantic_proof(root,user,device["id"],"personal",1,update["row"],update["previous"]); semantic=open_replica(seal_replica(update["row"],revised,"personal",1,key_,device["id"]),key_); apply_row_replicas(receiver/"data/convos.db",[semantic],"personal",[control],local_user="receiver",root=receiver)
     target=duckdb.connect(str(receiver/"data/convos.db"),read_only=True); assert target.execute("SELECT status,reason FROM provenance.file_edit_evidence").fetchone()==("invalid","provider_failure") and target.execute("SELECT count(*) FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed'").fetchone()[0]==0; target.close()
+
+def test_edit_evidence_inventory_is_set_based_not_per_edit(tmp_path,monkeypatch):
+    root=tmp_path/"archive"; path=root/"data/convos.db"; db=core_module.open_db(path,purpose="fixture"); init_schema(db); rows=[(f"p{i}","w","w","file_edits",f"e{i}",1,"h",f"{i:064x}",None,"active","u","d",1,"s") for i in range(40)]; db.executemany("INSERT INTO remote.row_proofs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",rows); db.executemany("INSERT INTO provenance.file_edit_evidence VALUES (?,'confirmed','test',NULL)",[(f"e{i}",) for i in range(40)]); db.close(); opened=[]; real=remote_client._core
+    @contextmanager
+    def counted(*args,purpose,**kwargs):
+        opened.append(purpose)
+        with real(*args,purpose=purpose,**kwargs) as db: yield db
+    monkeypatch.setattr(remote_client,"_core",counted); assert len(edit_evidence_records(root,"u","w","personal"))==40 and opened.count("remote.edit_evidence.read")==1
 
 def test_signed_edit_evidence_tracks_exact_row_heads_reorder_tombstones_and_forks(tmp_path):
     root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); archive=tmp_path/"archive"; path=archive/"data/convos.db"; apply=lambda values:apply_row_replicas(path,values,"w",[control],local_user="receiver",root=archive); state=lambda:duckdb.connect(str(path),read_only=True).execute("SELECT status,reason,tool_call_id IS NOT NULL FROM provenance.file_edit_evidence").fetchone()
@@ -260,6 +269,13 @@ def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
     with pytest.raises(ValueError,match="Unsupported remote bridge"): bridges()
     bridges.cache_clear()
 
+def test_bridge_collection_runs_once_and_persists_new_proofs_in_bulk(tmp_path,monkeypatch):
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); calls={"records":0,"accepted":[]}
+    def records(*_): calls["records"]+=1; return [dict(row={"v":1,"kind":"x","id":str(i),"state":"active","data":{}},proof=None,previous=None) for i in range(2)]
+    def accept_many(_,values,project): calls["accepted"].append((values,project)); return [True]*len(values)
+    monkeypatch.setattr(projection_module,"bridges",lambda:[{"v":3,"schema":1,"objects":{"x"},"records":records,"accept":lambda *_:None,"accept_many":accept_many}]); cfg={"root":root,"user":user,"device":device,"workspaces":{"w":{"epoch":1}}}
+    assert len(bridge_replicas(tmp_path,cfg,"w","personal",bytes(range(32))))==2 and calls["records"]==1 and len(calls["accepted"])==1 and len(calls["accepted"][0][0])==2 and calls["accepted"][0][1] is False
+
 
 def test_provider_session_alias_converges_one_author_and_separates_authors(tmp_path):
     archive=tmp_path/"archive"; path=archive/"data/convos.db"; path.parent.mkdir(parents=True); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); db=duckdb.connect(str(path)); init_schema(db); remote=foreign_id(user,"conversations","b"); metadata='{"session_id":"same","session_kind":"main","session_kind_evidence":"exact"}'; db.executemany("INSERT INTO conversations(id,source,title,metadata) VALUES (?, 'codex','T',?)",[("a",metadata),(remote,metadata)]); db.execute("INSERT INTO remote.row_origins VALUES ('conversations',?,'personal',?,'other-device','b','event','conversations:b',NULL,NULL)",(remote,user)); db.close()
@@ -276,7 +292,7 @@ def test_provider_session_alias_rejects_noncanonical_members(tmp_path):
 
 
 @pytest.mark.parametrize(("native_id","imported_id"),[("a","b"),("b","a")])
-def test_provider_alias_reconciliation_signs_successors_and_replays_mixed_native_imported_rows(tmp_path,native_id,imported_id):
+def test_provider_alias_reconciliation_signs_successors_and_replays_mixed_native_imported_rows(tmp_path,monkeypatch,native_id,imported_id):
     archive=tmp_path/"archive"
     path=archive/"data/convos.db"
     path.parent.mkdir(parents=True)
@@ -310,6 +326,7 @@ def test_provider_alias_reconciliation_signs_successors_and_replays_mixed_native
     db.close()
     alias={"v":1,"kind":"provider.session","id":provider_alias_id("codex","same"),"state":"active","data":{"source":"codex","session_id":"same","members":["a","b"],"canonical":"a"}}
     assert provider_alias_accept(archive,alias,semantic_proof(root,user,device["id"],"personal",1,alias))
+    pages=projection_module._alias_pages; monkeypatch.setattr(projection_module,"_alias_pages",lambda path,user,members:pages(path,user,members,1))
     first=reconcile_provider_aliases(path,cfg,"personal")
     assert first=={"changed":1,"settled":0,"blocked":{}}
     db=duckdb.connect(str(path),read_only=True)
@@ -432,7 +449,7 @@ def test_provider_alias_reconciliation_blocks_on_conflicting_exact_evidence(tmp_
     db.close()
 
 
-def test_provider_alias_reconciliation_rolls_back_interrupted_projection(tmp_path,monkeypatch):
+def test_provider_alias_reconciliation_resumes_interrupted_projection(tmp_path,monkeypatch):
     archive,path,root,device,user,cfg,entry=_provider_alias_archive(tmp_path)
     db=duckdb.connect(str(path),read_only=True)
     before=(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0])
@@ -442,11 +459,14 @@ def test_provider_alias_reconciliation_rolls_back_interrupted_projection(tmp_pat
     assert result["changed"]==0 and next(iter(result["blocked"].values()))=="interrupted"
     db=duckdb.connect(str(path),read_only=True)
     assert db.execute("SELECT id FROM conversations ORDER BY id").fetchall()==[("a",),("b",)]
-    assert db.execute("SELECT conversation_id FROM messages").fetchone()[0]=="b"
+    assert db.execute("SELECT conversation_id FROM messages").fetchone()[0]=="a"
     assert db.execute("SELECT conversation_id FROM provider_sessions").fetchone()[0]=="b"
-    assert (db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0])==before
+    assert all(a>b for a,b in zip((db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0]),before))
     db.close()
     assert path.with_name(path.name+".pre-provider-alias-reconciliation.bak").is_file()
+    monkeypatch.undo()
+    assert reconcile_provider_aliases(path,cfg,"personal")=={"changed":1,"settled":0,"blocked":{}}
+    db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT id FROM conversations").fetchall()==[("a",)] and db.execute("SELECT conversation_id FROM provider_sessions").fetchone()[0]=="a"; db.close()
 
 
 def test_provider_alias_reconciliation_takes_one_backup_for_a_batch(tmp_path,monkeypatch):
@@ -471,6 +491,19 @@ def test_provider_alias_reconciliation_takes_one_backup_for_a_batch(tmp_path,mon
     monkeypatch.setattr(projection_module,"_migration_backup",backup)
     assert reconcile_provider_aliases(path,cfg,"personal")=={"changed":2,"settled":0,"blocked":{}}
     assert len(backups)==1
+
+
+def test_provider_alias_reconciliation_pages_reads_and_writes(tmp_path,monkeypatch):
+    archive,path,root,device,user,cfg,entry=_provider_alias_archive(tmp_path)
+    db=duckdb.connect(str(path)); db.executemany("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES (?, 'b','user','B','{}')",[(f"message-{i:04}",) for i in range(501)]); state=connect(tmp_path/"page-state.db"); records=scan(db,state); db.close(); state.close(); assert attest_rows(path,cfg,"personal",records)==501
+    probes,sizes=[],[]; real_yield,real_project=projection_module.archive_yield,projection_module.project_logical_rows
+    def yielding(value):
+        with core_module.open_db(value,wait=0,purpose="alias page probe"): pass
+        probes.append(1); return real_yield(value)
+    def projected(db,items): sizes.append(len(items)); return real_project(db,items)
+    monkeypatch.setattr(projection_module,"archive_yield",yielding); monkeypatch.setattr(projection_module,"project_logical_rows",projected)
+    assert reconcile_provider_aliases(path,cfg,"personal")=={"changed":1,"settled":0,"blocked":{}} and probes and max(sizes)<=500
+    db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT count(*),count(DISTINCT conversation_id) FROM messages").fetchone()==(502,1); db.close()
 
 
 def test_event_support_is_exact_and_unknowns_fail_closed(monkeypatch):
@@ -542,7 +575,19 @@ def test_scan_redacts_edit_path_when_local_file_fact_is_missing(tmp_path):
 
 def test_team_incremental_uses_changed_rows_after_scope_seed(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); rid=next(r["payload"]["id"] for r in scan(core,state) if r["kind"]=="repository.observed"); seeded=set(); first=scan(core,state,"team",[rid],[],None,"w",seeded); state.executemany("INSERT INTO team_scopes VALUES (?,?)",[("w",c) for c in seeded]); changed=scan(core,state,"team",[rid],[],{("messages","u")},"w",set()); state.execute("DELETE FROM team_scopes"); reentered=scan(core,state,"team",[rid],[],{("conversations","c")},"w",set())
-    assert seeded=={"c"} and len(first)>len(changed)==1 and changed[0]["kind"]=="message.record" and changed[0]["payload"]["row"][0]=="u" and len(reentered)==len(first)
+    assert seeded=={"c"} and len(first)>len(changed)==1 and changed[0]["kind"]=="message.record" and changed[0]["payload"]["row"][0]=="u" and len(reentered)==1
+
+
+def test_team_admission_expands_in_bounded_reopenable_pages(tmp_path,monkeypatch):
+    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); rid=next(r["payload"]["id"] for r in scan(core,state) if r["kind"]=="repository.observed"); expected=scan(core,state,"team",[rid],[]); generation=core.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]; core.close(); scope,pages,probes=set(),[],[]; real_page=projection_module._team_page
+    def page(*args): rows=real_page(*args); pages.append(len(rows)); return rows
+    def progress(stage):
+        if stage.startswith("scanning admitted"):
+            with core_module.open_db(tmp_path/"source.db",wait=0,purpose="team page probe"): pass
+            probes.append(1)
+    monkeypatch.setattr(projection_module,"_team_page",page)
+    actual=projection_module.scan_archive(tmp_path/"source.db",state,"team",[rid],[],"w",scope,("cwd","edit"),None,generation,progress,page=1)
+    assert {(r["kind"],r["entity"]):r for r in actual}=={(r["kind"],r["entity"]):r for r in expected} and scope=={"c"} and probes and max(pages)<=1
 
 
 def test_repository_policy_does_not_reclassify_uncaptured_live_worktree(tmp_path):

@@ -22,7 +22,7 @@ def test_remote_sync_contention_is_concise_and_identifies_holder(tmp_path,monkey
     monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(tmp_path)); monkeypatch.setattr(remote_client,"MANUAL_WAIT",0); remote_client.save({"name":"alice","user":"user-id","device":{"name":"laptop","id":"device-id"}},tmp_path)
     with remote_client.sync_run(tmp_path): result=CliRunner().invoke(remote_client.remote,["sync"],terminal_width=500)
     output=" ".join(result.output.replace(chr(9474)," ").split())
-    assert result.exit_code==1 and "Could not start remote sync" in output and "remote user alice" in output and "PID " in output and "started " in output and "last activity " in output and "Traceback" not in output and "RuntimeError" not in output
+    assert result.exit_code==1 and "Could not start remote sync" in output and "remote user alice" in output and "PID " in output and "started " in output and "last progress " in output and "Traceback" not in output and "RuntimeError" not in output
 
 def test_remote_sync_expected_failure_is_concise(monkeypatch):
     monkeypatch.setattr(remote_client,"sync_once",lambda **kwargs:(_ for _ in ()).throw(RuntimeError("Personal: row replica proof mismatch")))

@@ -236,10 +236,9 @@ def test_db_waits_for_writer(tmp_path, monkeypatch, read_only):
     assert calls["n"] == 3
 
 
-def test_db_retry_releases_path_lock_and_archives_do_not_share_it(tmp_path,monkeypatch):
+def test_db_retry_notices_are_per_archive_and_fast_path_has_none(tmp_path,monkeypatch):
     events=[]; [p.touch() for p in (tmp_path/"a.db",tmp_path/"b.db")]
-    monkeypatch.setattr(cli,"_flock",lambda lock,*_:events.append(("lock",Path(lock.name).name)))
-    monkeypatch.setattr(cli.fcntl,"flock",lambda lock,op:events.append(("unlock",Path(lock.name).name)))
+    monkeypatch.setattr(cli.fcntl,"flock",lambda lock,op:events.append(Path(lock.name)))
     calls={}
     def connect(path,read_only=False):
         calls[path]=calls.get(path,0)+1
@@ -247,14 +246,13 @@ def test_db_retry_releases_path_lock_and_archives_do_not_share_it(tmp_path,monke
         return type("Connection",(),{"close":lambda _:None})()
     monkeypatch.setattr(cli.duckdb,"connect",connect); monkeypatch.setattr(cli.time,"sleep",lambda _:None)
     cli.get_db(path=tmp_path/"a.db").close(); cli.get_db(path=tmp_path/"b.db").close()
-    assert events[:3]==[("lock",".a.db.lock"),("unlock",".a.db.lock"),("lock",".a.db.lock")] and events[-1]==("lock",".b.db.lock")
+    assert len(events)==1 and events[0].parent==tmp_path/".a.db.waiters" and not (tmp_path/".b.db.waiters").exists()
 
 
-def test_db_symlink_alias_uses_canonical_lock(tmp_path,monkeypatch):
+def test_db_symlink_alias_uses_canonical_database_path(tmp_path,monkeypatch):
     db,alias=tmp_path/"archive.db",tmp_path/"alias.db"; db.touch(); alias.symlink_to(db); seen=[]
-    monkeypatch.setattr(cli,"_flock",lambda lock,*_:seen.append(Path(lock.name)))
-    monkeypatch.setattr(cli,"_open_db",lambda *_:type("Connection",(),{"close":lambda _:None})())
-    cli.get_db(path=alias).close(); assert seen==[tmp_path/".archive.db.lock"]
+    monkeypatch.setattr(cli,"_open_db",lambda path,read_only=False:(seen.append((path,read_only)),type("Connection",(),{"close":lambda _:None})())[-1])
+    cli.get_db(path=alias).close(); assert seen==[(db,False)] and not (tmp_path/".archive.db.waiters").exists()
 
 
 def test_db_rejects_hardlink_aliases(tmp_path):

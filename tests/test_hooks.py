@@ -1,4 +1,4 @@
-import json, os, signal, subprocess, sys, threading, time
+import contextlib, json, os, signal, subprocess, sys, threading, time
 from pathlib import Path
 import duckdb, pytest, typer
 from typer.testing import CliRunner
@@ -71,7 +71,7 @@ def test_concurrent_sync_exits_immediately_and_explicitly(hooks,capsys):
         finally: done.set()
     try:
         assert hold.stdout.readline().strip()=="ready"; thread=threading.Thread(target=attempt); thread.start(); assert done.wait(5); thread.join(); assert len(result)==1 and isinstance(result[0],typer.Exit)
-        assert not (data/"convos.db").exists() and "another process still holds the lock" in capsys.readouterr().err and result[0].exit_code==1
+        assert not (data/"convos.db").exists() and "another operation is already running" in capsys.readouterr().err and result[0].exit_code==1
     finally: hold.stdin.write("\n"); hold.stdin.flush(); hold.wait(timeout=5)
 
 def test_concurrent_sync_cli_error_has_no_traceback(hooks):
@@ -79,6 +79,19 @@ def test_concurrent_sync_cli_error_has_no_traceback(hooks):
     with cli.operation_lock(data/".sync.lock","sync"):
         result=CliRunner().invoke(cli.app,["sync","--local-only"])
     assert result.exit_code==1 and "Could not start sync" in result.output and "PID " in result.output and "Traceback" not in result.output and "LockBusy" not in result.output
+
+def test_parallel_sync_checkpoints_keep_queue_lease_alive(hooks,tmp_path,monkeypatch):
+    sessions,_=hooks; transcript(sessions/"codex.jsonl"); claude=tmp_path/"claude/projects"; claude.mkdir(parents=True); (claude/"claude.jsonl").write_text("fixture"); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(claude.parent)); barrier=threading.Barrier(2); parse=lambda *_:(barrier.wait(),cli.ParseResult())[-1]
+    monkeypatch.setattr(cli,"parse_codex",parse); monkeypatch.setattr(cli,"parse_claude_code",parse); monkeypatch.setattr(cli,"drain_hooks",lambda:0); monkeypatch.setattr(cli,"capture_provenance",lambda **_:None); monkeypatch.setattr(cli,"ingest_parts",lambda _:[]); real=cli.operation_lock; completed=[]
+    @contextlib.contextmanager
+    def quick(path,purpose,wait=30,identity=None,mandatory=True):
+        with real(path,purpose,.03 if purpose=="hooks.queue" else wait,identity,mandatory) as pulse: yield pulse
+    def commit(r,purpose,progress=None,parts=None):
+        completed.append(threading.get_ident())
+        for i in range(5): time.sleep(.02); progress(f"{purpose} {i}")
+        return (*[0]*7,set())
+    monkeypatch.setattr(cli,"operation_lock",quick); monkeypatch.setattr(cli,"commit_result",commit); cli.sync(False,300,True,True,False,False,True)
+    assert len(completed)==2
 
 def test_explicit_drain_is_idempotent_and_preserves_truncated_rewritten_history(hooks):
     sessions, data = hooks; path = sessions/"s.jsonl"; runner = CliRunner(); transcript(path); enqueue(path)
