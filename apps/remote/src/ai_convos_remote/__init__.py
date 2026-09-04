@@ -11,7 +11,7 @@ _pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases"
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_file_edit_evidence_many, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, reset_remote_projection
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
+from .projection import PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
                        recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
@@ -23,25 +23,32 @@ def paths(root=None): return (base:=local_root(root)/"remote"),base/"config.json
 def core_path(root=None): return local_root(root)/"data"/"convos.db"
 @contextmanager
 def _core(root=None,read_only=False,ready=True,*,purpose):
-    db=open_db(core_path(root),read_only,purpose=purpose)
-    try:
+    with closing(open_db(core_path(root),read_only,purpose=purpose)) as db:
         if not read_only and ready: init_schema(db)
         yield db
-    finally: db.close()
 def archive_info(root=None,create=False):
     if not (path:=core_path(root)).exists() and not create: return None
     path.parent.mkdir(parents=True,exist_ok=True)
     with _core(root,not create,purpose="remote.archive_info") as db: return core_archive_state(db)
+def _archive_marker(root):
+    if not core_path(root).is_file(): return None
+    try:
+        with _core(root,True,purpose="remote.settled.read") as db: return db.execute("SELECT archive_id::VARCHAR,generation,(SELECT version FROM core_schema WHERE singleton) FROM archive_state WHERE singleton").fetchone()
+    except duckdb.CatalogException: return None
+def _sync_marker(cfg,root,archive): return (lambda bridges:digest({"v":1,"archive":archive,"controls":{ws:state_hash(cfg["controls"][ws]) for ws in sorted(bridges)},"keys":cfg["keys"],"sharing":cfg.get("sharing",{}),"bindings":cfg.get("bindings",{}),"promotions":cfg.get("promotions",{}),"routes":{key:core_repository(path) for key,value in cfg.get("bindings",{}).items() if (path:=binding_path(value))},"bridges":bridges}))({w["id"]:bridge_state(root,cfg,w["id"],w["kind"],archive[1]) for w in cfg["server_state"]["workspaces"] if w["device_authorized"]})
+def _meta(state,key,default=0): return (state.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone() or [default])[0]
+def _local_tails(state,ws): return {"events":(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(ws,)).fetchone() or [0])[0],"replicas":int(_meta(state,f"replica_cursor:{ws}")),"blobs":int(_meta(state,f"blob_cursor:{ws}")),"origins":state.execute("SELECT COALESCE(MAX(cursor),0) FROM (SELECT cursor FROM origin_bindings WHERE workspace=? UNION ALL SELECT cursor FROM control_dependencies WHERE workspace=?)",(ws,ws)).fetchone()[0]}
+def _settled(cfg,state,root):
+    if cfg["server_state"].get("capabilities",{}).get("sync_tails")!=1 or not (archive:=_archive_marker(root)) or archive[2]!=11: return False
+    active={w["id"]:w for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
+    dirty=not active or any(state.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() for table in ("outbox","blob_outbox","lazy_events","sequence_gaps")) or any(path.exists() and any(path.iterdir()) for path in (paths(root)[0]/"outbox",paths(root)[0]/"attachments")) or state.execute("SELECT 1 FROM meta WHERE key LIKE 'replica_repair:%' OR key LIKE 'archive_mode:%' OR key LIKE 'replica_upload_blocked:%' LIMIT 1").fetchone() or any(json.loads(value)["blocked"] for value, in state.execute("SELECT value FROM meta WHERE key LIKE 'provider_aliases:%'").fetchall()) or any(event_support(row)!=("required" if row[2] else "optional") for row in state.execute("SELECT kind,payload_v,required FROM deferred_events"))
+    ready=all((lifecycle:=state.execute("SELECT lifecycle,error FROM sync_states WHERE workspace=?",(ws,)).fetchone()) and lifecycle[0]=="ready" and not lifecycle[1] and remote.get("sync")==_local_tails(state,ws) and int(_meta(state,f"core_generation:{ws}"))==archive[1] and _meta(state,f"replica_projection:{ws}",None)==bridge_stamp(root) for ws,remote in active.items())
+    return not dirty and ready and _meta(state,"sync_settled",None)==_sync_marker(cfg,root,archive)
 def load(root=None):
     if not (path:=paths(root)[1]).exists(): raise ValueError("Remote is not configured. Run `convos remote setup`.")
     return json.loads(path.read_text())
 def provider_alias_id(source,session): return "provider-session:"+digest([source,session])
-def _provider_alias_value(row):
-    workspace,author,object_id,revision,source,session,members,canonical,proof=row
-    members=json.loads(members)
-    proof=json.loads(proof)
-    body={"v":1,"kind":"provider.session","id":object_id,"state":"active","data":{"source":source,"session_id":session,"members":members,"canonical":canonical}}
-    return dict(row=body,proof=proof,previous=None,workspace=workspace,author=author)
+def _provider_alias_value(row): return (lambda workspace,author,object_id,revision,source,session,members,canonical,proof:dict(row={"v":1,"kind":"provider.session","id":object_id,"state":"active","data":{"source":source,"session_id":session,"members":json.loads(members),"canonical":canonical}},proof=json.loads(proof),previous=None,workspace=workspace,author=author))(*row)
 def provider_alias_records(root,user,workspace,kind):
     if kind!="personal" or not core_path(root).is_file(): return []
     with _core(root,True,purpose="remote.provider_alias.read") as db:
@@ -70,9 +77,7 @@ def provider_alias_accept(root,row,proof,project=True):
     return len([value for value in values if (value["workspace"],value["author"],value["row"]["id"],value["proof"]["revision"]) not in ancestors])==1
 def provider_alias_bridge(): return dict(v=3,schema=1,source="archive",objects={"provider.session"},records=provider_alias_records,accept=provider_alias_accept)
 def edit_evidence_id(edit): return "file-edit-evidence:"+provenance_digest(edit)
-def _edit_evidence_value(row):
-    workspace,author,object_id,revision,edit,edit_revision,status,reason,tool,tool_revision,proof=row
-    return dict(row={"v":1,"kind":"file-edit.evidence","id":object_id,"state":"active","data":{"edit":edit,"edit_revision":edit_revision,"status":status,"reason":reason,"tool_call":tool,"tool_revision":tool_revision}},proof=json.loads(proof),previous=None,workspace=workspace,author=author)
+def _edit_evidence_value(row): return (lambda workspace,author,object_id,revision,edit,edit_revision,status,reason,tool,tool_revision,proof:dict(row={"v":1,"kind":"file-edit.evidence","id":object_id,"state":"active","data":{"edit":edit,"edit_revision":edit_revision,"status":status,"reason":reason,"tool_call":tool,"tool_revision":tool_revision}},proof=json.loads(proof),previous=None,workspace=workspace,author=author))(*row)
 def _edit_pages(root,query,args,after,page=1000):
     while True:
         with _core(root,True,purpose="remote.edit_evidence.page") as db: rows=(started:=time.monotonic(),db.execute(query,(*args,*after,page)).fetchall())[-1]
@@ -83,8 +88,7 @@ def _edit_record(value,evidence,origins,tools,leaves,user):
     edit,edit_revision,physical=value
     if physical not in evidence: return None
     status,reason,physical_tool,tool,tool_revision=(*evidence[physical],(tool:=origins.get(evidence[physical][2],evidence[physical][2]) if evidence[physical][2] else None),tools.get(tool) if tool else None)
-    if tool and not tool_revision: return None
-    return (lambda row,matching:None if len(matching)==1 and matching[0]["row"]==row else dict(row=row,proof=None,previous=[v["proof"] for v in matching] if len(matching)>1 else matching[0]["proof"] if matching else None))(row:={"v":1,"kind":"file-edit.evidence","id":edit_evidence_id(edit),"state":"active","data":{"edit":edit,"edit_revision":edit_revision,"status":status,"reason":reason,"tool_call":tool,"tool_revision":tool_revision}},leaves.get((user,row["id"]),[]))
+    return None if tool and not tool_revision else (lambda row,matching:None if len(matching)==1 and matching[0]["row"]==row else dict(row=row,proof=None,previous=[v["proof"] for v in matching] if len(matching)>1 else matching[0]["proof"] if matching else None))(row:={"v":1,"kind":"file-edit.evidence","id":edit_evidence_id(edit),"state":"active","data":{"edit":edit,"edit_revision":edit_revision,"status":status,"reason":reason,"tool_call":tool,"tool_revision":tool_revision}},leaves.get((user,row["id"]),[]))
 def edit_evidence_records(root,user,workspace,kind):
     if (_progress("scanning edit evidence"),not core_path(root).is_file())[1]: return []
     stored,ancestors=[_edit_evidence_value(r[3:]) for rows in _edit_pages(root,"SELECT author_user_id,object_id,revision,workspace_id,author_user_id,object_id,revision,source_edit_id,edit_revision,status,reason,source_tool_call_id,tool_revision,CAST(proof AS VARCHAR) FROM remote.file_edit_evidence_proofs WHERE workspace_id=? AND (author_user_id,object_id,revision)>(?,?,?) ORDER BY author_user_id,object_id,revision LIMIT ?",(workspace,),("","","")) for r in rows],{r[4:] for rows in _edit_pages(root,"SELECT author_user_id,object_id,child_revision,ancestor_revision,workspace_id,author_user_id,object_id,ancestor_revision FROM remote.semantic_ancestors WHERE object_kind='file-edit.evidence' AND workspace_id=? AND (author_user_id,object_id,child_revision,ancestor_revision)>(?,?,?,?) ORDER BY author_user_id,object_id,child_revision,ancestor_revision LIMIT ?",(workspace,),("","","","")) for r in rows}
@@ -99,10 +103,7 @@ def edit_evidence_records(root,user,workspace,kind):
         at,page,tool_superseded,tools,_=at+len(batch),max(100,min(10000,int(page*.25/max(time.monotonic()-started,.001)))),(tool_superseded:={r[2] for r in tool_proofs if r[2]}),(tools:={source:revisions[0] for source,group in itertools.groupby(sorted(tool_proofs),key=lambda r:r[0]) if len(revisions:=[revision for _,revision,previous,state in group if state=="active" and revision not in tool_superseded])==1}),records.extend(record for value in batch if (record:=_edit_record(value,evidence,origins,tools,groups,user)))
         (_progress(f"scanning edit evidence {at}/{len(candidates)}"),archive_yield(core_path(root)))
     return records
-def _edit_evidence_project(row,proof):
-    data=(verify_semantic_proof(proof,row,proof.get("author_user_id")),row.get("data"))[-1]
-    required(set(row)=={"v","kind","id","state","data"} and row["v"]==1 and row["kind"]=="file-edit.evidence" and row["state"]=="active" and isinstance(data,dict) and set(data)=={"edit","edit_revision","status","reason","tool_call","tool_revision"} and row["id"]==edit_evidence_id(data["edit"]) and data["status"] in {"confirmed","invalid","unknown","unverified"} and all(isinstance(data[k],str) and data[k] for k in ("edit","edit_revision","reason")) and ((data["tool_call"] is None and data["tool_revision"] is None) or all(isinstance(data[k],str) and data[k] for k in ("tool_call","tool_revision"))),ValueError("Malformed file edit evidence"))
-    return dict(workspace_id=proof["workspace"],author_user_id=proof["author_user_id"],object_id=row["id"],revision=proof["revision"],source_edit_id=data["edit"],edit_revision=data["edit_revision"],status=data["status"],reason=data["reason"],source_tool_call_id=data["tool_call"],tool_revision=data["tool_revision"],proof=proof)
+def _edit_evidence_project(row,proof): return (lambda data:(required(set(row)=={"v","kind","id","state","data"} and row["v"]==1 and row["kind"]=="file-edit.evidence" and row["state"]=="active" and isinstance(data,dict) and set(data)=={"edit","edit_revision","status","reason","tool_call","tool_revision"} and row["id"]==edit_evidence_id(data["edit"]) and data["status"] in {"confirmed","invalid","unknown","unverified"} and all(isinstance(data[k],str) and data[k] for k in ("edit","edit_revision","reason")) and ((data["tool_call"] is None and data["tool_revision"] is None) or all(isinstance(data[k],str) and data[k] for k in ("tool_call","tool_revision"))),ValueError("Malformed file edit evidence")),dict(workspace_id=proof["workspace"],author_user_id=proof["author_user_id"],object_id=row["id"],revision=proof["revision"],source_edit_id=data["edit"],edit_revision=data["edit_revision"],status=data["status"],reason=data["reason"],source_tool_call_id=data["tool_call"],tool_revision=data["tool_revision"],proof=proof))[-1])((verify_semantic_proof(proof,row,proof.get("author_user_id")),row.get("data"))[-1])
 def edit_evidence_accept(root,row,proof,project=True):
     with _core(root,purpose="remote.edit_evidence.write") as db,_transaction(db):
         project_file_edit_evidence(db,_edit_evidence_project(row,proof),project)
@@ -120,10 +121,7 @@ def edit_evidence_accept_many(root,values,project=True):
     with _core(root,True,purpose="remote.edit_evidence.result") as db: counts={(ws,author,object_id):count for ws,author,object_id,count in db.execute("SELECT p.workspace_id,p.author_user_id,p.object_id,count(*) FROM remote.file_edit_evidence_proofs p WHERE p.object_id IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.semantic_ancestors a WHERE a.object_kind='file-edit.evidence' AND (a.workspace_id,a.author_user_id,a.object_id,a.ancestor_revision)=(p.workspace_id,p.author_user_id,p.object_id,p.revision)) GROUP BY p.workspace_id,p.author_user_id,p.object_id",[[r["object_id"] for r in records]]).fetchall()}
     return [counts.get((r["workspace_id"],r["author_user_id"],r["object_id"]),0)==1 for r in records]
 def edit_evidence_bridge(): return dict(v=3,schema=1,source="archive",objects={"file-edit.evidence"},records=edit_evidence_records,accept=edit_evidence_accept,accept_many=edit_evidence_accept_many)
-def _private_json(path,value):
-    path.parent.mkdir(parents=True,exist_ok=True)
-    os.chmod(path.parent,0o700)
-    atomic_json(path,value)
+def _private_json(path,value): return (path.parent.mkdir(parents=True,exist_ok=True),os.chmod(path.parent,0o700),atomic_json(path,value))[-1]
 def save(cfg,root=None): _private_json(paths(root)[1],cfg)
 def sync_save(cfg,root=None):
     with local_lock(root,"mutation",True):
@@ -240,9 +238,7 @@ def upload_replicas(cfg,state,root=None,workspaces=None,direct=()):
         done=(path.unlink(missing_ok=True) or done)+count
         if total>=500: _progress(f"uploading rows {done}/{total}")
 def receipt(state,ws,value,cursor,epoch): state.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],cursor,value["author"],value["seq"],epoch,value["kind"],value["payload_v"],value["entity"],value["revision"],value["payload"].get("status") if isinstance(value["payload"],dict) and value["payload"].get("status") in ("active","deleted") else None))
-def safe_url(url):
-    parsed=urllib.parse.urlparse(url)
-    required(parsed.scheme=="https" or parsed.hostname in ("127.0.0.1","localhost","::1") or os.environ.get("CONVOS_REMOTE_INSECURE")=="1",ValueError("Remote URL must use HTTPS (set CONVOS_REMOTE_INSECURE=1 only on a trusted test network)"))
+def safe_url(url): return required((parsed:=urllib.parse.urlparse(url)).scheme=="https" or parsed.hostname in ("127.0.0.1","localhost","::1") or os.environ.get("CONVOS_REMOTE_INSECURE")=="1",ValueError("Remote URL must use HTTPS (set CONVOS_REMOTE_INSECURE=1 only on a trusted test network)"))
 def request(cfg,body,auth=True):
     _heartbeat(f"request {body['op']}")
     safe_url(cfg["url"])
@@ -252,11 +248,7 @@ def request(cfg,body,auth=True):
     try: return json.loads(urllib.request.urlopen(req,timeout=(timeout:=120 if body["op"] in {"upload_many","replica_upload_many","blob_upload","origin_upload"} else 30)).read())
     except urllib.error.HTTPError as e: raise ValueError(json.loads(e.read())["error"]) from e
     except (urllib.error.URLError,TimeoutError) as e: raise ConnectionError(f"Remote {body['op']} failed (socket timeout {timeout}s): {e}") from e
-def health(cfg):
-    safe_url(cfg["url"])
-    result=json.loads(urllib.request.urlopen(cfg["url"].rstrip("/")+"/v1/health",timeout=3).read())
-    required(result.get("version")==1,ValueError("relay protocol v1 required"))
-    return result
+def health(cfg): return (safe_url(cfg["url"]),(lambda result:(required(result.get("version")==1,ValueError("relay protocol v1 required")),result)[-1])(json.loads(urllib.request.urlopen(cfg["url"].rstrip("/")+"/v1/health",timeout=3).read())))[-1]
 def _manual_waiting(root):
     path=paths(root)[0]/"manual.lock"
     with operation_lock(path,"remote background admission",0,_lock_identity(root),False) as pulse:
@@ -638,8 +630,8 @@ def _upload_batches(rows,limit=8*1024*1024,measure=lambda row:row["size"],maximu
         batch.append(row)
         size+=amount
     if batch: yield batch
-def upload(cfg,state,root=None,workspaces=None,concurrent=False):
-    active={w["id"] for w in refresh(cfg,root,concurrent)["workspaces"] if workspaces is None or w["id"] in workspaces}
+def upload(cfg,state,root=None,workspaces=None,concurrent=False,server=None):
+    active={w["id"] for w in (server or refresh(cfg,root,concurrent))["workspaces"] if workspaces is None or w["id"] in workspaces}
     rows=[r for r in state.execute("SELECT * FROM outbox ORDER BY workspace,seq").fetchall() if r["workspace"] in active]
     for batch in _upload_batches(rows):
         prepared,acknowledged=[],[]
@@ -861,11 +853,11 @@ def pull_blobs(cfg,state,root,ws,recover=None):
             if invalid: raise ValueError(f"invalid blob replica: no valid delivery copy for {len(invalid)} object(s)")
             return total
         if not result["blobs"]: raise ValueError("relay blob tail cannot be reached")
-def pull(cfg,state,root=None,concurrent=False,keep_going=False,fresh=False,ready=True):
+def pull(cfg,state,root=None,concurrent=False,keep_going=False,fresh=False,ready=True,server=None):
     root,path=local_root(root),core_path(root)
     if ready and path.is_file():
         with _core(root,purpose="schema.remote.receive"): pass
-    server=refresh(cfg,root,concurrent)
+    server=server or refresh(cfg,root,concurrent)
     summary={}
     for ws in server["workspaces"]:
         if not ws["device_authorized"]: continue
@@ -1005,8 +997,6 @@ def sync_once(root=None,repair=False,manual=False):
         _,_,state_path=paths(root)
         info=inspect_state(state_path,manual or repair)
         cutover=None
-        _progress("relocating attachments")
-        relocate_attachments(core_path(root),paths(root)[0]/"attachments")
         if info["status"] in ("incompatible","invalid"):
             with local_lock(root,"mutation",True):
                 cfg,info=load(root),inspect_state(state_path,manual or repair)
@@ -1016,16 +1006,22 @@ def sync_once(root=None,repair=False,manual=False):
         state=connect(state_path)
         try:
             drain_hooks()
-            refresh(cfg,root,True)
+            server=refresh(cfg,root,True)
+            if not repair and _settled(cfg,state,root):
+                state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))
+                state.commit()
+                return cutover
+            _progress("relocating attachments")
+            relocate_attachments(core_path(root),paths(root)[0]/"attachments")
             ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
             if repair:
                 for ws in ready: state.execute("INSERT OR REPLACE INTO meta VALUES (?,'1')",(f"replica_repair:{ws}",))
             state.commit()
-            upload(cfg,state,root,ready,True)
+            upload(cfg,state,root,ready,True,server)
             prepare_archive(cfg,state,root)
             baseline=archive_info(root)
             bound={r[0] for r in state.execute("SELECT DISTINCT workspace FROM origin_bindings").fetchall()}
-            failures={ws:value["error"] for ws,value in pull(cfg,state,root,True,True).items() if "error" in value}
+            failures={ws:value["error"] for ws,value in pull(cfg,state,root,True,True,server=server).items() if "error" in value}
             ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
             authorized={w["id"] for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
             aliases={ws:reconcile_provider_aliases(core_path(root),cfg,ws) for ws in ready&authorized if cfg["workspaces"].get(ws,{}).get("kind")=="personal"}
@@ -1100,10 +1096,13 @@ def sync_once(root=None,repair=False,manual=False):
                     reconcile_replicas(cfg,state,root,ws,bridge_replicas(root,cfg,ws,meta["kind"],key(cfg,ws,meta["epoch"]),known,lambda ids:replica_inventory(cfg,state,ws,ids) if repair else set(known),ws in {scan[0] for scan in scans}),True)
             for ws in ready&active: state.execute("DELETE FROM meta WHERE key=?",(f"replica_repair:{ws}",))
             state.commit()
-            upload(cfg,state,root,ready,True)
-            failures.update({ws:value["error"] for ws,value in pull(cfg,state,root,True,True,ready=False).items() if "error" in value})
+            server=refresh(cfg,root,True)
+            upload(cfg,state,root,ready,True,server)
+            failures.update({ws:value["error"] for ws,value in pull(cfg,state,root,True,True,ready=False,server=server).items() if "error" in value})
             if failures: raise next(iter(failures.values())) if len(authorized)==1 else (ConnectionError if all(isinstance(error,ConnectionError) for error in failures.values()) else RuntimeError)(f"Remote sync completed partially: {len(failures)} workspace error(s); workspaces were isolated and failed data was not accepted or acknowledged. "+"; ".join(f"{cfg['workspaces'].get(ws,{}).get('name',ws[:8])}: {error}" for ws,error in failures.items()))
             remember_archive(cfg,state,root)
+            marker=_sync_marker(cfg,root,archive) if (archive:=_archive_marker(root)) else None
+            state.execute("INSERT OR REPLACE INTO meta VALUES ('sync_settled',?)",(marker,)) if marker else state.execute("DELETE FROM meta WHERE key='sync_settled'")
             state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))
             state.commit()
         finally: state.close()

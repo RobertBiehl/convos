@@ -29,7 +29,7 @@ def test_incompatible_relay_database_is_rejected_instead_of_mutated(tmp_path):
 
 
 def test_paged_ledgers_seek_workspace_cursor_indexes(tmp_path):
-    db=connect(tmp_path/"server.db"); tables={"events":"event_workspace_cursor","row_replicas":"replica_workspace_cursor","blob_replicas":"blob_workspace_cursor"}
+    db=connect(tmp_path/"server.db"); tables={"events":"event_workspace_cursor","row_replicas":"replica_workspace_cursor","semantic_replicas":"semantic_workspace_cursor","blob_replicas":"blob_workspace_cursor","origin_bundles":"origin_workspace_cursor"}
     for table,index in tables.items():
         assert tuple(r[2] for r in db.execute(f"PRAGMA index_info({index})"))==("workspace","cursor")
         for direction in ("","DESC"):
@@ -44,6 +44,7 @@ def test_personal_workspace_idempotency_and_ciphertext_only(tmp_path):
     assert first["created"] and not second["created"] and first["cursor"] == second["cursor"]
     assert "server must not see this" not in (tmp_path/"server.db").read_bytes().decode(errors="ignore")
     pulled=action(db,{"op":"pull","workspace":ws,"after":0},a["token"]); assert pulled["events"][0]["envelope"]==envelope and (pulled["floor"],pulled["tail"])==(first["cursor"],first["cursor"])
+    status=action(db,{"op":"state"},a["token"]); assert status["capabilities"]["sync_tails"]==1 and status["workspaces"][0]["sync"]=={"events":first["cursor"],"replicas":0,"blobs":0,"origins":0}
     bad = copy.deepcopy(envelope); bad["ciphertext"] = bad["ciphertext"][:-1] + ("A" if bad["ciphertext"][-1] != "A" else "B")
     with pytest.raises(ValueError,match="different ciphertext"): action(db,{"op":"upload","envelope":bad},a["token"])
     same_seq = seal_event(event(a["device"],1,"message.record","m2",{"content":"different"},[],"2026-01-02T00:00:00Z"),ws,1,key)

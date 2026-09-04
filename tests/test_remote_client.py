@@ -198,9 +198,28 @@ def test_remote_scan_is_read_only_and_does_not_self_trigger(tmp_path,monkeypatch
     sync_once(root); db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT observed_at FROM provenance.repositories").fetchone()[0]==observed; db.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count
 
 def test_manual_noop_sync_does_not_force_repair_or_scan_archive_bridges(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","settled"); sync_once(root,True)
+    server=server_connect(tmp_path/"server.db"); direct,calls=transport(server),[]; monkeypatch.setattr("ai_convos_remote.request",lambda cfg,body,auth=True:calls.append(body["op"]) or direct(cfg,body,auth)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","settled"); sync_once(root,True); calls.clear()
     monkeypatch.setattr(remote_client,"scan_archive",lambda *args,**kwargs:(_ for _ in ()).throw(AssertionError("no-op archive scan"))); monkeypatch.setattr(remote_client,"edit_evidence_records",lambda *args,**kwargs:(_ for _ in ()).throw(AssertionError("no-op evidence scan")))
-    sync_once(root,manual=True); state=connect(root/"remote/state.db"); assert not state.execute("SELECT 1 FROM meta WHERE key LIKE 'replica_repair:%'").fetchone(); state.close()
+    sync_once(root,manual=True); state=connect(root/"remote/state.db"); assert calls==["state"] and not state.execute("SELECT 1 FROM meta WHERE key LIKE 'replica_repair:%'").fetchone(); state.close()
+
+def test_noop_fast_path_falls_back_for_local_remote_and_legacy_changes(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct,calls=transport(server),[]; request=lambda cfg,body,auth=True:calls.append(body["op"]) or direct(cfg,body,auth); monkeypatch.setattr(remote_client,"request",request); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None); root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","one"); sync_once(root,True)
+    calls.clear(); write_archive(root/"data/convos.db","two"); sync_once(root); assert len(calls)>1 and calls.count("state")==2
+    calls.clear(); state=connect(root/"remote/state.db"); inject(load(root),state,server,workspace(load(root),"Personal"),"workspace.membership"); state.close(); sync_once(root); assert len(calls)>1 and calls.count("state")==2
+    calls.clear(); sync_once(root,repair=True); assert len(calls)>1
+    state=connect(root/"remote/state.db"); publish(load(root),state,workspace(load(root),"Personal"),ledger_event("pending","pending"),root); state.close(); calls.clear(); sync_once(root); assert "upload_many" in calls
+    cfg=load(root); cfg.setdefault("bindings",{})["unused"]="changed"; remote_client.save(cfg,root); calls.clear(); sync_once(root); assert len(calls)>1
+    calls.clear(); real=request
+    def legacy(cfg,body,auth=True):
+        result=real(cfg,body,auth)
+        if body["op"]=="state": result["capabilities"].pop("sync_tails"); [w.pop("sync") for w in result["workspaces"]]
+        return result
+    monkeypatch.setattr(remote_client,"request",legacy); sync_once(root); assert len(calls)>1
+
+def test_noop_fast_path_tracks_external_bridge_state(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct,calls=transport(server),[]; monkeypatch.setattr(remote_client,"request",lambda cfg,body,auth=True:calls.append(body["op"]) or direct(cfg,body,auth)); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None); root=tmp_path/"client"; monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(root)); setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","settled"); sync_once(root,True)
+    memory_module.remember_data("new remote memory","global"); calls.clear(); sync_once(root); assert len(calls)>1 and server.execute("SELECT COUNT(*) FROM semantic_replicas").fetchone()[0]>0
+    calls.clear(); sync_once(root); assert calls==["state"]
 
 def test_manual_sync_cli_repairs_only_when_requested(monkeypatch):
     calls=[]; monkeypatch.setattr(remote_client,"sync_once",lambda *args,**kwargs:calls.append(kwargs))

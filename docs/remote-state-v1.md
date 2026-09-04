@@ -248,6 +248,12 @@ A ready synchronization cycle:
 7. Pull once more if upload or concurrent writers advanced the tail.
 8. Report exact convergence or a nonzero partial/blocked result.
 
+The successful cycle records an exact local settled marker. On a later run, an
+unchanged marker and equal indexed relay channel tails finish after the initial
+authenticated state request; absent capability or any uncertain comparison runs
+the complete cycle. Relay tails are only change hints and never replace signed
+control, envelope, proof, revision-chain, or projection verification.
+
 A rebaselining cycle performs only steps 1 through 3 until it becomes `READY`.
 It cannot scan or publish the existing archive.
 
