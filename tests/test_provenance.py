@@ -112,6 +112,11 @@ def test_v5_repairs_unique_conversation_binding_and_preserves_aliases(tmp_path):
 def test_v5_adds_provider_alias_ledger_without_archive_mutation(tmp_path):
     path=tmp_path/"v5.db"; db=graph(path); db.execute("DROP TABLE remote.provider_session_aliases; INSERT INTO conversations(id,source,title,metadata) VALUES ('c','codex','T','{}')"); before=archive_state(db); init_schema(db); assert archive_state(db)==before and db.execute("SELECT version FROM core_schema").fetchone()[0]==core_module.CORE_VERSION and db.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='remote' AND table_name='provider_session_aliases'").fetchone(); db.close()
 
+def test_v10_rejected_row_body_cache_is_retired_with_backup(tmp_path):
+    path=tmp_path/"v10.db"; db=graph(path); db.execute("CREATE TABLE remote.row_bodies(proof_id VARCHAR PRIMARY KEY,body JSON); INSERT INTO remote.row_bodies VALUES ('p','{\"kept\":true}'); INSERT INTO conversations(id,source,title,metadata) VALUES ('c','codex','kept','{}'); UPDATE core_schema SET version=10"); db.close()
+    db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==core_module.CORE_VERSION and not db.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='remote' AND table_name='row_bodies'").fetchone() and db.execute("SELECT title FROM conversations").fetchone()[0]=="kept"; db.close()
+    backup=duckdb.connect(str(path.with_name("v10.db.pre-v11.bak")),read_only=True); assert json.loads(backup.execute("SELECT CAST(body AS VARCHAR) FROM remote.row_bodies").fetchone()[0])=={"kept":True}; backup.close()
+
 def test_v6_backs_up_and_labels_existing_edits_once(tmp_path):
     path=tmp_path/"v5.db"; db=graph(path); db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('c','codex','{}'); INSERT INTO messages(id,conversation_id,role,metadata) VALUES ('m','c','assistant','{}'); INSERT INTO file_edits VALUES ('e','m','x.py','write','x',NULL,NULL); DELETE FROM provenance.file_edit_evidence; UPDATE core_schema SET version=5"); before=archive_state(db)[1]; db.close(); db=duckdb.connect(str(path)); init_schema(db); backup=path.with_name("v5.db.pre-v6.bak")
     assert backup.is_file() and duckdb.connect(str(backup),read_only=True).execute("SELECT version FROM core_schema").fetchone()[0]==5
