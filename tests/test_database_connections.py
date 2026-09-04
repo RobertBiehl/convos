@@ -141,7 +141,17 @@ def test_manual_sync_progress_uses_existing_operation_events(tmp_path,monkeypatc
     assert cli._sync_leader(lambda progress:progress("parsing codex 20/40")) is None
     with ai_convos_remote.sync_run(tmp_path/"remote",True): ai_convos_remote._progress("receiving rows 500/1000")
     output=capsys.readouterr().err
-    assert "Local sync: parsing codex 20/40" in output and "Remote sync: receiving rows 500/1000 [0s]" in output
+    assert "Local sync: parsing codex 20/40" in output and "Remote 0s | receiving rows 500/1000" in output and output.endswith("\n")
+
+def test_remote_progress_replaces_one_line_and_throttles_same_stage(tmp_path,monkeypatch,capsys):
+    import ai_convos_remote
+    monkeypatch.setattr(ai_convos_remote.sys.stderr,"isatty",lambda:True)
+    with ai_convos_remote.sync_run(tmp_path,True):
+        ai_convos_remote._progress("receiving rows 500/1000")
+        ai_convos_remote._progress("receiving rows 1000/1000")
+        ai_convos_remote._progress("request state")
+    output=capsys.readouterr().err
+    assert output.count("\r\033[2KRemote ")==2 and "receiving rows 1000/1000" not in output and output.endswith("\n")
 
 def test_signed_evidence_reconciliation_is_always_targeted():
     tree=ast.parse((ROOT/"src/ai_convos/cli.py").read_text()); calls=[node for node in ast.walk(tree) if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=="_apply_signed_edit_evidence"]
@@ -190,7 +200,7 @@ def test_remote_repair_inventory_releases_the_archive_between_pages(tmp_path,mon
     def progress(stage):
         with cli.open_db(path,wait=0,purpose="concurrent inventory probe"): pass
         stages.append(stage)
-    assert len(ai_convos_remote.local_replica_ids(tmp_path,{"keys":{"w:1":base64.b64encode(b"x"*32).decode()}},"w","team",{1},1,progress))==2 and stages==["p0","p1"]
+    assert len(ai_convos_remote.local_replica_ids(tmp_path,{"keys":{"w:1":base64.b64encode(b"x"*32).decode()}},"w","team",{1},1,progress))==2 and stages==["scanning local proofs 1","scanning local proofs 2"]
 
 def test_redaction_and_export_processing_run_without_archive_lock(monkeypatch):
     from ai_convos_redact import scan_data

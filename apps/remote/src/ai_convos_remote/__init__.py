@@ -1,5 +1,5 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
-import contextvars, duckdb, hashlib, itertools, json, os, shutil, sqlite3, sys, time, traceback, urllib.error, urllib.parse, urllib.request
+import contextvars, duckdb, hashlib, itertools, json, os, re, shutil, sqlite3, sys, time, traceback, urllib.error, urllib.parse, urllib.request
 from contextlib import ExitStack, closing, contextmanager
 from functools import wraps
 from pathlib import Path
@@ -7,7 +7,7 @@ from typing import Optional
 
 import typer
 from ai_convos_redact import protect_all
-_pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases",default=()),[0,0],5
+_pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases",default=()),[0,0,""],5
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_file_edit_evidence_many, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, reset_remote_projection
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
@@ -265,7 +265,7 @@ def _manual_waiting(root):
     try: return json.loads(path.read_text())
     except (OSError,ValueError): return {}
 def _progress(stage):
-    _leases.get() and sys.stderr.isatty() and (now:=time.monotonic()) and (not _PROGRESS[0] or now-_PROGRESS[0]>=1) and (typer.echo(f"  Remote sync: {stage} [{now-(started:=_PROGRESS[1] or now):.0f}s]",err=True),_PROGRESS.__setitem__(slice(None),[now,started]))
+    _leases.get() and sys.stderr.isatty() and (now:=time.monotonic()) and ((group:=re.sub(r" (?:\d+(?:/\d+)?|[0-9a-f]{64})$","",stage))!=_PROGRESS[2] or not _PROGRESS[0] or now-_PROGRESS[0]>=5) and (typer.echo(f"\r\033[2KRemote {now-(started:=_PROGRESS[1] or now):.0f}s | {stage}",err=True,nl=False),_PROGRESS.__setitem__(slice(None),[now,started,group]))
     for pulse,root in _leases.get():
         if root and (owner:=_manual_waiting(root)) is not None: raise InterruptedError(f"Background Remote sync yielded to a manual command. Holder: {lock_holder(owner)}.")
         pulse(stage)
@@ -280,7 +280,7 @@ def local_lock(root,name="mutation",blocking=True):
         lease=(pulse,None)
         token=_leases.set((*_leases.get(),lease))
         try: yield pulse
-        finally: (_leases.reset(token),_PROGRESS.__setitem__(slice(None),[0,0]))
+        finally: (_leases.reset(token),not _leases.get() and sys.stderr.isatty() and _PROGRESS[1] and typer.echo(err=True),not _leases.get() and _PROGRESS.__setitem__(slice(None),[0,0,""]))
 def mutation_lock(root): return local_lock(root,"mutation",False)
 @contextmanager
 def sync_run(root,manual=False,purpose="sync"):
@@ -293,7 +293,7 @@ def sync_run(root,manual=False,purpose="sync"):
         lease=(heartbeat,None if manual else root)
         token=_leases.set((*_leases.get(),lease))
         try: yield heartbeat
-        finally: _leases.reset(token)
+        finally: (_leases.reset(token),not _leases.get() and sys.stderr.isatty() and _PROGRESS[1] and typer.echo(err=True),not _leases.get() and _PROGRESS.__setitem__(slice(None),[0,0,""]))
 def locked(fn):
     @wraps(fn)
     def call(*args,**kwargs):
@@ -745,13 +745,13 @@ def pull_origins(cfg,state,root,ws):
             raise
     return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
 def local_replica_ids(root,cfg,workspace,kind,epochs,page=5000,progress=None):
-    found,path,after={(fingerprint(key(cfg,workspace,epoch),digest(value["proof"])),epoch) for value in bridge_records(root,cfg,workspace,kind) if value["proof"] for epoch in epochs},core_path(root),""
+    found,path,after,done={(fingerprint(key(cfg,workspace,epoch),digest(value["proof"])),epoch) for value in bridge_records(root,cfg,workspace,kind) if value["proof"] for epoch in epochs},core_path(root),"",0
     if not path.is_file(): return found
     while True:
         with closing(open_db(path,True,purpose="remote.replica.inventory")) as core: rows=core.execute("SELECT id,workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id>? ORDER BY id LIMIT ?",(after,page)).fetchall()
         if not rows: return found
         found.update((fingerprint(key(cfg,workspace,epoch),digest({"v":1,"kind":"row.proof",**dict(zip(PROOF_FIELDS,row[1:]))})),epoch) for row in rows for epoch in epochs)
-        after=(rows[-1][0],progress and progress(rows[-1][0]))[0]
+        after,done,_=rows[-1][0],done+len(rows),progress and progress(f"scanning local proofs {done+len(rows)}")
         archive_yield(path)
 def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
     sid,stamp=ws["id"],bridge_stamp(root)
