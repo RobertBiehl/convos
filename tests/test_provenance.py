@@ -92,6 +92,12 @@ def test_core_schema_upgrade_adds_canonical_schemas_without_rewriting_archive(tm
     assert db.execute("SELECT title FROM conversations WHERE id='keep'").fetchone()[0]=="preserved" and db.execute("SELECT COUNT(*) FROM provenance.repositories").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0 and archive_state(db)[0]==identity
 
 
+def test_newer_archive_schema_is_refused_before_mutation(tmp_path):
+    db=duckdb.connect(str(tmp_path/"future.db")); init_schema(db); db.execute("INSERT INTO conversations(id,source,title,metadata) VALUES ('keep','codex','preserved','{}'); UPDATE core_schema SET version=?",(core_module.CORE_VERSION+1,))
+    with pytest.raises(ValueError,match="newer than this Convos build"): init_schema(db)
+    assert db.execute("SELECT version FROM core_schema").fetchone()[0]==core_module.CORE_VERSION+1 and db.execute("SELECT title FROM conversations").fetchone()[0]=="preserved"; db.close()
+
+
 def test_existing_core_is_checkpointed_once_before_automatic_migration(tmp_path):
     path=tmp_path/"legacy.db"; db=duckdb.connect(str(path)); db.execute("CREATE TABLE conversations(id VARCHAR,title VARCHAR)"); db.execute("INSERT INTO conversations VALUES ('keep','preserved')"); db.close(); db=duckdb.connect(str(path)); init_schema(db); db.close(); backup=path.with_name("legacy.db.pre-v1.bak"); check=duckdb.connect(str(backup),read_only=True); assert check.execute("SELECT * FROM conversations").fetchall()==[("keep","preserved")]; check.close(); stamp=backup.stat().st_mtime_ns; db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==core_module.CORE_VERSION; db.close(); assert backup.stat().st_mtime_ns==stamp and backup.stat().st_mode&0o777==0o600
 

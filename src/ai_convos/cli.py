@@ -438,7 +438,7 @@ def _schema_migrate(conn,version,fn):
         with _transaction(conn): fn()
 def init_schema(conn):
     tables,current=(tables:={r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()}),(conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0] if "core_schema" in tables else 0
-    scope,_=remote_id_migration_scope(conn,remote_id) if current<2 else set(),_migration_backup(conn)
+    scope,_=remote_id_migration_scope(conn,remote_id) if required(current<=CORE_VERSION,ValueError(f"Archive schema {current} is newer than this Convos build ({CORE_VERSION}); upgrade Convos before writing.")) and current<2 else set(),_migration_backup(conn)
     current==1 and scope and ("core_migrations" not in tables or not conn.execute("SELECT 1 FROM core_migrations WHERE name='remote_ids'").fetchone()) and _migration_backup(conn,2)
     v3_backup=_migration_backup(conn,3) if current==2 else None
     if current==2 and (foreign:=[r[0] for r in conn.execute("SELECT x.file_edit_id FROM (SELECT file_edit_id FROM provenance.file_edit_files GROUP BY file_edit_id HAVING count(*)>1) x LEFT JOIN provenance.local_facts l ON (l.kind,l.entity)=('edit.observed',x.file_edit_id) WHERE l.entity IS NULL OR EXISTS (SELECT 1 FROM remote.provenance_origins o WHERE (o.kind,o.physical_entity)=('edit.observed',x.file_edit_id))").fetchall()]): raise ValueError(f"v3 migration refused to rewrite ambiguous foreign signed edit {foreign[0]}; archive preserved and backed up at {v3_backup}")
