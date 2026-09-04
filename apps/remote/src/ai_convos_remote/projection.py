@@ -1,5 +1,5 @@
 """Portable record/event projection. The immutable relay ledger can rebuild every local view."""
-import contextlib, hashlib, json, os, shutil, sqlite3, time
+import contextlib, duckdb, hashlib, json, os, shutil, sqlite3, time
 from datetime import date, datetime
 from functools import lru_cache
 from importlib.metadata import entry_points
@@ -578,6 +578,7 @@ def reconcile_provider_aliases(db_path,cfg,workspace):
                 project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native),proof,pid in zip(rows,proofs,ids)])
                 project_provider_bindings(db,source,session,member_physical[canonical],list(member_physical.values()))
             result["changed"]+=1
+        except duckdb.InterruptException: raise
         except Exception as e: result["blocked"][object_id]=str(e)
     return result
 def blob_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,retained=True):

@@ -1,14 +1,13 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
-import hashlib, itertools, json, os, shutil, sqlite3, sys, time, traceback, urllib.error, urllib.parse, urllib.request
+import contextvars, duckdb, hashlib, itertools, json, os, shutil, sqlite3, sys, time, traceback, urllib.error, urllib.parse, urllib.request
 from contextlib import ExitStack, closing, contextmanager
-from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
 from typing import Optional
 
 import typer
 from ai_convos_redact import protect_all
-_pending,_leases,_PROGRESS,MANUAL_WAIT=[],ContextVar("remote_leases",default=()),[0,0],5
+_pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases",default=()),[0,0],5
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_file_edit_evidence_many, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, reset_remote_projection
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
@@ -936,7 +935,7 @@ def pull(cfg,state,root=None,concurrent=False,keep_going=False,fresh=False,ready
             state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'blocked',COALESCE((SELECT tail FROM sync_states WHERE workspace=?),0),COALESCE((SELECT floor FROM sync_states WHERE workspace=?),0),?)",(sid,sid,sid,str(e)))
             state.commit()
             summary[sid]={"error":e}
-            if isinstance(e,InterruptedError) or not keep_going: raise
+            if isinstance(e,(InterruptedError,duckdb.InterruptException)) or not keep_going: raise
     return summary
 def reset_repull_state(state,workspaces):
     for ws in workspaces:
@@ -1328,7 +1327,7 @@ def config_cmd(space:str,auto_contribute:Optional[bool]=typer.Option(None,"--aut
 def sync_cmd():
     try: result=sync_once(force=True)
     except ConnectionError as e: cli_error(f"{e}. Local sync progress was preserved; retry `convos remote sync`.")
-    except (ValueError,RuntimeError) as e: cli_error(e)
+    except (ValueError,RuntimeError,duckdb.InterruptException) as e: cli_error(e)
     typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else ""))
 @remote.command("repull")
 def repull_cmd():
@@ -1344,6 +1343,7 @@ def watch(interval:int=typer.Option(2,"--interval")):
     failures=0
     while True:
         try: sync_once()
+        except duckdb.InterruptException: raise KeyboardInterrupt from None
         except Exception as e:
             failures+=1
             delay=min(300,interval*2**min(failures-1,9))

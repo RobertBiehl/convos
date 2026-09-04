@@ -347,6 +347,20 @@ def test_pull_can_block_bad_workspace_and_continue_healthy_workspaces(tmp_path,m
     assert set(attempted)=={personal,team} and str(summary[personal]["error"])=="row replica proof mismatch" and "error" not in summary[team]
     assert dict(state.execute("SELECT workspace,lifecycle FROM sync_states").fetchall())=={personal:"blocked",team:"ready"} and state.execute("SELECT error FROM sync_states WHERE workspace=?",(personal,)).fetchone()[0]=="row replica proof mismatch"; state.close()
 
+def test_pull_never_treats_query_cancellation_as_a_workspace_failure(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); create(cfg,"Team","team",root); attempted=[]
+    monkeypatch.setattr(remote_client,"pull_origins",lambda *args:set()); monkeypatch.setattr(remote_client,"pull_blobs",lambda *args:0)
+    def cancelled(cfg,state,root,ws,*args): attempted.append(ws["id"]); raise duckdb.InterruptException("Interrupted")
+    monkeypatch.setattr(remote_client,"pull_row_replicas",cancelled); state=connect(root/"remote/state.db")
+    with pytest.raises(duckdb.InterruptException): pull(cfg,state,root,keep_going=True)
+    assert len(attempted)==1; state.close()
+
+def test_duckdb_query_cancellation_stops_manual_and_watched_sync(monkeypatch,capsys):
+    monkeypatch.setattr(remote_client,"sync_once",lambda *args,**kwargs:(_ for _ in ()).throw(duckdb.InterruptException("Interrupted")))
+    with pytest.raises(remote_client.typer.Exit): remote_client.sync_cmd()
+    assert capsys.readouterr().err=="Error: Interrupted\n"
+    with pytest.raises(KeyboardInterrupt): remote_client.watch()
+
 def test_sync_reports_partial_failure_after_finishing_healthy_workspace(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); team=create(cfg,"Team","team",root); personal=workspace(cfg,"Personal"); monkeypatch.setattr(remote_client,"pull_origins",lambda *args:set()); monkeypatch.setattr(remote_client,"pull_blobs",lambda *args:0)
     def replicas(cfg,state,root,ws,*args):
