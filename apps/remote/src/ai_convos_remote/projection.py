@@ -140,7 +140,7 @@ def connect(path):
     return db
 @lru_cache(maxsize=1)
 def bridges():
-    if (result:=[entry.load()() for entry in entry_points(group="convos.remote")]) and any(not {"v","schema","objects","records","accept"}<=set(b)<={"v","schema","objects","records","accept","accept_many"} or b["v"]!=3 or isinstance(b["v"],bool) or not isinstance(b["schema"],int) or isinstance(b["schema"],bool) or b["schema"]<1 or any(not callable(b[k]) for k in ("records","accept")+(("accept_many",) if "accept_many" in b else ())) or not isinstance(b["objects"],set) or not b["objects"] or any(not isinstance(v,str) or not v for v in b["objects"]) for b in result) or len([v for b in result for v in b["objects"]])!=len({v for b in result for v in b["objects"]}): raise ValueError("Unsupported remote bridge")
+    if (result:=[entry.load()() for entry in entry_points(group="convos.remote")]) and any(not {"v","schema","objects","records","accept"}<=set(b)<={"v","schema","objects","records","accept","accept_many","source"} or b["v"]!=3 or isinstance(b["v"],bool) or not isinstance(b["schema"],int) or isinstance(b["schema"],bool) or b["schema"]<1 or b.get("source") not in (None,"archive") or any(not callable(b[k]) for k in ("records","accept")+(("accept_many",) if "accept_many" in b else ())) or not isinstance(b["objects"],set) or not b["objects"] or any(not isinstance(v,str) or not v for v in b["objects"]) for b in result) or len([v for b in result for v in b["objects"]])!=len({v for b in result for v in b["objects"]}): raise ValueError("Unsupported remote bridge")
     return result
 def control_chain(controls):
     ordered,previous=sorted(controls,key=lambda c:c["revision"]),None
@@ -194,7 +194,7 @@ def audit_rows(db_path,page=5000,progress=None):
 def event_support(value):
     if not isinstance(kind:=value["kind"],str) or not isinstance(version:=value["payload_v"],int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
     return "supported" if (kind,version) in CORE_EVENTS else "required"
-def bridge_records(root,cfg,workspace,kind): return [record for bridge in bridges() for record in bridge["records"](root,cfg["user"],workspace,kind)]
+def bridge_records(root,cfg,workspace,kind,archive=True): return [record for bridge in bridges() if archive or bridge.get("source")!="archive" for record in bridge["records"](root,cfg["user"],workspace,kind)]
 def bridge_stamp(root): return digest({kind:(bridge["v"],bridge["schema"]) for bridge in bridges() for kind in bridge["objects"]})
 def bridge_accept(root,row,proof,project=True): return bool((found:=[bridge for bridge in bridges() if row["kind"] in bridge["objects"]]) and found[0]["accept"](root,row,proof,project))
 def bridge_accept_many(root,values,project=True):
@@ -202,8 +202,8 @@ def bridge_accept_many(root,values,project=True):
     batches=[(selected,bridge["accept_many"](root,[value for _,value in selected],project) if "accept_many" in bridge else [bridge["accept"](root,*value,project) for _,value in selected]) for bridge,selected in groups]
     mapped=(required(all(len(selected)==len(answers) for selected,answers in batches),ValueError("Remote bridge batch result mismatch")),{i:bool(answer) for selected,answers in batches for (i,_),answer in zip(selected,answers)})[-1]
     return [mapped.get(i,False) for i in range(len(values))]
-def bridge_replicas(root,cfg,workspace,kind,key_,known=(),inventory=None):
-    values=bridge_records(root,cfg,workspace,kind)
+def bridge_replicas(root,cfg,workspace,kind,key_,known=(),inventory=None,archive=True):
+    values=bridge_records(root,cfg,workspace,kind,archive)
     fresh=[(value["row"],value["proof"]) for value in values if value["proof"] is None and not value.__setitem__("proof",semantic_proof(cfg["root"],cfg["user"],cfg["device"]["id"],workspace,cfg["workspaces"][workspace]["epoch"],value["row"],value["previous"]))]
     bridge_accept_many(root,fresh,False)
     values=[(value,fingerprint(key_,digest(value["proof"]))) for value in values if value["proof"]]
@@ -355,29 +355,27 @@ def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,worksp
         if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits: keep.append(r)
     return keep
 def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspace=None,new_scope=None,match=("cwd","edit"),user=None,generation=None,progress=None,page=5000,since=None):
-    query,args=(" UNION ALL ".join([*(f"SELECT '{table}' kind,id entity FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='{table}' AND o.physical_row_id=x.id)" for table in TABLES.values()),"SELECT kind,entity FROM provenance.local_facts"]),()) if since is None else ("SELECT kind,entity FROM archive_changes WHERE generation>?",(since,))
+    required(generation is not None,ValueError("archive scan requires a generation watermark"))
+    query,args=(" UNION ALL ".join([*(f"SELECT '{table}' kind,id entity FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='{table}' AND o.physical_row_id=x.id) AND NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=('{table}',x.id) AND c.generation>?)" for table in TABLES.values()),"SELECT kind,entity FROM provenance.local_facts x WHERE NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=(x.kind,x.entity) AND c.generation>?)"]),(generation,)*(len(TABLES)+1)) if since is None else ("SELECT kind,entity FROM archive_changes WHERE generation>? AND generation<=?",(since,generation))
     out,after,done=[],("",""),0
     while True:
         with contextlib.closing(open_db(db_path,True,purpose="remote.scan.page")) as core:
-            required(generation is None or core.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote scan; retry"))
             changes=core.execute(f"SELECT kind,entity FROM ({query}) WHERE kind>? OR kind=? AND entity>? ORDER BY kind,entity LIMIT ?",(*args,after[0],after[0],after[1],page)).fetchall()
             batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,new_scope,match,user) if changes else []
         out+=batch
         if not changes: return out
         after,done,_=changes[-1],done+len(changes),(progress and progress(f"scanning archive {done+len(changes)}"),archive_yield(db_path))
-def _store_proofs(db_path,proofs,signer,controls,generation):
+def _store_proofs(db_path,proofs,signer,controls):
     with contextlib.closing(open_db(db_path,purpose="remote.attest.write")) as db,_transaction(db):
-        required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
         project_workspace_controls(db,controls)
         project_row_proofs(db,proofs,signer["root_public"],signer["certificate"])
     archive_yield(db_path)
-def attest_rows(db_path,cfg,workspace,records,origins=(),generation=None):
+def attest_rows(db_path,cfg,workspace,records,origins=()):
     controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace)
     device=cfg["device"]
     signer=cfg["controls"][workspace]["devices"][device["id"]]
     wanted={value for r in records if r["kind"] in TABLES and r["payload"].get("state")!="deleted" for column,value in zip(r["payload"]["columns"],r["payload"]["row"]) if value is not None and (column=="id" or column in dict(FKS.get(r["payload"]["table"],())))}
-    with contextlib.closing(open_db(db_path,True,purpose="remote.attest.plan")) as db: actual,aliases=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],{(table,physical):source for table,physical,source in db.execute("SELECT table_name,physical_row_id,source_row_id FROM remote.row_origins WHERE author_user_id=? AND physical_row_id IN (SELECT UNNEST(?))",(cfg["user"],list(wanted))).fetchall()}
-    if generation is not None: required(actual==generation,RuntimeError("Archive changed during Remote publication; retry"))
+    with contextlib.closing(open_db(db_path,True,purpose="remote.attest.plan")) as db: aliases={(table,physical):source for table,physical,source in db.execute("SELECT table_name,physical_row_id,source_row_id FROM remote.row_origins WHERE author_user_id=? AND physical_row_id IN (SELECT UNNEST(?))",(cfg["user"],list(wanted))).fetchall()}
     selected=[_logical_record(r,aliases) for r in records if r["kind"] in SIGNED]
     rows=[signed_row(r) if r["kind"] in TABLES else logical_fact(r) for r in selected]
     scopes,ids=(workspace,*origins),[r["id"] for r in rows]
@@ -390,21 +388,20 @@ def attest_rows(db_path,cfg,workspace,records,origins=(),generation=None):
         if any(h[2]==current for h in prior): continue
         if len(prior)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
         proofs.append(row_proof(device,cfg["user"],prior[0][0] if prior else workspace,cfg["workspaces"][workspace]["epoch"],row,prior[0][1] if prior else None,workspace,current))
-    [_store_proofs(db_path,proofs[i:i+500],signer,controls,actual) for i in range(0,len(proofs),500)]
+    [_store_proofs(db_path,proofs[i:i+500],signer,controls) for i in range(0,len(proofs),500)]
     return len(proofs)
-def retained_proof_pages(db_path,workspace,origins=(),author=None,generation=None,page=5000):
+def retained_proof_pages(db_path,workspace,origins=(),author=None,page=5000):
     scopes,after,marks=(scopes:=(workspace,*origins)),"",','.join('?'*len(scopes))
     sql=f"SELECT id FROM (SELECT p.id FROM remote.row_proofs p WHERE p.workspace_id IN ({marks}) AND p.author_user_id=? AND p.state='deleted' AND p.row_kind IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision) UNION SELECT p.id FROM remote.row_origins o JOIN remote.row_proofs q ON q.id=o.proof_id JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.content_hash)=(o.table_name,o.source_row_id,o.author_user_id,q.content_hash) WHERE p.workspace_id IN ({marks}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision) UNION SELECT p.id FROM remote.provenance_origins o JOIN remote.row_proofs q ON q.id=o.proof_id JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.content_hash)=(o.kind,o.source_entity,o.author_user_id,q.content_hash) WHERE p.workspace_id IN ({marks}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision) UNION SELECT p.id FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks})) retained WHERE id>? ORDER BY id LIMIT ?"
     while True:
-        with contextlib.closing(open_db(db_path,True,purpose="remote.replicas.page")) as db: rows=(required(generation is None or db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry")),db.execute(sql,(*scopes,author,list(TABLES.values()),*scopes,*scopes,*scopes,after,page)).fetchall())[1]
+        with contextlib.closing(open_db(db_path,True,purpose="remote.replicas.page")) as db: rows=db.execute(sql,(*scopes,author,list(TABLES.values()),*scopes,*scopes,*scopes,after,page)).fetchall()
         if not rows: return
         yield (after:=rows[-1][0]) and {r[0] for r in rows}
         archive_yield(db_path)
-def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,inventory=None,retained=True,generation=None,blocked=None):
-    if retained is True: return list({(env["replica"],env["epoch"]):env for env in [*row_replicas(db_path,cfg,workspace,records,keys,known,origins,origin_epochs,inventory,False,generation,blocked),*(env for page in retained_proof_pages(db_path,workspace,origins,cfg["user"],generation) for env in row_replicas(db_path,cfg,workspace,[],keys,known,origins,origin_epochs,inventory,page,generation,blocked))]}.values())
+def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,inventory=None,retained=True,blocked=None):
+    if retained is True: return list({(env["replica"],env["epoch"]):env for env in [*row_replicas(db_path,cfg,workspace,records,keys,known,origins,origin_epochs,inventory,False,blocked),*(env for page in retained_proof_pages(db_path,workspace,origins,cfg["user"]) for env in row_replicas(db_path,cfg,workspace,[],keys,known,origins,origin_epochs,inventory,page,blocked))]}.values())
     fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
     db=open_db(db_path,True,purpose="remote.replicas.read")
-    if generation is not None: required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote publication; retry"))
     records,bodies,only,only_sql=logical_records(db,records,cfg["user"]),{},list(retained) if retained else []," AND p.id IN (SELECT UNNEST(?))" if retained else ""
     proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(fields,values))}
     keep=lambda row,p,content_hash=None:bodies.setdefault(digest(p),(row,p,content_hash))

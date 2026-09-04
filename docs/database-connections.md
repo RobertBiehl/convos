@@ -39,8 +39,10 @@ a crashed waiter is distinguishable from a live one and its stale notice can be 
 2. A connection scope contains database work and materialization only. Network requests,
    model inference, Git commands, signing/encryption, attachment hashing/copying, secret
    inspection, and output-file writing happen before acquisition or after close.
-3. Ordinary writes are bounded transactions. Work prepared without a lock is committed
-   only after revalidating the archive generation or the exact rows on which it depended.
+3. Ordinary canonical writes are bounded transactions and revalidate the archive generation
+   or exact rows on which unlocked preparation depended. Remote publication may instead persist
+   an immutable signed revision already captured at watermark `G`; it records only `G`, so later
+   archive changes remain pending for the next idempotent sync.
 4. Read snapshots are materialized and closed before expensive Python processing. A read
    lock is not harmless: DuckDB cannot admit a writer from another process while it is open.
 5. DuckDB's native cross-process lock is authoritative. After a real native conflict, Convos

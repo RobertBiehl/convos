@@ -170,14 +170,14 @@ def test_remote_signing_and_attachment_io_run_without_archive_lock(tmp_path,monk
     monkeypatch.setattr(projection,"row_proof",proof)
     record=dict(kind="conversation.record",entity="conversations:c",payload=dict(table="conversations",columns=cli.ARCHIVE_COLUMNS["conversations"],row=["c","codex",None,None,None,None,None,None,None,"{}"]))
     assert projection.attest_rows(path,cfg,"w",[record])==1
-    db=cli.open_db(path,purpose="fixture"); db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('d','codex','{}')"); generation=cli.archive_state(db)[1]; cli._archive_touch(db,[("conversations","d")]); generation=cli.archive_state(db)[1]; db.close(); changed=False
+    db=cli.open_db(path,purpose="fixture"); db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('d','codex','{}')"); cli._archive_touch(db,[("conversations","d")]); db.close(); changed=False
     def changing_proof(*args,**kwargs):
         nonlocal changed
         if not changed:
             writer=cli.open_db(path,wait=0,purpose="concurrent archive change"); writer.execute("UPDATE conversations SET title='changed' WHERE id='d'"); cli._archive_touch(writer,[("conversations","d")]); writer.close(); changed=True
         return real_proof(*args,**kwargs)
     monkeypatch.setattr(projection,"row_proof",changing_proof); other={**record,"entity":"conversations:d","payload":{**record["payload"],"row":["d","codex",None,None,None,None,None,None,None,"{}"]}}
-    with pytest.raises(RuntimeError,match="Archive changed"): projection.attest_rows(path,cfg,"w",[other],generation=generation)
+    assert projection.attest_rows(path,cfg,"w",[other])==1 and changed
     legacy=tmp_path/"legacy"; legacy.mkdir(); body=legacy/"body"; body.write_bytes(b"content"); db=cli.open_db(path,purpose="fixture"); db.execute("INSERT INTO attachments VALUES ('a','m','body',NULL,7,?,NULL,NULL)",[str(body)]); db.close(); real_hash=projection.file_hash
     def hashed(value):
         cli.open_db(path,wait=0,purpose="concurrent attachment probe").close()
@@ -193,6 +193,15 @@ def test_remote_full_scan_releases_the_archive_between_bounded_pages(tmp_path):
         stages.append(stage)
     records=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); state.close()
     assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages==["scanning archive 1","scanning archive 2","scanning archive 3"]
+
+def test_remote_scan_defers_changes_after_its_watermark(tmp_path):
+    from ai_convos_remote import projection
+    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[("c",),("d",)]); cli._archive_touch(db,[("conversations","c"),("conversations","d")]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); changed=[]
+    def progress(stage):
+        if not changed:
+            with cli.open_db(path,purpose="concurrent archive change") as db: db.execute("UPDATE conversations SET title='later' WHERE id='d'"); cli._archive_touch(db,[("conversations","d")]); changed.append(cli.archive_state(db)[1])
+    first=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); second=projection.scan_archive(path,state,generation=changed[0],page=1,since=generation); state.close()
+    assert [r["payload"]["row"][0] for r in first]==["c"] and [(r["payload"]["row"][0],r["payload"]["row"][2]) for r in second]==[("d","later")]
 
 def test_remote_repair_inventory_releases_the_archive_between_pages(tmp_path,monkeypatch):
     import base64, ai_convos_remote

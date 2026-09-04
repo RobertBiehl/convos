@@ -335,7 +335,8 @@ convos remote doctor
 convos remote audit                 # verify signed proofs against typed projections
 convos remote repull                # replace received rows from the relay
 convos remote fetch                 # materialize deferred large events
-convos remote sync                  # explicit repair/backfill only
+convos remote sync                  # run one foreground incremental sync
+convos remote sync --repair         # verify and restore the full retained replica set
 ```
 
 The worker writes errors to `<root>/remote/last_error` (by default,
