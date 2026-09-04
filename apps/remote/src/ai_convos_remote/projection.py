@@ -198,6 +198,7 @@ def event_support(value):
     return "supported" if (kind,version) in CORE_EVENTS else "required"
 def bridge_records(root,cfg,workspace,kind,archive=True): return [record for bridge in bridges() if archive or bridge.get("source")!="archive" for record in bridge["records"](root,cfg["user"],workspace,kind)]
 def bridge_stamp(root): return digest({kind:(bridge["v"],bridge["schema"]) for bridge in bridges() for kind in bridge["objects"]})
+def bridge_state(root,cfg,workspace,kind,generation): return digest((generation,bridge_stamp(root),bridge_records(root,cfg,workspace,kind,False)))
 def bridge_accept(root,row,proof,project=True): return bool((found:=[bridge for bridge in bridges() if row["kind"] in bridge["objects"]]) and found[0]["accept"](root,row,proof,project))
 def bridge_accept_many(root,values,project=True):
     groups=[(bridge,selected) for bridge in bridges() if (selected:=[(i,value) for i,value in enumerate(values) if value[0]["kind"] in bridge["objects"]])]

@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS replica_usage(workspace TEXT,uploader TEXT,bytes INT 
 CREATE TABLE IF NOT EXISTS blob_replicas(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,blob TEXT,epoch INT,uploader TEXT,size INT,nonce TEXT,ciphertext BLOB,created REAL,updated REAL,UNIQUE(workspace,blob,epoch,uploader));
 CREATE INDEX IF NOT EXISTS blob_workspace_cursor ON blob_replicas(workspace,cursor);
 CREATE TABLE IF NOT EXISTS origin_bundles(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,origin TEXT,epoch INT,uploader TEXT,envelope TEXT,wire_hash TEXT,created REAL,updated REAL,UNIQUE(workspace,origin,epoch,uploader));
+CREATE INDEX IF NOT EXISTS origin_workspace_cursor ON origin_bundles(workspace,cursor);
 CREATE TABLE IF NOT EXISTS workspace_controls(workspace TEXT,revision INT,state_hash TEXT UNIQUE,state TEXT,PRIMARY KEY(workspace,revision));
 CREATE TABLE IF NOT EXISTS device_proposals(id TEXT PRIMARY KEY,workspace TEXT,base TEXT,target_user TEXT,target_device TEXT,proposal TEXT,not_before REAL,expires REAL,active INT);
 CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_device TEXT,approve INT,vote TEXT,PRIMARY KEY(proposal,voter_user));
@@ -90,6 +91,10 @@ def certify(db,actor,req):
     return {"certified":body["device"]["id"]}
 def rows(db, sql, args=()): return [dict(r) for r in db.execute(sql, args).fetchall()]
 def cursor_bounds(db,table,access,args): return tuple((db.execute(f"SELECT cursor FROM {table} WHERE {access} ORDER BY cursor {direction} LIMIT 1",args).fetchone() or [0])[0] for direction in ("","DESC"))
+def sync_tails(db,workspace,history,device):
+    args,access=(workspace,history,device),"x.workspace=? AND x.epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?)"
+    tail=lambda table:(db.execute(f"SELECT cursor FROM {table} x WHERE {access} ORDER BY cursor DESC LIMIT 1",args).fetchone() or [0])[0]
+    return {"events":tail("events"),"replicas":max(tail("row_replicas"),tail("semantic_replicas")),"blobs":tail("blob_replicas"),"origins":tail("origin_bundles")}
 def verify_signed(value,sign_public):
     signature=unb64(value["signature"])
     body={k:v for k,v in value.items() if k!="signature"}
@@ -439,8 +444,9 @@ def action(db, req, token=None):
             w["devices"]=rows(db,"SELECT DISTINCT d.id,d.user_id,d.name,d.sign_public,d.box_public,d.active,c.certificate,u.root_public,NOT EXISTS(SELECT 1 FROM workspace_device_exclusions x WHERE x.workspace=? AND x.device=d.id) allowed,EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=? AND k.epoch=? AND k.device=d.id) authorized FROM devices d JOIN users u ON u.id=d.user_id LEFT JOIN device_certificates c ON c.device=d.id JOIN members m ON d.user_id=m.user_id WHERE m.workspace=?",(w["id"],w["id"],w["epoch"],w["id"]))
             w["members"]=rows(db,"SELECT user_id,role,active,joined_epoch,history_from FROM members WHERE workspace=?",(w["id"],))
             w["device_authorized"]=bool(db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(w["id"],w["epoch"],actor["id"])).fetchone()) and not bool(db.execute("SELECT 1 FROM workspace_device_exclusions WHERE workspace=? AND device=?",(w["id"],actor["id"])).fetchone())
+            w["sync"]=sync_tails(db,w["id"],w["history_from"],actor["id"]) if w["device_authorized"] else None
             w["controls"]=[json.loads(r[0]) for r in db.execute("SELECT state FROM workspace_controls WHERE workspace=? ORDER BY revision",(w["id"],)).fetchall()]
-        return {"user":actor["user_id"],"device":actor["id"],"workspaces":memberships,"capabilities":{"replica_reconcile_limit":2500,"replica_pull_limit":2500}}
+        return {"user":actor["user_id"],"device":actor["id"],"workspaces":memberships,"capabilities":{"replica_reconcile_limit":2500,"replica_pull_limit":2500,"sync_tails":1}}
     if op == "ledger":
         member(db,req["workspace"],actor["user_id"])
         return ledger_state(db,req["workspace"])

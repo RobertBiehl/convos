@@ -339,6 +339,11 @@ convos remote sync                  # run one foreground incremental sync
 convos remote sync --repair         # verify and restore the full retained replica set
 ```
 
+After one full successful cycle, an unchanged client completes ordinary sync with
+one authenticated `state` request. The response carries indexed per-workspace
+channel tails; any changed tail, local archive generation, bridge state, policy,
+pending work, or uncertainty falls back to the complete idempotent cycle.
+
 The worker writes errors to `<root>/remote/last_error` (by default,
 `~/.convos/remote/last_error`). Queries never wait for the server. `doctor`
 reports connectivity, identity, workspaces, epochs, upload-blocked rows, pending
