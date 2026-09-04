@@ -451,7 +451,7 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
         candidates=[(row,p,content_hash,epoch,fingerprint(keys[epoch],digest(p))) for row,p,content_hash in bodies.values() for epoch in [delivery(p)] if epoch in keys]
         db.close()
         archive_yield(db_path)
-        known=set(inventory([(r[4],r[3]) for r in candidates])) if inventory else set(known)
+        known=set(inventory([(r[4],r[3]) for r in candidates])) if inventory else known if isinstance(known,set) else set(known)
         candidates=[r for r in candidates if r[4] not in known]
         if not candidates: return []
         heads={(p["workspace"],p["row_kind"],p["row_id"],p["author_user_id"]):p for row,p,content_hash,epoch,replica in candidates if p["kind"]=="row.proof"}
