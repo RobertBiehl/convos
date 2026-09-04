@@ -1215,18 +1215,18 @@ def backup():
     typer.echo(f"Archive backed up to {path} with attachments at {path}.attachments")
 
 def _sync_leader(fn):
-    with operation_lock(DATA_DIR/".sync.lock","sync",wait=0) as pulse: return fn(pulse)
+    with operation_lock(DATA_DIR/".sync.lock","sync",wait=0) as pulse: return fn(lambda stage:(pulse(stage),sys.stderr.isatty() and (now:=time.monotonic())-getattr(pulse,"shown",0)>=1 and (setattr(pulse,"shown",now),typer.echo(f"  Local sync: {stage}",err=True)))[0])
 
 def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch all sources and reconcile all provenance"), verbose: bool = typer.Option(False, "-v", "--verbose"), local_only: bool = typer.Option(False, "--local-only", help="Import local agent sessions and configured exports without contacting web sources.")):
     if sys.argv[1:2] == ["sync"]: signal.signal(signal.SIGINT, signal.SIG_DFL)
     state,local,web,imports,chatgpt_ok,chatgpt_frontiers,offline,ready={},{},{},{},{},{},local_only is True,False
     def set_state(section,key,val): state.setdefault(section,{})[key]=val
-    def plan_local(name, path, parser, bindings, sink):
+    def plan_local(name, path, parser, bindings, sink, progress):
         if not path.exists(): return None
         if name in ("codex", "claude-code"):
             prev,mt=local.get(name,{}).get("files",{}),{str(p):m for p in path.rglob("*.jsonl") if (m:=stat_mtime(p)) is not None}
             if not (chg:=list(map(Path,mt)) if full or local.get(name,{}).get("parser")!=PARSER_EPOCH else [Path(p) for p,m in mt.items() if m>prev.get(p,0)]): return None
-            saved,run=[],lambda p=path,fs=chg:saved.extend(sink(parser(p,fs[i:i+20],bindings)) for i in range(0,len(fs),20)) or ParseResult()
+            saved,run=[],lambda p=path,fs=chg:saved.extend((value:=sink(parser(p,fs[i:i+20],bindings)),progress(f"parsing {name} {min(i+20,len(fs))}/{len(fs)}"),value)[-1] for i in range(0,len(fs),20)) or ParseResult()
             return dict(name=name,label=name.replace("-"," ").title(),source=name,func=run,saved=saved,state=("local",name,{"parser":PARSER_EPOCH,"files":mt}))
         mtime = latest_mtime(path)
         return None if not full and mtime<=local.get(name,{}).get("mtime",0) else dict(name=name,label=name.replace("-"," ").title(),source=name,func=lambda p=path:parser(p),state=("local",name,{"mtime":mtime}))
@@ -1288,7 +1288,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
             jobs+=start("imports") or [j for p in paths if (j:=plan_import(p))]
         for name,label,enabled,p,parser in (("claude-code","Claude Code",claude_code,Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))/"projects",parse_claude_code),("codex","Codex",codex,Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),parse_codex)):
-            if enabled and p.exists(): start(label,name) or schedule(plan_local(name,p,parser,bindings,checkpoint))
+            if enabled and p.exists(): start(label,name) or schedule(plan_local(name,p,parser,bindings,checkpoint,pulse))
         if not offline:
             start("ChatGPT"+(f", provider order={len(candidates)-len(repair_order)} attempted/{len(candidates)} unresolved" if candidates else ""),"chatgpt")
             schedule(plan_web("chatgpt",fetch_chatgpt,probe_chatgpt,{} if full else known,checkpoint,legacy,not repair_order))

@@ -1,5 +1,5 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
-import hashlib, itertools, json, os, shutil, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
+import hashlib, itertools, json, os, shutil, sqlite3, sys, time, traceback, urllib.error, urllib.parse, urllib.request
 from contextlib import ExitStack, closing, contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -8,7 +8,7 @@ from typing import Optional
 
 import typer
 from ai_convos_redact import protect_all
-_pending,_leases,MANUAL_WAIT=[],ContextVar("remote_leases",default=()),5
+_pending,_leases,_PROGRESS,MANUAL_WAIT=[],ContextVar("remote_leases",default=()),[0,0],5
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_file_edit_evidence_many, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, reset_remote_projection
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
@@ -87,7 +87,7 @@ def _edit_record(value,evidence,origins,tools,leaves,user):
     if tool and not tool_revision: return None
     return (lambda row,matching:None if len(matching)==1 and matching[0]["row"]==row else dict(row=row,proof=None,previous=[v["proof"] for v in matching] if len(matching)>1 else matching[0]["proof"] if matching else None))(row:={"v":1,"kind":"file-edit.evidence","id":edit_evidence_id(edit),"state":"active","data":{"edit":edit,"edit_revision":edit_revision,"status":status,"reason":reason,"tool_call":tool,"tool_revision":tool_revision}},leaves.get((user,row["id"]),[]))
 def edit_evidence_records(root,user,workspace,kind):
-    if not core_path(root).is_file(): return []
+    if (_progress("scanning edit evidence"),not core_path(root).is_file())[1]: return []
     stored,ancestors=[_edit_evidence_value(r[3:]) for rows in _edit_pages(root,"SELECT author_user_id,object_id,revision,workspace_id,author_user_id,object_id,revision,source_edit_id,edit_revision,status,reason,source_tool_call_id,tool_revision,CAST(proof AS VARCHAR) FROM remote.file_edit_evidence_proofs WHERE workspace_id=? AND (author_user_id,object_id,revision)>(?,?,?) ORDER BY author_user_id,object_id,revision LIMIT ?",(workspace,),("","","")) for r in rows],{r[4:] for rows in _edit_pages(root,"SELECT author_user_id,object_id,child_revision,ancestor_revision,workspace_id,author_user_id,object_id,ancestor_revision FROM remote.semantic_ancestors WHERE object_kind='file-edit.evidence' AND workspace_id=? AND (author_user_id,object_id,child_revision,ancestor_revision)>(?,?,?,?) ORDER BY author_user_id,object_id,child_revision,ancestor_revision LIMIT ?",(workspace,),("","","","")) for r in rows}
     leaves,groups=(leaves:=[value for value in stored if (value["workspace"],value["author"],value["row"]["id"],value["proof"]["revision"]) not in ancestors]),{(group[0]["author"],group[0]["row"]["id"]):group for _,values in itertools.groupby(leaves,key=lambda v:(v["author"],v["row"]["id"])) if (group:=list(values))}
     proofs,superseded,candidates,records=(proofs:=[r[1:] for rows in _edit_pages(root,"SELECT p.id,p.source_row_id,p.revision,p.previous_revision,p.state,COALESCE(o.physical_row_id,p.source_row_id) FROM remote.row_proofs p LEFT JOIN remote.row_origins o ON o.proof_id=p.id WHERE p.workspace_id=? AND p.author_user_id=? AND p.row_kind='file_edits' AND p.id>? ORDER BY p.id LIMIT ?",(workspace,user),("",)) for r in rows]),(superseded:={r[2] for r in proofs if r[2]}),[(edit,revision,physical) for edit,revision,previous,state,physical in proofs if state=="active" and revision not in superseded],[{k:v[k] for k in ("row","proof","previous")} for v in leaves]
@@ -266,6 +266,7 @@ def _manual_waiting(root):
     try: return json.loads(path.read_text())
     except (OSError,ValueError): return {}
 def _progress(stage):
+    _leases.get() and sys.stderr.isatty() and (now:=time.monotonic()) and (not _PROGRESS[0] or now-_PROGRESS[0]>=1) and (typer.echo(f"  Remote sync: {stage} [{now-(started:=_PROGRESS[1] or now):.0f}s]",err=True),_PROGRESS.__setitem__(slice(None),[now,started]))
     for pulse,root in _leases.get():
         if root and (owner:=_manual_waiting(root)) is not None: raise InterruptedError(f"Background Remote sync yielded to a manual command. Holder: {lock_holder(owner)}.")
         pulse(stage)
@@ -280,7 +281,7 @@ def local_lock(root,name="mutation",blocking=True):
         lease=(pulse,None)
         token=_leases.set((*_leases.get(),lease))
         try: yield pulse
-        finally: _leases.reset(token)
+        finally: (_leases.reset(token),_PROGRESS.__setitem__(slice(None),[0,0]))
 def mutation_lock(root): return local_lock(root,"mutation",False)
 @contextmanager
 def sync_run(root,manual=False,purpose="sync"):
@@ -299,9 +300,7 @@ def locked(fn):
     def call(*args,**kwargs):
         with mutation_lock(None): return fn(*args,**kwargs)
     return call
-def workspace(cfg,value):
-    if len(hits:=[k for k,v in cfg["workspaces"].items() if k.startswith(value) or v["name"]==value])!=1: raise ValueError(f"Workspace must match exactly one of: {', '.join(v['name'] for v in cfg['workspaces'].values())}")
-    return hits[0]
+def workspace(cfg,value): return required(len(hits:=[k for k,v in cfg["workspaces"].items() if k.startswith(value) or v["name"]==value])==1,ValueError(f"Workspace must match exactly one of: {', '.join(v['name'] for v in cfg['workspaces'].values())}")) and hits[0]
 def key(cfg,ws,epoch): return unb64(cfg["keys"][f"{ws}:{epoch}"])
 def trusted(devices):
     for d in devices:

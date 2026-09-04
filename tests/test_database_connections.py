@@ -135,6 +135,14 @@ for page in range(12):
     assert [actor.wait(15) for actor in actors]==[0]*4,[actor.stderr.read() for actor in actors]
     db=cli.open_db(path,True,purpose="fixture.read"); assert db.execute("SELECT count(*),count(DISTINCT actor) FROM turns").fetchone()==(48,4); db.close()
 
+def test_manual_sync_progress_uses_existing_operation_events(tmp_path,monkeypatch,capsys):
+    import ai_convos_remote
+    monkeypatch.setattr(cli,"DATA_DIR",tmp_path/"local"); monkeypatch.setattr(cli.sys.stderr,"isatty",lambda:True)
+    assert cli._sync_leader(lambda progress:progress("parsing codex 20/40")) is None
+    with ai_convos_remote.sync_run(tmp_path/"remote",True): ai_convos_remote._progress("receiving rows 500/1000")
+    output=capsys.readouterr().err
+    assert "Local sync: parsing codex 20/40" in output and "Remote sync: receiving rows 500/1000 [0s]" in output
+
 def test_signed_evidence_reconciliation_is_always_targeted():
     tree=ast.parse((ROOT/"src/ai_convos/cli.py").read_text()); calls=[node for node in ast.walk(tree) if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=="_apply_signed_edit_evidence"]
     assert len(calls)==3 and all(len(node.args)>1 or any(k.arg in {"edits","tools"} for k in node.keywords) for node in calls)
