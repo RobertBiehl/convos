@@ -316,27 +316,22 @@ def _team_scope(core,provenance,repositories,roots,candidates=None,match=("cwd",
     rows=core.execute("SELECT s.route,m.conversation_id,s.repository FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN provenance.file_edit_scopes s ON s.file_edit_id=fe.id JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id"+where,args).fetchall()
     cwd_rows=core.execute("SELECT c.id,s.cwd,s.repository FROM conversations c JOIN provenance.conversation_scopes s ON s.conversation=c.id"+where,args).fetchall()
     return ({cid for route,cid,repo in rows if repo in repositories or route and any(Path(route).is_relative_to(root) for root in roots)} if "edit" in match else set())|({cid for cid,cwd,repo in cwd_rows if repo in repositories or cwd and any(Path(cwd).is_relative_to(root) for root in roots)} if "cwd" in match else set())
-def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,workspace=None,new_scope=None,match=("cwd","edit"),user=None):
+def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,workspace=None,new_scope=None,match=("cwd","edit"),user=None,selected=None):
     local={tuple(r) for r in core.execute("SELECT kind,entity FROM provenance.local_facts"+(f" WHERE entity IN ({TEXT_IDS})" if facts is not None else ""),[packed(r[1] for r in facts)] if facts is not None else []).fetchall()} if (facts:=None if changes is None else {r for r in changes if r[0] in PROVENANCE}) is None or facts else set()
     all_provenance=[clean(r) for r in provenance_records(core,facts) if (r["kind"],r["entity"]) in local] if local else []
     prior={r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()} if kind=="team" and workspace and changes is not None else set()
     admitted={r[0] for r in core.execute("SELECT source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=? AND author_user_id=? AND row_kind='conversations' AND state='active'",(workspace,user)).fetchall()} if kind=="team" and workspace and user else set()
     changed={table:{entity for name,entity in changes or () if name==table} for table in TABLES.values()}
     candidates=changed["conversations"]|{r[0] for r in core.execute("SELECT conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(changed["messages"])]).fetchall()}|{r[0] for r in core.execute("SELECT m.conversation_id FROM messages m JOIN (SELECT message_id FROM tool_calls WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM attachments WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM file_edits WHERE id IN (SELECT UNNEST(?))) x ON x.message_id=m.id",[list(changed["tool_calls"]),list(changed["attachments"]),list(changed["file_edits"])]).fetchall()}|{r[0] for r in core.execute("SELECT conversation_id FROM artifacts WHERE id IN (SELECT UNNEST(?))",[list(changed["artifacts"])]).fetchall()} if kind=="team" and changes is not None else None
-    convs=(admitted|prior|_team_scope(core,all_provenance,set(repositories),roots,candidates,match)) if kind=="team" else set()
-    if changes is not None and workspace and (new:=convs-{r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()}):
-        local={tuple(r) for r in core.execute("SELECT kind,entity FROM provenance.local_facts").fetchall()}
-        all_provenance=[clean(r) for r in provenance_records(core) if (r["kind"],r["entity"]) in local]
-        msgs={r[0] for r in core.execute("SELECT id FROM messages WHERE conversation_id IN (SELECT UNNEST(?))",[list(new)]).fetchall()}
-        changes=set(changes)|{("conversations",x) for x in new}|{("messages",x) for x in msgs}|{(table,r[0]) for table in ("tool_calls","attachments","file_edits") for r in core.execute(f"SELECT id FROM {table} WHERE message_id IN (SELECT UNNEST(?))",[list(msgs)]).fetchall()}|{("artifacts",r[0]) for r in core.execute("SELECT id FROM artifacts WHERE conversation_id IN (SELECT UNNEST(?))",[list(new)]).fetchall()}|local
+    convs=set(selected) if selected is not None else (admitted|prior|_team_scope(core,all_provenance,set(repositories),roots,candidates,match)) if kind=="team" else set()
     if workspace and new_scope is not None: new_scope.update(convs)
     provenance=[r for r in all_provenance if changes is None or (r["kind"],r["entity"]) in changes]
     records=_records(core,graph,kind=="personal",changes)
-    edit_paths={r["payload"]["id"]:r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed"}
+    edit_paths={r["payload"]["id"]:r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed"} if kind=="personal" else {r[0]:r[1] for r in core.execute("SELECT x.file_edit_id,f.path FROM provenance.file_edit_files x JOIN provenance.files f ON f.id=x.file_id JOIN provenance.local_facts e ON (e.kind,e.entity)=('edit.observed',x.file_edit_id) JOIN provenance.local_facts l ON (l.kind,l.entity)=('file.observed',f.id) WHERE x.file_edit_id IN (SELECT UNNEST(?))",[[r["payload"]["row"][0] for r in records if r["kind"]=="file_edit.record" and r["payload"].get("state")!="deleted"]]).fetchall()}
     file_paths={r["payload"]["id"]:r["payload"]["path"] for r in provenance if r["kind"]=="file.observed"}
     for r in records:
-        if r["kind"]=="file_edit.record" and r["payload"].get("state")!="deleted" and (fid:=edit_paths.get(r["payload"]["row"][0])): r["payload"]["row"][2]=file_paths.get(fid)
-    if kind=="personal": return records+provenance
+        if r["kind"]=="file_edit.record" and r["payload"].get("state")!="deleted": r["payload"]["row"][2]=edit_paths.get(r["payload"]["row"][0]) if kind=="team" else file_paths.get(fid) if (fid:=edit_paths.get(r["payload"]["row"][0])) else r["payload"]["row"][2]
+    if kind=="personal" or selected is not None: return records+provenance
     keep=[]
     parents={r["payload"]["row"][1] for r in records if r["payload"]["table"] in ("tool_calls","attachments","file_edits") and r["payload"].get("state")!="deleted"}
     msg_convs=dict(core.execute("SELECT id,conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(parents)]).fetchall()) if parents else {}
@@ -351,20 +346,35 @@ def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,worksp
         p,k=r["payload"],r["kind"]
         if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits: keep.append(r)
     return keep
+def _team_page(core,conversations,after,page):
+    convs=packed(conversations)
+    query="""WITH scoped AS (SELECT json_extract_string(value,'$') id FROM json_each(?)), edits AS (SELECT fe.id,x.file_id,f.repository FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN scoped s ON s.id=m.conversation_id JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' LEFT JOIN provenance.file_edit_files x ON x.file_edit_id=fe.id LEFT JOIN provenance.files f ON f.id=x.file_id), selected AS (SELECT 'conversations' kind,c.id entity FROM conversations c JOIN scoped s ON s.id=c.id UNION SELECT 'messages',m.id FROM messages m JOIN scoped s ON s.id=m.conversation_id UNION SELECT 'tool_calls',x.id FROM tool_calls x JOIN messages m ON m.id=x.message_id JOIN scoped s ON s.id=m.conversation_id UNION SELECT 'attachments',x.id FROM attachments x JOIN messages m ON m.id=x.message_id JOIN scoped s ON s.id=m.conversation_id UNION SELECT 'file_edits',e.id FROM edits e UNION SELECT 'artifacts',x.id FROM artifacts x JOIN scoped s ON s.id=x.conversation_id UNION SELECT 'edit.observed',l.entity FROM provenance.local_facts l JOIN edits e ON l.kind='edit.observed' AND l.entity=e.id UNION SELECT 'file.observed',l.entity FROM provenance.local_facts l JOIN edits e ON l.kind='file.observed' AND l.entity=e.file_id UNION SELECT 'file.version',l.entity FROM provenance.local_facts l JOIN provenance.file_versions v ON l.kind='file.version' AND l.entity=v.id JOIN edits e ON e.file_id=v.file_id UNION SELECT 'repository.observed',l.entity FROM provenance.local_facts l JOIN edits e ON l.kind='repository.observed' AND l.entity=e.repository UNION SELECT 'git.checkpoint',l.entity FROM provenance.local_facts l JOIN provenance.git_checkpoints c ON l.kind='git.checkpoint' AND l.entity=c.id JOIN edits e ON e.repository=c.repository UNION SELECT 'checkpoint.link',l.entity FROM provenance.local_facts l JOIN provenance.checkpoint_edits c ON l.kind='checkpoint.link' AND l.entity=sha256(json_object('checkpoint',c.checkpoint_id,'edit',c.file_edit_id)) JOIN edits e ON e.id=c.file_edit_id) SELECT kind,entity FROM selected WHERE entity IS NOT NULL AND (kind>? OR kind=? AND entity>?) ORDER BY kind,entity LIMIT ?"""
+    return core.execute(query,(convs,after[0],after[0],after[1],page)).fetchall()
 def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspace=None,new_scope=None,match=("cwd","edit"),user=None,generation=None,progress=None,page=2500,since=None):
     sources=required(generation is not None,ValueError("archive scan requires a generation watermark")) and ([*((f"SELECT '{table}' kind,id entity FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='{table}' AND o.physical_row_id=x.id) AND NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=('{table}',x.id) AND c.generation>?)",(generation,)) for table in TABLES.values()),("SELECT kind,entity FROM provenance.local_facts x WHERE NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=(x.kind,x.entity) AND c.generation>?)",(generation,))] if since is None else [("SELECT kind,entity FROM archive_changes WHERE generation>? AND generation<=?",(since,generation))])
-    out,done=[],0
+    out,done,prior,scope=[],0,{r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()} if kind=="team" and workspace else set(),new_scope if new_scope is not None else set()
     for query,args in sources:
         after,limit=("",""),page
         while True:
             started=time.monotonic()
             with contextlib.closing(open_db(db_path,True,purpose="remote.scan.page")) as core:
                 changes=core.execute(f"SELECT kind,entity FROM ({query}) WHERE kind>? OR kind=? AND entity>? ORDER BY kind,entity LIMIT ?",(*args,after[0],after[0],after[1],limit)).fetchall()
-                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,new_scope,match,user) if changes else []
+                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,scope,match,user) if changes else []
             out+=batch
             if not changes: break
             after,done,limit,_=changes[-1],done+len(changes),max(100,min(5000,int(limit*.5/max(time.monotonic()-started,.001)))),(progress and progress(f"scanning archive {done+len(changes)}"),archive_yield(db_path))
-    return out
+    if new:=scope-prior:
+        after=("","")
+        while True:
+            with contextlib.closing(open_db(db_path,True,purpose="remote.scan.team-page")) as core:
+                changes=_team_page(core,new,after,page)
+                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,None,match,user,new) if changes else []
+            out+=batch
+            if not changes: break
+            after=changes[-1]
+            progress and progress(f"scanning admitted conversations {after[0]}")
+            archive_yield(db_path)
+    return list({(r["kind"],r["entity"]):r for r in out}.values())
 def _store_proofs(db_path,proofs,signer,controls):
     with contextlib.closing(open_db(db_path,purpose="remote.attest.write")) as db,_transaction(db):
         project_workspace_controls(db,controls)
@@ -487,65 +497,42 @@ def _heads(db,user,ids):
     forks=[key for key,values in out.items() if len(values)!=1]
     if missing or forks: raise ValueError(f"provider alias row proof unavailable or forked: {(missing or forks)[0]}")
     return {key:next(iter(values.values())) for key,values in out.items()}
-def _alias_plan(db,user,source,session,members,canonical):
-    member_heads=_heads(db,user,{"conversations":set(members)})
-    origin_rows=db.execute("SELECT physical_row_id,source_row_id FROM remote.row_origins WHERE table_name='conversations' AND author_user_id=? AND source_row_id IN (SELECT UNNEST(?))",(user,members)).fetchall()
+def _alias_members(db,user,source,session,members,canonical):
+    member_heads,origin_rows=_heads(db,user,{"conversations":set(members)}),db.execute("SELECT physical_row_id,source_row_id FROM remote.row_origins WHERE table_name='conversations' AND author_user_id=? AND source_row_id IN (SELECT UNNEST(?))",(user,members)).fetchall()
     origin_members={}
     [origin_members.setdefault(logical,set()).add(physical) for physical,logical in origin_rows]
-    local={r[0] for r in db.execute("SELECT id FROM conversations WHERE id IN (SELECT UNNEST(?))",(members,)).fetchall()}
-    member_physical={member:required(next(iter(found)) if len(found)==1 else None,ValueError(f"provider alias member projection is ambiguous: {member}")) for member in members for found in [{*origin_members.get(member,set()),*({member} if member in local else set())}] if found}
-    active={member for member in members if member_heads[("conversations",member)]["state"]=="active"}
-    required(canonical in active and active<=set(member_physical),ValueError("provider alias active body unavailable"))
+    local,member_physical=(local:={r[0] for r in db.execute("SELECT id FROM conversations WHERE id IN (SELECT UNNEST(?))",(members,)).fetchall()}),{member:required(next(iter(found)) if len(found)==1 else None,ValueError(f"provider alias member projection is ambiguous: {member}")) for member in members for found in [{*origin_members.get(member,set()),*({member} if member in local else set())}] if found}
+    active=(required(canonical in (active:={member for member in members if member_heads[("conversations",member)]["state"]=="active"}) and active<=set(member_physical),ValueError("provider alias active body unavailable")),active)[-1]
     member_physical|={member:next(iter(origin_members.get(member,{member}))) for member in set(members)-set(member_physical)}
-    selected={"conversations":{member_physical[m] for m in active}}
-    selected["messages"]={r[0] for r in db.execute("SELECT id FROM messages WHERE conversation_id IN (SELECT UNNEST(?))",([member_physical[m] for m in members],)).fetchall()}
-    selected["tool_calls"]={r[0] for r in db.execute("SELECT id FROM tool_calls WHERE message_id IN (SELECT UNNEST(?))",(list(selected["messages"]),)).fetchall()}
-    selected["attachments"]={r[0] for r in db.execute("SELECT id FROM attachments WHERE message_id IN (SELECT UNNEST(?))",(list(selected["messages"]),)).fetchall()}
-    selected["file_edits"]={r[0] for r in db.execute("SELECT id FROM file_edits WHERE message_id IN (SELECT UNNEST(?))",(list(selected["messages"]),)).fetchall()}
-    selected["artifacts"]={r[0] for r in db.execute("SELECT id FROM artifacts WHERE conversation_id IN (SELECT UNNEST(?))",([member_physical[m] for m in members],)).fetchall()}
-    origins={(table,physical):(logical,origin_workspace) for table,physical,logical,origin_workspace in db.execute("SELECT table_name,physical_row_id,source_row_id,workspace_id FROM remote.row_origins WHERE author_user_id=? AND table_name IN (SELECT UNNEST(?)) AND physical_row_id IN (SELECT UNNEST(?))",(user,list(selected),[v for values in selected.values() for v in values])).fetchall()}
-    logical_ids={table:{origins.get((table,physical),(physical,None))[0] for physical in values} for table,values in selected.items()}
-    heads=_heads(db,user,logical_ids|{"conversations":set(members)})
-    physical_by_source={(table,origins.get((table,physical),(physical,None))[0]):physical for table,values in selected.items() for physical in values}
-    physical_by_source|={("conversations",member):physical for member,physical in member_physical.items()}
-    reverse={(table,physical):source_id for (table,source_id),physical in physical_by_source.items()}
-    logical={}
-    native={}
-    for table,physical_ids in selected.items():
-        query="SELECT * EXCLUDE (embedding) FROM messages WHERE id IN (SELECT UNNEST(?))" if table=="messages" else "SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id WHERE a.id IN (SELECT UNNEST(?))" if table=="attachments" else f"SELECT * FROM {table} WHERE id IN (SELECT UNNEST(?))"
-        cur=db.execute(query,(list(physical_ids),))
-        columns=[d[0] for d in cur.description]
-        for values in cur.fetchall():
-            physical=values[0]
-            logical_id=reverse[(table,physical)]
-            parents=dict(FKS.get(table,()))
-            row=logical_row(table,columns,[reverse.get((parents[column],value),value) if column in parents else value for column,value in zip(columns,values)],logical_id)
-            required(digest(row)==heads[(table,logical_id)]["content_hash"],ValueError(f"provider alias body/proof mismatch: {table}:{logical_id}"))
-            logical[(table,logical_id)]=row
-            native[(table,logical_id)]=(table,physical) not in origins
-            if table=="attachments" and row["data"]["body_hash"]:
-                path=Path(values[columns.index("path")]) if values[columns.index("path")] else None
-                required(path and path.is_file() and not path.is_symlink() and file_hash(path)==row["data"]["body_hash"],ValueError(f"provider alias attachment body unavailable: {logical_id}"))
-    for member in active:
-        row=logical[("conversations",member)]
-        metadata=row["data"]["metadata"]
-        required(row["data"]["source"]==source and isinstance(metadata,dict) and metadata.get("session_id")==session,ValueError("provider alias exact evidence conflicts"))
-    losers=set(members)-{canonical}
-    rows=[({**row,"data":{**row["data"],"conversation_id":canonical}},heads[key],native[key]) for key,row in logical.items() if key[0] in ("messages","artifacts") and row["data"]["conversation_id"] in losers]
-    rows += [(logical_row("conversations",identity=member,state="deleted"),member_heads[("conversations",member)],native[("conversations",member)]) for member in active-{canonical}]
-    parent_map={(table,source_id):physical for (table,source_id),physical in physical_by_source.items()}
-    binding=db.execute("SELECT conversation_id FROM provider_sessions WHERE source=? AND session_id=?",(source,session)).fetchone()
-    return rows,parent_map,member_physical,not binding or binding[0]!=member_physical[canonical]
+    return member_heads,member_physical,active,{member:member not in origin_members for member in members},not (binding:=db.execute("SELECT conversation_id FROM provider_sessions WHERE source=? AND session_id=?",(source,session)).fetchone()) or binding[0]!=member_physical[canonical]
+def _alias_page(db,user,member_physical,after,page=500):
+    members,query=list(member_physical.values()),"""WITH selected AS (SELECT 'conversations' kind,id FROM conversations WHERE id IN (SELECT UNNEST(?)) UNION SELECT 'messages',id FROM messages WHERE conversation_id IN (SELECT UNNEST(?)) UNION SELECT 'tool_calls',x.id FROM tool_calls x JOIN messages m ON m.id=x.message_id WHERE m.conversation_id IN (SELECT UNNEST(?)) UNION SELECT 'attachments',x.id FROM attachments x JOIN messages m ON m.id=x.message_id WHERE m.conversation_id IN (SELECT UNNEST(?)) UNION SELECT 'file_edits',x.id FROM file_edits x JOIN messages m ON m.id=x.message_id WHERE m.conversation_id IN (SELECT UNNEST(?)) UNION SELECT 'artifacts',id FROM artifacts WHERE conversation_id IN (SELECT UNNEST(?))) SELECT kind,id FROM selected WHERE kind>? OR kind=? AND id>? ORDER BY kind,id LIMIT ?"""
+    keys=db.execute(query,(*([members]*6),after[0],after[0],after[1],page)).fetchall()
+    if not keys: return [],after
+    selected,raws=((selected:={table:{row_id for kind,row_id in keys if kind==table} for table in COLUMNS}),{(table,values[0]):(columns,values) for table,physical_ids in selected.items() if physical_ids for cur in [db.execute("SELECT * EXCLUDE (embedding) FROM messages WHERE id IN (SELECT UNNEST(?))" if table=="messages" else "SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id WHERE a.id IN (SELECT UNNEST(?))" if table=="attachments" else f"SELECT * FROM {table} WHERE id IN (SELECT UNNEST(?))",(list(physical_ids),))] for columns in [[d[0] for d in cur.description]] for values in cur.fetchall()})
+    origins={(table,physical):(logical,workspace) for table,physical,logical,workspace in db.execute("SELECT table_name,physical_row_id,source_row_id,workspace_id FROM remote.row_origins WHERE author_user_id=? AND physical_row_id IN (SELECT UNNEST(?))",(user,[row_id for kind,row_id in keys])).fetchall()}
+    reverse={(table,physical):logical for (table,physical),(logical,workspace) in origins.items()}|{("conversations",physical):logical for logical,physical in member_physical.items()}
+    refs={(parent,value) for (table,physical),(columns,values) in raws.items() for column,value in zip(columns,values) for parent in [dict(FKS.get(table,())).get(column)] if parent and value is not None}
+    reverse|={(table,physical):logical for table,physical,logical in db.execute("SELECT table_name,physical_row_id,source_row_id FROM remote.row_origins WHERE author_user_id=? AND physical_row_id IN (SELECT UNNEST(?))",(user,[value for table,value in refs])).fetchall()}
+    reverse|={ref:ref[1] for ref in refs if ref not in reverse}
+    physical_by_source={(table,logical):physical for (table,physical),logical in reverse.items()}|{("conversations",logical):physical for logical,physical in member_physical.items()}
+    heads,out=(heads:=_heads(db,user,{table:{reverse.get((table,physical),physical) for physical in values} for table,values in selected.items()})),[(row,heads[(table,logical_id)],(table,physical) not in origins,physical_by_source,values[columns.index("path")] if table=="attachments" else None) for table,physical in keys for columns,values in [raws[(table,physical)]] for logical_id in [reverse.get((table,physical),physical)] for parents in [dict(FKS.get(table,()))] for row in [logical_row(table,columns,[reverse.get((parents[column],value),value) if column in parents else value for column,value in zip(columns,values)],logical_id)] if required(digest(row)==heads[(table,logical_id)]["content_hash"],ValueError(f"provider alias body/proof mismatch: {table}:{logical_id}"))]
+    return out,keys[-1]
+def _alias_pages(db_path,user,member_physical,page=500):
+    after=("","")
+    while True:
+        with contextlib.closing(open_db(db_path,True,purpose="remote.alias.page")) as db: generation,values=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],_alias_page(db,user,member_physical,after,page)
+        rows,after=values
+        if not rows: return
+        yield generation,rows
+        archive_yield(db_path)
 def reconcile_provider_aliases(db_path,cfg,workspace):
     user=cfg["user"]
     with contextlib.closing(open_db(db_path,purpose="remote.alias.schema")) as db: init_schema(db)
     with contextlib.closing(open_db(db_path,True,purpose="remote.alias.plan")) as db: stored=[(oid,source,session,json.loads(members),canonical,json.loads(proof)) for oid,source,session,members,canonical,proof in db.execute("SELECT object_id,source,session_id,CAST(members AS VARCHAR),canonical_source_row_id,CAST(proof AS VARCHAR) FROM remote.provider_session_aliases WHERE author_user_id=? ORDER BY object_id,revision",(user,)).fetchall()]
     groups={}
     [groups.setdefault(row[0],[]).append(row) for row in stored]
-    result={"changed":0,"settled":0,"blocked":{}}
-    controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace)
-    signer=cfg["controls"][workspace]["devices"][cfg["device"]["id"]]
-    backed_up=False
+    result,controls,signer,backed_up={"changed":0,"settled":0,"blocked":{}},next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace),cfg["controls"][workspace]["devices"][cfg["device"]["id"]],False
     for object_id,values in groups.items():
         ancestors={a for value in values for a in value[5]["ancestors"]}
         leaves=[value for value in values if value[5]["revision"] not in ancestors]
@@ -554,26 +541,39 @@ def reconcile_provider_aliases(db_path,cfg,workspace):
             continue
         _,source,session,members,canonical,_=leaves[0]
         try:
-            with contextlib.closing(open_db(db_path,True,purpose="remote.alias.rows")) as db: generation,plan=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],_alias_plan(db,user,source,session,members,canonical)
-            rows,parent_map,member_physical,binding=plan
+            with contextlib.closing(open_db(db_path,True,purpose="remote.alias.members")) as db: member_heads,member_physical,active,member_native,binding=_alias_members(db,user,source,session,members,canonical)
+            losers,moving=set(members)-{canonical},False
+            for generation,rows in _alias_pages(db_path,user,member_physical):
+                for row,head,native,parent_map,path in rows:
+                    if row["kind"]=="conversations" and row["id"] in active:
+                        required(row["data"]["source"]==source and isinstance(metadata:=row["data"]["metadata"],dict) and metadata.get("session_id")==session,ValueError("provider alias exact evidence conflicts"))
+                    if row["kind"]=="attachments" and row["data"]["body_hash"]: required(path and (path:=Path(path)).is_file() and not path.is_symlink() and file_hash(path)==row["data"]["body_hash"],ValueError(f"provider alias attachment body unavailable: {row['id']}"))
+                    moving|=row["kind"] in ("messages","artifacts") and row["data"]["conversation_id"] in losers
         except ValueError as e:
             result["blocked"][object_id]=str(e)
             continue
-        if not rows and not binding:
+        if not moving and active=={canonical} and not binding:
             result["settled"]+=1
             continue
         if not backed_up:
             with contextlib.closing(open_db(db_path,purpose="maintenance.remote.alias-backup")) as db: _migration_backup(db,"provider-alias-reconciliation")
             backed_up=True
-        proofs=[row_proof(cfg["device"],user,head["workspace"],cfg["workspaces"][workspace]["epoch"],row,head["revision"],workspace) for row,head,native in rows]
         try:
-            with contextlib.closing(open_db(db_path,purpose="remote.alias.write")) as db,_transaction(db):
-                required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during provider alias reconciliation; retry"))
-                project_workspace_controls(db,controls)
-                ids=project_row_proofs(db,proofs,signer["root_public"],signer["certificate"])
-                project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native),proof,pid in zip(rows,proofs,ids)])
-                project_provider_bindings(db,source,session,member_physical[canonical],list(member_physical.values()))
-            result["changed"]+=1
+            changed=False
+            for generation,values in _alias_pages(db_path,user,member_physical):
+                rows=[({**row,"data":{**row["data"],"conversation_id":canonical}},head,native,parent_map) for row,head,native,parent_map,path in values if row["kind"] in ("messages","artifacts") and row["data"]["conversation_id"] in losers]
+                if not rows: continue
+                proofs=[row_proof(cfg["device"],user,head["workspace"],cfg["workspaces"][workspace]["epoch"],row,head["revision"],workspace) for row,head,native,parent_map in rows]
+                with contextlib.closing(open_db(db_path,purpose="remote.alias.write-page")) as db,_transaction(db):
+                    (required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during provider alias reconciliation; retry")),project_workspace_controls(db,controls),project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native,parent_map),proof,pid in zip(rows,proofs,project_row_proofs(db,proofs,signer["root_public"],signer["certificate"]))]))
+                changed=True
+            with contextlib.closing(open_db(db_path,True,purpose="remote.alias.finish-plan")) as db:
+                generation,(member_heads,member_physical,active,member_native,binding)=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],_alias_members(db,user,source,session,members,canonical)
+                required(not db.execute("SELECT 1 FROM (SELECT conversation_id FROM messages UNION ALL SELECT conversation_id FROM artifacts) WHERE conversation_id IN (SELECT UNNEST(?)) LIMIT 1",([member_physical[m] for m in set(members)-{canonical}],)).fetchone(),RuntimeError("Provider alias rows remain; retry"))
+            rows,proofs=(rows:=[(logical_row("conversations",identity=member,state="deleted"),member_heads[("conversations",member)],member_native[member],{("conversations",source_id):physical for source_id,physical in member_physical.items()}) for member in active-{canonical}]),[row_proof(cfg["device"],user,head["workspace"],cfg["workspaces"][workspace]["epoch"],row,head["revision"],workspace) for row,head,native,parent_map in rows]
+            with contextlib.closing(open_db(db_path,purpose="remote.alias.finish")) as db,_transaction(db):
+                (required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during provider alias reconciliation; retry")),project_workspace_controls(db,controls),project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native,parent_map),proof,pid in zip(rows,proofs,project_row_proofs(db,proofs,signer["root_public"],signer["certificate"]))]),project_provider_bindings(db,source,session,member_physical[canonical],list(member_physical.values())))
+            result["changed"]+=bool(changed or rows or binding)
         except duckdb.InterruptException: raise
         except Exception as e: result["blocked"][object_id]=str(e)
     return result
