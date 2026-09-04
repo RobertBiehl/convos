@@ -516,7 +516,7 @@ def gen_id(source: str, oid: str) -> str: return hashlib.sha256(f"{source}:{oid}
 def ts_from_epoch(t):
     try: return datetime.fromtimestamp(float(t)) if t is not None and t!="" else None
     except Exception: return None
-def ts_from_iso(t): return datetime.fromisoformat(t.replace("Z", "+00:00")) if t else None
+def ts_from_iso(t): return (lambda v:v.astimezone().replace(tzinfo=None) if v.tzinfo else v)(datetime.fromisoformat(t.replace("Z", "+00:00"))) if t else None
 def ts_any(t): return ts_from_epoch(t) or (ts_from_iso(t) if isinstance(t, str) else None)  # chatgpt list api sends iso, exports send epoch
 
 def extract_content(content) -> dict:
@@ -838,12 +838,12 @@ def upsert(conn, r: ParseResult):
     if message_history: conn.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",message_history)
     if changed_rows: conn.executemany(_MSG_UPS,[list(m.values()) for m in r.msgs if m["id"] in changed_rows])
     def replace_preserving(table, rows):
-        if not rows: return []
+        if not rows: return [],0
         old,skip,payload,changed,histories=(old:=_rows_by_id(conn,table,[r["id"] for r in rows])),(skip:={"tool_calls":7,"attachments":7,"artifacts":6,"file_edits":5}[table]),(payload:=lambda values:tuple(v for i,v in enumerate(values) if i not in (0,skip))),(changed:=[(list(row.values()),old.get(row["id"])) for row in rows if not old.get(row["id"]) or payload(old[row["id"]])!=payload(tuple(row.values()))]),[_history_row(table,previous,payload(previous)) for values,previous in changed if previous]
         if histories: conn.executemany(f"INSERT INTO {table} VALUES ({','.join('?'*len(histories[0]))}) ON CONFLICT DO NOTHING",histories)
         if changed: conn.executemany(f"INSERT OR REPLACE INTO {table} VALUES ({','.join('?'*len(changed[0][0]))})",[values for values,previous in changed])
-        return [(table,values[0]) for values,previous in changed]+[(table,row[0]) for row in histories]
-    historical=[item for table,rows in (("tool_calls",r.tools),("attachments",r.attachs),("artifacts",r.artifacts),("file_edits",r.edits)) for item in replace_preserving(table,rows)]
+        return [(table,values[0]) for values,previous in changed]+[(table,row[0]) for row in histories],len(changed)
+    replacements,historical=(replacements:=[replace_preserving(table,rows) for table,rows in (("tool_calls",r.tools),("attachments",r.attachs),("artifacts",r.artifacts),("file_edits",r.edits))]),[item for rows,count in replacements for item in rows]
     evidence_row,evidence,classified,incoming=(evidence_row:=lambda v:(v["file_edit_id"],v["status"],v["reason"],v["tool_call_id"])),{v[0]:v for v in conn.execute("SELECT * FROM provenance.file_edit_evidence WHERE file_edit_id IN (SELECT UNNEST(?))",[[v["file_edit_id"] for v in r.edit_evidence]+[e["id"] for e in r.edits]]).fetchall()} if r.edit_evidence or r.edits else {},(classified:={v["file_edit_id"] for v in r.edit_evidence}),[*r.edit_evidence,*(dict(file_edit_id=e["id"],status="unknown",reason="unclassified_input",tool_call_id=None) for e in r.edits if e["id"] not in classified)]
     required(all(set(v)=={"file_edit_id","status","reason","tool_call_id"} and v["status"] in {"confirmed","invalid","unknown","unverified"} and v["file_edit_id"] and v["reason"] for v in incoming),ValueError("invalid file edit evidence"))
     tool_ids={v["tool_call_id"] for v in incoming if v["tool_call_id"]}
@@ -858,7 +858,7 @@ def upsert(conn, r: ParseResult):
     archive_msgs=changed_rows|changed_msgs-set(mids)
     if changed_convs or archive_msgs or historical or evidence_changed: _archive_touch(conn,[("conversations",x) for x in changed_convs]+[("messages",x) for x in archive_msgs]+historical+[("file_edits",x) for x in evidence_changed])
     r.provenance_edits,r.provenance_conversations={x for x in {e["id"] for e in r.edits}|classified if statuses.get(x)=="confirmed"}&({i for t,i in historical if t=="file_edits"}|evidence_changed),changed_convs
-    return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated), changed_msgs
+    return len(changed_conversations),len(changed_rows),replacements[0][1],replacements[1][1],replacements[3][1],len(new_convs),len(updated),changed_msgs
 def ingest_parts(r,size=500):
     prepared,valid,blank,scopes,edit_scopes,chunks,byid=prepare_result(r),required(not (conflict:=_id_conflict(r.convs,("source","cwd","git_branch","project_id","metadata")) or _id_conflict(r.msgs,("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"))),ValueError(f"divergent provider session in import batch: {conflict}")),lambda **values:ParseResult(**{"scopes":[],"edit_scopes":[],**values}),{v[0]:v for v in r.scopes},{v[0]:v for v in r.edit_scopes},lambda rows:[rows[i:i+size] for i in range(0,len(rows),size)],{m["id"]:m for m in r.msgs}
     rank,messages=(rank:={mid:i for i,mid in enumerate(graphlib.TopologicalSorter({mid:{m["parent_id"]}&byid.keys() for mid,m in byid.items()}).static_order())}),sorted(r.msgs,key=lambda m:rank[m["id"]])
@@ -867,7 +867,7 @@ def commit_result(r,purpose,progress=None,parts=None):
     total,changed,newids=[0]*7,set(),set()
     for part in (p for p in (ingest_parts(r) if parts is None else parts) if any((p.convs,p.msgs,p.tools,p.attachs,p.artifacts,p.edits,p.edit_evidence))):
         with _core(purpose=purpose) as conn,_transaction(conn): out=(newids.update({c["id"] for c in part.convs}-{x[0] for x in conn.execute("SELECT id FROM conversations WHERE id IN (SELECT UNNEST(?))",[[c["id"] for c in part.convs]]).fetchall()}) if part.convs else None,upsert(conn,part))[-1]
-        (total.__setitem__(slice(None),[total[i]+out[i] for i in range(7)]),changed.update(out[7]),total.__setitem__(slice(5,7),[len(newids),len({m["conversation_id"] for m in r.msgs if m["id"] in changed}-newids)]),r.provenance_edits.update(part.provenance_edits),r.provenance_conversations.update(part.provenance_conversations),progress and progress(f"{purpose} {sum(total[:5])} rows"))
+        (total.__setitem__(slice(None),[total[i]+out[i] for i in range(7)]),changed.update(out[7]),total.__setitem__(slice(5,7),[len(newids),len({m["conversation_id"] for m in r.msgs if m["id"] in changed}-newids)]),r.provenance_edits.update(part.provenance_edits),r.provenance_conversations.update(part.provenance_conversations),progress and any(out[:5]) and progress(f"{purpose} {sum(total[:5])} rows"))
         archive_yield(DB_PATH)
     return (*total,changed)
 
@@ -911,7 +911,7 @@ def drain_hooks(embed=False, local_only=False,block=False):
                     done.append((work,key,snap,set()))
                     continue
                 changed=commit_result(r,purpose="hooks.ingest",progress=pulse)[-1]|({m["id"] for m in r.msgs} if e.get("retry") else set())
-                capture_provenance(edit_ids=[x["id"] for x in r.edits],conversation_ids=[x["id"] for x in r.convs],source=f"{e['source']}.hook")
+                capture_provenance(edit_ids=r.provenance_edits,conversation_ids=r.provenance_conversations,source=f"{e['source']}.hook")
                 atomic_json(work,{**e,"snap":snap,"changed":sorted(changed)})
                 done.append((work,key,snap,changed))
             except FileNotFoundError: work.unlink(missing_ok=True)
@@ -1273,10 +1273,10 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         local,web,imports=state.setdefault("local",{}),state.setdefault("web",{}),state.setdefault("imports",{})
         chatgpt_ok.clear() or chatgpt_frontiers.clear()
         total,changed,jobs,newc,updc,provenance_edits,provenance_conversations,repair_attempted=[0]*5,set(),[],0,0,set(),set(),set()
-        def checkpoint(r):
+        def checkpoint(r,source):
             parts=ingest_parts(r)
             with operation_lock(HOOK_DIR/".lock","hooks.queue") as queue:
-                out=commit_result(r,purpose="sync.ingest",progress=lambda stage:(pulse(stage),queue(stage))[-1],parts=parts)
+                out=commit_result(r,purpose="sync.ingest",progress=lambda stage:(pulse(label:=f"ingesting {source} {stage.removeprefix('sync.ingest ')}"),queue(label))[-1],parts=parts)
                 (known.update({c["id"]:(u.timestamp() if (u:=ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"}),repair_attempted.update(c["id"] for c in r.convs if c["id"] in repair_order))
                 return (*out,getattr(r,"provenance_edits",set()),getattr(r,"provenance_conversations",set()))
         with _core(read_only=True,purpose="sync.chatgpt.repair.plan") as conn: repairs=conn.execute("SELECT c.id,MIN(m.created_at),MAX(m.created_at) FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL) AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) GROUP BY c.id").fetchall()
@@ -1288,10 +1288,10 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
             jobs+=start("imports") or [j for p in paths if (j:=plan_import(p))]
         for name,label,enabled,p,parser in (("claude-code","Claude Code",claude_code,Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))/"projects",parse_claude_code),("codex","Codex",codex,Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),parse_codex)):
-            if enabled and p.exists(): start(label,name) or schedule(plan_local(name,p,parser,bindings,checkpoint,pulse))
+            if enabled and p.exists(): start(label,name) or schedule(plan_local(name,p,parser,bindings,lambda r,name=name:checkpoint(r,name),pulse))
         if not offline:
             start("ChatGPT"+(f", provider order={len(candidates)-len(repair_order)} attempted/{len(candidates)} unresolved" if candidates else ""),"chatgpt")
-            schedule(plan_web("chatgpt",fetch_chatgpt,probe_chatgpt,{} if full else known,checkpoint,legacy,not repair_order))
+            schedule(plan_web("chatgpt",fetch_chatgpt,probe_chatgpt,{} if full else known,lambda r:checkpoint(r,"chatgpt"),legacy,not repair_order))
             start("Claude","claude")
             schedule(plan_web("claude",fetch_claude,probe_claude))
         verbose and typer.echo(f"Planning took {time.perf_counter()-t0:.2f}s")
@@ -1304,12 +1304,12 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     if saved := j.get("saved"):
                         c,m,t,a,e,n,u,changed_ids,provenance_edits,provenance_conversations=(*[sum(s[i] for s in saved) for i in range(7)],set().union(*(s[7] for s in saved)),provenance_edits|set().union(*(s[8] for s in saved)),provenance_conversations|set().union(*(s[9] for s in saved)))
                     elif r is not None:
-                        c,m,t,a,e,n,u,changed_ids,*_=checkpoint(r)
+                        c,m,t,a,e,n,u,changed_ids,*_=checkpoint(r,j["name"])
                     else: continue
                     total,newc,updc,changed=[total[i]+v for i,v in enumerate([c,m,t,a,e])],newc+n,updc+u,changed|changed_ids
                     if r is not None: provenance_edits,provenance_conversations=provenance_edits|getattr(r,"provenance_edits",set()),provenance_conversations|getattr(r,"provenance_conversations",set())
                     if r is not None and (st:=j.get("state")): (j["name"]=="chatgpt" and st[2].update(coverage=sorted(known),order_repairs={cid:known[cid] for cid in ({cid for cid in candidates if prior_order.get(cid)==updated[cid]}|repair_attempted)}),set_state(*st))
-                    if j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} processed){' before failure' if r is None else ''}{' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
+                    if j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} changed){' before failure' if r is None else ''}{' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
         (pulse("capturing provenance"),capture_provenance() if full else capture_provenance(edit_ids=provenance_edits,conversation_ids=provenance_conversations))
         if before!=json.dumps(state,sort_keys=True): atomic_json(STATE_PATH,state)
         verbose and typer.echo(f"Total sync time {time.perf_counter()-t0:.2f}s")
@@ -1323,7 +1323,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         typer.echo(f"[{datetime.now().isoformat()}] {n} new, {u} updated convs; {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits")
         time.sleep(interval)
     r,n,u=do_sync()
-    typer.echo(f"Updated {n} new, {u} updated convs; {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits processed")
+    typer.echo(f"Updated {n} new, {u} updated convs; {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits changed")
     with _core(read_only=True,purpose="sync.summary") as conn: total=[conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("conversations","messages","tool_calls","attachments","file_edits")]
     typer.echo(f"Total: {', '.join(f'{n} {label}' for n,label in zip(total,('convs','msgs','tools','attachs','edits')))}")
 

@@ -300,6 +300,18 @@ class TestCodexParser:
         conv=dict(id="c",source="codex",title="t",created_at=None,updated_at=None,model=None,cwd="/repo",git_branch=None,project_id=None,metadata="{}"); msg=dict(id="m",conversation_id="c",role="assistant",content="done",thinking=None,created_at=None,model=None,metadata="{}",parent_id=None); edit=dict(id="e",message_id="m",file_path="x.py",edit_type="write",content="x",created_at=None,old_content=None); result=cli.ParseResult([conv],[msg],edits=[edit],edit_evidence=[dict(file_edit_id="e",status="confirmed",reason="test_fixture",tool_call_id=None)]); db=duckdb.connect(); cli.init_schema(db)
         cli.upsert(db,result); assert result.provenance_conversations=={"c"} and result.provenance_edits=={"e"}; cli.upsert(db,result); assert not result.provenance_conversations and not result.provenance_edits
 
+    def test_aware_parser_timestamps_compare_equal_to_duckdb_storage(self):
+        import duckdb
+        from ai_convos import cli
+        when=cli.ts_from_iso("2026-01-01T00:00:00Z"); conv=dict(id="c",source="codex",title="t",created_at=when,updated_at=when,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}"); msg=dict(id="m",conversation_id="c",role="user",content="same",thinking=None,created_at=when,model=None,metadata="{}",parent_id=None); db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,cli.ParseResult([conv],[msg])); generation=cli.archive_state(db)[1]
+        cli.upsert(db,cli.ParseResult([conv],[msg])); assert cli.archive_state(db)[1]==generation
+
+    def test_upsert_reports_only_new_or_changed_rows(self):
+        import duckdb
+        from ai_convos import cli
+        when=cli.ts_from_iso("2026-01-01T00:00:00Z"); conv=dict(id="c",source="codex",title="t",created_at=when,updated_at=when,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}"); msg=lambda mid,text:dict(id=mid,conversation_id="c",role="user",content=text,thinking=None,created_at=when,model=None,metadata="{}",parent_id=None); tool=lambda output:dict(id="t",message_id="m",tool_name="shell",input="{}",output=output,status="complete",duration_ms=None,created_at=when); edit=dict(id="e",message_id="m",file_path="x.py",edit_type="write",content="x",created_at=when,old_content=None); evidence=dict(file_edit_id="e",status="confirmed",reason="provider_success",tool_call_id="t"); db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,cli.ParseResult([conv],[msg("m","old")],[tool('"old"')],edits=[edit],edit_evidence=[evidence]))
+        result=cli.upsert(db,cli.ParseResult([conv],[msg("m","old"),msg("new","new")],[tool('"new"')],edits=[edit],edit_evidence=[evidence])); assert result[:5]==(0,1,1,0,0)
+
     def test_upsert_reclassifies_historical_edit_without_deleting_raw_row(self):
         import duckdb
         from ai_convos import cli
@@ -780,10 +792,9 @@ class TestTimestampParsing:
 
     def test_iso_to_datetime(self):
         """Parse ISO format timestamp."""
-        from ai_convos.cli import ts_from_iso
+        from ai_convos.cli import ts_from_epoch, ts_from_iso
         dt = ts_from_iso("2024-01-01T12:00:00Z")
-        assert dt.year == 2024
-        assert dt.hour == 12
+        assert dt == ts_from_epoch(1704110400) and dt.tzinfo is None
 
     def test_iso_none(self):
         """None ISO returns None."""

@@ -105,6 +105,11 @@ def test_explicit_drain_is_idempotent_and_preserves_truncated_rewritten_history(
     conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3; assert conn.execute("SELECT COUNT(*) FROM messages WHERE content IN ('remember alpha','rewritten alpha')").fetchone()[0] == 2; meta = json.loads(conn.execute("SELECT metadata FROM messages WHERE content='remember alpha'").fetchone()[0]); assert meta["history_of"] and meta["superseded_at"]; conn.close()
     enqueue(path); assert cli.drain_hooks()==0; conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3; conn.close()
 
+def test_changed_mtime_without_changed_rows_does_not_touch_archive(hooks):
+    sessions,data=hooks; path=sessions/"same.jsonl"; transcript(path); enqueue(path); assert cli.drain_hooks()==1
+    conn=duckdb.connect(str(data/"convos.db")); generation=cli.archive_state(conn)[1]; conn.close(); os.utime(path,ns=(path.stat().st_atime_ns,path.stat().st_mtime_ns+1)); enqueue(path); assert cli.drain_hooks()==1
+    conn=duckdb.connect(str(data/"convos.db")); assert cli.archive_state(conn)[1]==generation; conn.close()
+
 def test_enqueue_during_drain_survives_for_next_worker(hooks, monkeypatch):
     sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); original, raced = cli.upsert, {"done":False}
     def upsert(conn, result):

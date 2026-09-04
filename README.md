@@ -367,7 +367,7 @@ Syncing Claude Code (2 convs, 118 msgs, 12 tools, 0 attachs, 4 edits)
 Syncing Codex (8 convs, 214 msgs, 19 tools, 0 attachs, 0 edits)
 Syncing ChatGPT (142 convs, 1734 msgs, 97 tools, 12 attachs, 0 edits)
 Syncing Claude (96 convs, 842 msgs, 0 tools, 5 attachs, 0 edits)
-Updated Codex (0 new, 1 updated convs; 0 convs, 9 msgs, 0 tools, 0 attachs, 0 edits processed)
+Updated Codex (0 new, 1 updated convs; 0 convs, 9 msgs, 0 tools, 0 attachs, 0 edits changed)
 Updated 0 new, 1 updated convs; 9 msgs, 0 tools, 0 attachs, 0 edits
 Total: 248 convs, 2908 msgs, 128 tools, 17 attachs, 4 edits
 ```
