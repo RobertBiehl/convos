@@ -44,6 +44,27 @@ def test_replica_outbox_is_disk_and_request_bounded(tmp_path,monkeypatch):
         calls.append(len(json.dumps(body).encode())); return {"present":{rid:i+1 for i,rid in enumerate(body["replicas"])}} if body["op"]=="replica_reconcile" else {"replicas":[]}
     monkeypatch.setattr(remote_client,"request",request); state=connect(root/"remote/state.db"); remote_client.upload_replicas({},state,root); assert max(calls)<=700 and state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]==len(envs) and not list((root/"remote/outbox").glob("replica-*")); state.close()
 
+def test_replica_preparation_interrupt_removes_temporary_batches(tmp_path,monkeypatch):
+    root=tmp_path/"client"; monkeypatch.setattr(remote_client,"REPLICA_BATCH_BYTES",700); envs=[{"workspace":"w","replica":f"{i:064x}","epoch":1,"payload":"x"*120} for i in range(19)]; real=remote_client._prepare_replica; calls=[]
+    def interrupted(*args):
+        calls.append(1)
+        if len(calls)==2: raise KeyboardInterrupt
+        return real(*args)
+    monkeypatch.setattr(remote_client,"_prepare_replica",interrupted)
+    with pytest.raises(KeyboardInterrupt): remote_client.prepare_replicas(root,envs)
+    assert len(calls)==2 and not list((root/"remote/outbox").glob(".replica-*"))
+
+def test_replica_inventory_uses_server_limit_and_legacy_default(tmp_path,monkeypatch):
+    state=connect(tmp_path/"state.db"); candidates=[(f"{i:064x}",1) for i in range(5001)]; calls=[]
+    monkeypatch.setattr(remote_client,"request",lambda cfg,body,auth=True:calls.append(len(body["replicas"])) or {"present":{rid:i+1 for i,rid in enumerate(body["replicas"])}})
+    assert len(remote_client.replica_inventory({"server_state":{"capabilities":{"replica_reconcile_limit":2500}}},state,"w",candidates))==5001 and calls==[2500,2500,1]
+    calls.clear(); assert len(remote_client.replica_inventory({},state,"w",candidates[:1001]))==1001 and calls==[500,500,1]; state.close()
+
+def test_first_publication_does_not_reconcile_each_preparation_page(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); calls=[]
+    monkeypatch.setattr("ai_convos_remote.request",lambda cfg,body,auth=True:calls.append(body["op"]) or direct(cfg,body,auth)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","first publication"); orphan=root/"remote/outbox/.replica-batch-orphan.json.1.1"; orphan.write_text("ignored staging data"); calls.clear(); sync_once(root)
+    assert "replica_reconcile" not in calls and not orphan.exists() and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==1
+
 def test_legacy_replica_batch_stream_splits_and_resumes(tmp_path,monkeypatch):
     root=tmp_path/"client"; monkeypatch.setattr(remote_client,"REPLICA_BATCH_BYTES",700); envs=[{"workspace":"w","replica":f"{i:064x}","epoch":1,"payload":"x"*120} for i in range(19)]; path=remote_client.replica_file(root,envs,False); path.parent.mkdir(parents=True); path.write_text(json.dumps({"semantic":False,"envelopes":envs},separators=(",",":"))); real=Path.read_text
     monkeypatch.setattr(Path,"read_text",lambda self,*a,**k:(_ for _ in ()).throw(AssertionError("batch loaded whole")) if self.name.startswith("replica-batch-") else real(self,*a,**k)); uploads=[0]

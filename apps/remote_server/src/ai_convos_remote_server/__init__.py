@@ -440,7 +440,7 @@ def action(db, req, token=None):
             w["members"]=rows(db,"SELECT user_id,role,active,joined_epoch,history_from FROM members WHERE workspace=?",(w["id"],))
             w["device_authorized"]=bool(db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(w["id"],w["epoch"],actor["id"])).fetchone()) and not bool(db.execute("SELECT 1 FROM workspace_device_exclusions WHERE workspace=? AND device=?",(w["id"],actor["id"])).fetchone())
             w["controls"]=[json.loads(r[0]) for r in db.execute("SELECT state FROM workspace_controls WHERE workspace=? ORDER BY revision",(w["id"],)).fetchall()]
-        return {"user":actor["user_id"],"device":actor["id"],"workspaces":memberships}
+        return {"user":actor["user_id"],"device":actor["id"],"workspaces":memberships,"capabilities":{"replica_reconcile_limit":2500,"replica_pull_limit":2500}}
     if op == "ledger":
         member(db,req["workspace"],actor["user_id"])
         return ledger_state(db,req["workspace"])
@@ -489,7 +489,7 @@ def action(db, req, token=None):
         semantic=req.get("semantic",False)
         table="semantic_replicas" if semantic else "row_replicas"
         if not isinstance(semantic,bool): raise ValueError("replica channel is invalid")
-        if not isinstance(ids,list) or not 1<=len(ids)<=500 or len(ids)!=len(set(ids)) or any(not isinstance(v,str) or len(v)!=64 for v in ids): raise ValueError("replica inventory is invalid")
+        if not isinstance(ids,list) or not 1<=len(ids)<=2500 or len(ids)!=len(set(ids)) or any(not isinstance(v,str) or len(v)!=64 for v in ids): raise ValueError("replica inventory is invalid")
         found=rows(db,f"SELECT replica,MAX(cursor) cursor FROM {table} x WHERE workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?) AND replica IN ({','.join('?'*len(ids))}) GROUP BY replica",(ws,member(db,ws,actor["user_id"])["history_from"],actor["id"],*ids))
         return {"present":{r["replica"]:r["cursor"] for r in found}}
     if op == "replica_pull":
@@ -499,7 +499,7 @@ def action(db, req, token=None):
         semantic=req.get("semantic",False)
         table="(SELECT * FROM row_replicas UNION ALL SELECT * FROM semantic_replicas)" if semantic else "row_replicas"
         if not isinstance(semantic,bool): raise ValueError("replica channel is invalid")
-        if not isinstance(after,int) or isinstance(after,bool) or after<0 or not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=500: raise ValueError("replica page is invalid")
+        if not isinstance(after,int) or isinstance(after,bool) or after<0 or not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=2500: raise ValueError("replica page is invalid")
         access="x.workspace=? AND x.epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?)"
         args=(ws,m["history_from"],actor["id"])
         floor,tail=cursor_bounds(db,table+" x",access,args)

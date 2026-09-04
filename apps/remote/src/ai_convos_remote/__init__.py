@@ -17,7 +17,7 @@ from .protocol import (b64, certificate, digest, event, fingerprint, identity, o
 from .service import edit_hooks, enable
 def cli_error(message): raise typer.Exit(typer.echo(f"Error: {message}",err=True) or 1)
 
-remote,REPLICA_BATCH_BYTES,REPLICA_ITEM_BYTES=typer.Typer(help="End-to-end encrypted personal and team synchronization"),4*1024**2,48*1024**2
+remote,REPLICA_BATCH_BYTES,REPLICA_ITEM_BYTES,REPLICA_DB_PAGE=typer.Typer(help="End-to-end encrypted personal and team synchronization"),4*1024**2,48*1024**2,2500
 def local_root(root=None): return Path(root or os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT))
 def paths(root=None): return (base:=local_root(root)/"remote"),base/"config.json",base/"state.db"
 def core_path(root=None): return local_root(root)/"data"/"convos.db"
@@ -171,7 +171,10 @@ def _prepare_replica(root,envelopes,semantic):
 def _replica_size(env): return len(json.dumps(env,separators=(",",":")).encode())+1
 def prepare_replicas(root,envelopes,semantic=False):
     required(not envelopes or len({env["workspace"] for env in envelopes})==1,ValueError("replica batch must contain one workspace"))
-    return [] if not envelopes else [_prepare_replica(root,batch,semantic) for batch in _upload_batches(envelopes,REPLICA_BATCH_BYTES-256,_replica_size,REPLICA_ITEM_BYTES)]
+    try: return [] if not envelopes else [_prepare_replica(root,batch,semantic) for batch in _upload_batches(envelopes,REPLICA_BATCH_BYTES-256,_replica_size,REPLICA_ITEM_BYTES)]
+    except BaseException:
+        discard_replicas((p,None) for p in (paths(root)[0]/"outbox").glob(f".replica-*.{os.getpid()}.*"))
+        raise
 def publish_replicas(prepared): [durable_replace(tmp,final) for tmp,final in prepared]
 def discard_replicas(prepared): [tmp.unlink(missing_ok=True) for tmp,final in prepared]
 def stage_replicas(root,envelopes,semantic=False):
@@ -220,13 +223,13 @@ def _replica_files(root):
             for batch in _upload_batches((env for sem,env in _replica_values(path)),REPLICA_BATCH_BYTES-256,_replica_size,REPLICA_ITEM_BYTES): yield (stage_replicas(root,batch,semantic) and replica_file(root,batch,semantic)),ws,semantic,len(batch)
             path.unlink()
         else: yield path,ws,semantic,count
-def upload_replicas(cfg,state,root=None,workspaces=None):
+def upload_replicas(cfg,state,root=None,workspaces=None,direct=()):
     total,done=(sum(row[3] for row in selected),0) if (selected:=[row for row in {row[0]:row for row in _replica_files(root)}.values() if workspaces is None or row[1] in workspaces]) else (0,0)
-    if total>=500: typer.echo(f"  remote replicas 0/{total}")
+    if total>=500: _progress(f"uploading rows 0/{total}")
     for path,ws,semantic,count in selected:
         for page in _upload_batches((env for sem,env in _replica_values(path)),REPLICA_BATCH_BYTES-256,_replica_size,REPLICA_ITEM_BYTES):
             ids=[env["replica"] for env in page]
-            present=request(cfg,{"op":"replica_reconcile","workspace":ws,"replicas":ids,"semantic":semantic})["present"]
+            present={} if path in direct else request(cfg,{"op":"replica_reconcile","workspace":ws,"replicas":ids,"semantic":semantic})["present"]
             required(isinstance(present,dict) and set(present)<=set(ids) and all(isinstance(v,int) and not isinstance(v,bool) and v>0 for v in present.values()),ValueError("relay replica inventory mismatch"))
             missing=[env for env in page if env["replica"] not in present]
             uploaded=request(cfg,{"op":"replica_upload_many","envelopes":missing,"semantic":semantic})["replicas"] if missing else []
@@ -234,14 +237,14 @@ def upload_replicas(cfg,state,root=None,workspaces=None):
             cursors={**present,**{env["replica"]:ack["cursor"] for env,ack in zip(missing,uploaded)}}
             state.executemany("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",[(ws,env["replica"],env["epoch"],cursors[env["replica"]]) for env in page])
             state.commit()
-        before,done=(path.unlink(missing_ok=True) or done),done+count
-        if total>=500 and (done==total or done//5000!=before//5000): typer.echo(f"  remote replicas {done}/{total}")
+        done=(path.unlink(missing_ok=True) or done)+count
+        if total>=500: _progress(f"uploading rows {done}/{total}")
 def receipt(state,ws,value,cursor,epoch): state.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],cursor,value["author"],value["seq"],epoch,value["kind"],value["payload_v"],value["entity"],value["revision"],value["payload"].get("status") if isinstance(value["payload"],dict) and value["payload"].get("status") in ("active","deleted") else None))
 def safe_url(url):
     parsed=urllib.parse.urlparse(url)
     required(parsed.scheme=="https" or parsed.hostname in ("127.0.0.1","localhost","::1") or os.environ.get("CONVOS_REMOTE_INSECURE")=="1",ValueError("Remote URL must use HTTPS (set CONVOS_REMOTE_INSECURE=1 only on a trusted test network)"))
 def request(cfg,body,auth=True):
-    _progress(f"request {body['op']}")
+    _heartbeat(f"request {body['op']}")
     safe_url(cfg["url"])
     headers={"Content-Type":"application/json"}
     if auth: headers["Authorization"]="Bearer "+cfg["token"]
@@ -260,11 +263,13 @@ def _manual_waiting(root):
         if pulse: return None
     try: return json.loads(path.read_text())
     except (OSError,ValueError): return {}
-def _progress(stage):
-    _leases.get() and sys.stderr.isatty() and (now:=time.monotonic()) and ((group:=re.sub(r" (?:\d+(?:/\d+)?|[0-9a-f]{64})$","",stage))!=_PROGRESS[2] or not _PROGRESS[0] or now-_PROGRESS[0]>=5) and (typer.echo(f"\r\033[2KRemote {now-(started:=_PROGRESS[1] or now):.0f}s | {stage}",err=True,nl=False),_PROGRESS.__setitem__(slice(None),[now,started,group]))
+def _heartbeat(stage):
     for pulse,root in _leases.get():
         if root and (owner:=_manual_waiting(root)) is not None: raise InterruptedError(f"Background Remote sync yielded to a manual command. Holder: {lock_holder(owner)}.")
         pulse(stage)
+def _progress(stage):
+    _leases.get() and sys.stderr.isatty() and (now:=time.monotonic()) and ((group:=re.sub(r" (?:\d+(?:/\d+)?|[0-9a-f]{64})$","",stage))!=_PROGRESS[2] or not _PROGRESS[0] or now-_PROGRESS[0]>=5) and (typer.echo(f"\r\033[2KRemote {now-(started:=_PROGRESS[1] or now):.0f}s | {stage}",err=True,nl=False),_PROGRESS.__setitem__(slice(None),[now,started,group]))
+    _heartbeat(stage)
 def _lock_identity(root):
     try: cfg=json.loads(paths(root)[1].read_text())
     except (OSError,ValueError): cfg={}
@@ -671,8 +676,8 @@ def reconcile_replicas(cfg,state,root,ws,envelopes,semantic=False):
     stage_replicas(root,envelopes,semantic)
     upload_replicas(cfg,state,root,{ws})
 def replica_inventory(cfg,state,ws,candidates):
-    found={}
-    for rows in (candidates[i:i+500] for i in range(0,len(candidates),500)):
+    found,limit={},min(2500,max(1,cfg.get("server_state",{}).get("capabilities",{}).get("replica_reconcile_limit",500)))
+    for rows in (candidates[i:i+limit] for i in range(0,len(candidates),limit)):
         present=request(cfg,{"op":"replica_reconcile","workspace":ws,"replicas":(page:=[r[0] for r in rows])})["present"]
         if not isinstance(present,dict) or not set(present)<=set(page) or any(not isinstance(v,int) or isinstance(v,bool) or v<1 for v in present.values()): raise ValueError("relay replica inventory mismatch")
         found.update(present)
@@ -680,6 +685,7 @@ def replica_inventory(cfg,state,ws,candidates):
         missing=[(ws,replica,epoch) for replica,epoch in rows if replica not in present]
         if available: state.executemany("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",available)
         if missing: state.executemany("DELETE FROM replica_receipts WHERE workspace=? AND replica=? AND epoch=?",missing)
+        _heartbeat(f"reconciled replicas {len(found)}/{len(candidates)}")
     state.commit()
     return set(found)
 def reconcile_blobs(cfg,state,root,ws,envelopes):
@@ -766,7 +772,7 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
         if missing: after=0
     cursor,total,valid,invalid=after,0,set(known),{}
     while True:
-        result=request(cfg,{"op":"replica_pull","workspace":sid,"after":cursor,"limit":500,"semantic":True})
+        result=request(cfg,{"op":"replica_pull","workspace":sid,"after":cursor,"limit":min(2500,max(1,cfg.get("server_state",{}).get("capabilities",{}).get("replica_pull_limit",500))),"semantic":True})
         floor,tail=result["floor"],result["tail"]
         if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail: raise ValueError("relay replica cursor window is invalid")
         if cursor>tail:
@@ -790,17 +796,16 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
                     opened.append((item,body))
                     valid.add(identity)
                     invalid.pop(identity,None)
-        accepted=apply_row_replicas(core_path(root),[body for item,body in opened],sid,controls,recover,cfg["user"],root=root,ready=not core_path(root).is_file())
+        accepted=[ok for i in range(0,len(opened),500) for ok in apply_row_replicas(core_path(root),[body for item,body in opened[i:i+500]],sid,controls,recover,cfg["user"],root=root,ready=not core_path(root).is_file())]
         accepted_keys={(item["envelope"]["replica"],item["envelope"]["epoch"]) for (item,body),ok in zip(opened,accepted) if body["proof"]["kind"]=="row.proof" or ok}
         known|=accepted_keys
         receipts=[(sid,item["envelope"]["replica"],item["envelope"]["epoch"],item["cursor"]) for item in received if (item["envelope"]["replica"],item["envelope"]["epoch"]) in known]
         if receipts: state.executemany("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",receipts)
         after=min(invalid.values())-1 if invalid else cursor
-        before,total=total,total+len(received)
+        total+=len(received)
         state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"replica_cursor:{sid}",str(after),f"replica_projection:{sid}",stamp))
         state.commit()
         _progress(f"receiving rows {cursor}/{tail}")
-        if fresh and (cursor>=tail or total//5000!=before//5000): typer.echo(f"  remote rows {cursor}/{tail}")
         if cursor>=tail:
             if invalid: raise ValueError(f"invalid row replica: no valid delivery copy for {len(invalid)} object(s)")
             return total
@@ -996,6 +1001,7 @@ def sync_once(root=None,repair=False,manual=False):
     root=local_root(root)
     with sync_run(root,manual):
         cfg=load(root)
+        discard_replicas((p,None) for p in (paths(root)[0]/"outbox").glob(".replica-*"))
         _,_,state_path=paths(root)
         info=inspect_state(state_path,manual or repair)
         cutover=None
@@ -1057,12 +1063,14 @@ def sync_once(root=None,repair=False,manual=False):
                     _progress(f"preparing workspace {cfg['workspaces'][ws]['name']}")
                     bindings={r[0]:r[1] for r in state.execute("SELECT origin,epoch FROM origin_bindings WHERE workspace=?",(ws,)).fetchall()}
                     origins=set(bindings)
-                    repair=initial or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone())
-                    sum((count:=attest_rows(path,cfg,ws,records[i:i+500],origins),_progress(f"attesting rows {min(i+500,len(records))}/{len(records)}"),count)[-1] for i in range(0,len(records),500))
+                    verify=bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone())
+                    retained=initial or verify
+                    sum((count:=attest_rows(path,cfg,ws,records[i:i+REPLICA_DB_PAGE],origins),_progress(f"attesting rows {min(i+REPLICA_DB_PAGE,len(records))}/{len(records)}"),count)[-1] for i in range(0,len(records),REPLICA_DB_PAGE))
                     keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}
-                    known_replicas=set() if repair else {r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
+                    known_replicas={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
                     upload_blocked=[]
-                    prepared=[pair for i in range(0,max(len(records),1),500) for envelopes in [(row_replicas(path,cfg,ws,records[i:i+500],keys,known_replicas,origins,bindings,lambda ids:replica_inventory(cfg,state,ws,ids) if repair else set(known_replicas),False,upload_blocked),_progress(f"preparing rows {min(i+500,len(records))}/{len(records)}"))[0]] for pair in prepare_replicas(root,envelopes)]+[pair for page in (retained_proof_pages(path,ws,origins,cfg["user"]) if repair else ()) for envelopes in [(row_replicas(path,cfg,ws,[],keys,known_replicas,origins,bindings,lambda ids:replica_inventory(cfg,state,ws,ids),page,upload_blocked),_progress("preparing retained rows"))[0]] for pair in prepare_replicas(root,envelopes)]
+                    inventory=(lambda ids:replica_inventory(cfg,state,ws,ids)) if verify else None
+                    prepared=[pair for i in range(0,max(len(records),1),REPLICA_DB_PAGE) for envelopes in [(row_replicas(path,cfg,ws,records[i:i+REPLICA_DB_PAGE],keys,known_replicas,origins,bindings,inventory,False,upload_blocked),_progress(f"preparing rows {min(i+REPLICA_DB_PAGE,len(records))}/{len(records)}"))[0]] for pair in prepare_replicas(root,envelopes)]+[pair for page in (retained_proof_pages(path,ws,origins,cfg["user"],REPLICA_DB_PAGE) if retained else ()) for envelopes in [(row_replicas(path,cfg,ws,[],keys,known_replicas,origins,bindings,inventory,page,upload_blocked),_progress("preparing retained rows"))[0]] for pair in prepare_replicas(root,envelopes)]
                     try:
                         with local_lock(root,"mutation",True):
                             current=load(root)
@@ -1079,7 +1087,7 @@ def sync_once(root=None,repair=False,manual=False):
                     except BaseException:
                         discard_replicas(prepared)
                         raise
-                    upload_replicas(cfg,state,root,{ws})
+                    upload_replicas(cfg,state,root,{ws},{final for tmp,final in prepared} if initial or verify else ())
                     state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_upload_blocked:{ws}",json.dumps(sorted(set(upload_blocked))))) if upload_blocked else state.execute("DELETE FROM meta WHERE key=?",(f"replica_upload_blocked:{ws}",))
                     if upload_blocked: typer.echo(f"Remote upload skipped {len(set(upload_blocked))} received row(s) whose local projection does not match the author's proof; run `convos remote repull` to restore them.",err=True)
                     known_blobs={r[0] for r in state.execute("SELECT blob FROM blob_receipts WHERE workspace=? UNION SELECT blob FROM blob_outbox WHERE workspace=?",(ws,ws)).fetchall()}

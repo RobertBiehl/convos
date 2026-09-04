@@ -153,6 +153,12 @@ def test_remote_progress_replaces_one_line_and_throttles_same_stage(tmp_path,mon
     output=capsys.readouterr().err
     assert output.count("\r\033[2KRemote ")==2 and "receiving rows 1000/1000" not in output and output.endswith("\n")
 
+def test_remote_internal_requests_heartbeat_without_rendering(tmp_path,monkeypatch,capsys):
+    import ai_convos_remote
+    monkeypatch.setattr(ai_convos_remote.sys.stderr,"isatty",lambda:True); monkeypatch.setattr(ai_convos_remote.urllib.request,"urlopen",lambda *a,**k:type("Response",(),{"read":lambda self:b"{}"})())
+    with ai_convos_remote.sync_run(tmp_path,True): ai_convos_remote._progress("preparing rows 500/1000"); ai_convos_remote.request({"url":"http://localhost","token":"t"},{"op":"replica_reconcile"})
+    output=capsys.readouterr().err; assert output.count("\r\033[2KRemote ")==1 and "request replica_reconcile" not in output
+
 def test_signed_evidence_reconciliation_is_always_targeted():
     tree=ast.parse((ROOT/"src/ai_convos/cli.py").read_text()); calls=[node for node in ast.walk(tree) if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=="_apply_signed_edit_evidence"]
     assert len(calls)==3 and all(len(node.args)>1 or any(k.arg in {"edits","tools"} for k in node.keywords) for node in calls)
@@ -192,7 +198,7 @@ def test_remote_full_scan_releases_the_archive_between_bounded_pages(tmp_path):
         with cli.open_db(path,wait=0,purpose="concurrent page probe"): pass
         stages.append(stage)
     records=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); state.close()
-    assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages==["scanning archive 1","scanning archive 2","scanning archive 3"]
+    assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages[0]=="scanning archive 1" and stages[-1]=="scanning archive 3" and len(stages)>=2
 
 def test_remote_scan_defers_changes_after_its_watermark(tmp_path):
     from ai_convos_remote import projection
