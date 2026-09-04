@@ -38,7 +38,7 @@ def _flock(lock,op,deadline,wait,purpose,identity=None):
         except BlockingIOError:
             owner,pulse=(owner:=_lock_read(lock)),owner.get("heartbeat_at")
             if pulse is not None and pulse!=progress: progress,deadline=pulse,time.monotonic()+wait
-            if (remaining:=deadline-time.monotonic())<=0: raise LockBusy(f"Could not start {purpose}: another process {'is already running' if not wait else f'made no recorded progress for {wait:g}s'}. Holder: {lock_holder(owner)}.")
+            if (remaining:=deadline-time.monotonic())<=0: raise LockBusy(f"Could not start {purpose}: another operation {'is already running' if not wait else f'made no recorded progress for {wait:g}s'}. Holder: {lock_holder(owner)}.")
             delay=(time.sleep(random.uniform((pause:=min(delay,remaining))/2,pause)),min(delay*2,5))[-1]
 _DUCKDB_PID=re.compile(r"(?:\(PID |PID )(\d+)\)?")
 def _duckdb_owner(path,error):
@@ -863,9 +863,9 @@ def ingest_parts(r,size=500):
     prepared,valid,blank,scopes,edit_scopes,chunks,byid=prepare_result(r),required(not (conflict:=_id_conflict(r.convs,("source","cwd","git_branch","project_id","metadata")) or _id_conflict(r.msgs,("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"))),ValueError(f"divergent provider session in import batch: {conflict}")),lambda **values:ParseResult(**{"scopes":[],"edit_scopes":[],**values}),{v[0]:v for v in r.scopes},{v[0]:v for v in r.edit_scopes},lambda rows:[rows[i:i+size] for i in range(0,len(rows),size)],{m["id"]:m for m in r.msgs}
     rank,messages=(rank:={mid:i for i,mid in enumerate(graphlib.TopologicalSorter({mid:{m["parent_id"]}&byid.keys() for mid,m in byid.items()}).static_order())}),sorted(r.msgs,key=lambda m:rank[m["id"]])
     return [*[blank(convs=v,scopes=[scopes[c["id"]] for c in v if c["id"] in scopes]) for v in chunks(r.convs)],*[blank(msgs=v) for v in chunks(messages)],*[blank(tools=v) for v in chunks(r.tools)],*[blank(attachs=v,attachment_indexes={a["id"]:r.attachment_indexes[a["id"]] for a in v if a.get("path")}) for v in chunks(r.attachs)],*[blank(artifacts=v) for v in chunks(r.artifacts)],*[blank(edits=v,edit_scopes=[edit_scopes[e["id"]] for e in v if e["id"] in edit_scopes]) for v in chunks(r.edits)],*[blank(edit_evidence=v) for v in chunks(r.edit_evidence)]]
-def commit_result(r,purpose,progress=None):
+def commit_result(r,purpose,progress=None,parts=None):
     total,changed,newids=[0]*7,set(),set()
-    for part in (p for p in ingest_parts(r) if any((p.convs,p.msgs,p.tools,p.attachs,p.artifacts,p.edits,p.edit_evidence))):
+    for part in (p for p in (ingest_parts(r) if parts is None else parts) if any((p.convs,p.msgs,p.tools,p.attachs,p.artifacts,p.edits,p.edit_evidence))):
         with _core(purpose=purpose) as conn,_transaction(conn): out=(newids.update({c["id"] for c in part.convs}-{x[0] for x in conn.execute("SELECT id FROM conversations WHERE id IN (SELECT UNNEST(?))",[[c["id"] for c in part.convs]]).fetchall()}) if part.convs else None,upsert(conn,part))[-1]
         (total.__setitem__(slice(None),[total[i]+out[i] for i in range(7)]),changed.update(out[7]),total.__setitem__(slice(5,7),[len(newids),len({m["conversation_id"] for m in r.msgs if m["id"] in changed}-newids)]),r.provenance_edits.update(part.provenance_edits),r.provenance_conversations.update(part.provenance_conversations),progress and progress(f"{purpose} {sum(total[:5])} rows"))
         archive_yield(DB_PATH)
@@ -1274,10 +1274,10 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         chatgpt_ok.clear() or chatgpt_frontiers.clear()
         total,changed,jobs,newc,updc,provenance_edits,provenance_conversations,repair_attempted=[0]*5,set(),[],0,0,set(),set(),set()
         def checkpoint(r):
-            with operation_lock(HOOK_DIR/".lock","hooks.queue"):
-                out=commit_result(r,purpose="sync.ingest",progress=pulse)
-                known.update({c["id"]:(u.timestamp() if (u:=ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"})
-                repair_attempted.update(c["id"] for c in r.convs if c["id"] in repair_order)
+            parts=ingest_parts(r)
+            with operation_lock(HOOK_DIR/".lock","hooks.queue") as queue:
+                out=commit_result(r,purpose="sync.ingest",progress=lambda stage:(pulse(stage),queue(stage))[-1],parts=parts)
+                (known.update({c["id"]:(u.timestamp() if (u:=ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"}),repair_attempted.update(c["id"] for c in r.convs if c["id"] in repair_order))
                 return (*out,getattr(r,"provenance_edits",set()),getattr(r,"provenance_conversations",set()))
         with _core(read_only=True,purpose="sync.chatgpt.repair.plan") as conn: repairs=conn.execute("SELECT c.id,MIN(m.created_at),MAX(m.created_at) FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL) AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) GROUP BY c.id").fetchall()
         if repairs:
@@ -1304,7 +1304,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     if saved := j.get("saved"):
                         c,m,t,a,e,n,u,changed_ids,provenance_edits,provenance_conversations=(*[sum(s[i] for s in saved) for i in range(7)],set().union(*(s[7] for s in saved)),provenance_edits|set().union(*(s[8] for s in saved)),provenance_conversations|set().union(*(s[9] for s in saved)))
                     elif r is not None:
-                        with operation_lock(HOOK_DIR/".lock","hooks.queue"): c,m,t,a,e,n,u,changed_ids=commit_result(r,purpose="sync.ingest",progress=pulse)
+                        c,m,t,a,e,n,u,changed_ids,*_=checkpoint(r)
                     else: continue
                     total,newc,updc,changed=[total[i]+v for i,v in enumerate([c,m,t,a,e])],newc+n,updc+u,changed|changed_ids
                     if r is not None: provenance_edits,provenance_conversations=provenance_edits|getattr(r,"provenance_edits",set()),provenance_conversations|getattr(r,"provenance_conversations",set())

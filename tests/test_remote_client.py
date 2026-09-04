@@ -65,7 +65,7 @@ def test_remote_timeout_names_operation(monkeypatch):
 def test_sync_lease_is_nonblocking_and_separate_from_mutation_lease(tmp_path):
     with remote_client.mutation_lock(tmp_path):
         with remote_client.sync_run(tmp_path): pass
-        with pytest.raises(RuntimeError,match="another process"):
+        with pytest.raises(RuntimeError,match="another operation"):
             with remote_client.mutation_lock(tmp_path): pass
     remote_client.save({"name":"alice","user":"user-id","device":{"name":"laptop","id":"device-id"}},tmp_path)
     with remote_client.sync_run(tmp_path) as pulse:
@@ -131,7 +131,7 @@ def test_sync_revalidates_sharing_policy_before_publication(tmp_path,monkeypatch
 def test_sync_serializes_state_cutover_with_control_mutations(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); state=connect(root/"remote/state.db"); state.execute("UPDATE meta SET value='1' WHERE key='state_schema'"); state.commit(); state.close(); real=remote_client.cutover_state; seen=[]
     def guarded(path):
-        with pytest.raises(RuntimeError,match="remote mutation.*another process"):
+        with pytest.raises(RuntimeError,match="remote mutation.*another operation"):
             with remote_client.mutation_lock(root): pass
         seen.append(True); return real(path)
     monkeypatch.setattr(remote_client,"cutover_state",guarded); sync_once(root); assert seen==[True] and inspect_state(root/"remote/state.db")["status"]=="current"
