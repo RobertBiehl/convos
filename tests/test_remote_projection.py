@@ -8,7 +8,7 @@ import ai_convos.cli as core_module
 from ai_convos.cli import ARCHIVE_COLUMNS, capture_provenance, init_schema, project_attachment_body, project_row_proof, provenance_digest, repository
 import ai_convos_remote as remote_client
 import ai_convos_remote.projection as projection_module
-from ai_convos_remote import edit_evidence_accept, edit_evidence_bridge, edit_evidence_records, promote_paths, provider_alias_accept, provider_alias_bridge, provider_alias_id, provider_alias_records, publish, sharing_routes
+from ai_convos_remote import edit_evidence_accept, edit_evidence_bridge, edit_evidence_delta, edit_evidence_records, promote_paths, provider_alias_accept, provider_alias_bridge, provider_alias_id, provider_alias_records, publish, sharing_routes
 from ai_convos_remote.projection import apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_replicas, bridge_stamp, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, reconcile_provider_aliases, relocate_attachments, row_replicas, scan, sequence, sharing
 from ai_convos_remote.protocol import b64, certificate, digest, event, identity, logical_row, open_blob, open_replica, public, public_id, row_proof, seal_replica, semantic_proof
 
@@ -55,6 +55,13 @@ def test_edit_evidence_inventory_is_set_based_not_per_edit(tmp_path,monkeypatch)
         opened.append(purpose)
         with real(*args,purpose=purpose,**kwargs) as db: yield db
     monkeypatch.setattr(remote_client,"_core",counted); assert len(edit_evidence_records(root,"u","w","personal"))==40 and opened.count("remote.edit_evidence.read")==1
+
+def test_edit_evidence_delta_limits_large_inventory_and_includes_changed_tool_dependents(tmp_path,monkeypatch):
+    root=tmp_path/"archive"; path=root/"data/convos.db"; db=core_module.open_db(path,purpose="fixture"); init_schema(db); rows=[(f"p{i}","w","w","file_edits",f"e{i}",1,"h",f"{i:064x}",None,"active","u","d",1,"s") for i in range(4000)]+[("pt","w","w","tool_calls","t",1,"h","f"*64,None,"active","u","d",1,"s")]; db.executemany("INSERT INTO remote.row_proofs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",rows); db.executemany("INSERT INTO provenance.file_edit_evidence VALUES (?,'confirmed','test',?)",[(f"e{i}","t" if i==3999 else None) for i in range(4000)]); db.close(); pages=[]; real=remote_client._edit_pages
+    def counted(*args,**kwargs):
+        for rows in real(*args,**kwargs): pages.append(len(rows)); yield rows
+    monkeypatch.setattr(remote_client,"_edit_pages",counted); records=[{"kind":"file_edit.record","payload":{"row":["e7"]}},{"kind":"tool.record","payload":{"row":["t"]}}]; values=edit_evidence_delta(root,"u","w","personal",records)
+    assert {v["row"]["data"]["edit"] for v in values}=={"e7","e3999"} and max(pages)==2
 
 def test_signed_edit_evidence_tracks_exact_row_heads_reorder_tombstones_and_forks(tmp_path):
     root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); archive=tmp_path/"archive"; path=archive/"data/convos.db"; apply=lambda values:apply_row_replicas(path,values,"w",[control],local_user="receiver",root=archive); state=lambda:duckdb.connect(str(path),read_only=True).execute("SELECT status,reason,tool_call_id IS NOT NULL FROM provenance.file_edit_evidence").fetchone()
@@ -275,6 +282,10 @@ def test_bridge_collection_runs_once_and_persists_new_proofs_in_bulk(tmp_path,mo
     def accept_many(_,values,project): calls["accepted"].append((values,project)); return [True]*len(values)
     monkeypatch.setattr(projection_module,"bridges",lambda:[{"v":3,"schema":1,"objects":{"x"},"records":records,"accept":lambda *_:None,"accept_many":accept_many}]); cfg={"root":root,"user":user,"device":device,"workspaces":{"w":{"epoch":1}}}
     assert len(bridge_replicas(tmp_path,cfg,"w","personal",bytes(range(32))))==2 and calls["records"]==1 and len(calls["accepted"])==1 and len(calls["accepted"][0][0])==2 and calls["accepted"][0][1] is False
+
+def test_bridge_delta_receives_exact_archive_changes(tmp_path,monkeypatch):
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); changes=[{"kind":"file_edit.record","payload":{"row":["e"]}}]; calls=[]; row={"v":1,"kind":"x","id":"1","state":"active","data":{}}; bridge={"v":3,"schema":1,"objects":{"x"},"records":lambda *_:(_ for _ in ()).throw(AssertionError("full inventory used")),"delta":lambda *args:calls.append(args[-1]) or [dict(row=row,proof=None,previous=None)],"accept":lambda *_:True}; monkeypatch.setattr(projection_module,"bridges",lambda:[bridge]); cfg={"root":root,"user":user,"device":device,"workspaces":{"w":{"epoch":1}}}
+    assert len(bridge_replicas(tmp_path,cfg,"w","personal",bytes(range(32)),changes=changes))==1 and calls==[changes]
 
 
 def test_provider_session_alias_converges_one_author_and_separates_authors(tmp_path):

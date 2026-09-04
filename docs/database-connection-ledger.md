@@ -51,6 +51,7 @@ Each row is one production connection acquisition site. IDs are stable labels, s
 | A36 | `apps/remote/src/ai_convos_remote/__init__.py::provider_alias_records` | `remote.provider_alias.read` | Shared | All personal provider aliases plus duplicate-session grouping over conversations | Background Remote sync can delay a writer as aliases/archive grow | Materializes before signing/network work; over-5s diagnostic |
 | A37 | `apps/remote/src/ai_convos_remote/__init__.py::provider_alias_accept` | `remote.provider_alias.write` | Exclusive | One verified semantic alias revision and its leaf check | Briefly blocks all archive clients | Signature verification precedes acquisition; bounded object commit |
 | A38 | `apps/remote/src/ai_convos_remote/__init__.py::edit_evidence_records` | `remote.edit_evidence.read` | Shared | One adaptive batch of at most 10,000 current edit candidates plus their evidence and tool-proof heads, targeting about 250 ms | Briefly delays writers during evidence publication | Set-based batch lookup; closes before record comparison/signing, records real page progress, and yields to a waiting client |
+| A81 | `apps/remote/src/ai_convos_remote/__init__.py::edit_evidence_delta` | `remote.edit_evidence.delta` | Shared | One exact lookup of file edits linked to the changed tool-call IDs in the captured generation delta | Briefly delays a writer; cardinality is bounded by the changed tools and their linked edits | Skipped when no tool changed; materializes IDs and closes before evidence inventory/signing |
 | A39 | `apps/remote/src/ai_convos_remote/__init__.py::edit_evidence_accept` | `remote.edit_evidence.write` | Exclusive | One verified evidence revision plus leaf reconciliation | Briefly blocks all archive clients | Verification precedes acquisition; one object commit |
 | A40 | `apps/remote/src/ai_convos_remote/__init__.py::pull_origins` | `remote.origins.write` | Exclusive | One relay origin response and its control chains in one transaction | Large origin response can block all archive clients | Decryption/validation precedes acquisition; response-bounded transaction |
 | A42 | `apps/remote/src/ai_convos_remote/__init__.py::local_replica_ids` | `remote.replica.inventory` | Shared | Generation-independent proof inventory in 5,000-proof pages, closing between pages | Each page briefly delays writers during repair | Keyset paging plus writer-acquisition contention test |
@@ -91,13 +92,13 @@ Each row is one production connection acquisition site. IDs are stable labels, s
 | A78 | `apps/remote/src/ai_convos_remote/projection.py::reconcile_provider_aliases` | `remote.alias.finish-plan` | Shared | Conversation heads/binding plus a remaining-dependent-row existence check for one alias | Briefly delays writers | Runs after paged revisions; closes before signing and final mutation |
 | A79 | `apps/remote/src/ai_convos_remote/projection.py::reconcile_provider_aliases` | `remote.alias.finish` | Exclusive | Conversation tombstones and provider binding for one alias member set | Briefly blocks archive clients | Generation recheck and one atomic final identity switch after no dependent row references a loser |
 
-The AST ledger has 77 archive acquisition sites; duplicate purpose strings are separate rows when separate functions acquire connections.
+The AST ledger has 78 archive acquisition sites; duplicate purpose strings are separate rows when separate functions acquire connections.
 
 ## Direct DuckDB constructors
 
 | ID | Site | Database and mode | Lifetime and cardinality | Possible impact | Mitigation |
 |---|---|---|---|---|---|
-| D01 | `src/ai_convos/cli.py::_open_db` | Live archive, mode supplied by gateway | Constructor only; lifetime belongs to A01-A74 | A caller outside the gateway would lose standardized contention diagnosis and connection-duration reporting | It is called only by `get_db`; AST test freezes that fact |
+| D01 | `src/ai_convos/cli.py::_open_db` | Live archive, mode supplied by gateway | Constructor only; lifetime belongs to A01-A81 | A caller outside the gateway would lose standardized contention diagnosis and connection-duration reporting | It is called only by `get_db`; AST test freezes that fact |
 | D02 | `src/ai_convos/cli.py::_check_archive` | Detached backup candidate, read-only | One scalar validation query | No live archive lock impact | Path is a staged backup, never the live archive; AST test freezes the exception |
 
 ## SQLite constructors

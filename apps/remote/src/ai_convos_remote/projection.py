@@ -142,7 +142,7 @@ def connect(path):
     return db
 @lru_cache(maxsize=1)
 def bridges():
-    if (result:=[entry.load()() for entry in entry_points(group="convos.remote")]) and any(not {"v","schema","objects","records","accept"}<=set(b)<={"v","schema","objects","records","accept","accept_many","source"} or b["v"]!=3 or isinstance(b["v"],bool) or not isinstance(b["schema"],int) or isinstance(b["schema"],bool) or b["schema"]<1 or b.get("source") not in (None,"archive") or any(not callable(b[k]) for k in ("records","accept")+(("accept_many",) if "accept_many" in b else ())) or not isinstance(b["objects"],set) or not b["objects"] or any(not isinstance(v,str) or not v for v in b["objects"]) for b in result) or len([v for b in result for v in b["objects"]])!=len({v for b in result for v in b["objects"]}): raise ValueError("Unsupported remote bridge")
+    if (result:=[entry.load()() for entry in entry_points(group="convos.remote")]) and any(not {"v","schema","objects","records","accept"}<=set(b)<={"v","schema","objects","records","accept","accept_many","delta","source"} or b["v"]!=3 or isinstance(b["v"],bool) or not isinstance(b["schema"],int) or isinstance(b["schema"],bool) or b["schema"]<1 or b.get("source") not in (None,"archive") or any(not callable(b[k]) for k in ("records","accept")+tuple(k for k in ("accept_many","delta") if k in b)) or not isinstance(b["objects"],set) or not b["objects"] or any(not isinstance(v,str) or not v for v in b["objects"]) for b in result) or len([v for b in result for v in b["objects"]])!=len({v for b in result for v in b["objects"]}): raise ValueError("Unsupported remote bridge")
     return result
 def control_chain(controls):
     ordered,previous=sorted(controls,key=lambda c:c["revision"]),None
@@ -196,7 +196,7 @@ def audit_rows(db_path,page=5000,progress=None):
 def event_support(value):
     if not isinstance(kind:=value["kind"],str) or not isinstance(version:=value["payload_v"],int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
     return "supported" if (kind,version) in CORE_EVENTS else "required"
-def bridge_records(root,cfg,workspace,kind,archive=True): return [record for bridge in bridges() if archive or bridge.get("source")!="archive" for record in bridge["records"](root,cfg["user"],workspace,kind)]
+def bridge_records(root,cfg,workspace,kind,archive=True,changes=None): return [record for bridge in bridges() if archive or bridge.get("source")!="archive" for record in (bridge["delta"](root,cfg["user"],workspace,kind,changes) if changes is not None and "delta" in bridge else bridge["records"](root,cfg["user"],workspace,kind))]
 def bridge_stamp(root): return digest({kind:(bridge["v"],bridge["schema"]) for bridge in bridges() for kind in bridge["objects"]})
 def bridge_state(root,cfg,workspace,kind,generation): return digest((generation,bridge_stamp(root),bridge_records(root,cfg,workspace,kind,False)))
 def bridge_accept(root,row,proof,project=True): return bool((found:=[bridge for bridge in bridges() if row["kind"] in bridge["objects"]]) and found[0]["accept"](root,row,proof,project))
@@ -205,8 +205,8 @@ def bridge_accept_many(root,values,project=True):
     batches=[(selected,bridge["accept_many"](root,[value for _,value in selected],project) if "accept_many" in bridge else [bridge["accept"](root,*value,project) for _,value in selected]) for bridge,selected in groups]
     mapped=(required(all(len(selected)==len(answers) for selected,answers in batches),ValueError("Remote bridge batch result mismatch")),{i:bool(answer) for selected,answers in batches for (i,_),answer in zip(selected,answers)})[-1]
     return [mapped.get(i,False) for i in range(len(values))]
-def bridge_replicas(root,cfg,workspace,kind,key_,known=(),inventory=None,archive=True):
-    values=bridge_records(root,cfg,workspace,kind,archive)
+def bridge_replicas(root,cfg,workspace,kind,key_,known=(),inventory=None,archive=True,changes=None):
+    values=bridge_records(root,cfg,workspace,kind,archive,changes)
     fresh=[(value["row"],value["proof"]) for value in values if value["proof"] is None and not value.__setitem__("proof",semantic_proof(cfg["root"],cfg["user"],cfg["device"]["id"],workspace,cfg["workspaces"][workspace]["epoch"],value["row"],value["previous"]))]
     bridge_accept_many(root,fresh,False)
     values=[(value,fingerprint(key_,digest(value["proof"]))) for value in values if value["proof"]]
