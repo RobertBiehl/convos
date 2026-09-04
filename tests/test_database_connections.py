@@ -139,19 +139,19 @@ def test_manual_sync_progress_uses_existing_operation_events(tmp_path,monkeypatc
     import ai_convos_remote
     monkeypatch.setattr(cli,"DATA_DIR",tmp_path/"local"); monkeypatch.setattr(cli.sys.stderr,"isatty",lambda:True)
     assert cli._sync_leader(lambda progress:progress("parsing codex 20/40")) is None
-    with ai_convos_remote.sync_run(tmp_path/"remote",True): ai_convos_remote._progress("receiving rows 500/1000")
+    with ai_convos_remote.sync_run(tmp_path/"remote",True): ai_convos_remote._progress("receiving rows 500")
     output=capsys.readouterr().err
-    assert "Local sync: parsing codex 20/40" in output and "Remote 0s | receiving rows 500/1000" in output and output.endswith("\n")
+    assert "Local sync: parsing codex 20/40" in output and "Remote 0s | receiving rows 500" in output and output.endswith("\n")
 
 def test_remote_progress_replaces_one_line_and_throttles_same_stage(tmp_path,monkeypatch,capsys):
     import ai_convos_remote
     monkeypatch.setattr(ai_convos_remote.sys.stderr,"isatty",lambda:True)
     with ai_convos_remote.sync_run(tmp_path,True):
-        ai_convos_remote._progress("receiving rows 500/1000")
-        ai_convos_remote._progress("receiving rows 1000/1000")
+        ai_convos_remote._progress("receiving rows 500")
+        ai_convos_remote._progress("receiving rows 1000")
         ai_convos_remote._progress("request state")
     output=capsys.readouterr().err
-    assert output.count("\r\033[2KRemote ")==2 and "receiving rows 1000/1000" not in output and output.endswith("\n")
+    assert output.count("\r\033[2KRemote ")==2 and "receiving rows 1000" not in output and output.endswith("\n")
 
 def test_remote_internal_requests_heartbeat_without_rendering(tmp_path,monkeypatch,capsys):
     import ai_convos_remote

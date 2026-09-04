@@ -82,45 +82,45 @@ def _edit_pages(root,query,args,after,page=1000):
     while True:
         with _core(root,True,purpose="remote.edit_evidence.page") as db: rows=(started:=time.monotonic(),db.execute(query,(*args,*after,page)).fetchall())[-1]
         if not rows: return
-        after,page,_=rows[-1][:len(after)],max(100,min(10000,int(page*.25/max(time.monotonic()-started,.001)))),(_progress("scanning edit evidence"),archive_yield(core_path(root)))
-        yield rows
+        yield (after:=rows[-1][:len(after)],page:=max(100,min(10000,int(page*.25/max(time.monotonic()-started,.001)))),(_progress("scanning edit evidence"),archive_yield(core_path(root))),rows)[-1]
 def _edit_record(value,evidence,origins,tools,leaves,user):
     edit,edit_revision,physical=value
     if physical not in evidence: return None
     status,reason,physical_tool,tool,tool_revision=(*evidence[physical],(tool:=origins.get(evidence[physical][2],evidence[physical][2]) if evidence[physical][2] else None),tools.get(tool) if tool else None)
     return None if tool and not tool_revision else (lambda row,matching:None if len(matching)==1 and matching[0]["row"]==row else dict(row=row,proof=None,previous=[v["proof"] for v in matching] if len(matching)>1 else matching[0]["proof"] if matching else None))(row:={"v":1,"kind":"file-edit.evidence","id":edit_evidence_id(edit),"state":"active","data":{"edit":edit,"edit_revision":edit_revision,"status":status,"reason":reason,"tool_call":tool,"tool_revision":tool_revision}},leaves.get((user,row["id"]),[]))
-def edit_evidence_records(root,user,workspace,kind):
-    if (_progress("scanning edit evidence"),not core_path(root).is_file())[1]: return []
-    stored,ancestors=[_edit_evidence_value(r[3:]) for rows in _edit_pages(root,"SELECT author_user_id,object_id,revision,workspace_id,author_user_id,object_id,revision,source_edit_id,edit_revision,status,reason,source_tool_call_id,tool_revision,CAST(proof AS VARCHAR) FROM remote.file_edit_evidence_proofs WHERE workspace_id=? AND (author_user_id,object_id,revision)>(?,?,?) ORDER BY author_user_id,object_id,revision LIMIT ?",(workspace,),("","","")) for r in rows],{r[4:] for rows in _edit_pages(root,"SELECT author_user_id,object_id,child_revision,ancestor_revision,workspace_id,author_user_id,object_id,ancestor_revision FROM remote.semantic_ancestors WHERE object_kind='file-edit.evidence' AND workspace_id=? AND (author_user_id,object_id,child_revision,ancestor_revision)>(?,?,?,?) ORDER BY author_user_id,object_id,child_revision,ancestor_revision LIMIT ?",(workspace,),("","","","")) for r in rows}
+def edit_evidence_records(root,user,workspace,kind,edits=None):
+    if edits is not None and not edits or (_progress("scanning edit evidence"),not core_path(root).is_file())[1]: return []
+    ids,objects=(None,None) if edits is None else (list(edits),list(map(edit_evidence_id,edits)))
+    stored,ancestors=[_edit_evidence_value(r[3:]) for rows in _edit_pages(root,"SELECT author_user_id,object_id,revision,workspace_id,author_user_id,object_id,revision,source_edit_id,edit_revision,status,reason,source_tool_call_id,tool_revision,CAST(proof AS VARCHAR) FROM remote.file_edit_evidence_proofs WHERE workspace_id=?"+(" AND object_id IN (SELECT UNNEST(?))" if objects is not None else "")+" AND (author_user_id,object_id,revision)>(?,?,?) ORDER BY author_user_id,object_id,revision LIMIT ?",(workspace,*((objects,) if objects is not None else ())),("","","")) for r in rows],{r[4:] for rows in _edit_pages(root,"SELECT author_user_id,object_id,child_revision,ancestor_revision,workspace_id,author_user_id,object_id,ancestor_revision FROM remote.semantic_ancestors WHERE object_kind='file-edit.evidence' AND workspace_id=?"+(" AND object_id IN (SELECT UNNEST(?))" if objects is not None else "")+" AND (author_user_id,object_id,child_revision,ancestor_revision)>(?,?,?,?) ORDER BY author_user_id,object_id,child_revision,ancestor_revision LIMIT ?",(workspace,*((objects,) if objects is not None else ())),("","","","")) for r in rows}
     leaves,groups=(leaves:=[value for value in stored if (value["workspace"],value["author"],value["row"]["id"],value["proof"]["revision"]) not in ancestors]),{(group[0]["author"],group[0]["row"]["id"]):group for _,values in itertools.groupby(leaves,key=lambda v:(v["author"],v["row"]["id"])) if (group:=list(values))}
-    proofs,superseded,candidates,records=(proofs:=[r[1:] for rows in _edit_pages(root,"SELECT p.id,p.source_row_id,p.revision,p.previous_revision,p.state,COALESCE(o.physical_row_id,p.source_row_id) FROM remote.row_proofs p LEFT JOIN remote.row_origins o ON o.proof_id=p.id WHERE p.workspace_id=? AND p.author_user_id=? AND p.row_kind='file_edits' AND p.id>? ORDER BY p.id LIMIT ?",(workspace,user),("",)) for r in rows]),(superseded:={r[2] for r in proofs if r[2]}),[(edit,revision,physical) for edit,revision,previous,state,physical in proofs if state=="active" and revision not in superseded],[{k:v[k] for k in ("row","proof","previous")} for v in leaves]
+    proofs,superseded,candidates,records=(proofs:=[r[1:] for rows in _edit_pages(root,"SELECT p.id,p.source_row_id,p.revision,p.previous_revision,p.state,COALESCE(o.physical_row_id,p.source_row_id) FROM remote.row_proofs p LEFT JOIN remote.row_origins o ON o.proof_id=p.id WHERE p.workspace_id=? AND p.author_user_id=? AND p.row_kind='file_edits'"+(" AND p.source_row_id IN (SELECT UNNEST(?))" if ids is not None else "")+" AND p.id>? ORDER BY p.id LIMIT ?",(workspace,user,*((ids,) if ids is not None else ())),("",)) for r in rows]),(superseded:={r[2] for r in proofs if r[2]}),[(edit,revision,physical) for edit,revision,previous,state,physical in proofs if state=="active" and revision not in superseded],[{k:v[k] for k in ("row","proof","previous")} for v in leaves]
     at,page=0,1000
     while at<len(candidates):
         started,batch=time.monotonic(),candidates[at:at+page]
         with _core(root,True,purpose="remote.edit_evidence.read") as db:
             evidence,physical_tools,origins,source_tools=(evidence:={r[0]:r[1:] for r in db.execute("SELECT file_edit_id,status,reason,tool_call_id FROM provenance.file_edit_evidence WHERE file_edit_id IN (SELECT UNNEST(?))",[[r[2] for r in batch]]).fetchall()}),(physical_tools:={r[2] for r in evidence.values() if r[2]}),(origins:=dict(db.execute("SELECT physical_row_id,source_row_id FROM remote.row_origins WHERE table_name='tool_calls' AND author_user_id=? AND physical_row_id IN (SELECT UNNEST(?))",(user,list(physical_tools))).fetchall()) if physical_tools else {}),{origins.get(tool,tool) for tool in physical_tools}
             tool_proofs=db.execute("SELECT source_row_id,revision,previous_revision,state FROM remote.row_proofs WHERE workspace_id=? AND author_user_id=? AND row_kind='tool_calls' AND source_row_id IN (SELECT UNNEST(?))",(workspace,user,list(source_tools))).fetchall() if source_tools else []
-        at,page,tool_superseded,tools,_=at+len(batch),max(100,min(10000,int(page*.25/max(time.monotonic()-started,.001)))),(tool_superseded:={r[2] for r in tool_proofs if r[2]}),(tools:={source:revisions[0] for source,group in itertools.groupby(sorted(tool_proofs),key=lambda r:r[0]) if len(revisions:=[revision for _,revision,previous,state in group if state=="active" and revision not in tool_superseded])==1}),records.extend(record for value in batch if (record:=_edit_record(value,evidence,origins,tools,groups,user)))
-        (_progress(f"scanning edit evidence {at}/{len(candidates)}"),archive_yield(core_path(root)))
+        at,page,tool_superseded,tools,_,_=at+len(batch),max(100,min(10000,int(page*.25/max(time.monotonic()-started,.001)))),(tool_superseded:={r[2] for r in tool_proofs if r[2]}),(tools:={source:revisions[0] for source,group in itertools.groupby(sorted(tool_proofs),key=lambda r:r[0]) if len(revisions:=[revision for _,revision,previous,state in group if state=="active" and revision not in tool_superseded])==1}),records.extend(record for value in batch if (record:=_edit_record(value,evidence,origins,tools,groups,user))),(_progress(f"scanning edit evidence {at+len(batch)}/{len(candidates)}"),archive_yield(core_path(root)))
     return records
+def edit_evidence_delta(root,user,workspace,kind,records):
+    edits,tools={p["id"] if p.get("state")=="deleted" else p["row"][0] for r in records if r["kind"]=="file_edit.record" for p in [r["payload"]]},{p["id"] if p.get("state")=="deleted" else p["row"][0] for r in records if r["kind"]=="tool.record" for p in [r["payload"]]}
+    with ExitStack() as stack: edits|={r[0] for r in stack.enter_context(_core(root,True,purpose="remote.edit_evidence.delta")).execute("SELECT file_edit_id FROM provenance.file_edit_evidence WHERE tool_call_id IN (SELECT UNNEST(?))",[list(tools)]).fetchall()} if tools else set()
+    return edit_evidence_records(root,user,workspace,kind,edits)
 def _edit_evidence_project(row,proof): return (lambda data:(required(set(row)=={"v","kind","id","state","data"} and row["v"]==1 and row["kind"]=="file-edit.evidence" and row["state"]=="active" and isinstance(data,dict) and set(data)=={"edit","edit_revision","status","reason","tool_call","tool_revision"} and row["id"]==edit_evidence_id(data["edit"]) and data["status"] in {"confirmed","invalid","unknown","unverified"} and all(isinstance(data[k],str) and data[k] for k in ("edit","edit_revision","reason")) and ((data["tool_call"] is None and data["tool_revision"] is None) or all(isinstance(data[k],str) and data[k] for k in ("tool_call","tool_revision"))),ValueError("Malformed file edit evidence")),dict(workspace_id=proof["workspace"],author_user_id=proof["author_user_id"],object_id=row["id"],revision=proof["revision"],source_edit_id=data["edit"],edit_revision=data["edit_revision"],status=data["status"],reason=data["reason"],source_tool_call_id=data["tool_call"],tool_revision=data["tool_revision"],proof=proof))[-1])((verify_semantic_proof(proof,row,proof.get("author_user_id")),row.get("data"))[-1])
 def edit_evidence_accept(root,row,proof,project=True):
     with _core(root,purpose="remote.edit_evidence.write") as db,_transaction(db):
-        project_file_edit_evidence(db,_edit_evidence_project(row,proof),project)
-        count=db.execute("SELECT count(*) FROM remote.file_edit_evidence_proofs p WHERE workspace_id=? AND author_user_id=? AND object_id=? AND NOT EXISTS (SELECT 1 FROM remote.semantic_ancestors a WHERE a.object_kind='file-edit.evidence' AND (a.workspace_id,a.author_user_id,a.object_id,a.ancestor_revision)=(p.workspace_id,p.author_user_id,p.object_id,p.revision))",(proof["workspace"],proof["author_user_id"],row["id"])).fetchone()[0]
-    return count==1
+        return (project_file_edit_evidence(db,_edit_evidence_project(row,proof),project),db.execute("SELECT count(*) FROM remote.file_edit_evidence_proofs p WHERE workspace_id=? AND author_user_id=? AND object_id=? AND NOT EXISTS (SELECT 1 FROM remote.semantic_ancestors a WHERE a.object_kind='file-edit.evidence' AND (a.workspace_id,a.author_user_id,a.object_id,a.ancestor_revision)=(p.workspace_id,p.author_user_id,p.object_id,p.revision))",(proof["workspace"],proof["author_user_id"],row["id"])).fetchone()[0])[-1]==1
 def edit_evidence_accept_many(root,values,project=True):
     records,at,page=[_edit_evidence_project(row,proof) for row,proof in values],0,500
     while at<len(records):
         started,batch=time.monotonic(),records[at:at+page]
         with _core(root,ready=not at and not core_path(root).is_file(),purpose="remote.edit_evidence.batch") as db,_transaction(db):
             project_file_edit_evidence_many(db,batch,project)
-        at,page=at+len(batch),max(50,min(2000,int(page*.25/max(time.monotonic()-started,.001))))
-        (_progress(f"projecting edit evidence {at}/{len(records)}"),archive_yield(core_path(root)))
+        at,page,_=at+len(batch),max(50,min(2000,int(page*.25/max(time.monotonic()-started,.001)))),(_progress(f"projecting edit evidence {at+len(batch)}/{len(records)}"),archive_yield(core_path(root)))
     if not project: return [True]*len(records)
     with _core(root,True,purpose="remote.edit_evidence.result") as db: counts={(ws,author,object_id):count for ws,author,object_id,count in db.execute("SELECT p.workspace_id,p.author_user_id,p.object_id,count(*) FROM remote.file_edit_evidence_proofs p WHERE p.object_id IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.semantic_ancestors a WHERE a.object_kind='file-edit.evidence' AND (a.workspace_id,a.author_user_id,a.object_id,a.ancestor_revision)=(p.workspace_id,p.author_user_id,p.object_id,p.revision)) GROUP BY p.workspace_id,p.author_user_id,p.object_id",[[r["object_id"] for r in records]]).fetchall()}
     return [counts.get((r["workspace_id"],r["author_user_id"],r["object_id"]),0)==1 for r in records]
-def edit_evidence_bridge(): return dict(v=3,schema=1,source="archive",objects={"file-edit.evidence"},records=edit_evidence_records,accept=edit_evidence_accept,accept_many=edit_evidence_accept_many)
+def edit_evidence_bridge(): return dict(v=3,schema=1,source="archive",objects={"file-edit.evidence"},records=edit_evidence_records,delta=edit_evidence_delta,accept=edit_evidence_accept,accept_many=edit_evidence_accept_many)
 def _private_json(path,value): return (path.parent.mkdir(parents=True,exist_ok=True),os.chmod(path.parent,0o700),atomic_json(path,value))[-1]
 def save(cfg,root=None): _private_json(paths(root)[1],cfg)
 def sync_save(cfg,root=None):
@@ -796,8 +796,7 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
         after=min(invalid.values())-1 if invalid else cursor
         total+=len(received)
         state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"replica_cursor:{sid}",str(after),f"replica_projection:{sid}",stamp))
-        state.commit()
-        _progress(f"receiving rows {cursor}/{tail}")
+        (state.commit(),_progress(f"receiving rows {total}"))
         if cursor>=tail:
             if invalid: raise ValueError(f"invalid row replica: no valid delivery copy for {len(invalid)} object(s)")
             return total
@@ -1044,7 +1043,7 @@ def sync_once(root=None,repair=False,manual=False):
             if baseline and baseline[2]==0:
                 for ws in ready&active-bound: state.execute("INSERT OR IGNORE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation)))
             scans=[(ws,meta,state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()) for ws,meta in cfg["workspaces"].items() if path.is_file() and ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]]
-            scans=[(ws,meta,prior) for ws,meta,prior in scans if prior is None or int(prior[0])!=generation or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()]
+            scans,deltas=[(ws,meta,prior) for ws,meta,prior in scans if prior is None or int(prior[0])!=generation or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()],{}
             if scans:
                 _progress("scanning archive")
                 routes={ws:sharing_routes(state,ws,cfg["user"],cfg.get("bindings",{}),known) for ws,meta,prior in scans}
@@ -1054,13 +1053,13 @@ def sync_once(root=None,repair=False,manual=False):
                     full=prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()
                     scope=set()
                     records=scan_archive(path,state,meta["kind"],repos,roots,ws,scope,match,cfg["user"],generation,_progress,since=None if full else int(prior[0]))
-                    batches.append((ws,protect_all(records,root,ws) if meta["kind"]=="team" else records,scope,prior is None))
-                for ws,records,scope,initial in batches:
-                    _progress(f"preparing workspace {cfg['workspaces'][ws]['name']}")
+                    batches.append((ws,protect_all(records,root,ws) if meta["kind"]=="team" else records,scope,full))
+                for ws,records,scope,full in batches:
+                    (_progress(f"preparing workspace {cfg['workspaces'][ws]['name']}"),deltas.__setitem__(ws,None if full else records))
                     bindings={r[0]:r[1] for r in state.execute("SELECT origin,epoch FROM origin_bindings WHERE workspace=?",(ws,)).fetchall()}
                     origins=set(bindings)
                     verify=bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone())
-                    retained=initial or verify
+                    retained=full
                     sum((count:=attest_rows(path,cfg,ws,records[i:i+REPLICA_DB_PAGE],origins),_progress(f"attesting rows {min(i+REPLICA_DB_PAGE,len(records))}/{len(records)}"),count)[-1] for i in range(0,len(records),REPLICA_DB_PAGE))
                     keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}
                     known_replicas={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
@@ -1083,17 +1082,17 @@ def sync_once(root=None,repair=False,manual=False):
                     except BaseException:
                         discard_replicas(prepared)
                         raise
-                    upload_replicas(cfg,state,root,{ws},{final for tmp,final in prepared} if initial or verify else ())
+                    upload_replicas(cfg,state,root,{ws},{final for tmp,final in prepared} if full else ())
                     state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_upload_blocked:{ws}",json.dumps(sorted(set(upload_blocked))))) if upload_blocked else state.execute("DELETE FROM meta WHERE key=?",(f"replica_upload_blocked:{ws}",))
                     if upload_blocked: typer.echo(f"Remote upload skipped {len(set(upload_blocked))} received row(s) whose local projection does not match the author's proof; run `convos remote repull` to restore them.",err=True)
                     known_blobs={r[0] for r in state.execute("SELECT blob FROM blob_receipts WHERE workspace=? UNION SELECT blob FROM blob_outbox WHERE workspace=?",(ws,ws)).fetchall()}
                     reconcile_blobs(cfg,state,root,ws,blob_replicas(path,cfg,ws,records,keys,known_blobs,origins,bindings,repair))
-                for ws,meta,prior in scans: state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation)))
             for ws,meta in cfg["workspaces"].items():
                 if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]:
                     known={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
                     repair=bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone())
-                    reconcile_replicas(cfg,state,root,ws,bridge_replicas(root,cfg,ws,meta["kind"],key(cfg,ws,meta["epoch"]),known,lambda ids:replica_inventory(cfg,state,ws,ids) if repair else set(known),ws in {scan[0] for scan in scans}),True)
+                    reconcile_replicas(cfg,state,root,ws,bridge_replicas(root,cfg,ws,meta["kind"],key(cfg,ws,meta["epoch"]),known,lambda ids:replica_inventory(cfg,state,ws,ids) if repair else set(known),ws in deltas,deltas.get(ws)),True)
+                    if ws in deltas: (state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation))),state.commit())
             for ws in ready&active: state.execute("DELETE FROM meta WHERE key=?",(f"replica_repair:{ws}",))
             state.commit()
             server=refresh(cfg,root,True)
