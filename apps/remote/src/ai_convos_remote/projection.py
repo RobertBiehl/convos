@@ -8,7 +8,7 @@ from pathlib import Path
 from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, set_attachment_path, typed_logical_rows
 from .control import verify_state
 from .migrations import migrate_state
-from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
+from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
 STATE_VERSION="4"
 STATE = """
@@ -385,12 +385,12 @@ def attest_rows(db_path,cfg,workspace,records,origins=()):
         found=db.execute(f"SELECT DISTINCT p.workspace_id,p.row_kind,p.source_row_id,p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id IN ({','.join('?'*len(scopes))}) AND p.author_user_id=? AND p.source_row_id IN ({TEXT_IDS}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],packed(ids))).fetchall() if rows else []
     heads={}
     [heads.setdefault((r[1],r[2]),{}).setdefault(r[3],(r[0],r[3],r[4])) for r in sorted(found,key=lambda r:(r[0]!=workspace,r[0]))]
-    snapshots=[]
+    snapshots,signing_key=[],None
     for row in rows:
         prior,current=list(heads.get((row["kind"],row["id"]),{}).values()),digest(row)
         if any(h[2]==current for h in prior): continue
         if len(prior)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
-        snapshots.append((row,row_proof(device,cfg["user"],prior[0][0] if prior else workspace,cfg["workspaces"][workspace]["epoch"],row,prior[0][1] if prior else None,workspace,current)))
+        snapshots.append((row,row_proof(device,cfg["user"],prior[0][0] if prior else workspace,cfg["workspaces"][workspace]["epoch"],row,prior[0][1] if prior else None,workspace,current,signing_key=(signing_key:=signing_key or row_signing_key(device)))))
     [_store_proofs(db_path,snapshots[i:i+500],signer,controls) for i in range(0,len(snapshots),500)]
     return len(snapshots)
 def retained_proof_pages(db_path,workspace,origins=(),author=None,page=5000):

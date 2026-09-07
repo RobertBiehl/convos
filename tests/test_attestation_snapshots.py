@@ -7,7 +7,7 @@ import pytest
 from ai_convos import cli as core
 from ai_convos_remote import projection
 from ai_convos_remote.projection import attest_rows, audit_rows, row_replicas, signed_row
-from ai_convos_remote.protocol import digest, open_replica, row_proof
+from ai_convos_remote.protocol import digest, open_replica, row_proof, row_signing_key
 from tests.test_native_provenance import people, scanned
 from tests.test_remote_projection import git, source
 
@@ -89,3 +89,10 @@ def test_stale_attestation_snapshots_are_retained_in_bounded_pages(tmp_path,monk
     with duckdb.connect(str(path),read_only=True) as db:
         assert db.execute('SELECT count(*) FROM remote.row_conflicts').fetchone()[0]==501
         assert db.execute("SELECT count(*) FROM messages WHERE content='after'").fetchone()[0]==501
+
+
+@pytest.mark.parametrize('previous',[None,'1'*64])
+def test_prepared_signing_key_produces_identical_row_proofs(tmp_path,previous):
+    path,state,cfg,records,snapshot=prepared(tmp_path,'messages')
+    args=cfg['device'],cfg['user'],'w',1,snapshot,previous,'authorized',digest(snapshot)
+    assert row_proof(*args)==row_proof(*args,signing_key=row_signing_key(cfg['device']))

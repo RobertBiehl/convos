@@ -18,7 +18,7 @@ def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat(timespe
 def _priv(cls, value): return cls.from_private_bytes(unb64(value))
 def _pub(cls, value): return cls.from_public_bytes(unb64(value))
 def _raw(k): return b64(k.private_bytes_raw() if hasattr(k, "private_bytes_raw") else k.public_bytes_raw())
-def _signed(body,private,field="signature"): return {**body,field:b64(_priv(ed25519.Ed25519PrivateKey,private).sign(canon(body)))}
+def _signed(body,private,field="signature",signing_key=None): return {**body,field:b64((signing_key or _priv(ed25519.Ed25519PrivateKey,private)).sign(canon(body)))}
 def _verified(value,public,field="signature"):
     body={k:v for k,v in value.items() if k!=field}
     _pub(ed25519.Ed25519PublicKey,public).verify(unb64(value[field]),canon(body))
@@ -45,8 +45,9 @@ def verify_certificate(cert, root_public):
 def verified_certificate(raw,root_public): return verify_certificate(json.loads(raw),root_public)
 def registration_proof(device,challenge,root_public,cert): return _signed({"v":V,"kind":"device.registration","challenge":digest(challenge),"root_public":root_public,"certificate":digest(cert),"user":public_id(root_public),"device":device["id"]},device["sign_private"])
 
-def row_proof(device,user,workspace,epoch,row,previous=None,authorization_workspace=None,content_hash=None):
-    return _signed({"v":1,"kind":"row.proof","workspace":workspace,"authorization_workspace":authorization_workspace or workspace,**(claim:={"row_kind":row["kind"],"row_id":row["id"],"encoding_v":row["v"],"content_hash":content_hash if content_hash is not None else digest(row),"previous_revision":previous,"state":row["state"]}),"revision":digest({"v":1,**claim}),"author_user_id":user,"author_device_id":device["id"],"authorization_epoch":epoch},device["sign_private"])
+def row_signing_key(device): return _priv(ed25519.Ed25519PrivateKey,device["sign_private"])
+def row_proof(device,user,workspace,epoch,row,previous=None,authorization_workspace=None,content_hash=None,signing_key=None):
+    return _signed({"v":1,"kind":"row.proof","workspace":workspace,"authorization_workspace":authorization_workspace or workspace,**(claim:={"row_kind":row["kind"],"row_id":row["id"],"encoding_v":row["v"],"content_hash":content_hash if content_hash is not None else digest(row),"previous_revision":previous,"state":row["state"]}),"revision":digest({"v":1,**claim}),"author_user_id":user,"author_device_id":device["id"],"authorization_epoch":epoch},device["sign_private"],signing_key=signing_key)
 
 def verify_row_proof_header(value,cert,root_public):
     try:
