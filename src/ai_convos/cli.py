@@ -251,13 +251,13 @@ def provenance_issue(db,value,map_id=lambda table,value:value,replace_file=False
     return None
 @contextlib.contextmanager
 def preserve_fact_heads(db,keys):
-    keys=set(keys)
+    keys={(k,entity) for kind,entity in keys for k in ((kind,"edit.observed" if kind=="file_edits" else "file_edits") if kind in ("file_edits","edit.observed") else (kind,))}
     rows=db.execute("WITH wanted AS (SELECT json_extract_string(value,'$[0]') kind,json_extract_string(value,'$[1]') entity FROM json_each(?)), origins AS (SELECT o.* FROM remote.provenance_origins o JOIN wanted w ON o.kind=w.kind AND o.physical_entity=w.entity), proofs AS MATERIALIZED (SELECT p.* FROM remote.row_proofs p WHERE p.source_row_id IN (SELECT entity FROM wanted UNION SELECT source_entity FROM origins)), claims AS (SELECT p.id,p.row_kind,o.physical_entity,p.source_row_id,p.author_user_id,p.state,p.content_hash,p.revision FROM wanted w JOIN origins o ON (o.kind,o.physical_entity)=(w.kind,w.entity) JOIN proofs p ON (p.row_kind,p.source_row_id,p.author_user_id)=(o.kind,o.source_entity,o.author_user_id) UNION SELECT p.id,p.row_kind,p.source_row_id,p.source_row_id,p.author_user_id,p.state,p.content_hash,p.revision FROM wanted w JOIN proofs p ON (p.row_kind,p.source_row_id)=(w.kind,w.entity)) SELECT id,row_kind,physical_entity,source_row_id,author_user_id,state,content_hash FROM claims p WHERE NOT EXISTS (SELECT 1 FROM proofs c WHERE (c.row_kind,c.source_row_id,c.author_user_id,c.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision))",[json.dumps(list(keys),separators=(",",":"))]).fetchall() if keys else []
-    found=typed_logical_rows(db,[r[1:6] for r in rows]) if rows else {}
-    kept=[(r[0],r[6],r[1:6],body) for r in rows if (body:=matching_logical_row(found[r[1:6]],r[6])) is not None]
+    found,paths=typed_logical_rows(db,[r[1:6] for r in rows]) if rows else {},captured_edit_paths(db,[r[2] for r in rows if r[1]=="file_edits"])
+    kept=[(r[0],r[6],r[1:6],body) for r in rows if (body:=matching_logical_row(found[r[1:6]],r[6],[paths[r[2]]] if r[1]=="file_edits" and r[2] in paths else ())) is not None]
     yield
-    found=typed_logical_rows(db,[claim for pid,expected,claim,body in kept]) if kept else {}
-    if lost:=[(pid,json.dumps(body,sort_keys=True,separators=(",",":"))) for pid,expected,claim,body in kept if matching_logical_row(found[claim],expected) is None]: _insert_pages(db,"remote.row_conflicts",lost,mode=" OR IGNORE")
+    found,paths=typed_logical_rows(db,[claim for pid,expected,claim,body in kept]) if kept else {},captured_edit_paths(db,[claim[1] for pid,expected,claim,body in kept if claim[0]=="file_edits"])
+    if lost:=[(pid,json.dumps(body,sort_keys=True,separators=(",",":"))) for pid,expected,claim,body in kept if matching_logical_row(found[claim],expected,[paths[claim[1]]] if claim[0]=="file_edits" and claim[1] in paths else ()) is None]: _insert_pages(db,"remote.row_conflicts",lost,mode=" OR IGNORE")
 def project_provenance(db,value,map_id=lambda table,value:value,touch=True,replace_file=False,preserve=True,native=False):
     p,k,observed=value["payload"],value["kind"],value["observed_at"]
     if k not in PROVENANCE_KINDS: return False
@@ -328,7 +328,7 @@ def project_archive_rows(db,table,columns,rows,preserve=True):
     required(table in ARCHIVE_COLUMNS and columns==ARCHIVE_COLUMNS[table] and not any(len(v)!=len(columns) or o and set(o) not in (set(fields),set(fields)|{"proof_id"}) for v,o in rows),ValueError("record schema/entity mismatch"))
     ids,owned,occupied=(ids:=[v[0] for v,o in rows]),{r[0]:(r[1],r[2]) for r in db.execute("SELECT physical_row_id,author_user_id,source_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id IN (SELECT UNNEST(?))",(table,ids)).fetchall()},{r[0] for r in db.execute(f"SELECT id FROM {table} WHERE id IN (SELECT UNNEST(?))",(ids,)).fetchall()}
     required(not (conflict:=next((v[0] for v,o in rows if v[0] in owned and (not o or owned[v[0]]!=(o["author_user_id"],o["source_row_id"])) or o and v[0] in occupied and v[0] not in owned),None)),ValueError(f"archive ownership conflict: {table}:{conflict}"))
-    with preserve_fact_heads(db,[("edit.observed",row_id) for row_id in ids]) if preserve and table=="file_edits" else contextlib.nullcontext():
+    with preserve_fact_heads(db,[(table,row_id) for row_id in ids if row_id in occupied]) if preserve else contextlib.nullcontext():
         _insert_pages(db,table,values,columns,f" ON CONFLICT(id) DO UPDATE SET {updates}",embedding=table=="messages")
         if table=="file_edits":
             for mode,foreign in ((" OR REPLACE",True),(" OR IGNORE",False)): _insert_pages(db,"provenance.file_edit_evidence",[(v[0],"unverified","signed_replica_missing_evidence",None) for v,o in rows if bool(o)==foreign],mode=mode)
@@ -351,7 +351,7 @@ def project_attested_rows(db,records,root_public,certificate):
     required(all((row["kind"],row["id"],row["v"],row["state"],provenance_digest(row))==(proof["row_kind"],proof["row_id"],proof["encoding_v"],proof["state"],proof["content_hash"]) for row,proof in records),ValueError("attestation snapshot/proof mismatch"))
     items=[(row,proof,pid,True) for (row,proof),pid in zip(records,project_row_proofs(db,proofs,root_public,certificate))]
     _retain_lossy_replicas(db,_protect_native_replicas(db,items,pending.add),pending.add)
-    return (_insert_pages(db,"remote.row_conflicts",[(pid,json.dumps(row,sort_keys=True,separators=(",",":"))) for row,proof,pid,native in items if pid in pending],mode=" OR IGNORE"),record_local_row_bases(db,proofs))[-1]
+    return (_insert_pages(db,"remote.row_conflicts",[(pid,json.dumps(row,sort_keys=True,separators=(",",":"))) for row,proof,pid,native in items if pid in pending],mode=" OR IGNORE"),(prior:=[(p["row_kind"],p["row_id"],p["author_user_id"],p["previous_revision"]) for p in proofs if p["previous_revision"]]) and retire_row_bodies(db,prior),record_local_row_bases(db,proofs))[-1]
 def record_local_row_bases(db,proofs,seed=False):
     rows=db.execute("SELECT p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p WHERE p.id IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_conflicts c WHERE c.proof_id=p.id) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision))",[[provenance_digest(p) for p in proofs]]).fetchall() if seed else [(p["row_kind"],p["row_id"],p["author_user_id"],p["revision"]) for p in proofs]
     return _insert_pages(db,"remote.local_row_bases",rows,mode=" OR IGNORE" if seed else " OR REPLACE")
@@ -436,7 +436,7 @@ def project_logical_rows(db,items,defer=False):
     if defer: items=_protect_native_replicas(db,items,defer)
     delayed,logical,out=[item for item in items if item[0]["kind"] in PROVENANCE_KINDS or item[0]["state"]=="deleted"],(logical:=[_logical_archive(row,proof,pid,native,maps[0] if maps else None) for row,proof,pid,native,*maps in items if row["kind"] not in PROVENANCE_KINDS and row["state"]!="deleted"]),[(table,physical) for table,physical,values,origin,data in logical]
     local=set(db.execute("SELECT kind,entity FROM provenance.local_facts WHERE entity IN (SELECT UNNEST(?))",[ids]).fetchall()) if (ids:=[source if table=="repository.observed" else mapped("file_edits",source) for row,p,pid,native,*maps in delayed for table,source,mapped,physical,origin in [_logical_parts(row,p,pid,native,maps[0] if maps else None)] if table in ("repository.observed","edit.observed")]) else set()
-    with preserve_fact_heads(db,[("edit.observed" if table=="file_edits" else table,mapped("file_edits",source) if table=="edit.observed" else source if table=="repository.observed" else physical) for row,p,pid,native,*maps in items for table,source,mapped,physical,origin in [_logical_parts(row,p,pid,native,maps[0] if maps else None)] if table in ("repository.observed","edit.observed","file_edits")]):
+    with preserve_fact_heads(db,[(table,mapped("file_edits",source) if table=="edit.observed" else source if table=="repository.observed" else physical) for row,p,pid,native,*maps in items for table,source,mapped,physical,origin in [_logical_parts(row,p,pid,native,maps[0] if maps else None)] if table in ("repository.observed","edit.observed","file_edits") or native and table in ARCHIVE_COLUMNS]):
         for table in ARCHIVE_COLUMNS:
             if rows := [(values,origin) for kind,physical,values,origin,data in logical if kind==table]: project_archive_rows(db,table,ARCHIVE_COLUMNS[table],rows,False)
         if bodies:=[(physical,data["body_hash"],data["size"]) for table,physical,values,origin,data in logical if table=="attachments" and data["body_hash"]]: _insert_pages(db,"attachment_bodies",bodies,mode=" OR REPLACE")
@@ -505,13 +505,13 @@ def project_logical_row(db,row,proof,proof_id,native=False,touch=True,parent_map
         old=db.execute("SELECT author_user_id,source_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id=?",(table,physical)).fetchone()
         required(not old or origin and old==(origin["author_user_id"],origin["source_row_id"]),ValueError(f"archive ownership conflict: {table}:{physical}"))
         required(not origin or old or not db.execute(f"SELECT 1 FROM {table} WHERE id=?",(physical,)).fetchone(),ValueError(f"archive ownership conflict: {table}:{physical}"))
-        with preserve_fact_heads(db,[("edit.observed",physical)]) if preserve and table=="file_edits" else contextlib.nullcontext():
+        with preserve_fact_heads(db,[(table,physical)]) if preserve else contextlib.nullcontext():
             db.execute(f"DELETE FROM {table} WHERE id=?",(physical,))
             for related in {"attachments":("attachment_bodies WHERE attachment_id",),"file_edits":("provenance.file_edit_evidence WHERE file_edit_id",)}.get(table,()): db.execute(f"DELETE FROM {related}=?",(physical,))
             (origin and db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,physical,*(origin[k] for k in ("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at","proof_id")))),table in ("file_edits","tool_calls") and _apply_signed_edit_evidence(db,[physical] if table=="file_edits" else (),[physical] if table=="tool_calls" else ()),touch and _archive_touch(db,[(table,physical)]))
         return physical
     table,physical,values,origin,data=_logical_archive(row,proof,proof_id,native,parent_map)
-    (project_archive_row(db,table,ARCHIVE_COLUMNS[table],values,origin,touch,preserve),table=="attachments" and data["body_hash"] and db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(physical,data["body_hash"],data["size"])))
+    with preserve_fact_heads(db,[(table,physical)]) if preserve else contextlib.nullcontext(): (project_archive_row(db,table,ARCHIVE_COLUMNS[table],values,origin,touch,False),table=="attachments" and data["body_hash"] and db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(physical,data["body_hash"],data["size"])))
     return physical
 def set_attachment_path(db,row_id,path): db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),row_id))
 def attachment_index(path,size=None): return (lambda path,actual:None if actual<0 or actual>ATTACHMENT_LIMIT or size is not None and actual!=size else (_file_sha256(path),actual))(path:=Path(path),path.stat().st_size if path.is_file() and not path.is_symlink() else -1)
@@ -519,8 +519,7 @@ def index_attachment_body(db,row_id,path,size=None,prepared=None):
     if not (indexed:=prepared or attachment_index(path,size)): return None
     body_hash,actual,old,signed=(*indexed,db.execute("SELECT content_hash,size FROM attachment_bodies WHERE attachment_id=?",(row_id,)).fetchone(),db.execute("SELECT 1 FROM remote.row_origins WHERE table_name='attachments' AND physical_row_id=?",(row_id,)).fetchone())
     if signed: return required(old==(body_hash,actual) and (size is None or size==actual),ValueError("signed attachment body conflicts with retained proof")) and body_hash
-    if size is None: db.execute("UPDATE attachments SET size=? WHERE id=? AND size IS NULL",(actual,row_id))
-    if old!=(body_hash,actual): (db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(row_id,body_hash,actual)),_archive_touch(db,[("attachments",row_id)]))
+    with preserve_fact_heads(db,[("attachments",row_id)] if size is None or old!=(body_hash,actual) else ()): ((updated:=size is None and db.execute("UPDATE attachments SET size=? WHERE id=? AND size IS NULL RETURNING id",(actual,row_id)).fetchone()),old!=(body_hash,actual) and db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(row_id,body_hash,actual)),(updated or old!=(body_hash,actual)) and _archive_touch(db,[("attachments",row_id)]))
     return body_hash
 def project_attachment_body(db_path,data,body_hash):
     path=(required(provenance_digest(data)==body_hash,ValueError("attachment body hash mismatch")),attachment_body(data,Path(db_path).parent))[-1]
@@ -1028,18 +1027,18 @@ def upsert(conn, r: ParseResult):
     cids,mids,bindings=[c["id"] for c in r.convs],[m["id"] for m in r.msgs],[(c["source"],meta["session_id"],c["id"]) for c in r.convs if (meta:=json.loads(c["metadata"] or "{}")).get("session_id")]
     required(not (conflict:=conn.execute("SELECT p.source,p.session_id,p.conversation_id,json_extract_string(j.value,'$.conversation_id') FROM provider_sessions p JOIN json_each(?) j ON p.source=json_extract_string(j.value,'$.source') AND p.session_id=json_extract_string(j.value,'$.session_id') WHERE p.conversation_id<>json_extract_string(j.value,'$.conversation_id') LIMIT 1",(json.dumps([dict(source=s,session_id=i,conversation_id=c) for s,i,c in bindings]),)).fetchone() if bindings else None),ValueError(f"provider session identity conflict: {conflict}"))
     old_convs,old_msgs,new_convs,changed_rows,changed_msgs,updated,changed_conversations=(old_convs:=_rows_by_id(conn,"conversations",cids)),(old_msgs:=_rows_by_id(conn,"messages",mids)),(new_convs:=set(cids)-set(old_convs)),(changed_rows:={m["id"] for m in r.msgs if m["id"] not in old_msgs or old_msgs[m["id"]][:8]+old_msgs[m["id"]][9:]!=tuple(m.values())}),(changed_msgs:={m["id"] for m in r.msgs if m["id"] not in old_msgs or old_msgs[m["id"]][2:5]!=tuple(m[k] for k in ("role","content","thinking"))}),{m["conversation_id"] for m in r.msgs if m["id"] in changed_msgs}-new_convs,[list(c.values()) for c in r.convs if old_convs.get(c["id"])!=tuple(c.values())]
-    if changed_conversations: conn.executemany(_CONV_UPS,changed_conversations)
+    with preserve_fact_heads(conn,[("conversations",row[0]) for row in changed_conversations if row[0] in old_convs]): changed_conversations and conn.executemany(_CONV_UPS,changed_conversations)
     if bindings: conn.executemany("INSERT INTO provider_sessions VALUES (?,?,?) ON CONFLICT(source,session_id) DO NOTHING",list(dict.fromkeys(bindings)))
     frozen=r.scopes if r.scopes is not None else pending_scopes([(c["id"],c["cwd"]) for c in r.convs])
     if frozen: conn.executemany("INSERT OR IGNORE INTO provenance.conversation_scopes VALUES (?,?,?,?,?,?)",frozen)
     message_history=[_history_row("messages",old,old[2:5]) for m in r.msgs if (old:=old_msgs.get(m["id"])) and old[2:5]!=tuple(m[k] for k in ("role","content","thinking"))]
     changed_msgs|={row[0] for row in message_history}
     if message_history: conn.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",message_history)
-    if changed_rows: conn.executemany(_MSG_UPS,[list(m.values()) for m in r.msgs if m["id"] in changed_rows])
+    with preserve_fact_heads(conn,[("messages",row_id) for row_id in changed_rows if row_id in old_msgs]): changed_rows and conn.executemany(_MSG_UPS,[list(m.values()) for m in r.msgs if m["id"] in changed_rows])
     def replace_preserving(table, rows):
         if not rows: return [],0
         old,skip,payload,changed,histories=(old:=_rows_by_id(conn,table,[r["id"] for r in rows])),(skip:={"tool_calls":7,"attachments":7,"artifacts":6,"file_edits":5}[table]),(payload:=lambda values:tuple(v for i,v in enumerate(values) if i not in (0,skip))),(changed:=[(list(row.values()),old.get(row["id"])) for row in rows if not old.get(row["id"]) or payload(old[row["id"]])!=payload(tuple(row.values()))]),[_history_row(table,previous,payload(previous)) for values,previous in changed if previous]
-        with preserve_fact_heads(conn,[("edit.observed",values[0]) for values,previous in changed if previous]) if table=="file_edits" and changed else contextlib.nullcontext():
+        with preserve_fact_heads(conn,[(table,values[0]) for values,previous in changed if previous]):
             if histories: conn.executemany(f"INSERT INTO {table} VALUES ({','.join('?'*len(histories[0]))}) ON CONFLICT DO NOTHING",histories)
             if changed: conn.executemany(f"INSERT OR REPLACE INTO {table} VALUES ({','.join('?'*len(changed[0][0]))})",[values for values,previous in changed])
         return [(table,values[0]) for values,previous in changed]+[(table,row[0]) for row in histories],len(changed)
@@ -1490,7 +1489,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                 return (*out,getattr(r,"provenance_edits",set()),getattr(r,"provenance_conversations",set()))
         with _core(read_only=True,purpose="sync.chatgpt.repair.plan") as conn: repairs=conn.execute("SELECT c.id,MIN(m.created_at),MAX(m.created_at) FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL) AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) GROUP BY c.id").fetchall()
         if repairs:
-            with _core(purpose="sync.chatgpt.repair.write") as conn,_transaction(conn): (conn.executemany("UPDATE conversations SET created_at=COALESCE(created_at,?),updated_at=COALESCE(updated_at,?) WHERE id=?",[(first,last,cid) for cid,first,last in repairs]),_archive_touch(conn,[("conversations",cid) for cid,_,_ in repairs]))
+            with _core(purpose="sync.chatgpt.repair.write") as conn,_transaction(conn),preserve_fact_heads(conn,[("conversations",cid) for cid,_,_ in repairs]): (conn.executemany("UPDATE conversations SET created_at=COALESCE(created_at,?),updated_at=COALESCE(updated_at,?) WHERE id=?",[(first,last,cid) for cid,first,last in repairs]),_archive_touch(conn,[("conversations",cid) for cid,_,_ in repairs]))
         with _core(read_only=True,purpose="sync.plan") as conn: cur,bindings,rows,candidates=counts_by_source(conn),session_bindings(conn),conn.execute(f"SELECT c.id,c.updated_at,json_extract_string(c.metadata,'$.remote_update_time'),json_extract_string(c.metadata,'$.remote_complete'),(SELECT role FROM messages m WHERE m.conversation_id=c.id ORDER BY {MESSAGE_ORDER_DESC} LIMIT 1) FROM conversations c WHERE source='chatgpt'").fetchall(),{r[0] for r in conn.execute("SELECT DISTINCT m.conversation_id FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.source='chatgpt' AND json_extract_string(m.metadata,'$.provider_index') IS NULL QUALIFY count(*) OVER (PARTITION BY m.conversation_id,m.created_at)>1").fetchall()}
         prior_order,updated,repair_order,known,legacy,fmt,start=(prior_order:=web.get("chatgpt",{}).get("order_repairs",{})),(updated:={cid:v.timestamp() if (v:=ts_any(raw)) else ts.timestamp() if ts else None for cid,ts,raw,_,_ in rows}),(repair_order:={cid for cid in candidates if prior_order.get(cid)!=updated[cid]}),{cid:None if cid in repair_order or (complete=="false" or complete is None and role=="tool") and (v:=ts_any(raw) or ts) and (datetime.now()-v).total_seconds()<900 else updated[cid] for cid,ts,raw,complete,role in rows},{cid for cid,_,raw,_,_ in rows if raw is None},(fmt:=lambda v:f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"),lambda label,src=None:typer.echo(f"Syncing {label}" if not src else f"Syncing {label} ({fmt(cur.setdefault(src,[0]*5))})")
         def schedule(job): jobs.extend([job] if job else [])
