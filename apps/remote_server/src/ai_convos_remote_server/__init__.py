@@ -1,5 +1,5 @@
 """Opaque self-hosted relay. It authorizes envelopes but never receives content keys."""
-import argparse, base64, hashlib, hmac, json, logging, os, secrets, socket, sqlite3, threading, time
+import argparse, base64, hashlib, hmac, json, logging, os, secrets, socket, sqlite3, tempfile, threading, time
 from contextlib import closing, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -608,14 +608,25 @@ def main(argv=None):
     p.add_argument("--port",type=int,default=8787)
     p.add_argument("--output")
     a=p.parse_args(argv)
-    Path(a.db).parent.mkdir(parents=True,exist_ok=True)
-    with closing(connect(a.db)): pass
     if a.command == "backup":
         if not a.output: p.error("backup requires --output")
-        Path(a.output).parent.mkdir(parents=True,exist_ok=True)
-        with closing(sqlite3.connect(a.db)) as src,closing(sqlite3.connect(a.output)) as dst: src.backup(dst)
+        source,output=Path(a.db).resolve(),Path(a.output).absolute()
+        if not source.is_file(): p.error("backup requires an existing source database")
+        if output.exists() and source.samefile(output): p.error("backup output must be a different file from the source")
+        if any(Path(str(output)+suffix).exists() for suffix in ("-wal","-shm","-journal")): p.error("backup output has SQLite sidecars; choose a fresh output path")
+        output.parent.mkdir(parents=True,exist_ok=True)
+        fd,stage=tempfile.mkstemp(prefix=f".{output.name}.",dir=output.parent)
+        try:
+            with os.fdopen(fd,"r+b") as handle,closing(sqlite3.connect(source.as_uri()+"?mode=ro",uri=True)) as src,closing(sqlite3.connect(stage)) as dst:
+                src.backup(dst)
+                dst.execute("PRAGMA journal_mode=DELETE").fetchone()
+                os.fsync(handle.fileno())
+            os.replace(stage,output)
+        finally: Path(stage).unlink(missing_ok=True)
         print(a.output)
         return
+    Path(a.db).parent.mkdir(parents=True,exist_ok=True)
+    with closing(connect(a.db)): pass
     global DB
     DB=a.db
     print(f"convos-server http://{a.host}:{a.port}",flush=True)
