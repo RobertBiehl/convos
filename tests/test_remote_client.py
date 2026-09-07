@@ -172,6 +172,62 @@ def test_remote_sync_publishes_captured_snapshot_then_concurrent_change(tmp_path
     sync_once(root,manual=True); assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==2
 
 
+def test_sync_process_serializes_attestation_planning_and_retry(tmp_path,monkeypatch):
+    server_path,root=tmp_path/"server.db",tmp_path/"client"
+    server=server_connect(server_path)
+    monkeypatch.setattr(remote_client,"request",transport(server))
+    monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
+    monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(root))
+    cfg,_=setup_client("http://server","alice",root=root)
+    ws,path=workspace(cfg,"Personal"),root/"data/convos.db"
+    write_archive(path,"base")
+    sync_once(root)
+    base=open_replica(json.loads(server.execute("SELECT envelope FROM row_replicas").fetchone()[0]),key(load(root),ws,1))
+    write_archive(path,"planned")
+    child="""
+import sys
+from pathlib import Path
+import ai_convos_remote as remote
+from ai_convos.cli import LockBusy
+from ai_convos_remote_server import action, connect
+server=connect(Path(sys.argv[2]),initialize=False)
+remote.request=lambda cfg,body,auth=True: action(server,body,cfg['token'] if auth else None)
+remote.drain_hooks=lambda:None
+try:
+    remote.sync_once(Path(sys.argv[1]))
+except LockBusy as error:
+    print(str(error))
+    sys.exit(17)
+finally:
+    server.close()
+"""
+    command=[sys.executable,"-c",child,str(root),str(server_path)]
+    sign,attempts=projection_module.row_proof,[]
+    def concurrent(device,user,workspace,epoch,row,previous=None,*args,**kwargs):
+        # The real attester has closed its planning read and selected this head.
+        assert row["data"]["title"]=="planned" and previous==base["proof"]["revision"]
+        write_archive(path,"retry")
+        result=subprocess.run(command,capture_output=True,text=True,timeout=30)
+        assert result.returncode==17 and "remote sync" in result.stdout and "another operation" in result.stdout,(result.stdout,result.stderr)
+        attempts.append(result)
+        return sign(device,user,workspace,epoch,row,previous,*args,**kwargs)
+    monkeypatch.setattr(projection_module,"row_proof",concurrent)
+    sync_once(root)
+    assert len(attempts)==1 and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==2
+    monkeypatch.setattr(projection_module,"row_proof",sign)
+    result=subprocess.run(command,capture_output=True,text=True,timeout=30)
+    assert result.returncode==0,(result.stdout,result.stderr)
+    rows=[open_replica(json.loads(raw),key(load(root),ws,1)) for raw, in server.execute("SELECT envelope FROM row_replicas ORDER BY cursor")]
+    assert [value["row"]["data"]["title"] for value in rows]==["base","planned","retry"]
+    assert [value["proof"]["previous_revision"] for value in rows]==[None,rows[0]["proof"]["revision"],rows[1]["proof"]["revision"]]
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==("retry",)
+        assert db.execute("SELECT p.revision FROM remote.row_proofs p WHERE NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.previous_revision=p.revision)").fetchall()==[(rows[-1]["proof"]["revision"],)]
+    sync_once(root)
+    assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==3
+    server.close()
+
+
 def test_team_delta_preserves_scope_without_rewriting_existing_members(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr(remote_client,"request",transport(server)); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
     root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); ws=create(cfg,"Team",root=root); replicate_conversation(root,ws); sync_once(root)
