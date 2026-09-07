@@ -19,6 +19,8 @@
   initialization in requests, bound HTTP framing and reads, and refuse redirects
   that could forward client credentials. Backups require an existing read-only
   source and publish a verified snapshot atomically.
+- Reject device approvals that alter existing devices and removals that add
+  unapproved replacements, in both the relay and client validators.
 - Remove quadratic ingestion validation and archive-sized team scope/receipt
   inventories. Bound proof preservation through an indexed source-history lookup.
 - Align all products and dependency minimums so the Remote client receives the

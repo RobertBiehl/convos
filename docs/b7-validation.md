@@ -7,9 +7,12 @@ Released v1 logical rows keep their encoding and identity recipes. Core schema
 v12 is additive and uses the existing verified database-and-attachments backup
 before migration.
 
-The final local suite passed 816 tests; nine live provider API tests were
+The final local suite passed 820 tests; nine live provider API tests were
 excluded. Installed wheels passed the focused recovery and backup cases with
 current public dependencies, including the native publication upgrade regression.
+Real relay-action tests also reject approvals that alter existing device records
+and removal transitions that enroll unapproved replacements; legitimate device
+approval, removal, recovery, and history transitions remain covered.
 
 ## Measured work
 
