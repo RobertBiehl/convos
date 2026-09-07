@@ -85,6 +85,19 @@ read-only mode to validate it. It is not the live archive and takes no archive l
 | Attachment relocation | Read plan, hash/copy/fsync unlocked, exact-row revalidation and bounded metadata write |
 | Backup and migration | Explicit maintenance exception; consistent checkpoint/backup precedes mutation |
 
+Captures totaling at most 500 rows use one dependency-ordered transaction across
+their related row kinds; larger captures keep the bounded, restart-safe phases.
+Local ingestion records unfinished provenance targets in its own transaction.
+Provenance capture retries at most 500 queued targets in addition to the current
+explicit targets; `sync --full` retains full reconciliation. Capturing an updated
+edit revisits its derived hashes, while an unchanged completed edit stays a no-op.
+The input snapshot also records generations for just the selected conversations
+and edits. Before writing derived facts, capture verifies those generations and
+acknowledges the targets in the same transaction. A changed target or Git failure
+retains the pending work and the already committed conversations; unrelated
+ingestion does not invalidate the snapshot. When scopes already exist, planning
+and input materialization share one read connection before all Git inspection.
+
 ## SQLite databases
 
 SQLite stores browser cookies (read-only), Remote client working state, Remote relay state,

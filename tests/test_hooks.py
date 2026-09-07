@@ -184,6 +184,19 @@ def test_missing_parser_dependency_does_not_discard_hook_input(hooks,monkeypatch
     assert cli.drain_hooks()==0 and json.loads(cli.HOOK_PROGRESS.read_text())["failed"]==1
     assert len(list(cli.HOOK_DIR.glob("*.json")))==1
 
+def test_hook_retries_provenance_after_ingestion_committed(hooks,tmp_path,monkeypatch):
+    sessions,_=hooks; root=tmp_path/"repo"; root.mkdir(); subprocess.run(["git","-C",str(root),"init","-q"],check=True)
+    transcript(path:=sessions/"git-retry.jsonl"); path.write_text(path.read_text().replace('"/repo"',json.dumps(str(root)))); enqueue(path); run=cli._git_run
+    monkeypatch.setattr(cli,"_git_run",lambda *args:(_ for _ in ()).throw(subprocess.CalledProcessError(1,args,stderr=b"temporary git failure")))
+    assert cli.drain_hooks()==0
+    with cli.open_db(read_only=True,purpose="fixture.read") as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==1
+        assert db.execute("SELECT checkout LIKE 'pending:%' FROM provenance.conversation_scopes").fetchone()[0]
+    monkeypatch.setattr(cli,"_git_run",run); assert cli.drain_hooks()==1
+    with cli.open_db(read_only=True,purpose="fixture.read") as db:
+        assert not db.execute("SELECT checkout LIKE 'pending:%' FROM provenance.conversation_scopes").fetchone()[0]
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==1
+
 def test_local_sync_retries_failed_unchanged_transcript(hooks,monkeypatch):
     sessions,_=hooks; parse=cli.parse_codex_session
     for name in ("good","bad"): transcript(sessions/f"{name}.jsonl",name)

@@ -156,6 +156,7 @@ product is strictly read-only.
 | `git_checkpoints` | Git head plus capture-time working-tree hash, changed paths, and capture source |
 | `checkpoint_edits` | Checkpoint-to-`file_edits.id` evidence |
 | `local_facts` | Content-free marker that this archive independently observed a fact and may sign it locally |
+| `pending` | Local conversation/edit identities and their ingestion generations awaiting provenance enrichment |
 
 There are intentionally no copied prompts, message bodies, changesets,
 file-edit bodies, raw remote payloads, workspace IDs, or device IDs in this

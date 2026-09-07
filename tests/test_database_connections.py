@@ -256,3 +256,23 @@ def test_ingest_chunks_are_ordered_restart_safe_and_preserve_evidence(tmp_path,m
     monkeypatch.setattr(cli,"upsert",recorded); cli.commit_result(result,purpose="test.ingest")
     db=cli.open_db(path,read_only=True,purpose="fixture.read"); assert db.execute("SELECT (SELECT count(*) FROM tool_calls),(SELECT count(*) FROM file_edits),(SELECT count(*) FROM provenance.file_edit_evidence WHERE status='confirmed')").fetchone()==(501,501,501); db.close()
     assert calls==[(1,0,0,0,0),(0,500,0,0,0),(0,1,0,0,0),(0,0,500,0,0),(0,0,1,0,0),(0,0,0,500,0),(0,0,0,1,0),(0,0,0,0,500),(0,0,0,0,1)] and result.provenance_edits=={f"e{i}" for i in range(501)}
+
+def test_small_capture_is_atomic_across_related_rows(tmp_path,monkeypatch):
+    path=tmp_path/"archive.db"; monkeypatch.setattr(cli,"DB_PATH",path)
+    with cli.open_db(path,purpose="fixture.schema") as db: cli.init_schema(db)
+    conv=dict(id="c",source="codex",title="small",created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")
+    msgs=[dict(id=mid,conversation_id="c",role="assistant",content="done",thinking=None,created_at=None,model=None,metadata="{}",parent_id=parent) for mid,parent in (("child","parent"),("parent",None))]
+    edit=dict(id="e",message_id="child",file_path="x.py",edit_type="write",content="x",created_at=None,old_content=None)
+    result=cli.ParseResult(convs=[conv],msgs=msgs,edits=[edit],edit_evidence=[dict(file_edit_id="e",status="confirmed",reason="test_fixture",tool_call_id=None)])
+    original,calls=cli.upsert,[]
+    def interrupted(db,part):
+        calls.append([m["id"] for m in part.msgs]); out=original(db,part)
+        if part.edit_evidence: raise RuntimeError("evidence commit interrupted")
+        return out
+    monkeypatch.setattr(cli,"upsert",interrupted)
+    with pytest.raises(RuntimeError,match="evidence commit interrupted"): cli.commit_result(result,purpose="test.ingest")
+    with cli.open_db(path,read_only=True,purpose="fixture.read") as db:
+        assert db.execute("SELECT (SELECT count(*) FROM conversations),(SELECT count(*) FROM messages),(SELECT count(*) FROM file_edits),(SELECT count(*) FROM provenance.file_edit_evidence),(SELECT count(*) FROM provenance.pending)").fetchone()==(0,0,0,0,0)
+    assert calls==[["parent","child"]]
+    monkeypatch.setattr(cli,"upsert",original); cli.commit_result(result,purpose="test.ingest")
+    with cli.open_db(path,read_only=True,purpose="fixture.read") as db: assert db.execute("SELECT (SELECT count(*) FROM messages),(SELECT count(*) FROM file_edits),(SELECT count(*) FROM provenance.file_edit_evidence WHERE status='confirmed')").fetchone()==(2,1,1)
