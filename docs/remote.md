@@ -87,6 +87,14 @@ HTTPS endpoint. The server itself has no TLS or public-network configuration.
 The client rejects plaintext HTTP except on loopback;
 `CONVOS_REMOTE_INSECURE=1` is only for a trusted test network.
 
+Schema initialization runs at startup. Each request opens an existing database
+without running migrations or acquiring a writer lock for connection setup.
+Reads use one SQLite snapshot, so a response cannot mix membership, keys, and
+signed controls from different rotations. Mutations authorize and commit within
+one write transaction; a failed batch is rolled back completely, and concurrent
+uploads cannot cross a signed epoch history boundary. WAL readers can continue
+while another request holds the write transaction.
+
 ## Personal multi-computer setup
 
 On the first computer:

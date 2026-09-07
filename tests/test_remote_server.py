@@ -1,4 +1,5 @@
 import copy, json, sqlite3, threading
+from contextlib import closing
 
 import pytest
 import ai_convos_remote_server as server_module
@@ -153,3 +154,90 @@ def test_registration_requires_fresh_device_key_proof_and_consumes_challenge(tmp
     assert action(db,{**request,"proof":proof})["device"]==device["id"]
     db.close(); db=connect(path)
     with pytest.raises(PermissionError,match="already used"): action(db,{**request,"proof":proof})
+
+
+def test_failed_event_batch_rolls_back_before_connection_reuse(tmp_path):
+    with closing(connect(tmp_path/"server.db")) as db:
+        a=account(db,"alice"); ws,key="personal",bytes(32); create_ws(db,a,ws,key,"personal")
+        env=seal_event(event(a["device"],1,"message.record","one",{},[]),ws,1,key)
+        with pytest.raises(PermissionError): action(db,{"op":"upload_many","envelopes":[env,{**env,"author":"wrong"}]},a["token"])
+        assert not db.in_transaction
+        action(db,sign_control(a["device"],{"op":"recovery","bundle":{"ciphertext":"updated"}}),a["token"])
+        assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0]==db.execute("SELECT COUNT(*) FROM ledger_cursors").fetchone()[0]==0
+
+
+def test_event_upload_and_signed_rotation_are_serialized(tmp_path,monkeypatch):
+    path=tmp_path/"server.db"
+    with closing(connect(path)) as db:
+        a=account(db,"alice"); ws,key="personal",bytes(32); state=create_ws(db,a,ws,key,"personal")
+        env=seal_event(event(a["device"],1,"message.record","one",{},[]),ws,1,key)
+        checked,resume=threading.Event(),threading.Event(); outcomes=[]; real=server_module.digest
+        def pause(value):
+            if value is env:
+                checked.set()
+                assert resume.wait(5)
+            return real(value)
+        def upload():
+            with closing(connect(path)) as conn:
+                try: outcomes.append(action(conn,{"op":"upload","envelope":env},a["token"]))
+                except BaseException as error: outcomes.append(error)
+        monkeypatch.setattr(server_module,"digest",pause)
+        worker=threading.Thread(target=upload,name="paused-upload"); worker.start()
+        try:
+            assert checked.wait(5)
+            db.execute("PRAGMA busy_timeout=0")
+            with pytest.raises(sqlite3.OperationalError,match="locked"): rotate_ws(db,a,state,bytes([1])*32,((a,"admin"),))
+            assert not db.in_transaction
+        finally:
+            resume.set(); worker.join(5)
+        assert not worker.is_alive() and len(outcomes)==1 and isinstance(outcomes[0],dict), outcomes
+        rotated=rotate_ws(db,a,state,bytes([1])*32,((a,"admin"),))
+        assert rotated["boundary"]=={"epoch":2,"tail":outcomes[0]["cursor"],"heads":{a["device"]["id"]:{"seq":1,"event":env["event"]}}}
+
+
+def test_state_is_one_snapshot_while_a_rotation_commits(tmp_path,monkeypatch):
+    path=tmp_path/"server.db"
+    with closing(connect(path)) as db,closing(connect(path,False)) as writer:
+        a=account(db,"alice"); ws,key="personal",bytes(32); state=create_ws(db,a,ws,key,"personal"); real=server_module.rows; rotations=[]
+        def rotate_after_membership(conn,sql,args=()):
+            values=real(conn,sql,args)
+            if sql.startswith("SELECT w.id") and not rotations: rotations.append(rotate_ws(writer,a,state,bytes([1])*32,((a,"admin"),)))
+            return values
+        monkeypatch.setattr(server_module,"rows",rotate_after_membership)
+        snapshot=action(db,{"op":"state"},a["token"])["workspaces"][0]
+        assert rotations and snapshot["epoch"]==snapshot["controls"][-1]["epoch"]==max(k["epoch"] for k in snapshot["keys"])==1
+        assert not db.in_transaction and action(db,{"op":"state"},a["token"])["workspaces"][0]["epoch"]==2
+
+
+def test_request_connection_reads_during_writer_and_does_not_create_missing_db(tmp_path):
+    path=tmp_path/"relay #1.db"
+    with closing(connect(path)) as writer:
+        a=account(writer,"alice")
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("UPDATE users SET recovery='{}'")
+        with closing(connect(path,False)) as reader:
+            assert reader.execute("PRAGMA foreign_keys").fetchone()[0]==reader.execute("PRAGMA secure_delete").fetchone()[0]==1
+            assert reader.execute("PRAGMA busy_timeout").fetchone()[0]==30000
+            assert action(reader,{"op":"recovery_fetch","user":a["user"]})=={"bundle":{"ciphertext":"opaque"}}
+        writer.rollback()
+    with pytest.raises(sqlite3.OperationalError): connect(tmp_path/"missing.db",False)
+    assert not (tmp_path/"missing.db").exists()
+
+
+def test_concurrent_event_retries_keep_one_cursor(tmp_path):
+    path=tmp_path/"server.db"
+    with closing(connect(path)) as db:
+        a=account(db,"alice"); ws,key="personal",bytes(32); create_ws(db,a,ws,key,"personal")
+        env=seal_event(event(a["device"],1,"message.record","one",{},[]),ws,1,key)
+        barrier=threading.Barrier(4); outcomes=[]
+        def upload():
+            with closing(connect(path,False)) as conn:
+                barrier.wait(5)
+                try: outcomes.append(action(conn,{"op":"upload","envelope":env},a["token"]))
+                except BaseException as error: outcomes.append(error)
+        workers=[threading.Thread(target=upload) for _ in range(4)]
+        for worker in workers: worker.start()
+        for worker in workers: worker.join(5)
+        assert len(outcomes)==4 and all(isinstance(value,dict) for value in outcomes), outcomes
+        assert sum(value["created"] for value in outcomes)==1 and len({value["cursor"] for value in outcomes})==1
+        assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0]==db.execute("SELECT COUNT(*) FROM ledger_cursors").fetchone()[0]==1

@@ -51,15 +51,16 @@ CREATE TABLE IF NOT EXISTS device_proposals(id TEXT PRIMARY KEY,workspace TEXT,b
 CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_device TEXT,approve INT,vote TEXT,PRIMARY KEY(proposal,voter_user));
 """
 
-def connect(path):
-    existed=Path(path).exists() and Path(path).stat().st_size>0
-    db=sqlite3.connect(path)
+def connect(path,initialize=True):
+    db=sqlite3.connect(path if initialize else Path(path).resolve().as_uri()+"?mode=rw",uri=not initialize,timeout=30)
     db.row_factory=sqlite3.Row
-    old=existed and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
+    db.executescript("PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;")
+    if not initialize: return db
+    old=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
     if old and (db.execute("PRAGMA user_version").fetchone()[0]!=1 or db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_purges'").fetchone()):
         db.close()
         raise ValueError("relay database is incompatible; create a fresh relay")
-    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=1;")
+    db.executescript("PRAGMA journal_mode=WAL;"+SCHEMA+"PRAGMA user_version=1;")
     db.execute("INSERT OR IGNORE INTO relay_meta VALUES ('registration_secret',?)",(b64(os.urandom(32)),))
     db.commit()
     return db
@@ -87,7 +88,6 @@ def certify(db,actor,req):
     expected={k:target[k] for k in ("id","name","sign_public","box_public")} if target else None
     if body["user"]!=actor["user_id"] or body["device"]!=expected: raise PermissionError("device certificate does not match account")
     db.execute("INSERT OR REPLACE INTO device_certificates VALUES (?,?)",(body["device"]["id"],json.dumps(req["certificate"])))
-    db.commit()
     return {"certified":body["device"]["id"]}
 def rows(db, sql, args=()): return [dict(r) for r in db.execute(sql, args).fetchall()]
 def cursor_bounds(db,table,access,args): return tuple((db.execute(f"SELECT cursor FROM {table} WHERE {access} ORDER BY cursor {direction} LIMIT 1",args).fetchone() or [0])[0] for direction in ("","DESC"))
@@ -195,7 +195,6 @@ def verify_control(db,actor,value,previous=None):
     return value
 def apply_control(db,value,envelopes):
     ws=value["workspace"]
-    previous=current_control(db,ws)
     if set(envelopes)!=set(value["devices"]): raise ValueError("one key envelope required for every authorized device")
     for old in rows(db,"SELECT user_id FROM members WHERE workspace=?",(ws,)):
         if old["user_id"] not in value["members"]: db.execute("UPDATE members SET active=0 WHERE workspace=? AND user_id=?",(ws,old["user_id"]))
@@ -240,25 +239,18 @@ def register(db,req):
         if set(proof)!=set(expected)|{"signature"} or {k:proof[k] for k in expected}!=expected: raise ValueError
         Ed25519PublicKey.from_public_bytes(unb64(dev["sign_public"])).verify(unb64(proof["signature"]),canon(expected))
     except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise PermissionError("invalid registration proof") from e
-    db.execute("BEGIN IMMEDIATE")
-    try:
-        db.execute("DELETE FROM registration_uses WHERE expires<?",(time.time(),))
-        if db.execute("SELECT 1 FROM registration_uses WHERE challenge=?",(challenge,)).fetchone(): raise PermissionError("registration challenge was already used")
-        db.execute("INSERT INTO registration_uses VALUES (?,?)",(challenge,req["challenge"]["expires"]))
-        old=db.execute("SELECT root_public FROM users WHERE id=?",(user,)).fetchone()
-        if old and old[0]!=root: raise PermissionError("user root mismatch")
-        if not old: db.execute("INSERT INTO users VALUES (?,?,?,?,?)",(user,req["user_name"],root,json.dumps(req.get("recovery")),time.time()))
-        token=secrets.token_urlsafe(32)
-        db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?)",(dev["id"],user,dev["name"],dev["sign_public"],dev["box_public"],token_hash(token),1,time.time()))
-        db.execute("INSERT INTO device_certificates VALUES (?,?)",(dev["id"],json.dumps(cert)))
-        db.commit()
-        return dict(user=user,device=dev["id"],token=token)
-    except BaseException:
-        db.rollback()
-        raise
+    db.execute("DELETE FROM registration_uses WHERE expires<?",(time.time(),))
+    if db.execute("SELECT 1 FROM registration_uses WHERE challenge=?",(challenge,)).fetchone(): raise PermissionError("registration challenge was already used")
+    db.execute("INSERT INTO registration_uses VALUES (?,?)",(challenge,req["challenge"]["expires"]))
+    old=db.execute("SELECT root_public FROM users WHERE id=?",(user,)).fetchone()
+    if old and old[0]!=root: raise PermissionError("user root mismatch")
+    if not old: db.execute("INSERT INTO users VALUES (?,?,?,?,?)",(user,req["user_name"],root,json.dumps(req.get("recovery")),time.time()))
+    token=secrets.token_urlsafe(32)
+    db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?)",(dev["id"],user,dev["name"],dev["sign_public"],dev["box_public"],token_hash(token),1,time.time()))
+    db.execute("INSERT INTO device_certificates VALUES (?,?)",(dev["id"],json.dumps(cert)))
+    return dict(user=user,device=dev["id"],token=token)
 
 def rotate(db, actor, req):
-    db.execute("BEGIN IMMEDIATE")
     previous=current_control(db,req["workspace"])
     if not previous: raise ValueError("workspace control state is not initialized")
     if actor["id"] not in previous["devices"] and req.get("control",{}).get("action")!="personal_recover": raise PermissionError("device is not authorized for current workspace epoch")
@@ -275,7 +267,6 @@ def rotate(db, actor, req):
     for device,epochs in history.items():
         db.executemany("INSERT OR REPLACE INTO key_envelopes VALUES (?,?,?,?)",[(req["workspace"],int(epoch),device,json.dumps(env)) for epoch,env in epochs.items()])
     if approval:=req["control"].get("approval"): db.execute("UPDATE device_proposals SET active=0 WHERE id=?",(control_hash(approval["proposal"]),))
-    db.commit()
     return result
 def store_event(db,actor,env):
     ws=env["workspace"]
@@ -359,16 +350,12 @@ def bounded(values,size,limit=48*1024**2):
         out.append(value)
         used+=size(value)
     return out
-def immediate(db,fn):
-    db.execute("BEGIN IMMEDIATE")
-    try:
-        value=fn()
-        db.commit()
-        return value
-    except BaseException:
-        db.rollback()
-        raise
 def action(db, req, token=None):
+    if not isinstance(req,dict) or not isinstance(req.get("op"),str): raise ValueError("request requires a string operation")
+    with db:
+        db.execute("BEGIN IMMEDIATE" if req["op"] in {"register","certify","create","rotate","propose","reject","vote","upload","upload_many","replica_upload_many","blob_upload","origin_upload","grant_all","history_activate","recovery"} else "BEGIN")
+        return dispatch(db,req,token)
+def dispatch(db, req, token):
     op = req["op"]
     if op == "register_challenge": return {"challenge":registration_challenge(db,req)}
     if op == "register": return register(db, req)
@@ -385,13 +372,8 @@ def action(db, req, token=None):
         if (control["workspace"],control["scope"])!=(ws,req["kind"]): raise ValueError("workspace create scope mismatch")
         db.execute("INSERT INTO workspaces VALUES (?,?,?,?,?)",(ws,req["kind"],1,actor["user_id"],time.time()))
         result=apply_control(db,control,req["envelopes"])
-        db.commit()
         return result
-    if op == "rotate":
-        try: return rotate(db,actor,req)
-        except BaseException:
-            db.rollback()
-            raise
+    if op == "rotate": return rotate(db,actor,req)
     if op == "propose":
         request=req["proposal"]
         previous=current_control(db,request["workspace"])
@@ -405,7 +387,6 @@ def action(db, req, token=None):
         if request["v"]!=V or request["certificate_hash"]!=digest(target["certificate"]) or actor["id"]!=request["author"] or target["device"]["id"]!=actor["id"] or target["user"]!=actor["user_id"] or request["base"]!=control_hash(previous) or request["epoch"]!=previous["epoch"] or actor["user_id"] not in previous["members"] or not (pending or history) or not active<request["expires"]<=now+86400+CLOCK_SKEW: raise PermissionError("invalid device proposal")
         pid=control_hash(request)
         db.execute("INSERT INTO device_proposals VALUES (?,?,?,?,?,?,?,?,1)",(pid,request["workspace"],request["base"],actor["user_id"],actor["id"],json.dumps(request),active,request["expires"]))
-        db.commit()
         return {"proposal":pid}
     if op == "reject":
         row=db.execute("SELECT proposal,active FROM device_proposals WHERE id=? AND workspace=?",(req["proposal"],req["workspace"])).fetchone()
@@ -414,7 +395,6 @@ def action(db, req, token=None):
         proposal=json.loads(row["proposal"]) if row else None
         if not row or not row["active"] or not record or record["user"]!=actor["user_id"] or proposal["target"]["user"]!=actor["user_id"] or proposal["base"]!=control_hash(previous): raise PermissionError("proposal rejection denied")
         db.execute("UPDATE device_proposals SET active=0 WHERE id=?",(req["proposal"],))
-        db.commit()
         return {"rejected":True}
     if op == "vote":
         value=req["vote"]
@@ -427,7 +407,6 @@ def action(db, req, token=None):
         old=db.execute("SELECT approve FROM device_votes WHERE proposal=? AND voter_user=?",(value["proposal"],actor["user_id"])).fetchone()
         if old and bool(old[0])!=value["approve"]: raise ValueError("conflicting user vote")
         db.execute("INSERT OR REPLACE INTO device_votes VALUES (?,?,?,?,?)",(value["proposal"],actor["user_id"],actor["id"],value["approve"],json.dumps(value)))
-        db.commit()
         return {"recorded":True}
     if op == "proposals":
         member(db,req["workspace"],actor["user_id"])
@@ -450,21 +429,16 @@ def action(db, req, token=None):
     if op == "ledger":
         member(db,req["workspace"],actor["user_id"])
         return ledger_state(db,req["workspace"])
-    if op == "upload":
-        result=store_event(db,actor,req["envelope"])
-        db.commit()
-        return result
+    if op == "upload": return store_event(db,actor,req["envelope"])
     if op == "upload_many":
         if len(req["envelopes"])>500: raise ValueError("upload batch limit is 500")
-        result=[store_event(db,actor,env) for env in req["envelopes"]]
-        db.commit()
-        return {"events":result}
+        return {"events":[store_event(db,actor,env) for env in req["envelopes"]]}
     if op == "replica_upload_many":
         if not isinstance(req["envelopes"],list) or not 1<=len(req["envelopes"])<=500: raise ValueError("replica upload batch limit is 1 to 500")
         semantic=req.get("semantic",False)
         if not isinstance(semantic,bool): raise ValueError("replica channel is invalid")
-        return immediate(db,lambda:{"replicas":[store_replica(db,actor,env,semantic) for env in req["envelopes"]]})
-    if op == "blob_upload": return immediate(db,lambda:store_blob(db,actor,req["envelope"]))
+        return {"replicas":[store_replica(db,actor,env,semantic) for env in req["envelopes"]]}
+    if op == "blob_upload": return store_blob(db,actor,req["envelope"])
     if op == "blob_reconcile":
         ws=req["workspace"]
         m=device_member(db,ws,actor)
@@ -482,7 +456,7 @@ def action(db, req, token=None):
         floor,tail=cursor_bounds(db,"blob_replicas",access,args)
         values=bounded(db.execute(f"SELECT * FROM blob_replicas WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(after,limit)),lambda r:4*((len(r["ciphertext"])+2)//3)+1024)
         return {"floor":floor,"tail":tail,"blobs":[{"cursor":r["cursor"],"envelope":blob_envelope(r)} for r in values]}
-    if op == "origin_upload": return immediate(db,lambda:store_origin(db,actor,req["envelope"]))
+    if op == "origin_upload": return store_origin(db,actor,req["envelope"])
     if op == "origin_pull":
         ws=req["workspace"]
         m=device_member(db,ws,actor)
@@ -543,7 +517,6 @@ def action(db, req, token=None):
         if req["control"]["members"][req["user"]]["history_from"]!=1 or any(not req["control"]["devices"][d]["history"] for d in expected): raise ValueError("history control does not grant all")
         apply_history(db,req["control"])
         db.executemany("INSERT OR REPLACE INTO key_envelopes VALUES (?,?,?,?)",[(req["workspace"],int(epoch),dev,json.dumps(env)) for epoch,values in req["envelopes"].items() for dev,env in values.items()])
-        db.commit()
         return {"granted":"all"}
     if op == "history_activate":
         previous=current_control(db,req["workspace"])
@@ -557,11 +530,9 @@ def action(db, req, token=None):
         apply_history(db,req["control"])
         db.executemany("INSERT OR REPLACE INTO key_envelopes VALUES (?,?,?,?)",[(req["workspace"],int(epoch),device,json.dumps(env)) for epoch,env in req["envelopes"].items()])
         db.execute("UPDATE device_proposals SET active=0 WHERE id=?",(control_hash(req["control"]["approval"]["proposal"]),))
-        db.commit()
         return {"activated":device}
     if op == "recovery":
         db.execute("UPDATE users SET recovery=? WHERE id=?",(json.dumps(req["bundle"]),actor["user_id"]))
-        db.commit()
         return {"updated":True}
     raise ValueError(f"unknown operation {op}")
 
@@ -585,7 +556,7 @@ class Handler(BaseHTTPRequestHandler):
             if length>64*1024*1024: raise ValueError("request exceeds 64 MiB")
             req=json.loads(self.rfile.read(length) or b"{}")
             token=self.headers.get("Authorization","").removeprefix("Bearer ")
-            with closing(connect(DB)) as db: out=action(db,req,token)
+            with closing(connect(DB,False)) as db: out=action(db,req,token)
             self.send(200,out)
         except PermissionError as e: self.send(403,{"error":str(e)})
         except (ValueError,KeyError,sqlite3.IntegrityError) as e: self.send(400,{"error":str(e)})
