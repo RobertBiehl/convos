@@ -419,8 +419,8 @@ def _logical_archive(row,proof,proof_id,native=False,parent_map=None):
 def _protect_native_replicas(db,items,defer):
     refs={"conversation_id":"conversations","message_id":"messages","parent_id":"messages","turn":"messages","edit":"file_edits"}
     wanted={(row["kind"],row["id"]) for row,p,pid,native,*maps in items if native}|{(refs[key],value) for row,p,pid,native,*maps in items if native for key,value in (row["data"] or {}).items() if key in refs and value}
-    existing={table:{row[0]:row for row in db.execute(f"SELECT {','.join(ARCHIVE_COLUMNS[table])} FROM {table} WHERE id IN (SELECT UNNEST(?))",[ids]).fetchall()} if (ids:=[value for kind,value in wanted if kind==table]) else {} for table in ARCHIVE_COLUMNS}
-    bindings={(kind,source):physical for kind,source,physical in db.execute("SELECT table_name,source_row_id,physical_row_id FROM remote.row_origins WHERE author_user_id IN (SELECT UNNEST(?)) AND source_row_id IN (SELECT UNNEST(?))",([p["author_user_id"] for row,p,pid,native,*maps in items if native],[value for kind,value in wanted])).fetchall() if source not in existing[kind]}
+    existing={table:{row[0]:row for row in db.execute(f"SELECT {','.join(ARCHIVE_COLUMNS[table])} FROM {table} WHERE id IN (SELECT json_extract_string(value,'$') FROM json_each(?))",[json.dumps(ids,separators=(",",":"))]).fetchall()} if (ids:=[value for kind,value in wanted if kind==table]) else {} for table in ARCHIVE_COLUMNS}
+    bindings={(kind,source):physical for kind,source,physical in db.execute("SELECT table_name,source_row_id,physical_row_id FROM remote.row_origins WHERE author_user_id IN (SELECT json_extract_string(value,'$') FROM json_each(?)) AND source_row_id IN (SELECT json_extract_string(value,'$') FROM json_each(?))",[json.dumps(list(ids),separators=(",",":")) for ids in ({p["author_user_id"] for row,p,pid,native,*maps in items if native},{value for kind,value in wanted})]).fetchall() if source not in existing[kind]}
     paths=captured_edit_paths(db,list(existing["file_edits"]))
     selected=[]
     for item in items:
