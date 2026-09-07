@@ -1,4 +1,4 @@
-import copy, json, sqlite3, threading
+import copy, json, sqlite3, threading, tracemalloc
 from contextlib import closing
 
 import pytest
@@ -241,3 +241,26 @@ def test_concurrent_event_retries_keep_one_cursor(tmp_path):
         assert len(outcomes)==4 and all(isinstance(value,dict) for value in outcomes), outcomes
         assert sum(value["created"] for value in outcomes)==1 and len({value["cursor"] for value in outcomes})==1
         assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0]==db.execute("SELECT COUNT(*) FROM ledger_cursors").fetchone()[0]==1
+
+
+def test_ledger_heads_use_each_authors_sequence_and_workspace_tail(tmp_path):
+    with closing(connect(tmp_path/"server.db")) as db:
+        values=[(ws,f"event-{i}",author,seq) for i,(ws,author,seq) in enumerate((("w","a",7),("w","b",2),("w","a",1),("other","a",100),("w","b",3),("w","b",1)))]
+        db.executemany("INSERT INTO events(workspace,event,author,seq) VALUES (?,?,?,?)",values)
+        assert ledger_state(db,"w")=={"tail":6,"heads":{"a":{"seq":7,"event":"event-0"},"b":{"seq":3,"event":"event-4"}}}
+        assert ledger_state(db,"absent")=={"tail":0,"heads":{}}
+
+
+def test_lazy_event_page_does_not_materialize_large_bodies(tmp_path):
+    with closing(connect(tmp_path/"server.db")) as db:
+        a=account(db,"alice"); ws,key="personal",bytes(32); create_ws(db,a,ws,key,"personal")
+        envelopes=[seal_event(event(a["device"],i+1,"future.large",str(i),{"body":"x"*1024**2},[]),ws,1,key) for i in range(8)]
+        action(db,{"op":"upload_many","envelopes":envelopes},a["token"])
+        tracemalloc.start()
+        try:
+            result=action(db,{"op":"pull","workspace":ws},a["token"])
+            peak=tracemalloc.get_traced_memory()[1]
+        finally: tracemalloc.stop()
+        assert len(result["events"])==8 and all(value["lazy"] and "envelope" not in value for value in result["events"])
+        assert peak<2*1024**2
+        assert action(db,{"op":"fetch","workspace":ws,"event":envelopes[-1]["event"]},a["token"])["envelope"]==envelopes[-1]

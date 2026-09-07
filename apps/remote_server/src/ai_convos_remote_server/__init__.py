@@ -1,6 +1,6 @@
 """Opaque self-hosted relay. It authorizes envelopes but never receives content keys."""
-import argparse, base64, hashlib, hmac, json, os, secrets, sqlite3, time
-from contextlib import closing
+import argparse, base64, hashlib, hmac, json, logging, os, secrets, socket, sqlite3, threading, time
+from contextlib import closing, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_devi
 """
 
 def connect(path,initialize=True):
-    db=sqlite3.connect(path if initialize else Path(path).resolve().as_uri()+"?mode=rw",uri=not initialize,timeout=30)
+    db=sqlite3.connect(path if initialize else Path(path).absolute().as_uri()+"?mode=rw",uri=not initialize,timeout=30)
     db.row_factory=sqlite3.Row
     db.executescript("PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;")
     if not initialize: return db
@@ -107,9 +107,8 @@ def verify_record(value):
     return value
 def control_hash(value): return digest(value)
 def ledger_state(db,ws):
-    values=rows(db,"SELECT cursor,event,author,seq FROM events WHERE workspace=?",(ws,))
-    heads={author:{"seq":row["seq"],"event":row["event"]} for author in {r["author"] for r in values} for row in [max((r for r in values if r["author"]==author),key=lambda r:r["seq"])]}
-    return {"tail":max((r["cursor"] for r in values),default=0),"heads":heads}
+    heads=rows(db,"SELECT e.author,e.seq,e.event FROM events e JOIN (SELECT author,MAX(seq) seq FROM events WHERE workspace=? GROUP BY author) h ON e.workspace=? AND e.author=h.author AND e.seq=h.seq",(ws,ws))
+    return {"tail":(db.execute("SELECT cursor FROM events WHERE workspace=? ORDER BY cursor DESC LIMIT 1",(ws,)).fetchone() or [0])[0],"heads":{r["author"]:{"seq":r["seq"],"event":r["event"]} for r in heads}}
 def current_control(db,ws):
     row=db.execute("SELECT state FROM workspace_controls WHERE workspace=? ORDER BY revision DESC LIMIT 1",(ws,)).fetchone()
     return json.loads(row[0]) if row else None
@@ -493,7 +492,7 @@ def dispatch(db, req, token):
         access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?)"
         args=(ws,m["history_from"],actor["id"])
         floor,tail=cursor_bounds(db,"events x",access,args)
-        out=rows(db,f"SELECT cursor,event,envelope,LENGTH(envelope) size FROM events x WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(req.get("after",0),limit))
+        out=rows(db,f"SELECT cursor,event,CASE WHEN LENGTH(CAST(envelope AS BLOB))<=65536 THEN envelope END envelope,LENGTH(CAST(envelope AS BLOB)) size FROM events x WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(req.get("after",0),limit))
         return {"floor":floor,"tail":tail,"events":[{"cursor":r["cursor"],**({"lazy":True,"event":r["event"],"size":r["size"]} if r["size"]>65536 else {"envelope":json.loads(r["envelope"])})} for r in out]}
     if op == "fetch":
         m=device_member(db,req["workspace"],actor)
@@ -537,7 +536,39 @@ def dispatch(db, req, token):
     raise ValueError(f"unknown operation {op}")
 
 DB = None
+class Server(ThreadingHTTPServer):
+    request_queue_size,request_timeout=128,120
+    def __init__(self,*args,**kwargs):
+        self.slots=threading.BoundedSemaphore(max(1,int(os.environ.get("CONVOS_SERVER_WORKERS","32"))))
+        self.deadlines={}
+        super().__init__(*args,**kwargs)
+    def process_request(self,request,client_address):
+        if not self.slots.acquire(False):
+            with suppress(OSError):
+                request.setblocking(False)
+                request.sendall(b'HTTP/1.0 503 Service Unavailable\r\nContent-Length: 22\r\nContent-Type: application/json\r\nRetry-After: 1\r\nConnection: close\r\n\r\n{"error":"relay busy"}')
+            return self.shutdown_request(request)
+        self.deadlines[request]=time.monotonic()+self.request_timeout
+        try: super().process_request(request,client_address)
+        except BaseException:
+            self.deadlines.pop(request,None)
+            self.slots.release()
+            raise
+    def service_actions(self):
+        now=time.monotonic()
+        for request,deadline in self.deadlines.copy().items():
+            if deadline<=now:
+                with suppress(OSError): request.shutdown(socket.SHUT_RDWR)
+    def process_request_thread(self,request,client_address):
+        try: super().process_request_thread(request,client_address)
+        finally:
+            self.deadlines.pop(request,None)
+            self.slots.release()
 class Handler(BaseHTTPRequestHandler):
+    timeout=30
+    def handle(self):
+        try: super().handle()
+        except (ConnectionError,TimeoutError): pass
     def log_message(self, fmt, *args): pass
     def send(self, status, value):
         body=canon(value)
@@ -552,15 +583,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send(404,{"error":"protocol v1 endpoint required"})
             return
         try:
-            length=int(self.headers.get("Content-Length","0"))
+            length=self.headers.get("Content-Length","")
+            if self.headers.get("Transfer-Encoding") is not None or len(self.headers.get_all("Content-Length",[]))!=1 or not length.isascii() or not length.isdecimal(): raise ValueError("one nonnegative Content-Length is required; transfer encoding is unsupported")
+            length=int(length)
             if length>64*1024*1024: raise ValueError("request exceeds 64 MiB")
-            req=json.loads(self.rfile.read(length) or b"{}")
+            body=self.rfile.read(length)
+            if len(body)!=length: raise ValueError("incomplete request body")
+            req=json.loads(body or b"{}")
             token=self.headers.get("Authorization","").removeprefix("Bearer ")
             with closing(connect(DB,False)) as db: out=action(db,req,token)
             self.send(200,out)
         except PermissionError as e: self.send(403,{"error":str(e)})
-        except (ValueError,KeyError,sqlite3.IntegrityError) as e: self.send(400,{"error":str(e)})
-        except Exception as e: self.send(500,{"error":str(e)})
+        except (ValueError,KeyError,TypeError,OverflowError,RecursionError,InvalidSignature,sqlite3.IntegrityError,sqlite3.ProgrammingError) as e: self.send(400,{"error":str(e)})
+        except (ConnectionError,TimeoutError): pass
+        except Exception:
+            logging.exception("relay request failed")
+            self.send(500,{"error":"relay request failed"})
 
 def main(argv=None):
     p=argparse.ArgumentParser()
@@ -581,4 +619,4 @@ def main(argv=None):
     global DB
     DB=a.db
     print(f"convos-server http://{a.host}:{a.port}",flush=True)
-    ThreadingHTTPServer((a.host,a.port),Handler).serve_forever()
+    Server((a.host,a.port),Handler).serve_forever()
