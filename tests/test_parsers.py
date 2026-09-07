@@ -279,6 +279,26 @@ class TestCodexParser:
         with pytest.raises(ValueError,match="divergent provider session"): cli.upsert(db,cli.parse_codex(root))
         assert db.execute("SELECT (SELECT count(*) FROM conversations),(SELECT count(*) FROM messages),(SELECT count(*) FROM provider_sessions)").fetchone()==(0,0,0)
 
+    def test_duplicate_identity_validation_is_linear_and_compares_complete_fields(self):
+        from ai_convos import cli
+        accesses=[0]
+        class Row(dict):
+            def __getitem__(self,key): accesses[0]+=1; return super().__getitem__(key)
+        rows=[Row(id=f"m{i}",content="prefix"*100,metadata="{}") for i in range(2000)]
+        assert cli._id_conflict([*rows,*rows],("content","metadata")) is None
+        assert accesses[0]<=len(rows)*8
+        assert cli._id_conflict([*rows,{**rows[-1],"content":"prefix"*100+"different"}],("content","metadata"))=="m1999"
+        assert cli._id_conflict([*rows,{**rows[0],"metadata":"{\"changed\":true}"}],("content","metadata"))=="m0"
+
+    def test_chunked_ingest_rejects_divergent_duplicates_before_opening_archive(self,monkeypatch):
+        import pytest
+        from ai_convos import cli
+        conv=dict(id="c",source="codex",title="long",created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")
+        msgs=[dict(id=f"m{i}",conversation_id="c",role="user",content="evidence",thinking=None,created_at=None,model=None,metadata="{}",parent_id=None) for i in range(501)]
+        monkeypatch.setattr(cli,"_core",lambda **_:pytest.fail("divergent batch opened archive"))
+        with pytest.raises(ValueError,match="divergent provider session in import batch: m0"):
+            cli.commit_result(cli.ParseResult(convs=[conv],msgs=[*msgs,{**msgs[0],"content":"different evidence"}]),purpose="test.ingest")
+
     def test_parse_result_relations_fail_before_any_write(self):
         import duckdb,pytest
         from ai_convos import cli
