@@ -516,25 +516,42 @@ def merge_archive_backup(path,backup,page=500):
         available={f"{schema}.{table}" for schema,table in donor.execute("SELECT table_schema,table_name FROM information_schema.tables WHERE table_type='BASE TABLE'").fetchall()}
         bodies=_backup_rows(donor)
         restored=0
-        for table,columns in targets.items():
+        for table,columns in sorted(targets.items(),key=lambda item:item[0]=="provenance.local_facts"):
             if table not in available: continue
             fields=[r[0] for r in donor.execute(f"DESCRIBE {table}").fetchall()]
             if not set(columns)<=set(fields): continue
-            reader=donor.execute(f"SELECT {','.join(columns)} FROM {table}")
-            while rows:=reader.fetchmany(page):
-                with contextlib.closing(open_db(path,purpose="remote.repair.merge")) as db,_transaction(db):
-                    kind=table.split(".")[1]
-                    missing={r[0] for r in rows}-set(_rows_by_id(db,kind,[r[0] for r in rows])) if kind in ARCHIVE_COLUMNS else set()
-                    _insert_pages(db,table,rows,columns,mode=" OR IGNORE")
-                    if missing: _archive_touch(db,[(kind,row_id) for row_id in missing])
-                restored+=len(rows)
-                archive_yield(path)
+            with contextlib.closing(donor.cursor()) as reader:
+                reader.execute(f"SELECT {','.join(columns)} FROM {table}")
+                while rows:=reader.fetchmany(page):
+                    with contextlib.closing(open_db(path,purpose="remote.repair.merge")) as db,_transaction(db):
+                        kind=table.split(".")[1]
+                        missing={r[0] for r in rows}-set(_rows_by_id(db,kind,[r[0] for r in rows])) if kind in ARCHIVE_COLUMNS else set()
+                        if table=="provenance.local_facts":
+                            claims=[(kind,entity,entity,"","active") for kind,entity in rows]
+                            original,current=typed_logical_rows(donor,claims,"remote.row_references" in available),typed_logical_rows(db,claims,"remote.row_references" in targets)
+                            rows=[row for row,claim in zip(rows,claims) if original[claim] is not None and current[claim]==original[claim]]
+                        _insert_pages(db,table,rows,columns,mode=" OR IGNORE")
+                        if missing: _archive_touch(db,[(kind,row_id) for row_id in missing])
+                    restored+=len(rows)
+                    archive_yield(path)
         if "remote.row_bodies" in available:
             reader=donor.execute("SELECT b.proof_id,b.body,p.content_hash FROM remote.row_bodies b JOIN remote.row_proofs p ON p.id=b.proof_id")
             while rows:=reader.fetchmany(page):
                 exact=[(pid,body) for pid,body,expected in rows if provenance_digest(json.loads(body))==expected]
                 with contextlib.closing(open_db(path,purpose="remote.repair.bodies")) as db,_transaction(db): _insert_pages(db,"remote.row_conflicts",exact,mode=" OR IGNORE")
                 archive_yield(path)
+        if {"remote.row_proofs","remote.row_origins","remote.provenance_origins"}<=available:
+            with contextlib.closing(donor.cursor()) as reader:
+                reader.execute("""WITH origins AS (SELECT table_name kind,physical_row_id physical,source_row_id source_id,author_user_id author,proof_id FROM remote.row_origins UNION SELECT kind,physical_entity,source_entity,author_user_id,proof_id FROM remote.provenance_origins) SELECT DISTINCT p.id,p.row_kind,COALESCE(o.physical,p.source_row_id) physical,p.source_row_id,p.author_user_id,p.state,p.content_hash FROM remote.row_proofs p LEFT JOIN origins o ON (o.kind,o.source_id,o.author)=(p.row_kind,p.source_row_id,p.author_user_id) WHERE p.id=o.proof_id OR NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE (c.row_kind,c.source_row_id,c.author_user_id,c.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) ORDER BY p.id,physical""")
+                while proofs:=reader.fetchmany(page):
+                    claims=[tuple(row[1:-1]) for row in proofs]
+                    found,paths=typed_logical_rows(donor,claims,"remote.row_references" in available),captured_edit_paths(donor,[physical for kind,physical,source,user,state in claims if kind=="file_edits"])
+                    exact=[(pid,expected,claim,row) for (pid,*_,expected),claim in zip(proofs,claims) if (row:=matching_logical_row(found[claim],expected,[paths[claim[1]]] if paths.get(claim[1]) else ())) is not None]
+                    if exact:
+                        with contextlib.closing(open_db(path,purpose="remote.repair.bodies")) as db,_transaction(db):
+                            current,paths=typed_logical_rows(db,[claim for pid,expected,claim,row in exact],"remote.row_references" in targets),captured_edit_paths(db,[claim[1] for pid,expected,claim,row in exact if claim[0]=="file_edits"])
+                            _insert_pages(db,"remote.row_conflicts",[(pid,json.dumps(row,sort_keys=True,separators=(",",":"))) for pid,expected,claim,row in exact if matching_logical_row(current[claim],expected,[paths[claim[1]]] if paths.get(claim[1]) else ()) is None],mode=" OR IGNORE")
+                    archive_yield(path)
         bundle=backup.with_name(backup.name+".attachments")
         for ref,body_hash,size,original in bodies:
             candidates=([bundle/body_hash,backup.parent/"attachments"/body_hash] if body_hash else [])+([Path(original)] if original else [])
