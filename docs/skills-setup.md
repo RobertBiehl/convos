@@ -58,6 +58,15 @@ configured, and appear exactly once under every required event. Old executable
 paths, duplicate handlers, and a Claude handler misplaced between `Stop` and
 `SessionEnd` report `convos install-hooks` as the repair.
 
+Capture hooks are installed on turn completion (`Stop`) and Claude `SessionEnd`,
+not tool calls. Intermediate events from custom or older hook configurations
+can launch a capture at most once per 60 seconds per transcript; completion
+always bypasses that limit. Suppressed events remain in the provider transcript
+and are imported on the next eligible event or local sync. There is no periodic
+timer. Unchanged successful captures skip worker launch and archive access.
+`convos read` and `convos sql` also drain pending captures before reading, so
+those commands can acquire write locks even when invoked from an agent tool.
+
 Cross-provider memory delivery
 ------------------------------
 

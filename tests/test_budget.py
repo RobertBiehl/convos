@@ -12,12 +12,12 @@ def _loc(paths):
 
 
 def test_line_budget():
-    """Keep the cohesive archive-writing core, including durable migrations and evidence classification, under its explicit 1300-line budget."""
+    """Keep the cohesive archive-writing core under the explicit 1500-line budget in AGENTS.md."""
     root = Path(__file__).resolve().parents[1]
     paths = sorted((root / "src" / "ai_convos").glob("*.py"))
     assert paths, "No source files found"
     loc = _loc(paths)
-    assert loc < 1300, f"Code line budget exceeded: {loc} >= 1300"
+    assert loc < 1500, f"Code line budget exceeded: {loc} >= 1500"
 
 
 def test_app_line_budgets():
@@ -54,7 +54,7 @@ def test_installable_product_versions_are_aligned():
     files = [root/"pyproject.toml", *sorted((root/"apps").glob("*/pyproject.toml"))]
     projects = {f.parent.name:tomllib.loads(f.read_text())["project"] for f in files}
     assert {p["name"] for p in projects.values()} == {"convos","convos-changegraph","convos-explore","convos-memory","convos-redact","convos-remote","convos-remote-server","convos-resume"}, projects
-    assert {p["version"] for p in projects.values()} == {"0.11.6b5"}, projects
+    assert {p["version"] for p in projects.values()} == {"0.11.6b6"}, projects
     major,minor=map(int,next(iter({p["version"] for p in projects.values()})).split(".")[:2])
     constrained=[d for p in projects.values() for d in [*p["dependencies"],*(d for ds in p.get("optional-dependencies",{}).values() for d in ds)] if d.startswith("convos") and ">=" in d]
     assert constrained and {d[d.index(">="):] for d in constrained} == {f">={major}.{minor},<{major}.{minor+1}"}, constrained

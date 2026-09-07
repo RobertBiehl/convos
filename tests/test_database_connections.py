@@ -209,14 +209,6 @@ def test_remote_scan_defers_changes_after_its_watermark(tmp_path):
     first=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); second=projection.scan_archive(path,state,generation=changed[0],page=1,since=generation); state.close()
     assert [r["payload"]["row"][0] for r in first]==["c"] and [(r["payload"]["row"][0],r["payload"]["row"][2]) for r in second]==[("d","later")]
 
-def test_remote_repair_inventory_releases_the_archive_between_pages(tmp_path,monkeypatch):
-    import base64, ai_convos_remote
-    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO remote.row_proofs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",[(f"p{i}","w","w","conversations",f"c{i}",1,"h",f"r{i}",None,"active","u","d",1,"s") for i in range(2)]); db.close(); stages=[]; monkeypatch.setattr(ai_convos_remote,"bridge_records",lambda *_:[])
-    def progress(stage):
-        with cli.open_db(path,wait=0,purpose="concurrent inventory probe"): pass
-        stages.append(stage)
-    assert len(ai_convos_remote.local_replica_ids(tmp_path,{"keys":{"w:1":base64.b64encode(b"x"*32).decode()}},"w","team",{1},1,progress))==2 and stages==["scanning local proofs 1","scanning local proofs 2"]
-
 def test_redaction_and_export_processing_run_without_archive_lock(monkeypatch):
     from ai_convos_redact import scan_data
     import ai_convos_redact

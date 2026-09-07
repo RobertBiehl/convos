@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.11.6b6
+
+- Throttle intermediate hook capture to at most once per minute per transcript;
+  turn/session completion bypasses that throttle. Unchanged captures skip workers.
+- Fix batch-dependent edit paths and reconstruct historical timestamp/path
+  encodings only when they exactly match the existing signed proof.
+- Keep same-user replay identity stable, preserve native differences without
+  duplicate conversations, and distinguish local publication from remote variants.
+- Retain verified provenance when dependencies are missing or facts conflict;
+  retry affected dependencies without blocking healthy rows.
+- Replace destructive repull with resumable reconciliation and optional additive
+  recovery from a same-archive backup. Preserve existing rows, legacy body donors,
+  and concurrent local captures; report unavailable bodies and retained variants.
+- Do not treat stored proof headers as proof that repair bodies are present;
+  audit current proof heads independently of surviving origin mappings.
+- Stop unchanged blocked aliases from forcing repeated full syncs.
+
+This beta does not automatically resolve ambiguous existing duplicates or
+conflicting native/remote versions. Keep recovery donors until those differences
+have been accounted for. Production repair counts remain unverified.
+
 ## 0.8.1
 
 - Publish Convos, Redact, Remote, and Remote Server through isolated trusted
