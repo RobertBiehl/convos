@@ -203,8 +203,7 @@ def capture_repository(path,db_path=None):
     record=_provenance_record("repository.observed",repo["id"],{k:repo[k] for k in ("id","lineage","roots","remotes","head")},datetime.now(timezone.utc).isoformat().replace("+00:00","Z"))
     with _core(db_path,purpose="provenance.repository") as db,_transaction(db):
         _observe_checkout(db,repo)
-        project_provenance(db,record)
-        db.execute("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",(record["kind"],record["entity"]))
+        project_native_provenance(db,[record])
     return repo
 def _resolved(path,cwd=None): return str((Path(cwd)/p if not (p:=Path(path)).is_absolute() and cwd else p).expanduser().resolve())
 def pending_scopes(conversations): return [(conversation,resolved,None,root,f"pending:{checkout}" if checkout else None,captured) for captured in [datetime.now(timezone.utc)] for conversation,cwd in conversations for resolved in [_resolved(cwd) if cwd else None] for root,checkout in [_git_marker(resolved) if resolved else (None,None)]]
@@ -257,12 +256,12 @@ def preserve_fact_heads(db,keys):
     yield
     found=typed_logical_rows(db,[claim for pid,expected,claim,body in kept]) if kept else {}
     if lost:=[(pid,json.dumps(body,sort_keys=True,separators=(",",":"))) for pid,expected,claim,body in kept if matching_logical_row(found[claim],expected) is None]: _insert_pages(db,"remote.row_conflicts",lost,mode=" OR IGNORE")
-def project_provenance(db,value,map_id=lambda table,value:value,touch=True,replace_file=False,preserve=True):
+def project_provenance(db,value,map_id=lambda table,value:value,touch=True,replace_file=False,preserve=True,native=False):
     p,k,observed=value["payload"],value["kind"],value["observed_at"]
     if k not in PROVENANCE_KINDS: return False
     if k!="checkpoint.link" and p["id"]!=value["entity"]: raise ValueError("provenance entity mismatch")
     if issue:=provenance_issue(db,value,map_id,replace_file): raise ValueError(issue)
-    with preserve_fact_heads(db,[(k,map_id("file_edits",p["id"]) if k=="edit.observed" else value["entity"])]) if preserve and k in ("repository.observed","edit.observed") else contextlib.nullcontext():
+    with preserve_fact_heads(db,[(k,map_id("file_edits",p["id"]) if k=="edit.observed" else value["entity"])]) if preserve and (native or k in ("repository.observed","edit.observed")) else contextlib.nullcontext():
         if k=="repository.observed":
             db.execute("INSERT INTO provenance.repositories VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET lineage=excluded.lineage,roots=excluded.roots,remotes=excluded.remotes,last_head=COALESCE(excluded.last_head,repositories.last_head),observed_at=COALESCE(excluded.observed_at,repositories.observed_at)",(p["id"],p["lineage"],json.dumps(p["roots"]),json.dumps(p["remotes"]),p.get("head"),observed))
         elif k=="edit.observed":
@@ -271,8 +270,14 @@ def project_provenance(db,value,map_id=lambda table,value:value,touch=True,repla
         else:
             check,error,sql,args=_PROVENANCE_ROWS[k]
             required(check(p,value,map_id,observed),ValueError(error))
-            db.execute(sql,args(p,value,map_id,observed))
+            db.execute(sql.replace("OR IGNORE","OR REPLACE") if native else sql,args(p,value,map_id,observed))
     return bool(_archive_touch(db,[(k,value["entity"])])) if touch else True
+def project_native_provenance(db,records):
+    keys=[(r["kind"],r["entity"]) for r in records]
+    local=set(db.execute("SELECT kind,entity FROM provenance.local_facts WHERE entity IN (SELECT UNNEST(?))",[[entity for kind,entity in keys]]).fetchall()) if keys else set()
+    with preserve_fact_heads(db,keys):
+        for record,key in zip(records,keys): project_provenance(db,record,preserve=False,native=key not in local)
+    _insert_pages(db,"provenance.local_facts",keys,mode=" OR IGNORE")
 def _provenance_generations(db,edits,conversations): return set(db.execute("SELECT kind,entity,generation FROM archive_changes WHERE kind='file_edits' AND entity IN (SELECT UNNEST(?)) OR kind='conversations' AND entity IN (SELECT UNNEST(?))",[edits,conversations]).fetchall())
 def capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="sync"):
     targeted,eids,cids=edit_ids is not None or conversation_ids is not None,sorted(set(edit_ids or ())),sorted(set(conversation_ids or ()))
@@ -308,9 +313,7 @@ def capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="syn
         if scopes: core.executemany("UPDATE provenance.conversation_scopes SET cwd=?,repository=?,root=?,checkout=?,observed_at=? WHERE conversation=? AND checkout LIKE 'pending:%'",[(cwd,rid,root,checkout,observed,conversation) for conversation,cwd,rid,root,checkout,observed in scopes])
         if edit_scopes: core.executemany("UPDATE provenance.file_edit_scopes SET path=?,repository=?,root=?,checkout=?,route=?,observed_at=? WHERE file_edit_id=? AND checkout LIKE 'pending:%'",[(relative,rid,root,checkout,route,observed,edit) for edit,relative,rid,root,checkout,route,observed in edit_scopes])
         for repo in repos.values(): _observe_checkout(core,repo)
-        with preserve_fact_heads(core,[(r["kind"],r["entity"]) for r in records]):
-            for record in records: project_provenance(core,record,preserve=False)
-        if records: core.executemany("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",[(r["kind"],r["entity"]) for r in records])
+        project_native_provenance(core,records)
         if scopes or touched: _archive_touch(core,[("conversations",r[0]) for r in scopes]+[("conversations",c) for c in touched])
         core.execute("DELETE FROM provenance.pending WHERE kind='file_edits' AND entity IN (SELECT UNNEST(?)) OR kind='conversations' AND entity IN (SELECT UNNEST(?))",[eids,cids])
     return records
@@ -426,11 +429,14 @@ def _protect_native_replicas(db,items,defer):
 def project_logical_rows(db,items,defer=False):
     if defer: items=_protect_native_replicas(db,items,defer)
     delayed,logical,out=[item for item in items if item[0]["kind"] in PROVENANCE_KINDS or item[0]["state"]=="deleted"],(logical:=[_logical_archive(row,proof,pid,native,maps[0] if maps else None) for row,proof,pid,native,*maps in items if row["kind"] not in PROVENANCE_KINDS and row["state"]!="deleted"]),[(table,physical) for table,physical,values,origin,data in logical]
+    local=set(db.execute("SELECT kind,entity FROM provenance.local_facts WHERE entity IN (SELECT UNNEST(?))",[ids]).fetchall()) if (ids:=[source if table=="repository.observed" else mapped("file_edits",source) for row,p,pid,native,*maps in delayed for table,source,mapped,physical,origin in [_logical_parts(row,p,pid,native,maps[0] if maps else None)] if table in ("repository.observed","edit.observed")]) else set()
     with preserve_fact_heads(db,[("edit.observed" if table=="file_edits" else table,mapped("file_edits",source) if table=="edit.observed" else source if table=="repository.observed" else physical) for row,p,pid,native,*maps in items for table,source,mapped,physical,origin in [_logical_parts(row,p,pid,native,maps[0] if maps else None)] if table in ("repository.observed","edit.observed","file_edits")]):
         for table in ARCHIVE_COLUMNS:
             if rows := [(values,origin) for kind,physical,values,origin,data in logical if kind==table]: project_archive_rows(db,table,ARCHIVE_COLUMNS[table],rows,False)
         if bodies:=[(physical,data["body_hash"],data["size"]) for table,physical,values,origin,data in logical if table=="attachments" and data["body_hash"]]: _insert_pages(db,"attachment_bodies",bodies,mode=" OR REPLACE")
-        out.extend((item[0]["kind"],physical) for item in delayed if (physical:=project_logical_row(db,*item[:4],touch=False,parent_map=item[4] if len(item)>4 else None,defer=defer,preserve=False)) is not None)
+        facts=[(item,physical) for item in delayed if (physical:=project_logical_row(db,*item[:4],touch=False,parent_map=item[4] if len(item)>4 else None,defer=defer,preserve=False,local=local,record_origin=False)) is not None]
+        out.extend((item[0]["kind"],physical) for item,physical in facts)
+        _insert_pages(db,"remote.provenance_origins",[(item[0]["kind"],physical,item[1]["workspace"],item[1]["author_user_id"],item[0]["id"],item[2]) for item,physical in facts if item[0]["kind"] in PROVENANCE_KINDS],mode=" OR REPLACE")
         if defer: _retain_lossy_replicas(db,items,defer)
     return (out and _archive_touch(db,out),out)[-1]
 def logical_references(db,ids,references=True):
@@ -469,15 +475,16 @@ def _retain_lossy_replicas(db,items,defer):
     claims=[(pid,p,(table,mapped("file_edits",source) if table=="edit.observed" else provenance_digest({"checkpoint":row["data"]["checkpoint"],"edit":mapped("file_edits",row["data"]["edit"])}) if table=="checkpoint.link" else source if table in PROVENANCE_KINDS else physical,source,p["author_user_id"],row["state"])) for row,p,pid,native,*maps in items for table,source,mapped,physical,origin in [_logical_parts(row,p,pid,native,maps[0] if maps else None)]]
     found=typed_logical_rows(db,[claim for pid,p,claim in claims])
     [defer(pid) for pid,p,claim in claims if matching_logical_row(found[claim],p["content_hash"]) is None]
-def project_logical_row(db,row,proof,proof_id,native=False,touch=True,parent_map=None,defer=False,preserve=True):
+def project_logical_row(db,row,proof,proof_id,native=False,touch=True,parent_map=None,defer=False,preserve=True,local=None,record_origin=True):
     table,source,mapped,physical,origin=_logical_parts(row,proof,proof_id,native,parent_map)
     if table in PROVENANCE_KINDS:
         data,value=(data:={"id":source,**row["data"]}),{"kind":table,"entity":source,"payload":data,"observed_at":data.pop("observed_at",None)}
         replace_file=table=="edit.observed" and bool(db.execute("WITH RECURSIVE ancestors(revision) AS (SELECT CAST(? AS VARCHAR) UNION SELECT p.previous_revision FROM remote.row_proofs p JOIN ancestors a ON p.revision=a.revision WHERE p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND p.previous_revision IS NOT NULL) SELECT 1 FROM remote.provenance_origins o JOIN remote.row_proofs p ON p.id=o.proof_id JOIN ancestors a ON a.revision=p.revision WHERE o.kind=? AND o.physical_entity=? AND o.author_user_id=? LIMIT 1",(proof["previous_revision"],table,source,proof["author_user_id"],table,mapped("file_edits",source),proof["author_user_id"])).fetchone())
         if defer and (issue:=provenance_issue(db,value,mapped,replace_file)): return (defer(proof_id),typer.echo(f"Remote fact retained: workspace={proof['workspace']} author={proof['author_user_id']} proof={proof_id}; {issue}",err=True))[1]
-        _,physical=project_provenance(db,value,mapped,False,replace_file,preserve),mapped("file_edits",source) if table=="edit.observed" else provenance_digest({"checkpoint":data["checkpoint"],"edit":mapped("file_edits",data["edit"])}) if table=="checkpoint.link" else source
+        physical=mapped("file_edits",source) if table=="edit.observed" else provenance_digest({"checkpoint":data["checkpoint"],"edit":mapped("file_edits",data["edit"])}) if table=="checkpoint.link" else source
+        if table not in ("repository.observed","edit.observed") or not ((table,physical) in local if local is not None else db.execute("SELECT 1 FROM provenance.local_facts WHERE kind=? AND entity=?",[table,physical]).fetchone()): project_provenance(db,value,mapped,False,replace_file,preserve)
         if touch: _archive_touch(db,[(table,physical)])
-        db.execute("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)" if native else "INSERT OR REPLACE INTO remote.provenance_origins VALUES (?,?,?,?,?,?)",(table,physical) if native else (table,physical,proof["workspace"],proof["author_user_id"],source,proof_id))
+        if record_origin: db.execute("INSERT OR REPLACE INTO remote.provenance_origins VALUES (?,?,?,?,?,?)",(table,physical,proof["workspace"],proof["author_user_id"],source,proof_id))
         return physical
     if row["state"]=="deleted":
         old=db.execute("SELECT author_user_id,source_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id=?",(table,physical)).fetchone()
