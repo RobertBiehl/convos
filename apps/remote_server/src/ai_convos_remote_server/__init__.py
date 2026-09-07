@@ -601,12 +601,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send(500,{"error":"relay request failed"})
 
 def main(argv=None):
-    p=argparse.ArgumentParser()
-    p.add_argument("command",choices=("serve","backup"))
-    p.add_argument("--db",default=os.environ.get("CONVOS_SERVER_DB","convos-server.db"))
-    p.add_argument("--host",default="127.0.0.1")
+    (p:=argparse.ArgumentParser()).add_argument("command",choices=("serve","backup"))
+    for name,default in (("db",os.environ.get("CONVOS_SERVER_DB","convos-server.db")),("host","127.0.0.1"),("output",None)): p.add_argument("--"+name,default=default)
     p.add_argument("--port",type=int,default=8787)
-    p.add_argument("--output")
     a=p.parse_args(argv)
     if a.command == "backup":
         if not a.output: p.error("backup requires --output")
@@ -620,11 +617,14 @@ def main(argv=None):
             with os.fdopen(fd,"r+b") as handle,closing(sqlite3.connect(source.as_uri()+"?mode=ro",uri=True)) as src,closing(sqlite3.connect(stage)) as dst:
                 src.backup(dst)
                 dst.execute("PRAGMA journal_mode=DELETE").fetchone()
+                if dst.execute("PRAGMA quick_check").fetchall()!=[("ok",)]: raise sqlite3.DatabaseError("backup integrity check failed")
                 os.fsync(handle.fileno())
             os.replace(stage,output)
+            directory=os.open(output.parent,os.O_RDONLY)
+            try: os.fsync(directory)
+            finally: os.close(directory)
         finally: Path(stage).unlink(missing_ok=True)
-        print(a.output)
-        return
+        return print(a.output)
     Path(a.db).parent.mkdir(parents=True,exist_ok=True)
     with closing(connect(a.db)): pass
     global DB

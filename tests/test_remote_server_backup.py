@@ -1,6 +1,7 @@
 """Relay backup preserves the source and publishes only complete private snapshots."""
 import os, sqlite3, stat
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 import ai_convos_remote_server as server
@@ -99,3 +100,36 @@ def test_failed_backup_keeps_existing_destination_and_removes_stage(tmp_path,mon
     with pytest.raises(OSError,match="injected"): server.main(["backup","--db",str(source),"--output",str(output)])
     assert source.read_bytes()==before and output.read_bytes()==b"previous complete backup"
     assert list(output.parent.iterdir())==[output]
+
+
+def test_backup_rejects_corrupt_snapshot_before_replacing_destination(tmp_path):
+    source,output=tmp_path/"source.db",tmp_path/"backups"/"copy.db"
+    with closing(create_database(source)) as db:
+        db.executescript("CREATE TABLE positive(value INTEGER CHECK(value>0)); PRAGMA ignore_check_constraints=ON; INSERT INTO positive VALUES(-1);")
+    output.parent.mkdir()
+    create_database(output).close()
+    before={p:p.read_bytes() for p in (source,output)}
+    with pytest.raises(sqlite3.DatabaseError,match="backup integrity check failed"):
+        server.main(["backup","--db",str(source),"--output",str(output)])
+    assert all(p.read_bytes()==data for p,data in before.items())
+    assert list(output.parent.iterdir())==[output]
+
+
+def test_backup_fsyncs_file_before_rename_and_directory_afterward(tmp_path,monkeypatch):
+    source,output=tmp_path/"source.db",tmp_path/"backups"/"copy.db"
+    create_database(source).close()
+    original_fsync,original_replace,events=os.fsync,os.replace,[]
+    def fsync(fd):
+        mode=os.fstat(fd).st_mode
+        events.append("directory" if stat.S_ISDIR(mode) else "file")
+        assert stat.S_ISDIR(mode) or stat.S_ISREG(mode)
+        return original_fsync(fd)
+    def replace(stage,target):
+        assert Path(stage).parent==output.parent and target==output
+        events.append("replace")
+        return original_replace(stage,target)
+    monkeypatch.setattr(server.os,"fsync",fsync)
+    monkeypatch.setattr(server.os,"replace",replace)
+    server.main(["backup","--db",str(source),"--output",str(output)])
+    assert events==["file","replace","directory"]
+    with closing(sqlite3.connect(output)) as db: assert db.execute("PRAGMA quick_check").fetchall()==[("ok",)]

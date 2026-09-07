@@ -425,11 +425,13 @@ convos-server backup \
   --output ~/backups/convos-server.db
 ```
 
-The command opens an existing source read-only and publishes a complete snapshot
-with private `0600` permissions. Missing sources and output paths that refer to
-the source, including symlinks and hardlinks, are rejected. A failed copy leaves
-an existing backup intact. Choose a fresh output path if the old output has
-SQLite `-wal`, `-shm`, or `-journal` files.
+The command opens an existing source read-only, verifies the staged snapshot
+with SQLite `quick_check`, and publishes it with private `0600` permissions.
+It fsyncs the file before replacement and the containing directory afterward.
+Missing sources and output paths that refer to the source, including symlinks
+and hardlinks, are rejected. A failed copy or validation leaves an existing
+backup intact. Choose a fresh output path if the old output has SQLite `-wal`,
+`-shm`, or `-journal` files.
 
 Restore by stopping the relay, replacing its database with the snapshot, and
 starting it again. The backup contains ciphertext, ACL metadata, key envelopes,
