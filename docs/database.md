@@ -193,12 +193,15 @@ separate provenance and does not change semantic row identity after recovery.
 
 | Relation | Durable facts |
 |----------|---------------|
+| `row_references` | Exact temporary reverse references from verified children awaiting parent origins; removed when the parent mapping is present |
+| `edit_dependencies` | Proof IDs waiting on author-scoped archive edits or shared file identities |
+| `edit_ready` | Durable dependency keys and bounded retry cursors, including legacy bootstrap progress |
 | `row_origins` | Author-scoped physical-to-source identity and currently materialized proof |
 | `provenance_origins` | Imported provenance fact attribution and original proof link |
 | `row_proofs` | Bodyless signed revision, content hash, predecessor, state, author, and authorization epoch |
 | `row_signers` | One normalized root key and device certificate per author device |
 | `workspace_controls` | Signed origin-workspace authorization chain, once per control revision |
-| `row_conflicts` | Canonical logical body for a rare verified incomparable head not selected as the main row |
+| `row_conflicts` | Exact signed body retained when the typed projection cannot reconstruct it, including unresolved heads and captured snapshots |
 | `provider_session_aliases` | Author-scoped root-signed exact provider-session membership leaves and their deterministic canonical source row |
 | `file_edit_evidence_proofs` | Root-signed evidence leaves bound to exact edit and optional tool-call row revisions |
 

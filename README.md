@@ -53,12 +53,12 @@ convos embed
 convos doctor
 ```
 
-Semantic retrieval is included on macOS and Linux. Linux uses the compact
-Model2Vec `potion-base-8M` model without a compiler toolchain; macOS keeps the
-existing EmbeddingGemma model through llama.cpp. Set `CONVOS_SEMANTIC=0` to
-disable model loading, embedding, and semantic queries while retaining literal
-`convos search`. The `semantic` extra remains available when llama.cpp is
-explicitly wanted on another platform.
+Semantic retrieval is included on macOS through EmbeddingGemma and llama.cpp.
+Linux defaults to capture, literal search, and remote sync without a native
+semantic runtime. To enable semantic retrieval elsewhere, install
+`convos[semantic]`, set `CONVOS_SEMANTIC=llama`, then run `convos embed`.
+Set `CONVOS_SEMANTIC=0` to disable model loading and embedding while retaining
+literal `convos search`.
 
 Upgrade later with:
 
@@ -272,7 +272,7 @@ Both accept `--cwd`/`-w` to include one recorded directory and its descendants,
 plus `--conversation` for an exact conversation-ID prefix. These direct options
 replace the deferred custom query language.
 
-Semantic search is included by default. Run `convos embed` after install to
+Semantic search is included by default on macOS. Run `convos embed` after install to
 backfill embeddings with a progress bar. `search` and `query` never ingest,
 reindex, or embed as a side effect. When BM25 is stale they use a complete
 literal scan and warn on stderr; run `convos fts` for BM25 ranking and
