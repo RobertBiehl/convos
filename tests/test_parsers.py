@@ -272,6 +272,14 @@ class TestCodexParser:
         from ai_convos import cli
         root=tmp_path/".codex"; a,b=root/"sessions/a.jsonl",root/"sessions/b.jsonl"; a.parent.mkdir(parents=True); events=[{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"same","cwd":"/repo"}},{"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}},{"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}]; a.write_text("\n".join(map(json.dumps,events[:2]))); b.write_text("\n".join(map(json.dumps,events))); parsed=cli.parse_codex(root); assert len(parsed.convs)==2; db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,parsed); assert db.execute("SELECT (SELECT count(*) FROM conversations),(SELECT count(*) FROM messages),(SELECT count(*) FROM provider_sessions)").fetchone()==(1,2,1)
 
+    def test_native_input_accounting_distinguishes_empty_from_failed(self,tmp_path):
+        from ai_convos import cli
+        root=tmp_path/".codex"; sessions=root/"sessions"; sessions.mkdir(parents=True); (sessions/"empty.jsonl").write_text(""); (sessions/"bad.jsonl").write_bytes(b"\xff")
+        parsed=cli.parse_codex(root)
+        assert not parsed.convs and parsed.failed_inputs==[str(sessions/"bad.jsonl")]
+        combined=cli.ParseResult()+parsed; combined+=cli.ParseResult(failed_inputs=["another.jsonl"])
+        assert combined.failed_inputs==[str(sessions/"bad.jsonl"),"another.jsonl"]
+
     def test_same_batch_divergent_native_session_fails_before_mutation(self,tmp_path):
         import duckdb,pytest
         from ai_convos import cli

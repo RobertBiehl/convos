@@ -178,6 +178,29 @@ def test_failed_parse_returns_claim_to_queue(hooks, monkeypatch):
     assert len(list((data/"hook_inbox").glob("*.json"))) == 1 and not list((data/"hook_inbox").glob("*.work"))
     monkeypatch.setattr(cli, "hook_result", original); assert cli.drain_hooks() == 1
 
+def test_missing_parser_dependency_does_not_discard_hook_input(hooks,monkeypatch):
+    sessions,_=hooks; transcript(path:=sessions/"missing.jsonl"); enqueue(path)
+    monkeypatch.setattr(cli,"hook_result",lambda *_:(_ for _ in ()).throw(FileNotFoundError("parser dependency unavailable")))
+    assert cli.drain_hooks()==0 and json.loads(cli.HOOK_PROGRESS.read_text())["failed"]==1
+    assert len(list(cli.HOOK_DIR.glob("*.json")))==1
+
+def test_local_sync_retries_failed_unchanged_transcript(hooks,monkeypatch):
+    sessions,_=hooks; parse=cli.parse_codex_session
+    for name in ("good","bad"): transcript(sessions/f"{name}.jsonl",name)
+    def broken(path,bindings=None):
+        if path.stem=="bad": raise ValueError("temporary parser failure")
+        return parse(path,bindings)
+    monkeypatch.setattr(cli,"parse_codex_session",broken); cli.sync(False,300,False,True,False,False,True)
+    with cli.open_db(read_only=True,purpose="fixture.read") as db: assert db.execute("SELECT content FROM messages").fetchall()==[("good",)]
+    assert str(sessions/"bad.jsonl") not in cli.load_state()["local"]["codex"]["files"]
+    monkeypatch.setattr(cli,"parse_codex_session",parse); cli.sync(False,300,False,True,False,False,True)
+    with cli.open_db(read_only=True,purpose="fixture.read") as db: assert set(db.execute("SELECT content FROM messages").fetchall())=={("good",),("bad",)}
+
+def test_local_sync_notices_backward_transcript_mtime(hooks):
+    sessions,_=hooks; transcript(path:=sessions/"restored.jsonl","original"); cli.sync(False,300,False,True,False,False,True); previous=path.stat()
+    transcript(path,"restored evidence"); os.utime(path,ns=(previous.st_atime_ns,previous.st_mtime_ns-60_000_000_000)); cli.sync(False,300,False,True,False,False,True)
+    with cli.open_db(read_only=True,purpose="fixture.read") as db: assert set(db.execute("SELECT content FROM messages").fetchall())=={("original",),("restored evidence",)}
+
 def test_stable_metadata_only_session_completes_until_changed(hooks):
     sessions, data = hooks; path = sessions/"empty.jsonl"; path.write_text(json.dumps({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"cwd":"/repo"}})); enqueue(path)
     assert cli.drain_hooks() == 1 and not list((data/"hook_inbox").glob("*.json"))

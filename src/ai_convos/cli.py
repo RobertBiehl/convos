@@ -696,9 +696,10 @@ class ParseResult:
     provenance_edits: set = field(default_factory=set)
     provenance_conversations: set = field(default_factory=set)
     attachment_indexes: dict = field(default_factory=dict)
+    failed_inputs: list = field(default_factory=list)
 
-    def __iadd__(self,other): return ([getattr(self,name).extend(getattr(other,name)) for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence")],self)[-1]
-    def __add__(self,other): return ParseResult(**{name:[*getattr(self,name),*getattr(other,name)] for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence")})
+    def __iadd__(self,other): return ([getattr(self,name).extend(getattr(other,name)) for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence","failed_inputs")],self)[-1]
+    def __add__(self,other): return ParseResult(**{name:[*getattr(self,name),*getattr(other,name)] for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence","failed_inputs")})
 
 def log_parse_error(context: str, err: Exception): typer.echo(f"  parse error ({context}): {type(err).__name__}: {err}", err=True)
 def _quarantine_stubs(r): return setattr(r,"convs",[{**c,"metadata":json.dumps({**json.loads(c["metadata"] or "{}"),"capture_mode":"startup-stub-candidate"})} if c["id"] in quarantined else c for c in r.convs]) if (quarantined:={c["id"] for c in r.convs if c["source"]=="codex" and (meta:=json.loads(c["metadata"] or "{}")).get("session_kind")=="main" and not meta.get("parent_session_id") and any(m["conversation_id"]==c["id"] and m["role"]=="user" for m in r.msgs) and not any(m["conversation_id"]==c["id"] and m["role"]=="user" and not re.fullmatch(_INJECTED_RE,m["content"]) for m in r.msgs) and not any(m["conversation_id"]==c["id"] and m["role"]=="assistant" for m in r.msgs) and not any(x.get("conversation_id")==c["id"] or x.get("message_id") in {m["id"] for m in r.msgs if m["conversation_id"]==c["id"]} for x in [*r.tools,*r.attachs,*r.artifacts,*r.edits])}) else None
@@ -826,8 +827,12 @@ def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
     return {"conv":dict(id=cid,source=src,title=f"{jsonl.parent.name.replace('-Users-','~/').replace('-','/')} ({jsonl.stem[:8]})",created_at=timestamps[0] if timestamps else None,updated_at=timestamps[-1] if timestamps else None,model=next((m["model"] for m in msgs if m["model"] and m["model"]!="<synthetic>"),None),cwd=system.get("cwd") or next((e.get("cwd") for e in events if e.get("cwd")),None),git_branch=system.get("gitBranch") or next((e.get("gitBranch") for e in events if e.get("gitBranch")),None),project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":agent_id or root_session,"parent_session_id":parent,"session_kind":kind,"session_kind_evidence":"exact" if explicit_agent or sidechain else "inferred","agent_id":agent_id,"agent_name":next((e.get("agentName") for e in events if e.get("agentName")),None),"agent_role":next((e.get("agentType") for e in events if e.get("agentType")),None),"agent_depth":next((e.get("agentDepth") for e in events if e.get("agentDepth") is not None),None),"originator":system.get("entrypoint"),"client_version":system.get("version"),"capture_mode":"transcript"}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[],"edits":edits,"edit_evidence":evidence}
 
 def _parse_sessions(paths,parser,bindings):
-    sessions=[(bound.setdefault((s["conv"]["source"],m["session_id"]),s["conv"]["id"]),s)[1] if (m:=json.loads(s["conv"]["metadata"] or "{}")).get("session_id") else s for bound in [{} if bindings is None else bindings] for path in sorted(paths) if (s:=safe_parse(f"{parser.__name__.removeprefix('parse_').replace('_session','').replace('_','-')} session {path}",parser,path,bound))]
-    return ParseResult(convs=[s["conv"] for s in sessions],msgs=[m for s in sessions for m in s["msgs"]],tools=[t for s in sessions for t in s["tools"]],attachs=[a for s in sessions for a in s["attachs"]],edits=[e for s in sessions for e in s["edits"]],edit_evidence=[v for s in sessions for v in s["edit_evidence"]])
+    def one(path,bound):
+        s=parser(path,bound)
+        return [(bound.setdefault((s["conv"]["source"],m["session_id"]),s["conv"]["id"]),s)[1] if s and (m:=json.loads(s["conv"]["metadata"] or "{}")).get("session_id") else s]
+    attempts=[(str(path),safe_parse(f"{parser.__name__.removeprefix('parse_').replace('_session','').replace('_','-')} session {path}",one,path,bound)) for bound in [{} if bindings is None else bindings] for path in sorted(paths)]
+    sessions=[s for _,result in attempts if result is not None for s in result if s]
+    return ParseResult(convs=[s["conv"] for s in sessions],msgs=[m for s in sessions for m in s["msgs"]],tools=[t for s in sessions for t in s["tools"]],attachs=[a for s in sessions for a in s["attachs"]],edits=[e for s in sessions for e in s["edits"]],edit_evidence=[v for s in sessions for v in s["edit_evidence"]],failed_inputs=[path for path,result in attempts if result is None])
 def parse_claude_code(projects_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult: return _parse_sessions(files or projects_dir.rglob("*.jsonl"),parse_claude_code_session,bindings)
 
 def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
@@ -1026,7 +1031,6 @@ def drain_hooks(embed=False, local_only=False,block=False):
                 capture_provenance(edit_ids=r.provenance_edits,conversation_ids=r.provenance_conversations,source=f"{e['source']}.hook")
                 atomic_json(work,{**e,"snap":snap,"changed":sorted(changed)})
                 done.append((work,key,snap,changed))
-            except FileNotFoundError: work.unlink(missing_ok=True)
             except Exception as error:
                 with operation_lock(HOOK_DIR/".lock","hooks.queue"): retry_hook(work)
                 attempted[work.stem]=stamp
@@ -1339,8 +1343,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if not path.exists(): return None
         if name in ("codex", "claude-code"):
             prev,mt=local.get(name,{}).get("files",{}),{str(p):m for p in path.rglob("*.jsonl") if (m:=stat_mtime(p)) is not None}
-            if not (chg:=list(map(Path,mt)) if full or local.get(name,{}).get("parser")!=PARSER_EPOCH else [Path(p) for p,m in mt.items() if m>prev.get(p,0)]): return None
-            saved,run=[],lambda p=path,fs=chg:saved.extend((value:=sink(parser(p,fs[i:i+20],bindings)),progress(f"parsing {name} {min(i+20,len(fs))}/{len(fs)}"),value)[-1] for i in range(0,len(fs),20)) or ParseResult()
+            if not (chg:=list(map(Path,mt)) if full or local.get(name,{}).get("parser")!=PARSER_EPOCH else [Path(p) for p,m in mt.items() if p not in prev or m!=prev[p]]): return None
+            saved,run=[],lambda p=path,fs=chg:saved.extend((parsed:=parser(p,fs[i:i+20],bindings),value:=sink(parsed),[mt.pop(p,None) for p in parsed.failed_inputs],progress(f"parsing {name} {min(i+20,len(fs))}/{len(fs)}"),value)[-1] for i in range(0,len(fs),20)) or ParseResult()
             return dict(name=name,label=name.replace("-"," ").title(),source=name,func=run,saved=saved,state=("local",name,{"parser":PARSER_EPOCH,"files":mt}))
         mtime = latest_mtime(path)
         return None if not full and mtime<=local.get(name,{}).get("mtime",0) else dict(name=name,label=name.replace("-"," ").title(),source=name,func=lambda p=path:parser(p),state=("local",name,{"mtime":mtime}))
