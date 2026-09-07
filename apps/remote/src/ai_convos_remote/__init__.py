@@ -1055,8 +1055,7 @@ def sync_once(root=None,repair=False,manual=False):
                             heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}
                             for record in records:
                                 if record["kind"] not in SIGNED: publish(cfg,state,ws,record,root,True,heads)
-                            state.execute("DELETE FROM team_scopes WHERE workspace=?",(ws,))
-                            state.executemany("INSERT INTO team_scopes VALUES (?,?)",[(ws,c) for c in scope])
+                            state.executemany("INSERT OR IGNORE INTO team_scopes VALUES (?,?)",[(ws,c) for c in scope])
                             state.commit()
                     except BaseException:
                         discard_replicas(prepared)

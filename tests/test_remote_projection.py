@@ -690,6 +690,37 @@ def test_team_incremental_uses_changed_rows_after_scope_seed(tmp_path):
     assert seeded=={"c"} and len(first)>len(changed)==1 and changed[0]["kind"]=="message.record" and changed[0]["payload"]["row"][0]=="u" and len(reentered)==1
 
 
+@pytest.mark.parametrize("kind",sorted(projection_module.PROVENANCE))
+def test_team_provenance_delta_uses_unchanged_scope_dependencies(tmp_path,kind):
+    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); rid=core.execute("SELECT id FROM provenance.repositories").fetchone()[0]
+    record=next(r for r in scan(core,state,"team",[rid],[],workspace="w") if r["kind"]==kind)
+    state.execute("INSERT INTO team_scopes VALUES ('w','c')"); state.commit(); scope=set(); change={(kind,record["entity"])}
+    assert scan(core,state,"team",[],[],change,"w",scope,match=[])==[record] and not scope
+    assert scan(core,state,"team",[],[],change,"unshared",set(),match=[])==[]
+    before=core.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]; core_module._archive_touch(core,change); generation=core.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]; core.close()
+    assert projection_module.scan_archive(tmp_path/"source.db",state,"team",workspace="w",new_scope=set(),match=[],generation=generation,since=before,page=1)==[record]
+    state.close()
+
+
+def test_team_message_delta_reads_only_its_scope_and_emits_no_scope_rewrite(tmp_path):
+    _,core=source(tmp_path); state=connect(tmp_path/"state.db")
+    core.execute("INSERT INTO conversations SELECT 'extra-c'||i,'codex','extra',NULL,NULL,NULL,NULL,NULL,NULL,'{}' FROM range(1000) r(i)")
+    core.execute("INSERT INTO messages SELECT 'extra-m'||i,'extra-c'||i,'assistant','extra',NULL,NULL,NULL,'{}',NULL,NULL FROM range(1000) r(i)")
+    core.execute("INSERT INTO file_edits SELECT 'extra-e'||i,'extra-m'||i,'extra.py','write','extra',NULL,NULL FROM range(1000) r(i)")
+    core.execute("INSERT INTO provenance.file_edit_evidence SELECT 'extra-e'||i,'confirmed','fixture',NULL FROM range(1000) r(i)")
+    state.executemany("INSERT INTO team_scopes VALUES ('w',?)",[("c",),*((f"extra-c{i}",) for i in range(1000))]); state.commit()
+    class Bounded:
+        def __init__(self,db): self.db=db
+        def execute(self,*args): self.cursor=self.db.execute(*args); return self
+        @property
+        def description(self): return self.cursor.description
+        def fetchall(self):
+            rows=self.cursor.fetchall(); assert len(rows)<=10, "one-message delta materialized unrelated archive inventory"; return rows
+    scope=set(); records=scan(Bounded(core),Bounded(state),"team",[],[],{("messages","u")},"w",scope,match=[],user="local")
+    assert len(records)==1 and records[0]["payload"]["row"][0]=="u" and not scope
+    core.close(); state.close()
+
+
 def test_team_admission_expands_in_bounded_reopenable_pages(tmp_path,monkeypatch):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); rid=next(r["payload"]["id"] for r in scan(core,state) if r["kind"]=="repository.observed"); expected=scan(core,state,"team",[rid],[]); generation=core.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]; core.close(); scope,pages,probes=set(),[],[]; real_page=projection_module._team_page
     def page(*args): rows=real_page(*args); pages.append(len(rows)); return rows

@@ -288,10 +288,6 @@ def _logical_record(record,aliases):
 def logical_records(db,records,author):
     aliases={(table,physical):source for table,physical,source in db.execute(f"SELECT table_name,physical_row_id,source_row_id FROM remote.row_origins WHERE author_user_id=? AND physical_row_id IN ({TEXT_IDS})",(author,packed(refs))).fetchall()} if (refs:={value for record in records if record["kind"] in TABLES and record["payload"].get("state")!="deleted" for column,value in zip(record["payload"]["columns"],record["payload"]["row"]) if column in dict(FKS.get(record["payload"]["table"],())) and value is not None}) else {}
     return [_logical_record(record,aliases) for record in records]
-def _under(path,cwd,roots):
-    p=Path(path)
-    p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve()
-    return any(p.is_relative_to(root) for root in roots)
 def sharing(state,workspace,user):
     rows=state.execute("SELECT revision,auto_contribute,match,proof FROM sharing_preferences WHERE workspace=? AND user=?",(workspace,user)).fetchall()
     proofs=[json.loads(r[3]) for r in rows]
@@ -324,20 +320,22 @@ def sharing_object(state,workspace,row,proof,authors):
     return True
 def _team_scope(core,provenance,repositories,roots,candidates=None,match=("cwd","edit")):
     roots=[Path(p).expanduser() for p in roots]
-    where=" WHERE c.id IN (SELECT UNNEST(?))" if candidates is not None else ""
-    args=[list(candidates)] if candidates is not None else []
+    where=f" WHERE c.id IN ({TEXT_IDS})" if candidates is not None else ""
+    args=[packed(candidates)] if candidates is not None else []
     rows=core.execute("SELECT s.route,m.conversation_id,s.repository FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN provenance.file_edit_scopes s ON s.file_edit_id=fe.id JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id"+where,args).fetchall()
     cwd_rows=core.execute("SELECT c.id,s.cwd,s.repository FROM conversations c JOIN provenance.conversation_scopes s ON s.conversation=c.id"+where,args).fetchall()
     return ({cid for route,cid,repo in rows if repo in repositories or route and any(Path(route).is_relative_to(root) for root in roots)} if "edit" in match else set())|({cid for cid,cwd,repo in cwd_rows if repo in repositories or cwd and any(Path(cwd).is_relative_to(root) for root in roots)} if "cwd" in match else set())
 def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,workspace=None,new_scope=None,match=("cwd","edit"),user=None,selected=None):
     local={tuple(r) for r in core.execute("SELECT kind,entity FROM provenance.local_facts"+(f" WHERE entity IN ({TEXT_IDS})" if facts is not None else ""),[packed(r[1] for r in facts)] if facts is not None else []).fetchall()} if (facts:=None if changes is None else {r for r in changes if r[0] in PROVENANCE}) is None or facts else set()
     all_provenance=[clean(r) for r in provenance_records(core,facts) if (r["kind"],r["entity"]) in local] if local else []
-    prior={r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()} if kind=="team" and workspace and changes is not None else set()
-    admitted={r[0] for r in core.execute("SELECT source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=? AND author_user_id=? AND row_kind='conversations' AND state='active'",(workspace,user)).fetchall()} if kind=="team" and workspace and user else set()
     changed={table:{entity for name,entity in changes or () if name==table} for table in TABLES.values()}
-    candidates=changed["conversations"]|{r[0] for r in core.execute("SELECT conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(changed["messages"])]).fetchall()}|{r[0] for r in core.execute("SELECT m.conversation_id FROM messages m JOIN (SELECT message_id FROM tool_calls WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM attachments WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM file_edits WHERE id IN (SELECT UNNEST(?))) x ON x.message_id=m.id",[list(changed["tool_calls"]),list(changed["attachments"]),list(changed["file_edits"])]).fetchall()}|{r[0] for r in core.execute("SELECT conversation_id FROM artifacts WHERE id IN (SELECT UNNEST(?))",[list(changed["artifacts"])]).fetchall()} if kind=="team" and changes is not None else None
+    edit_ids,file_ids,repo_ids=changed["file_edits"]|{r["payload"]["id"] if r["kind"]=="edit.observed" else r["payload"]["edit"] for r in all_provenance if r["kind"] in ("edit.observed","checkpoint.link")},{r["payload"]["id"] if r["kind"]=="file.observed" else r["payload"]["file"] for r in all_provenance if r["kind"] in ("file.observed","file.version")},{r["payload"]["id"] if r["kind"]=="repository.observed" else r["payload"]["repository"] for r in all_provenance if r["kind"] in ("repository.observed","git.checkpoint")}
+    linked=core.execute(f"SELECT fe.id,m.conversation_id,x.file_id,f.repository FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN messages m ON m.id=fe.message_id LEFT JOIN provenance.file_edit_files x ON x.file_edit_id=fe.id LEFT JOIN provenance.files f ON f.id=x.file_id"+(f" WHERE fe.id IN ({TEXT_IDS}) OR x.file_id IN ({TEXT_IDS}) OR f.repository IN ({TEXT_IDS})" if changes is not None else ""),[packed(ids) for ids in (edit_ids,file_ids,repo_ids)] if changes is not None else []).fetchall() if kind=="team" and selected is None and (changes is None or edit_ids or file_ids or repo_ids) else []
+    candidates=changed["conversations"]|{r[1] for r in linked}|{r[0] for r in core.execute(f"SELECT conversation_id FROM messages WHERE id IN ({TEXT_IDS}) UNION SELECT m.conversation_id FROM messages m JOIN (SELECT message_id FROM tool_calls WHERE id IN ({TEXT_IDS}) UNION SELECT message_id FROM attachments WHERE id IN ({TEXT_IDS}) UNION SELECT message_id FROM file_edits WHERE id IN ({TEXT_IDS})) x ON x.message_id=m.id UNION SELECT conversation_id FROM artifacts WHERE id IN ({TEXT_IDS})",[packed(changed[table]) for table in ("messages","tool_calls","attachments","file_edits","artifacts")]).fetchall()} if kind=="team" and changes is not None and selected is None else None
+    prior={r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?"+(" AND conversation IN (SELECT value FROM json_each(?))" if candidates is not None else ""),(workspace,*([packed(candidates)] if candidates is not None else []))).fetchall()} if kind=="team" and workspace and changes is not None and selected is None else set()
+    admitted={r[0] for r in core.execute("SELECT source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=? AND author_user_id=? AND row_kind='conversations' AND state='active'"+(f" AND source_row_id IN ({TEXT_IDS})" if candidates is not None else ""),(workspace,user,*([packed(candidates)] if candidates is not None else []))).fetchall()} if kind=="team" and workspace and user and selected is None else set()
     convs=set(selected) if selected is not None else (admitted|prior|_team_scope(core,all_provenance,set(repositories),roots,candidates,match)) if kind=="team" else set()
-    if workspace and new_scope is not None: new_scope.update(convs)
+    if workspace and new_scope is not None: new_scope.update(convs-prior)
     provenance=[r for r in all_provenance if changes is None or (r["kind"],r["entity"]) in changes]
     records=_records(core,graph,kind=="personal",changes)
     if user and records:
@@ -350,13 +348,11 @@ def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,worksp
     keep=[]
     parents={r["payload"]["row"][1] for r in records if r["payload"]["table"] in ("tool_calls","attachments","file_edits") and r["payload"].get("state")!="deleted"}
     msg_convs=dict(core.execute("SELECT id,conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(parents)]).fetchall()) if parents else {}
-    edits={r[0] for r in core.execute("SELECT fe.id FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN messages m ON m.id=fe.message_id WHERE m.conversation_id IN (SELECT UNNEST(?))",[list(convs)]).fetchall()}
-    shared=set(core.execute("SELECT row_kind,source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=?",(workspace,)).fetchall()) if workspace else set()
+    edits,allowed_files,allowed_repos=({r[column] for r in linked if r[1] in convs} for column in (0,2,3))
+    shared=set(core.execute(f"SELECT row_kind,source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=? AND source_row_id IN ({TEXT_IDS})",(workspace,packed(deleted))).fetchall()) if workspace and (deleted:={r["payload"]["id"] for r in records if r["payload"].get("state")=="deleted"}) else set()
     for r in records:
         table,row=r["payload"]["table"],r["payload"]["row"] if "row" in r["payload"] else [r["payload"]["id"]]
         if r["payload"].get("state")=="deleted" and (table,row[0]) in shared or table=="conversations" and row[0] in convs or len(row)>1 and (table=="messages" and row[1] in convs or table in ("tool_calls","attachments") and msg_convs.get(row[1]) in convs or table=="file_edits" and row[0] in edits or table=="artifacts" and row[1] in convs): keep.append(r)
-    allowed_files={r["payload"]["file"] for r in all_provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}
-    allowed_repos={r["payload"]["repository"] for r in all_provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}
     for r in provenance:
         p,k=r["payload"],r["kind"]
         if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits: keep.append(r)
@@ -367,7 +363,7 @@ def _team_page(core,conversations,after,page):
     return core.execute(query,(convs,after[0],after[0],after[1],page)).fetchall()
 def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspace=None,new_scope=None,match=("cwd","edit"),user=None,generation=None,progress=None,page=2500,since=None):
     sources=required(generation is not None,ValueError("archive scan requires a generation watermark")) and ([*((f"SELECT '{table}' kind,id entity FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='{table}' AND o.physical_row_id=x.id) AND NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=('{table}',x.id) AND c.generation>?)",(generation,)) for table in TABLES.values()),("SELECT kind,entity FROM provenance.local_facts x WHERE NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=(x.kind,x.entity) AND c.generation>?)",(generation,))] if since is None else [("SELECT kind,entity FROM archive_changes WHERE generation>? AND generation<=?",(since,generation))])
-    out,done,prior,scope=[],0,{r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()} if kind=="team" and workspace else set(),new_scope if new_scope is not None else set()
+    out,done,scope=[],0,new_scope if new_scope is not None else set()
     for query,args in sources:
         after,limit=("",""),page
         while True:
@@ -378,12 +374,12 @@ def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspac
             out+=batch
             if not changes: break
             after,done,limit,_=changes[-1],done+len(changes),max(100,min(5000,int(limit*.5/max(time.monotonic()-started,.001)))),(progress and progress(f"scanning archive {done+len(changes)}"),archive_yield(db_path))
-    if new:=scope-prior:
+    if scope:
         after=("","")
         while True:
             with contextlib.closing(open_db(db_path,True,purpose="remote.scan.team-page")) as core:
-                changes=_team_page(core,new,after,page)
-                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,None,match,user,new) if changes else []
+                changes=_team_page(core,scope,after,page)
+                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,None,match,user,scope) if changes else []
             out+=batch
             if not changes: break
             after=changes[-1]

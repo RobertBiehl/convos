@@ -141,6 +141,19 @@ def test_remote_sync_publishes_captured_snapshot_then_concurrent_change(tmp_path
     sync_once(root,manual=True); rows=[open_replica(json.loads(r[0]),key(load(root),ws,1)) for r in server.execute("SELECT envelope FROM row_replicas ORDER BY cursor").fetchall()]; assert [r["row"]["data"]["title"] for r in rows]==["snapshot","later"] and rows[1]["proof"]["previous_revision"]==rows[0]["proof"]["revision"]
     sync_once(root,manual=True); assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==2
 
+
+def test_team_delta_preserves_scope_without_rewriting_existing_members(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr(remote_client,"request",transport(server)); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
+    root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); ws=create(cfg,"Team",root=root); replicate_conversation(root,ws); sync_once(root)
+    with connect(root/"remote/state.db") as state:
+        assert [tuple(r) for r in state.execute("SELECT workspace,conversation FROM team_scopes")]==[(ws,"c")]
+        state.executescript("CREATE TRIGGER preserve_team_scope BEFORE DELETE ON team_scopes BEGIN SELECT RAISE(ABORT,'scope rows rewritten'); END; CREATE TRIGGER append_team_scope BEFORE INSERT ON team_scopes WHEN EXISTS (SELECT 1 FROM team_scopes WHERE (workspace,conversation)=(NEW.workspace,NEW.conversation)) BEGIN SELECT RAISE(ABORT,'existing scope reinserted'); END;")
+    write_archive(root/"data/convos.db","updated once"); sync_once(root)
+    with connect(root/"remote/state.db") as state: assert [tuple(r) for r in state.execute("SELECT workspace,conversation FROM team_scopes")]==[(ws,"c")]
+    env=json.loads(server.execute("SELECT envelope FROM row_replicas WHERE workspace=? ORDER BY cursor DESC LIMIT 1",[ws]).fetchone()[0])
+    assert open_replica(env,key(load(root),ws,1))["row"]["data"]["title"]=="updated once"
+
+
 def test_sync_revalidates_sharing_policy_before_publication(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","private until validated"); real=remote_client.sharing_routes; calls=[]
     def changed(*args,**kwargs):
