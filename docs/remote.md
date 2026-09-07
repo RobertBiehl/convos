@@ -333,7 +333,8 @@ active device and history proposals.
 convos doctor
 convos remote doctor
 convos remote audit                 # verify signed proofs against typed projections
-convos remote repull                # replace received rows from the relay
+convos remote repull                # reconcile received rows without deleting existing data
+convos remote repull --from-backup /absolute/path/convos.db.pre-remote-repull.bak
 convos remote fetch                 # materialize deferred large events
 convos remote sync                  # run one foreground incremental sync
 convos remote sync --repair         # verify and restore the full retained replica set
@@ -348,11 +349,42 @@ The worker writes errors to `<root>/remote/last_error` (by default,
 `~/.convos/remote/last_error`). Queries never wait for the server. `doctor`
 reports connectivity, identity, workspaces, epochs, upload-blocked rows, pending
 uploads, deferred events, and last successful synchronization. `remote audit`
-recomputes proof-to-projection integrity and exits nonzero on any gap. `remote
-repull` preserves locally authored rows, removes all received Remote projections
-including relay orphans and their derived children, replays the complete current
-authorized relay state, and audits it. Its validated temporary backup is deleted
-after success and retained with its path in the error after failure.
+checks surviving origins and current signed proof heads, so missing origins do
+not hide lost bodies. It distinguishes exact projections, retained signed
+variants, and unavailable bodies; incomplete projections exit nonzero.
+
+`remote repull` is additive and resumable. It verifies authorized relay data,
+reconciles received projections, retains conflicting native content and signed
+variants, and audits preservation. It never deletes relay orphans, origin-less
+children, or the live archive before downloading. An interruption preserves both
+existing rows and committed receive progress. `remote/repull.json` records its
+phase; the same command resumes it. Manual repull requests cooperative background
+sync to yield at a request boundary; a noncooperative holder is reported promptly.
+
+For damage from an older destructive repull, `--from-backup` accepts a read-only
+backup with the same archive identity. It restores missing rows in 500-row
+transactions without replacing newer rows, and recovers available attachment
+bodies and exact legacy signed-body donors. The donor is never deleted: it can
+still contain a divergent original version or attachments unavailable elsewhere.
+Repull success establishes preservation of the inventoried signed heads, not
+that every conflict has a resolved searchable projection. `retained_bodies` and
+`remote audit` expose that distinction. Existing ambiguous duplicate identities
+are not automatically deleted or merged.
+
+Same-user receive identity no longer depends on temporary recovery flags.
+Existing native rows and received bindings are reused. Native differences are
+retained rather than overwritten, and compact local publication bases distinguish
+an acknowledged old upload from a newer unresolved remote revision. Such a
+revision is not silently re-signed as its receiving machine's local content.
+Missing provenance dependencies retain their exact signed body and retry when
+the referenced edit/turn/file arrives, capped at 500 affected facts per receive
+page. Larger backlogs remain retained and can be replayed by explicit repull.
+A verified causal successor can update the
+association; independent conflicting facts remain retained. Authorization and
+signature failures still fail closed.
+
+Unchanged blocked aliases do not by themselves force an archive-wide sync.
+`doctor` continues reporting them; relevant changes or explicit repair retry them.
 
 ## Backup and restore
 

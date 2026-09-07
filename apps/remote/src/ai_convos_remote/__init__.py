@@ -9,7 +9,7 @@ import typer
 from ai_convos_redact import protect_all
 _pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases",default=()),[0,0,""],5
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_file_edit_evidence_many, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, reset_remote_projection
+from ai_convos.cli import PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_file_edit_evidence_many, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .projection import PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
@@ -35,13 +35,13 @@ def _archive_marker(root):
     try:
         with _core(root,True,purpose="remote.settled.read") as db: return db.execute("SELECT archive_id::VARCHAR,generation,(SELECT version FROM core_schema WHERE singleton) FROM archive_state WHERE singleton").fetchone()
     except duckdb.CatalogException: return None
-def _sync_marker(cfg,root,archive): return (lambda bridges:digest({"v":1,"archive":archive,"controls":{ws:state_hash(cfg["controls"][ws]) for ws in sorted(bridges)},"keys":cfg["keys"],"sharing":cfg.get("sharing",{}),"bindings":cfg.get("bindings",{}),"promotions":cfg.get("promotions",{}),"routes":{key:core_repository(path) for key,value in cfg.get("bindings",{}).items() if (path:=binding_path(value))},"bridges":bridges}))({w["id"]:bridge_state(root,cfg,w["id"],w["kind"],archive[1]) for w in cfg["server_state"]["workspaces"] if w["device_authorized"]})
+def _sync_marker(cfg,root,archive): return (lambda bridges:digest({"v":2,"archive":archive,"controls":{ws:state_hash(cfg["controls"][ws]) for ws in sorted(bridges)},"keys":cfg["keys"],"sharing":cfg.get("sharing",{}),"bindings":cfg.get("bindings",{}),"promotions":cfg.get("promotions",{}),"routes":{key:core_repository(path) for key,value in cfg.get("bindings",{}).items() if (path:=binding_path(value))},"bridges":bridges}))({w["id"]:bridge_state(root,cfg,w["id"],w["kind"],archive[1]) for w in cfg["server_state"]["workspaces"] if w["device_authorized"]})
 def _meta(state,key,default=0): return (state.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone() or [default])[0]
 def _local_tails(state,ws): return {"events":(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(ws,)).fetchone() or [0])[0],"replicas":int(_meta(state,f"replica_cursor:{ws}")),"blobs":int(_meta(state,f"blob_cursor:{ws}")),"origins":state.execute("SELECT COALESCE(MAX(cursor),0) FROM (SELECT cursor FROM origin_bindings WHERE workspace=? UNION ALL SELECT cursor FROM control_dependencies WHERE workspace=?)",(ws,ws)).fetchone()[0]}
 def _settled(cfg,state,root):
     if cfg["server_state"].get("capabilities",{}).get("sync_tails")!=1 or not (archive:=_archive_marker(root)) or archive[2]!=11: return False
     active={w["id"]:w for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
-    dirty=not active or any(state.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() for table in ("outbox","blob_outbox","lazy_events","sequence_gaps")) or any(path.exists() and any(path.iterdir()) for path in (paths(root)[0]/"outbox",paths(root)[0]/"attachments")) or state.execute("SELECT 1 FROM meta WHERE key LIKE 'replica_repair:%' OR key LIKE 'archive_mode:%' OR key LIKE 'replica_upload_blocked:%' LIMIT 1").fetchone() or any(json.loads(value)["blocked"] for value, in state.execute("SELECT value FROM meta WHERE key LIKE 'provider_aliases:%'").fetchall()) or any(event_support(row)!=("required" if row[2] else "optional") for row in state.execute("SELECT kind,payload_v,required FROM deferred_events"))
+    dirty=not active or any(state.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() for table in ("outbox","blob_outbox","lazy_events","sequence_gaps")) or any(path.exists() and any(path.iterdir()) for path in (paths(root)[0]/"outbox",paths(root)[0]/"attachments")) or state.execute("SELECT 1 FROM meta WHERE key LIKE 'replica_repair:%' OR key LIKE 'archive_mode:%' OR key LIKE 'replica_upload_blocked:%' LIMIT 1").fetchone() or any(event_support(row)!=("required" if row[2] else "optional") for row in state.execute("SELECT kind,payload_v,required FROM deferred_events"))
     ready=all((lifecycle:=state.execute("SELECT lifecycle,error FROM sync_states WHERE workspace=?",(ws,)).fetchone()) and lifecycle[0]=="ready" and not lifecycle[1] and remote.get("sync")==_local_tails(state,ws) and int(_meta(state,f"core_generation:{ws}"))==archive[1] and _meta(state,f"replica_projection:{ws}",None)==bridge_stamp(root) for ws,remote in active.items())
     return not dirty and ready and _meta(state,"sync_settled",None)==_sync_marker(cfg,root,archive)
 def load(root=None):
@@ -738,15 +738,6 @@ def pull_origins(cfg,state,root,ws):
             with __import__("contextlib").suppress(Exception): state.rollback()
             raise
     return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
-def local_replica_ids(root,cfg,workspace,kind,epochs,page=5000,progress=None):
-    found,path,after,done={(fingerprint(key(cfg,workspace,epoch),digest(value["proof"])),epoch) for value in bridge_records(root,cfg,workspace,kind) if value["proof"] for epoch in epochs},core_path(root),"",0
-    if not path.is_file(): return found
-    while True:
-        with closing(open_db(path,True,purpose="remote.replica.inventory")) as core: rows=core.execute("SELECT id,workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id>? ORDER BY id LIMIT ?",(after,page)).fetchall()
-        if not rows: return found
-        found.update((fingerprint(key(cfg,workspace,epoch),digest({"v":1,"kind":"row.proof",**dict(zip(PROOF_FIELDS,row[1:]))})),epoch) for row in rows for epoch in epochs)
-        after,done,_=rows[-1][0],done+len(rows),progress and progress(f"scanning local proofs {done+len(rows)}")
-        archive_yield(path)
 def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
     sid,stamp=ws["id"],bridge_stamp(root)
     saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]
@@ -756,12 +747,7 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
     controls=ws["controls"]+stored_controls(core_path(root),set(origins)|dependencies)
     known=set() if reset else {(r[0],r[1]) for r in state.execute("SELECT replica,epoch FROM replica_receipts WHERE workspace=?",(sid,)).fetchall()}
     repair=reset or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{sid}",)).fetchone())
-    if repair and not fresh:
-        epochs={r[1] for r in known} or {r["epoch"] for r in ws["keys"]}
-        local=local_replica_ids(root,cfg,sid,ws["kind"],epochs,progress=_progress)
-        missing=known-local
-        known=known&local if known else local
-        if missing: after=0
+    if repair: known,after=set(),0
     cursor,total,valid,invalid=after,0,set(known),{}
     while True:
         result=request(cfg,{"op":"replica_pull","workspace":sid,"after":cursor,"limit":min(2500,max(1,cfg.get("server_state",{}).get("capabilities",{}).get("replica_pull_limit",500))),"semantic":True})
@@ -788,7 +774,7 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
                     opened.append((item,body))
                     valid.add(identity)
                     invalid.pop(identity,None)
-        accepted=[ok for i in range(0,len(opened),500) for ok in apply_row_replicas(core_path(root),[body for item,body in opened[i:i+500]],sid,controls,recover,cfg["user"],root=root,ready=not core_path(root).is_file())]
+        accepted=[ok for i in range(0,len(opened),500) for ok in apply_row_replicas(core_path(root),[body for item,body in opened[i:i+500]],sid,controls,recover,cfg["user"],root=root,ready=not core_path(root).is_file(),local_device=cfg["device"]["id"])]
         accepted_keys={(item["envelope"]["replica"],item["envelope"]["epoch"]) for (item,body),ok in zip(opened,accepted) if body["proof"]["kind"]=="row.proof" or ok}
         known|=accepted_keys
         receipts=[(sid,item["envelope"]["replica"],item["envelope"]["epoch"],item["cursor"]) for item in received if (item["envelope"]["replica"],item["envelope"]["epoch"]) in known]
@@ -931,42 +917,35 @@ def pull(cfg,state,root=None,concurrent=False,keep_going=False,fresh=False,ready
     return summary
 def reset_repull_state(state,workspaces):
     for ws in workspaces:
-        [state.execute(f"DELETE FROM {table} WHERE workspace=?",(ws,)) for table in ("receipts","cursors","lazy_events","deferred_events","event_sequences","sequence_gaps","replica_receipts","blob_receipts","origin_bindings","control_dependencies","policies","policy_proofs","sharing_preferences","team_scopes","sync_states")]
-        [state.execute("DELETE FROM meta WHERE key=?",(f"{name}:{ws}",)) for name in ("boundary","replica_cursor","blob_cursor","replica_projection","replica_repair","replica_upload_blocked","history_from","key_from","provider_aliases","core_generation")]
+        [state.execute(f"DELETE FROM {table} WHERE workspace=?",(ws,)) for table in ("receipts","cursors","lazy_events","deferred_events","event_sequences","sequence_gaps","replica_receipts","blob_receipts","sync_states")]
+        [state.execute("DELETE FROM meta WHERE key=?",(f"{name}:{ws}",)) for name in ("boundary","replica_cursor","blob_cursor","replica_projection","replica_repair","replica_upload_blocked","history_from","key_from","provider_aliases","core_generation","archive_mode","archive_basis")]
     state.commit()
-def repull_once(root=None):
+def repull_once(root=None,from_backup=None):
     with sync_run(root:=local_root(root),True,"repull"),closing(connect(paths(root)[2])) as state:
-        typer.echo("Remote repull: refreshing relay")
-        cfg=load(root)
+        cfg,job=load(root),paths(root)[0]/"repull.json"
         server=refresh(cfg,root,True)
         workspaces={ws["id"] for ws in server["workspaces"] if ws["device_authorized"]}
         required(workspaces,ValueError("No authorized Remote workspace is available"))
-        path,backup=core_path(root),None
-        try:
-            typer.echo("Remote repull: backing up archive")
-            with closing(open_db(path,purpose="maintenance.remote.repull.backup")) as core:
-                init_schema(core)
-                backup=_migration_backup(core,f"remote-repull-{time.time_ns()}")
+        if from_backup: merge_archive_backup(core_path(root),from_backup)
+        with _core(root,purpose="remote.repull.prepare") as core: archive=core.execute("SELECT archive_id::VARCHAR FROM archive_state WHERE singleton").fetchone()[0]
+        saved=json.loads(job.read_text()) if job.exists() else {}
+        fresh=not saved or saved["archive"]!=archive or set(saved["workspaces"])!=workspaces or saved["phase"]=="complete"
+        if fresh:
+            atomic_json(job,dict(archive=archive,workspaces=sorted(workspaces),phase="resetting"))
             reset_repull_state(state,workspaces)
-            with closing(open_db(path,purpose="remote.repull.reset")) as core,_transaction(core): removed=reset_remote_projection(core,cfg["user"])
-            typer.echo(f"Remote repull: removed {sum(removed.values())} received row(s); downloading relay state")
-            failures={ws:value["error"] for ws,value in pull(cfg,state,root,True,True,True).items() if "error" in value}
-            if failures: raise RuntimeError("; ".join(f"{cfg['workspaces'].get(ws,{}).get('name',ws[:8])}: {error}" for ws,error in failures.items()))
-            typer.echo("Remote repull: auditing received rows")
-            audit=audit_rows(path,progress=_progress)
-            required(not sum(audit["totals"].get(key,0) for key in ("projection_mismatch","projection_missing","proof_missing")),ValueError("received-row audit is not clean after repull"))
-            state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))
-            state.commit()
-            if backup:
-                bundle=backup.with_name(backup.name+".attachments")
-                try:
-                    shutil.rmtree(bundle)
-                    backup.unlink()
-                except OSError as error: typer.echo(f"Remote repull completed, but temporary backup cleanup failed: {error}",err=True)
-            return removed,audit
+            atomic_json(job,dict(archive=archive,workspaces=sorted(workspaces),phase="receiving"))
+        elif saved["phase"]=="resetting": (reset_repull_state(state,workspaces),atomic_json(job,dict(archive=archive,workspaces=sorted(workspaces),phase="receiving")))
+        try:
+            typer.echo("Remote repull: receiving verified rows; existing archive preserved")
+            failures={ws:value["error"] for ws,value in pull(cfg,state,root,True,True,fresh).items() if "error" in value}
+            required(not failures,RuntimeError("; ".join(f"{ws}: {error}" for ws,error in failures.items())))
+            audit=audit_rows(core_path(root),progress=_progress,local_user=cfg["user"])
+            required(not audit["totals"].get("unavailable",0),ValueError("received-row audit remains incomplete; retained rows were not deleted"))
+            (remember_archive(cfg,state,root),state.commit())
+            atomic_json(job,dict(archive=archive,workspaces=sorted(workspaces),phase="complete"))
+            return {},audit
         except BaseException as error:
-            hint=f" Backup retained at {backup}." if backup else ""
-            raise RuntimeError(f"Remote repull did not complete; retry `convos remote repull`.{hint} Cause: {error}") from None
+            raise RuntimeError(f"Remote repull incomplete; archive and received progress preserved. Retry `convos remote repull`. Cause: {error}") from None
 def fetch_lazy(cfg,state,event_id=None,root=None):
     root=local_root(root)
     server=refresh(cfg,root)
@@ -1330,12 +1309,12 @@ def sync_cmd(repair:bool=False):
     try: result=sync_once(repair=repair,manual=True)
     except ConnectionError as e: cli_error(f"{e}. Local sync progress was preserved; retry `convos remote sync`.")
     except (ValueError,RuntimeError,duckdb.InterruptException) as e: cli_error(e)
-    typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else ""))
+    typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else "")+recovery_notice())
 @remote.command("repull")
-def repull_cmd():
-    try: removed,audit=repull_once()
+def repull_cmd(from_backup:Path|None=None):
+    try: removed,audit=repull_once(from_backup=from_backup)
     except (ConnectionError,ValueError,RuntimeError) as error: cli_error(error)
-    typer.echo("Remote rows replaced from relay; "+", ".join(f"{kind}={count}" for kind,count in removed.items())+f"; verified={audit['totals'].get('projection_match',0)}")
+    typer.echo(f"Remote rows reconciled from relay; existing rows preserved; verified={audit['totals'].get('projection_match',0)}, retained_variants={audit['totals'].get('retained_variants',0)}")
 @remote.command("fetch")
 @locked
 def fetch_cmd(event_id:Optional[str]=None):
@@ -1367,6 +1346,10 @@ def watch(interval:int=typer.Option(2,"--interval")):
         time.sleep(delay)
 @remote.command("enable")
 def enable_cmd(remove:bool=typer.Option(False,"--remove")): typer.echo((remove or install_hooks(False,False),enable(paths()[0],remove))[-1])
+def recovery_notice(root=None):
+    if not core_path(root).is_file(): return ""
+    with _core(root,True,purpose="remote.status.retained") as db: count=db.execute("SELECT count(*) FROM remote.row_conflicts").fetchone()[0]
+    return f"; retained_bodies={count} (run `convos remote audit` for unresolved projections)" if count else ""
 def doctor_status():
     try:
         cfg=load()
@@ -1389,18 +1372,18 @@ def doctor_status():
         watch_path=paths()[0]/"watch.json"
         watch=json.loads(watch_path.read_text()) if watch_path.exists() else {"failures":0}
         retry=f", next_retry={watch['next_retry']}" if watch["failures"] else ""
-        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, alias_blocked={alias_blocked}, upload_blocked={upload_blocked}, watch_failures={watch['failures']}{retry}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")
+        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, alias_blocked={alias_blocked}, upload_blocked={upload_blocked}, watch_failures={watch['failures']}{retry}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")+recovery_notice()
     except Exception as e: return f"remote: unavailable ({e})"
 @remote.command("doctor")
 def doctor_cmd(): typer.echo(doctor_status())
 @remote.command("audit")
 def audit_cmd(format:str=typer.Option("text","-f","--format")):
-    result=audit_rows(core_path(),progress=_progress)
+    result=audit_rows(core_path(),progress=_progress,local_user=load()["user"])
     if format=="json":
         typer.echo(json.dumps(result,sort_keys=True))
         return
-    [typer.echo(f"{kind}: origins={value['origins']}, projection={value['projection_match']} valid/{value['projection_mismatch']} mismatch/{value['projection_missing']} missing, proofs={value['proof_missing']} missing") for kind,value in sorted(result["tables"].items())]
+    [typer.echo(f"{kind}: checked={value['origins']}, projection={value['projection_match']} valid/{value['projection_mismatch']} mismatch/{value['projection_missing']} missing, retained_variants={value['retained_variants']}, unavailable={value['unavailable']}") for kind,value in sorted(result["tables"].items())]
     bad=sum(result["totals"].get(key,0) for key in ("projection_mismatch","projection_missing","proof_missing"))
-    if bad: cli_error(f"Signed-row integrity audit found {bad} issue(s). Run `convos remote repull` to replace received rows from the relay.")
+    if bad: cli_error(f"Signed-row audit: {result['totals'].get('unavailable',0)} unavailable bodies; {result['totals'].get('retained_variants',0)} retained variants. `convos remote repull` retries reconciliation without deleting existing rows.")
 for app in _pending: register(app)
 _pending.clear()

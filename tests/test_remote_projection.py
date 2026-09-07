@@ -30,6 +30,90 @@ def test_personal_edit_body_is_independent_of_scan_batch(tmp_path):
         edit=lambda changes:next(projection_module.signed_row(r) for r in scan(core,state,changes=changes) if r["kind"]=="file_edit.record")
         assert edit(None)==edit({("file_edits","e")})==edit({("file_edits","e"),("edit.observed","e")})
 
+def test_provenance_before_edit_is_retained_and_retried_across_calls(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph()
+    fid=digest(dict(repository=None,path="a.py"))
+    row=dict(v=1,kind="edit.observed",id="e",state="active",data=dict(turn="m",file=fid,repository=None,old_content_hash=None,new_content_hash="h",evidence="captured_exact"))
+    proof=row_proof(device,user,"w",1,row); path=tmp_path/"pending.db"
+    apply_row_replicas(path,[dict(row=row,proof=proof)],"w",[control],local_user="other")
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert json.loads(db.execute("SELECT body FROM remote.row_conflicts WHERE proof_id=?",[digest(proof)]).fetchone()[0])==row
+        assert db.execute("SELECT COUNT(*) FROM provenance.file_edit_files").fetchone()[0]==0
+    apply_row_replicas(path,bodies,"w",[control],local_user="other")
+    file=dict(v=1,kind="file.observed",id=fid,state="active",data=dict(repository=None,path="a.py",kind="external"))
+    apply_row_replicas(path,[dict(row=file,proof=row_proof(device,user,"w",1,file))],"w",[control],local_user="other")
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT file_id FROM provenance.file_edit_files WHERE file_edit_id=?",[foreign_id(user,"file_edits","e")]).fetchone()==(fid,)
+        assert db.execute("SELECT COUNT(*) FROM remote.row_conflicts").fetchone()[0]==0
+
+def test_same_user_replay_preserves_native_ids_and_pending_local_content(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"native.db"
+    apply_row_replicas(path,bodies,"w",[control],recover="native",local_user=user)
+    with duckdb.connect(str(path)) as db:
+        db.execute("UPDATE messages SET content='new local observation' WHERE id='m'")
+        before={table:db.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() for table in rows}
+    for _ in range(2): apply_row_replicas(path,bodies,"w",[control],local_user=user)
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert {table:db.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() for table in rows}==before
+        assert db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0
+        assert json.loads(db.execute("SELECT body FROM remote.row_conflicts WHERE proof_id=?",[digest(proofs["messages"])]).fetchone()[0])==rows["messages"]
+
+def test_same_user_existing_received_binding_is_reused(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"bound.db"
+    apply_row_replicas(path,bodies,"w",[control],local_user="previous")
+    with duckdb.connect(str(path),read_only=True) as db: before={table:db.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() for table in rows}
+    apply_row_replicas(path,bodies,"w",[control],local_user=user)
+    with duckdb.connect(str(path),read_only=True) as db: assert {table:db.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() for table in rows}==before
+
+def test_conflicting_provenance_preserves_both_facts_and_healthy_rows(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"conflict.db"
+    row=dict(v=1,kind="edit.observed",id="e",state="active",data=dict(turn="m",file="f",repository=None,old_content_hash=None,new_content_hash="h",evidence="captured_exact")); proof=row_proof(device,user,"w",1,row)
+    apply_row_replicas(path,[*bodies,dict(row=row,proof=proof)],"w",[control],local_user="other")
+    revised={**row,"data":{**row["data"],"file":"another"}}; successor=row_proof(device,user,"w",1,revised)
+    apply_row_replicas(path,[dict(row=revised,proof=successor)],"w",[control],local_user="other")
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT file_id FROM provenance.file_edit_files").fetchone()==("f",)
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==1
+        assert json.loads(db.execute("SELECT body FROM remote.row_conflicts WHERE proof_id=?",[digest(successor)]).fetchone()[0])==revised
+
+def test_author_successor_can_replace_provenance_association(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"successor.db"
+    old,new=(digest(dict(repository=None,path=f)) for f in ("old","new"))
+    row=dict(v=1,kind="edit.observed",id="e",state="active",data=dict(turn="m",file=old,repository=None,old_content_hash=None,new_content_hash="h",evidence="captured_exact")); proof=row_proof(device,user,"w",1,row)
+    files=[dict(v=1,kind="file.observed",id=digest(dict(repository=None,path=f)),state="active",data=dict(repository=None,path=f,kind="external")) for f in ("old","new")]
+    apply_row_replicas(path,[*bodies,*(dict(row=f,proof=row_proof(device,user,"w",1,f)) for f in files),dict(row=row,proof=proof)],"w",[control],local_user="other")
+    revised={**row,"data":{**row["data"],"file":new}}; successor=row_proof(device,user,"w",1,revised,proof["revision"])
+    apply_row_replicas(path,[dict(row=revised,proof=successor)],"w",[control],local_user="other")
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT file_id FROM provenance.file_edit_files").fetchone()==(new,)
+        assert db.execute("SELECT count(*) FROM remote.row_conflicts").fetchone()[0]==0
+
+def test_audit_detects_missing_body_even_without_surviving_origin(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"lost.db"
+    apply_row_replicas(path,bodies,"w",[control],local_user="other")
+    with duckdb.connect(str(path)) as db: db.execute("DELETE FROM messages; DELETE FROM remote.row_origins WHERE table_name='messages'")
+    audit=audit_rows(path,page=1,local_user="other")
+    assert audit["tables"]["messages"]["unavailable"]==1
+    apply_row_replicas(path,[bodies[1]],"w",[control],local_user="other")
+    assert audit_rows(path,page=1,local_user="other")["totals"]["unavailable"]==0
+
+@pytest.mark.parametrize("timestamp",["2026-01-01T00:00:00","2026-01-01T00:00:00.000000","2026-01-01T00:00:00.123456"])
+def test_historical_timestamp_reconstructs_exact_proof_without_resigning(tmp_path,timestamp):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"encoding.db"
+    row={**rows["messages"],"data":{**rows["messages"]["data"],"created_at":timestamp}}; proof=row_proof(device,user,"w",1,row)
+    apply_row_replicas(path,[bodies[0],dict(row=row,proof=proof)],"w",[control],local_user="other")
+    audit=audit_rows(path,local_user="other"); assert audit["totals"]["projection_mismatch"]==0 and audit["totals"]["unavailable"]==0
+    with duckdb.connect(str(path),read_only=True) as db: assert db.execute("SELECT content_hash FROM remote.row_proofs WHERE id=?",[digest(proof)]).fetchone()[0]==digest(row)
+
+def test_sql_conversion_cannot_discard_the_exact_verified_body(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"lossy.db"
+    row={**rows["messages"],"data":{**rows["messages"]["data"],"created_at":"2026-01-01T00:00:00+02:00"}}; proof=row_proof(device,user,"w",1,row)
+    apply_row_replicas(path,[bodies[0],dict(row=row,proof=proof)],"w",[control],local_user="other")
+    with duckdb.connect(str(path),read_only=True) as db: assert json.loads(db.execute("SELECT body FROM remote.row_conflicts WHERE proof_id=?",[digest(proof)]).fetchone()[0])==row
+    audit=audit_rows(path,local_user="other"); assert audit["totals"]["unavailable"]==0 and audit["totals"]["retained_variants"]==1
+    keys={1:b64(os.urandom(32))}; replicas=row_replicas(path,dict(user="other",device=device),"w",[],keys)
+    assert row in [open_replica(env,keys[1])["row"] for env in replicas]
+
 @pytest.mark.parametrize("timestamp",["2026-01-01 00:00:00","2026-01-01 00:00:00.123456"])
 def test_alias_page_matches_sealed_timestamp_encoding(tmp_path,timestamp):
     archive,path,root,device,user,cfg,entry=_provider_alias_archive(tmp_path)
@@ -211,7 +295,7 @@ def test_row_dag_converges_across_arrival_order_and_preserves_true_fork(tmp_path
     assert apply_row_replicas(tmp_path/"late",[body(row("child"),child)],"w",[control])==[True] and apply_row_replicas(tmp_path/"late",[body(row("parent"),parent)],"w",[control])==[False]; assert duckdb.connect(str(tmp_path/"late"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="child"
     assert apply_row_replicas(tmp_path/"batch",[body(row("child"),child),body(row("parent"),parent)],"w",[control])==[True,False] and duckdb.connect(str(tmp_path/"batch"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="child"
     shared=duckdb.connect(str(tmp_path/"shared")); init_schema(shared); assert apply_row_replicas(tmp_path/"shared",[body(row("parent"),parent)],"w",[control],db=shared)==[True] and apply_row_replicas(tmp_path/"shared",[body(row("child"),child)],"w",[control],db=shared)==[True]; shared.close()
-    fork=row_proof(device,user,"w",1,row("fork"),parent["revision"]); apply_row_replicas(tmp_path/"fork",[body(row("parent"),parent)],"w",[control]); assert apply_row_replicas(tmp_path/"fork",[body(row("child"),child),body(row("fork"),fork)],"w",[control])==[False,False]; db=duckdb.connect(str(tmp_path/"fork"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="parent" and db.execute("SELECT COUNT(*) FROM remote.row_conflicts").fetchone()[0]==2; db.close()
+    fork=row_proof(device,user,"w",1,row("fork"),parent["revision"]); apply_row_replicas(tmp_path/"fork",[body(row("parent"),parent)],"w",[control]); assert apply_row_replicas(tmp_path/"fork",[body(row("child"),child),body(row("fork"),fork)],"w",[control])==[False,False]; db=duckdb.connect(str(tmp_path/"fork"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="parent" and db.execute("SELECT COUNT(*) FROM remote.row_conflicts").fetchone()[0]==3; db.close()
 
 
 def test_current_replica_carries_signed_lineage_and_rejects_late_stale_ancestor(tmp_path):
