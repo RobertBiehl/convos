@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, set_attachment_path, typed_logical_rows
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, set_attachment_path, typed_logical_rows
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
@@ -591,14 +591,28 @@ def verified_replica(body,workspace,controls,user):
         if expected is not None: raise ValueError("incomplete row proof lineage")
     return row,proof,signer_,verified
 def temp_rows(db,name,columns,rows): db.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT x.* FROM UNNEST(from_json(?,?)) t(x)",(json.dumps([dict(zip(columns,row)) for row in rows]),json.dumps([{c:"VARCHAR" for c in columns}])))
-def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None,root=None,ready=True,local_device=None):
-    if not bodies: return []
+def _edit_retry_work(db):
+    seed=db.execute("SELECT after_proof_id FROM remote.edit_ready WHERE dependency_key=''").fetchone()[0]
+    if seed!='done':
+        rows=db.execute("SELECT p.id,'' FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.row_kind='edit.observed' AND p.id>? ORDER BY p.id LIMIT 500",[seed]).fetchall()
+        return rows,[('',rows[-1][0] if len(rows)==500 else 'done')]
+    rows=db.execute("SELECT d.proof_id,r.dependency_key FROM remote.edit_ready r JOIN remote.edit_dependencies d ON d.dependency_key=r.dependency_key WHERE r.dependency_key<>'' AND d.proof_id>r.after_proof_id ORDER BY r.dependency_key,d.proof_id LIMIT 500").fetchall()
+    return rows,list({key:pid for pid,key in rows}.items())
+def retry_edit_replicas(db_path,local_user,local_device=None,root=None,progress=lambda stage:None):
+    done=0
+    while count:=apply_row_replicas(db_path,[],None,[],local_user=local_user,root=root,ready=False,local_device=local_device,retry=True):
+        done+=count
+        progress(f"retrying edit facts {done}")
+        archive_yield(db_path)
+def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None,root=None,ready=True,local_device=None,retry=False):
+    if not bodies and not retry: return []
+    if len(bodies)>500: return [value for at in range(0,len(bodies),500) for value in apply_row_replicas(db_path,bodies[at:at+500],workspace,controls,recover,local_user,db,root,ready,local_device)]
     values=[verified_replica(body,workspace,controls,local_user) for body in bodies]
     if ready and Path(db_path).is_file() and any(value[1]["kind"]=="semantic.proof" for value in values):
         with contextlib.closing(open_db(db_path,purpose="schema.remote.rows")) as schema: ready=(init_schema(schema),False)[-1]
     semantic_ids,semantic=(semantic_ids:=[i for i,value in enumerate(values) if value[1]["kind"]=="semantic.proof"]),dict(zip(semantic_ids,bridge_accept_many(root,[(values[i][0],values[i][1]) for i in semantic_ids])))
     indexes=[i for i in range(len(values)) if i not in semantic]
-    if not indexes: return list(semantic.values())
+    if not indexes and not retry: return list(semantic.values())
     names=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
     proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(names,values))}
     own=db is None
@@ -607,8 +621,10 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
     try:
         with _transaction(db):
             items=[values[i] for i in indexes]
+            work,advanced=_edit_retry_work(db) if retry else ([],[])
             columns=("workspace","kind","row_id","author","revision")
             temp_rows(db,"incoming",columns,[tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id","revision")) for row,p,signer_,lineage in items])
+            if work: db.execute("INSERT INTO incoming SELECT workspace_id,row_kind,source_row_id,author_user_id,revision FROM remote.row_proofs WHERE id IN (SELECT UNNEST(?))",[[pid for pid,key in work]])
             old={tuple(r) for r in db.execute("SELECT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p JOIN incoming i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(i.workspace,i.kind,i.row_id,i.author,i.revision)").fetchall()}
             record_local_row_bases(db,[p for row,p,signer_,lineage in items if p["author_user_id"]==local_user and p["author_device_id"]==local_device],True)
             project_workspace_controls(db,controls)
@@ -617,7 +633,6 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
                 for p,signer_ in [*lineage,(head,head_signer)]: groups.setdefault((p["author_user_id"],p["author_device_id"]),(signer_,[]))[1].append(p)
             [project_row_proofs(db,proofs,signer_["root_public"],signer_["certificate"]) for signer_,proofs in groups.values()]
             _insert_pages(db,"remote.row_conflicts",[(digest(p),json.dumps(row,sort_keys=True,separators=(",",":"))) for row,p,signer_,lineage in items],("proof_id","body"),mode=" OR IGNORE")
-            db.execute("INSERT INTO incoming SELECT DISTINCT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id JOIN incoming i ON p.author_user_id=i.author AND ((i.kind='file_edits' AND p.row_kind='edit.observed' AND p.source_row_id=i.row_id) OR (i.kind='file.observed' AND p.row_kind='edit.observed' AND json_extract_string(c.body,'$.data.file')=i.row_id) OR (i.kind='messages' AND p.row_kind='edit.observed' AND json_extract_string(c.body,'$.data.turn')=i.row_id)) ORDER BY p.workspace_id,p.source_row_id LIMIT 500")
             projected,chosen=[],{}
             fields="p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature"
             chains={}
@@ -632,15 +647,30 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
             pending=set()
             project_logical_rows(db,projected,defer=pending.add)
             resolved=[(row["kind"],row["id"],p["author_user_id"]) for row,p,pid,native in projected if pid not in pending]
-            resolved += [scope for scope,revision in chosen.items() if (node:=chains[scope][revision])[1] is None and (node[2]["state"]=="deleted" or db.execute("SELECT 1 FROM remote.row_origins WHERE proof_id=? UNION ALL SELECT 1 FROM remote.provenance_origins WHERE proof_id=?",[node[0],node[0]]).fetchone())]
+            missing={scope:chains[scope][revision] for scope,revision in chosen.items() if chains[scope][revision][1] is None}
+            physical=dict(db.execute("SELECT proof_id,physical_row_id FROM remote.row_origins WHERE proof_id IN (SELECT UNNEST(?)) UNION ALL SELECT proof_id,physical_entity FROM remote.provenance_origins WHERE proof_id IN (SELECT UNNEST(?))",[[pid for pid,row,p in missing.values()]]*2).fetchall()) if missing else {}
+            claims={scope:(kind,physical.get(pid,source if user==local_user or kind in PROVENANCE-{'edit.observed','checkpoint.link'} else foreign_id(user,'file_edits' if kind=='edit.observed' else kind,source)),source,user,p['state']) for scope,(pid,row,p) in missing.items() for kind,source,user in [scope]}
+            found=typed_logical_rows(db,claims.values()) if claims else {}
+            resolved += [scope for scope,claim in claims.items() if matching_logical_row(found[claim],missing[scope][2]['content_hash']) is not None]
             if resolved:
-                temp_rows(db,"resolved_scopes",columns[1:4],resolved)
-                db.execute("DELETE FROM remote.row_conflicts c USING remote.row_proofs p,resolved_scopes r WHERE c.proof_id=p.id AND (p.row_kind,p.source_row_id,p.author_user_id)=(r.kind,r.row_id,r.author)")
+                retired=[]
+                for scope in resolved:
+                    revision=chosen[scope]
+                    while revision in chains[scope]:
+                        retired.append((*scope,revision))
+                        revision=chains[scope][revision][2]["previous_revision"]
+                temp_rows(db,"resolved_revisions",(*columns[1:4],"revision"),retired)
+                db.execute("DELETE FROM remote.row_conflicts c USING remote.row_proofs p,resolved_revisions r WHERE c.proof_id=p.id AND (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(r.kind,r.row_id,r.author,r.revision)")
+            dependency=lambda kind,entity,author:digest([kind,author if kind=='file_edits' else None,entity])
+            waiting=[(dependency(kind,entity,p['author_user_id']),pid) for row,p,pid,native in projected if pid in pending and row['kind']=='edit.observed' for kind,entity in (('file_edits',row['id']),('file.observed',row['data']['file']))]
+            again=project_edit_dependencies(db,waiting,[dependency(row['kind'],row['id'],p['author_user_id']) for row,p,pid,native in projected if pid not in pending and row['kind'] in ('file_edits','file.observed')],[pid for pid,key in work]+[digest(p) for row,p,signer_,lineage in items if row['kind']=='edit.observed'],advanced)
         results=[(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("row_kind","row_id","author_user_id")))==p["revision"] for row,p,signer_,lineage in items]
         accepted=semantic|dict(zip(indexes,results))
-        return [accepted[i] for i in range(len(values))]
+        result=len(work) if retry else [accepted[i] for i in range(len(values))]
     finally:
         if own: db.close()
+    if own and not retry and again: apply_row_replicas(db_path,[],None,[],local_user=local_user,root=root,ready=False,local_device=local_device,retry=True)
+    return result
 def author_user(value,authors): return required((authors or {}).get(value["author"]),ValueError("verified author user required"))
 def foreign_id(author_user,table,old): return digest(f"{author_user}:{table}:{old}")[:16] if old else old
 def sequence(state,workspace,value):

@@ -150,6 +150,11 @@ CREATE TABLE IF NOT EXISTS remote.row_proofs(id VARCHAR PRIMARY KEY,workspace_id
 CREATE INDEX IF NOT EXISTS row_proofs_source ON remote.row_proofs(source_row_id);
 CREATE TABLE IF NOT EXISTS remote.local_row_bases(kind VARCHAR,entity VARCHAR,author VARCHAR,revision VARCHAR,PRIMARY KEY(kind,entity,author));
 CREATE TABLE IF NOT EXISTS remote.row_conflicts(proof_id VARCHAR PRIMARY KEY,body JSON);
+CREATE TABLE IF NOT EXISTS remote.edit_dependencies(dependency_key VARCHAR,proof_id VARCHAR,PRIMARY KEY(dependency_key,proof_id));
+CREATE INDEX IF NOT EXISTS edit_dependency_key ON remote.edit_dependencies(dependency_key);
+CREATE INDEX IF NOT EXISTS edit_dependency_proof ON remote.edit_dependencies(proof_id);
+CREATE TABLE IF NOT EXISTS remote.edit_ready(dependency_key VARCHAR PRIMARY KEY,after_proof_id VARCHAR NOT NULL);
+INSERT OR IGNORE INTO remote.edit_ready VALUES ('','');
 CREATE TABLE IF NOT EXISTS remote.row_references(table_name VARCHAR,physical_row_id VARCHAR,author_user_id VARCHAR,source_row_id VARCHAR,PRIMARY KEY(table_name,physical_row_id,author_user_id));
 CREATE TABLE IF NOT EXISTS remote.provider_session_aliases(workspace_id VARCHAR,author_user_id VARCHAR,object_id VARCHAR,revision VARCHAR,source VARCHAR,session_id VARCHAR,members JSON,canonical_source_row_id VARCHAR,proof JSON,PRIMARY KEY(author_user_id,object_id,revision));
 CREATE TABLE IF NOT EXISTS remote.file_edit_evidence_proofs(workspace_id VARCHAR,author_user_id VARCHAR,object_id VARCHAR,revision VARCHAR,source_edit_id VARCHAR,edit_revision VARCHAR,status VARCHAR,reason VARCHAR,source_tool_call_id VARCHAR,tool_revision VARCHAR,proof JSON,PRIMARY KEY(workspace_id,author_user_id,object_id,revision));
@@ -440,6 +445,14 @@ def project_logical_rows(db,items,defer=False):
         _insert_pages(db,"remote.provenance_origins",[(item[0]["kind"],physical,item[1]["workspace"],item[1]["author_user_id"],item[0]["id"],item[2]) for item,physical in facts if item[0]["kind"] in PROVENANCE_KINDS],mode=" OR REPLACE")
         if defer: _retain_lossy_replicas(db,items,defer)
     return (out and _archive_touch(db,out),out)[-1]
+def project_edit_dependencies(db,waiting=(),arrived=(),processed=(),advanced=()):
+    clean={key for key,pid in waiting}|{key for key,pid in advanced}|{r[0] for r in db.execute("SELECT dependency_key FROM remote.edit_dependencies WHERE proof_id IN (SELECT UNNEST(?))",[list(processed)]).fetchall()} if waiting or processed or advanced else set()
+    if processed: db.execute("DELETE FROM remote.edit_dependencies WHERE proof_id IN (SELECT UNNEST(?))",[list(processed)])
+    if waiting: _insert_pages(db,"remote.edit_dependencies",list(waiting),mode=" OR IGNORE")
+    if advanced: _insert_pages(db,"remote.edit_ready",list(advanced),mode=" OR REPLACE")
+    if arrived: db.execute("INSERT OR REPLACE INTO remote.edit_ready SELECT DISTINCT dependency_key,'' FROM remote.edit_dependencies WHERE dependency_key IN (SELECT UNNEST(?))",[list(arrived)])
+    if clean: db.execute("DELETE FROM remote.edit_ready r WHERE r.dependency_key<>'' AND r.dependency_key IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.edit_dependencies d WHERE d.dependency_key=r.dependency_key AND d.proof_id>r.after_proof_id)",[list(clean)])
+    return bool(db.execute("SELECT 1 FROM remote.edit_ready WHERE dependency_key<>'' OR after_proof_id<>'done' LIMIT 1").fetchone())
 def logical_references(db,ids,references=True):
     sql=("SELECT table_name,physical_row_id,author_user_id,source_row_id FROM remote.row_references WHERE physical_row_id IN (SELECT UNNEST(?)) UNION ALL " if references else "")+"SELECT table_name,physical_row_id,author_user_id,source_row_id FROM remote.row_origins WHERE physical_row_id IN (SELECT UNNEST(?))"
     return {(table,physical,user):source for table,physical,user,source in db.execute(sql,[list(ids)]*(2 if references else 1)).fetchall()} if ids else {}
