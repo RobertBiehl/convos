@@ -118,8 +118,7 @@ def attachment_body(data,root=None):
     root,blob,path=(root:=secure_dir(Path(root or DATA_DIR)/"attachments")),(blob:=hashlib.sha256(data).hexdigest()),root/blob
     if path.exists():
         if path.is_symlink() or not path.is_file() or path.stat().st_size!=len(data): raise ValueError("attachment body conflicts with content hash")
-        with path.open("rb") as source: actual=hashlib.file_digest(source,"sha256").hexdigest()
-        return (required(actual==blob,ValueError("attachment body conflicts with content hash")),os.chmod(path,0o600),path)[-1]
+        return (required(_file_sha256(path)==blob,ValueError("attachment body conflicts with content hash")),os.chmod(path,0o600),path)[-1]
     return (atomic_publish(path,lambda tmp:tmp.write_bytes(data)),path)[-1]
 
 def detect_source(path: Path): return "codex" if path.is_dir() and (path/"sessions").exists() else "claude-code" if path.is_dir() else "chatgpt" if path.suffix==".zip" or "chatgpt" in path.name.lower() else "claude" if "chat_messages" in (data:=required(json.loads(path.read_text()),ValueError(f"Empty export: {path}")))[0] else "chatgpt"
@@ -236,10 +235,7 @@ def _observe_provenance(edits,source="sync",known=None,conversations=(),cache=No
     for conversation,cwd,rid,root,checkout,observed in conversations:
         repo=_cached_repository(cache,root,known) if root else None
         if repo and (repo["id"],repo["checkout"])==(rid,checkout): (repos.setdefault(rid,repo),repo_times.setdefault(rid,observed))
-    records[:0]=[_repository_record(repo,repo_times[rid]) for rid,repo in repos.items()]
-    records.extend(record for repo in repos.values() for record in _checkpoint_records(repo,versions,source,captured))
-    return records,repos
-def observe_provenance(core): return _observe_provenance(_provenance_edits(core),known=repository_state(core))[0]
+    return [*[_repository_record(repo,repo_times[rid]) for rid,repo in repos.items()],*records,*(record for repo in repos.values() for record in _checkpoint_records(repo,versions,source,captured))],repos
 def provenance_records(db,only=None):
     ids=lambda kind:[entity for k,entity in only or () if k==kind]
     rows=lambda kind,sql,column="id":[] if only is not None and not ids(kind) else db.execute(sql+(f" WHERE {column} IN (SELECT json_extract_string(value,'$') FROM json_each(?))" if only is not None else ""),[json.dumps(ids(kind),separators=(",",":"))] if only is not None else []).fetchall()
@@ -379,11 +375,9 @@ def matching_logical_row(row,expected,paths=()):
     if row is None or provenance_digest(row)==expected: return row
     candidates=[row]
     for field,value in (row["data"] or {}).items():
-        if field=="file_path": variants=paths
-        elif field in ("created_at","updated_at","observed_at") and isinstance(value,str):
-            try: variants=(datetime.fromisoformat(value).isoformat(),datetime.fromisoformat(value).isoformat(timespec="microseconds"))
-            except ValueError: variants=()
-        else: continue
+        if field!="file_path" and (field not in ("created_at","updated_at","observed_at") or not isinstance(value,str)): continue
+        try: variants=paths if field=="file_path" else ((parsed:=datetime.fromisoformat(value)).isoformat(),parsed.isoformat(timespec="microseconds"))
+        except ValueError: continue
         candidates += [{**candidate,"data":{**candidate["data"],field:variant}} for candidate in candidates for variant in variants if variant!=value]
     return next((candidate for candidate in candidates if provenance_digest(candidate)==expected),None)
 def _project_semantic_ancestors(db,kind,record): return _insert_pages(db,"remote.semantic_ancestors",[(kind,record["workspace_id"],record["author_user_id"],record["object_id"],record["revision"],a) for a in record["proof"]["ancestors"]],mode=" OR IGNORE")
@@ -587,7 +581,6 @@ def merge_archive_backup(path,backup,page=500):
             required(db.execute("SELECT archive_id::VARCHAR FROM archive_state WHERE singleton").fetchone()[0]==identity,ValueError("Repair backup belongs to a different archive"))
             targets={f"{schema}.{table}":[r[0] for r in db.execute(f"DESCRIBE {schema}.{table}").fetchall()] for schema,table in db.execute("SELECT table_schema,table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND (table_schema IN ('provenance','remote') OR table_name IN (SELECT UNNEST(?)))",[list(ARCHIVE_COLUMNS)+["attachment_bodies","provider_sessions"]]).fetchall()}
         available={f"{schema}.{table}" for schema,table in donor.execute("SELECT table_schema,table_name FROM information_schema.tables WHERE table_type='BASE TABLE'").fetchall()}
-        bodies=_backup_rows(donor)
         restored=0
         for table,columns in sorted(targets.items(),key=lambda item:item[0]=="provenance.local_facts"):
             if table not in available: continue
@@ -626,7 +619,7 @@ def merge_archive_backup(path,backup,page=500):
                             restore(db,"remote.row_conflicts",[(pid,json.dumps(row,sort_keys=True,separators=(",",":"))) for pid,expected,claim,row in exact if matching_logical_row(current[claim],expected,[paths[claim[1]]] if paths.get(claim[1]) else ()) is None])
                     archive_yield(path)
         bundle=backup.with_name(backup.name+".attachments")
-        for ref,body_hash,size,original in bodies:
+        for ref,body_hash,size,original in _backup_rows(donor):
             candidates=([bundle/body_hash,backup.parent/"attachments"/body_hash] if body_hash else [])+([Path(original)] if original else [])
             if found:=next((p for p in candidates if p.is_file() and not p.is_symlink() and (size is None or p.stat().st_size==size) and (not body_hash or _file_sha256(p)==body_hash)),None):
                 data=found.read_bytes()
@@ -724,16 +717,14 @@ def ts_from_iso(t): return (lambda v:v.astimezone().replace(tzinfo=None) if v.tz
 def ts_any(t): return ts_from_epoch(t) or (ts_from_iso(t) if isinstance(t, str) else None)  # chatgpt list api sends iso, exports send epoch
 
 def extract_content(content) -> dict:
-    if isinstance(content, str): return {"text": content, "thinking": None, "tools": [], "attachments": []}
-    if not isinstance(content, list): return {"text": "", "thinking": None, "tools": [], "attachments": []}
+    if not isinstance(content,list): return {"text":content if isinstance(content,str) else "","thinking":None,"tools":[],"attachments":[]}
     blocks = [b for b in content if isinstance(b, dict)]
     return {"text":"\n".join(b.get("text","") or b.get("thinking","") if b.get("type") in ("text",None) else "" for b in blocks).strip() or "\n".join(str(b) for b in content if isinstance(b,str)).strip(),"thinking":"\n".join(b["thinking"] for b in blocks if b.get("type")=="thinking" and b.get("thinking")).strip() or None,"tools":[{"name":b["name"],"input":b.get("input",{}),"id":b.get("id")} for b in blocks if b.get("type")=="tool_use"]+[{"id":b.get("tool_use_id"),"output":b.get("content","") ,"error":b.get("is_error",False)} for b in blocks if b.get("type")=="tool_result"],"attachments":[{"filename":b.get("name",b.get("file_name")),"mime_type":b.get("content_type",b.get("file_type")),"size":b.get("size",b.get("file_size")),"url":b.get("asset_pointer",b.get("url"))} for b in blocks if b.get("type") in ("image_asset_pointer","file") or b.get("content_type") in ("image_asset_pointer","file")]}
 
 def _safari_records():
     if not (path:=next((p for p in (Path.home()/"Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",Path.home()/"Library/Cookies/Cookies.binarycookies") if p.exists()),None)): return
-    data,count=(data:=path.read_bytes()),struct.unpack(">I",data[4:8])[0] if data[:4]==b"cook" else 0
-    if data[:4]!=b"cook": return
-    sizes,pages=(sizes:=[struct.unpack(">I",data[8+i*4:12+i*4])[0] for i in range(count)]),[data[start:start+size] for start,size in zip(itertools.accumulate([8+4*count,*sizes]),sizes)]
+    if (data:=path.read_bytes())[:4]!=b"cook": return
+    sizes,pages=(sizes:=[struct.unpack(">I",data[8+i*4:12+i*4])[0] for i in range(struct.unpack(">I",data[4:8])[0])]),[data[start:start+size] for start,size in zip(itertools.accumulate([8+4*len(sizes),*sizes]),sizes)]
     yield from ((text(fields[0]),text(fields[1]),text(struct.unpack("<I",page[off+28:off+32])[0])) for page in pages if page[:4]==b"\0\0\1\0" for i in range(struct.unpack("<I",page[4:8])[0]) for off in [struct.unpack("<I",page[8+i*4:12+i*4])[0]] for fields,text in [(struct.unpack("<III",page[off+16:off+28]),lambda pos,page=page,off=off:page[off+pos:page.find(b"\0",off+pos)].decode(errors="ignore"))])
 def read_safari_cookies(domain: str) -> dict[str,str]:
     target=domain.lstrip(".").lower()
@@ -909,10 +900,9 @@ def parse_claude(path: Path) -> ParseResult:
 
 def iter_jsonl(path: Path):
     for i, line in enumerate(path.open(), start=1):
-        if not line.strip(): continue
-        try: yield i-1,json.loads(line)
-        except Exception as e:
-            log_parse_error(f"jsonl {path} line {i}", e)
+        if line.strip():
+            try: yield i-1,json.loads(line)
+            except Exception as e: log_parse_error(f"jsonl {path} line {i}", e)
 
 def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
     events = [e for _,e in iter_jsonl(jsonl)]
@@ -1001,9 +991,7 @@ def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
 
     return {"conv":dict(id=cid,source=src,title=meta.get("cwd") or jsonl.stem,created_at=min(timestamps.values(),default=None),updated_at=max(timestamps.values(),default=None),model=next((m["model"] for m in msgs if m["role"]=="assistant" and m["model"]),None),cwd=meta.get("cwd"),git_branch=(meta.get("git") or {}).get("branch"),project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":provider_id,"parent_session_id":spawn.get("parent_thread_id") or meta.get("parent_thread_id"),"session_kind":"subagent" if subagent is not None else "main","session_kind_evidence":"exact" if subagent is not None else "inferred","agent_name":spawn.get("agent_nickname") or meta.get("agent_nickname"),"agent_role":spawn.get("agent_role") or (subagent if isinstance(subagent,str) else meta.get("agent_role")),"agent_depth":spawn.get("depth"),"originator":meta.get("originator"),"client_version":meta.get("cli_version"),"capture_mode":"transcript","git_repository":(meta.get("git") or {}).get("repository_url"),"git_commit":(meta.get("git") or {}).get("commit_hash"),"forked_from_id":meta.get("forked_from_id"),"thread_source":meta.get("thread_source")}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")],"edits":edits,"edit_evidence":evidence}
 
-def parse_codex(codex_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult:
-    if not (sessions_dir:=codex_dir/"sessions").exists(): return ParseResult()
-    return _parse_sessions(files or sessions_dir.rglob("*.jsonl"),parse_codex_session,bindings)
+def parse_codex(codex_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult: return _parse_sessions(files or sessions_dir.rglob("*.jsonl"),parse_codex_session,bindings) if (sessions_dir:=codex_dir/"sessions").exists() else ParseResult()
 
 _CONV_UPS = "INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source,title=excluded.title,created_at=CASE WHEN conversations.created_at IS NULL OR excluded.created_at < conversations.created_at THEN excluded.created_at ELSE conversations.created_at END,updated_at=CASE WHEN conversations.updated_at IS NULL OR excluded.updated_at > conversations.updated_at THEN excluded.updated_at ELSE conversations.updated_at END,model=COALESCE(excluded.model,conversations.model),cwd=COALESCE(excluded.cwd,conversations.cwd),git_branch=COALESCE(excluded.git_branch,conversations.git_branch),project_id=COALESCE(excluded.project_id,conversations.project_id),metadata=excluded.metadata"
 
@@ -1017,8 +1005,7 @@ def _parse_result_refs(conn,r):
         required(not (unavailable:=missing-existing),ValueError(f"parse result reference unavailable: {table}:{next(iter(sorted(unavailable)), '')}"))
 def _rows_by_id(conn,table,ids): return {row[0]:row for row in conn.execute(f"SELECT * FROM {table} WHERE id IN (SELECT UNNEST(?))",[list(ids)]).fetchall()} if ids else {}
 def _history_row(table,row,payload):
-    historical=list(row)
-    historical[0]=gen_id("history",f"{table}:{row[0]}:{json.dumps(payload,default=str)}")
+    historical=[gen_id("history",f"{table}:{row[0]}:{json.dumps(payload,default=str)}"),*row[1:]]
     if table=="messages": historical[7]=json.dumps({**json.loads(historical[7] or "{}"),"history_of":row[0],"superseded_at":datetime.now().isoformat()})
     return historical
 def _prune_remote_rows(conn,r):
@@ -1285,8 +1272,7 @@ def search(query: str, source: str|None = typer.Option(None, "-s"), days: int|No
 
 def read_cmd(conversation: str, limit: int = typer.Option(20, "-n", min=1), context: int = typer.Option(2000, "-c", min=1), around: str|None = typer.Option(None, "--around", "-a"), thinking: bool = typer.Option(False, "--thinking", "-t"), fmt: str = typer.Option("text", "-f", "--format")):
     drain_hooks()
-    if (conn := _ro()) is None: return
-    with contextlib.closing(conn):
+    with contextlib.closing(_ro()) as conn:
         cs=conn.execute("SELECT id,title,source,cwd FROM conversations WHERE starts_with(id, ?) ORDER BY updated_at DESC NULLS LAST LIMIT 2",[conversation]).fetchall()
         if len(cs)!=1: raise typer.Exit(typer.echo("No matching conversation" if not cs else "Ambiguous prefix: "+", ".join(c[0] for c in cs),err=True) or 1)
         cid,title,src,cwd=cs[0]
@@ -1304,8 +1290,7 @@ def hybrid_hits(q,source=None,days=None,role=None,limit=10,local_only=False,cwd=
     profile,stored,error=None,None,None
     try: profile=embedding_profile()
     except ValueError as e: error=str(e)
-    conn=_ro()
-    with contextlib.closing(conn):
+    with contextlib.closing(_ro()) as conn:
         stored=(conn.execute("SELECT CAST(profile AS VARCHAR) FROM embedding_state WHERE singleton").fetchone() or [None])[0]
         where=f"FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.content IS NOT NULL AND m.content!='' AND json_extract_string(m.metadata,'$.history_of') IS NULL{_NOISE}{' AND ' + ' AND '.join(w) if w else ''}"
         useful=bool(profile and stored and json.loads(stored)==profile and conn.execute(f"SELECT 1 {where} AND m.embedding IS NOT NULL AND len(m.embedding)=? LIMIT 1",p+[profile["dimensions"]]).fetchone())
@@ -1384,11 +1369,10 @@ def _skill_paths():
     return rel,skill,homes,[home/rel for home in homes]
 def install_skills():
     rel,skill,homes,dests=_skill_paths()
-    olds=[home/"skills"/"agent-convos"/"SKILL.md" for home in homes]
     if not skill.exists(): raise typer.Exit(typer.echo(f"Missing skill: {skill}",err=True) or 1)
     text,legacy,resolved=(text:=skill.read_text()),text.replace("name: convos","name: agent-convos",1).replace("# Convos","# Agent Convos",1),[Path(os.path.realpath(p)) for p in dests]
     if unsafe:=next((p for home,p,target in zip(homes,dests,resolved) if p.is_symlink() or p.exists() and not p.is_file() or any(q.is_symlink() and resolved.count(target)<2 or q.exists() and not q.is_dir() for q in [home/Path(*rel.parts[:i]) for i in range(1,len(rel.parts))])),None): raise typer.Exit(typer.echo(f"Refusing unsafe managed file: {unsafe}",err=True) or 1)
-    for dest,old in zip(dests,olds):
+    for dest,old in zip(dests,(home/"skills"/"agent-convos"/"SKILL.md" for home in homes)):
         if atomic_write(dest,text) is None: typer.echo(f"Installed {dest}")
         if old.is_file() and not old.is_symlink() and old.read_text()==legacy: typer.echo(f"Removed legacy {old}") if old.unlink() is None else None
 
@@ -1398,11 +1382,9 @@ def edit_hook_config(path, events, source, remove=False):
     data=json.loads(path.read_text()) if path.exists() else {}
     clean=lambda groups:[{**group,"hooks":kept} for group in groups for kept in [[h for h in group.get("hooks",[]) if not _managed_hook(h,source)]] if kept]
     hooks={event:kept for event,groups in data.get("hooks",{}).items() if (kept:=clean(groups))}
-    data["hooks"]=hooks
-    if not remove:
-        cmd = _capture_command(source)
-        for event in events: hooks.setdefault(event, []).append(dict(hooks=[dict(type="command", command=cmd, timeout=5, statusMessage="Saving conversation to Convos")]))
-    return data, sum(_managed_hook(h, source) for gs in hooks.values() for g in gs for h in g.get("hooks", []))
+    cmd=_capture_command(source) if not remove else None
+    for event in (() if remove else events): hooks.setdefault(event, []).append(dict(hooks=[dict(type="command", command=cmd, timeout=5, statusMessage="Saving conversation to Convos")]))
+    return {**data,"hooks":hooks}, sum(_managed_hook(h, source) for gs in hooks.values() for g in gs for h in g.get("hooks", []))
 
 def install_hooks(remove: bool = typer.Option(False, "--remove"), status: bool = typer.Option(False, "--status")):
     cfgs = [(Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"settings.json", ("Stop", "SessionEnd"), "claude-code"), (Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"hooks.json", ("Stop",), "codex")]
@@ -1419,9 +1401,8 @@ def install_hooks(remove: bool = typer.Option(False, "--remove"), status: bool =
     if not status and not remove: typer.echo("Start a new agent session; in Codex, review the user hook with `/hooks`.")
 
 def export(output: Path, fmt: str = typer.Option("json", "-f"), source: str|None = typer.Option(None, "-s")):
-    if (conn := _ro()) is None: return
     where,params=("WHERE c.source = ?",[source]) if source else ("",[])
-    with contextlib.closing(conn):
+    with contextlib.closing(_ro()) as conn:
         if fmt=="json":
             rows,grouped=(rows:=conn.execute(f"SELECT c.id,c.source,c.title,c.created_at,c.updated_at,c.model,c.cwd,c.git_branch,c.project_id FROM conversations c {where}",params).fetchall()),lambda values:{cid:[v[1:] for v in group] for cid,group in itertools.groupby(values,key=lambda v:v[0])}
             ids=[r[0] for r in rows]
