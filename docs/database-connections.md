@@ -30,6 +30,14 @@ or stops reporting progress; a stalled holder is reported after five seconds of 
 inventory every production `flock` call. Contention-only waiter notices also use `flock`, solely so
 a crashed waiter is distinguishable from a live one and its stale notice can be removed safely.
 
+Hook workers retain separate completed claims and newer captures for the same transcript.
+Automatic worker handoffs share one attempt token: each unchanged failed queue entry is
+tried once during that attempt, so failures cannot starve later captures or spin a backlog
+larger than one batch. A new capture or explicit drain starts a new attempt. Replacing a
+failed queue entry makes it immediately eligible, including within the current attempt.
+Progress and failed queue-file identities are published before releasing the worker lease;
+the queue remains the durable input record.
+
 ## DuckDB archive
 
 1. Every live archive connection goes through `get_db`/`open_db`, which resolves the

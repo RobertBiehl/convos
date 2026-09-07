@@ -993,16 +993,19 @@ def retry_hook(work, force=False):
     q,target=(q:=work.with_suffix(".json")),q if q.exists() else work
     if force: atomic_json(target,{**json.loads(target.read_text()),"retry":True})
     work.unlink(missing_ok=True) if q.exists() else os.replace(work, q)
+def _hook_stamp(path): return [(st:=path.stat()).st_mtime_ns,st.st_ino,st.st_size]
 def drain_hooks(embed=False, local_only=False,block=False):
-    done,claims,failed,started=[],[],0,time.monotonic()
+    done,claims,failed,started,attempt=[],[],0,time.monotonic(),os.environ.get("CONVOS_HOOK_ATTEMPT") or str(time.time_ns())
     with operation_lock(HOOK_DIR/".drain.lock","hooks.drain",30 if block else 0,mandatory=block) as pulse:
         if not pulse: return 0
         with operation_lock(HOOK_DIR/".lock","hooks.queue"):
-            state=json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}
+            state,previous=json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {},json.loads(HOOK_PROGRESS.read_text()) if HOOK_PROGRESS.exists() else {}
+            attempted=previous.get("failed_claims",{}) if previous.get("attempt")==attempt else {}
             [done.append((work,work.stem,event["snap"],set(event["changed"]))) if "changed" in event else retry_hook(work,True) for work in HOOK_DIR.glob("*.work") for event in [json.loads(work.read_text())]]
-            claims=[work for queue in sorted(HOOK_DIR.glob("*.json"),key=lambda p:(p.stat().st_mtime_ns,p.name))[:HOOK_DRAIN_EVENTS] for work in [queue.with_suffix(".work")] if os.replace(queue,work) is None]
+            queued={p:_hook_stamp(p) for p in HOOK_DIR.glob("*.json")}
+            claims=[(work,queued[queue]) for queue in [p for p in sorted(queued,key=lambda p:(queued[p][0],p.name)) if attempted.get(p.stem)!=queued[p]][:HOOK_DRAIN_EVENTS] for work in [queue.with_suffix(".work")] if not work.exists() and os.replace(queue,work) is None]
         bindings=None
-        for n,work in enumerate(claims):
+        for n,(work,stamp) in enumerate(claims):
             if n and time.monotonic()-started>=HOOK_DRAIN_SECONDS: break
             try:
                 pulse(f"processing {work.name}")
@@ -1026,6 +1029,7 @@ def drain_hooks(embed=False, local_only=False,block=False):
             except FileNotFoundError: work.unlink(missing_ok=True)
             except Exception as error:
                 with operation_lock(HOOK_DIR/".lock","hooks.queue"): retry_hook(work)
+                attempted[work.stem]=stamp
                 failed+=1
                 log_parse_error(f"hook inbox {work}",error)
         if done:
@@ -1033,8 +1037,9 @@ def drain_hooks(embed=False, local_only=False,block=False):
                 state.update((key,snap) for _,key,snap,_ in done)
                 atomic_json(HOOK_STATE,state)
                 for work,_,_,_ in done: work.unlink(missing_ok=True)
-    atomic_json(HOOK_PROGRESS,dict(completed_at=time.time_ns(),processed=len(done),failed=failed,pending=len(pending:=[*HOOK_DIR.glob("*.json"),*HOOK_DIR.glob("*.work")]),oldest=min((p.stat().st_mtime_ns for p in pending),default=None)))
-    if pending and len(pending)>failed: subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        pending={p:_hook_stamp(p) for p in [*HOOK_DIR.glob("*.json"),*HOOK_DIR.glob("*.work")]}
+        atomic_json(HOOK_PROGRESS,dict(completed_at=time.time_ns(),processed=len(done),failed=failed,pending=len(pending),oldest=min((s[0] for s in pending.values()),default=None),attempt=attempt,failed_claims={p.stem:s for p,s in pending.items() if attempted.get(p.stem)==s}))
+    if any(attempted.get(p.stem)!=s for p,s in pending.items()): subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env={**os.environ,"CONVOS_HOOK_ATTEMPT":attempt})
     return len(done)
 
 _MODELS,_MCFG,_LLAMA_LOG,_SEMANTIC_INSTALL={},dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF",filename="embeddinggemma-300m-qat-q8_0.gguf",revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64",artifact_sha256="6fa0c02a9c302be6f977521d399b4de3a46310a4f2621ee0063747881b673f67",embedding=True,n_ctx=16384,n_batch=2048,n_ubatch=2048,n_seq_max=8,n_gpu_layers=-1),None,"Semantic runtime unavailable. macOS includes it; elsewhere install `convos[semantic]`, set CONVOS_SEMANTIC=llama, then run `convos embed`. Literal `convos search` needs no model."
