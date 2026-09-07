@@ -7,6 +7,10 @@ Released v1 logical rows keep their encoding and identity recipes. Core schema
 v12 is additive and uses the existing verified database-and-attachments backup
 before migration.
 
+The final local suite passed 816 tests; nine live provider API tests were
+excluded. Installed wheels passed the focused recovery and backup cases with
+current public dependencies, including the native publication upgrade regression.
+
 ## Measured work
 
 The following are local measurements, not production capacity guarantees.
@@ -24,12 +28,19 @@ operations only.
 | First attestation, 501 rows with 4 KiB bodies, eight alternating samples | 252.64 ms | 206.45 ms |
 | Two-key preservation lookup in 548,389 proof headers | 31-44 ms | 6.35 ms |
 | Insert 500 proof headers, without/with the source index | 4.28 ms | 4.34 ms |
+| Replay 2,411 real replicas into an 8.3 GB archive copy | 8.19 s | 6.13 s |
 
 The signed-hook comparison includes preservation of the preceding signed body.
 Unchanged ingestion has a regression check proving that it performs no proof
 head lookup. An updated native row keeps its current signed body recoverable
 until a durable replacement attestation permits that predecessor body to retire;
 independent revision branches remain preserved.
+
+The real replay comparison used four alternating measured rounds after warmup,
+with identical encrypted inputs and fresh copies of the same archive for each
+trial. It spans nine row kinds and is weighted toward tools, edits, and
+conversations; it contains only 51 messages. Every b7 round was faster than
+every b6 round, and both original snapshot hashes remained unchanged.
 
 The preservation comparison isolates the new guard before and after query
 optimization, rather than comparing a missing safety check with a complete one.
@@ -92,6 +103,8 @@ preservation suite passed 120 tests with DuckDB 1.5.5 and cryptography 50.0.1.
 The development environment uses DuckDB 1.4.3. A fresh test with the former
 minimum, DuckDB 1.2.0, failed schema initialization because `json_each` is
 unavailable. The declared minimum is now the fully tested 1.4.3 release.
+An installed-wheel audit with DuckDB 1.5.5 and cryptography 50.0.1 also reproduced
+the complete 510,991-head archive audit exactly, with an unchanged database hash.
 
 macOS includes the llama.cpp semantic runtime and may need a compiler when no
 compatible dependency wheel exists. A binary-only PyPI resolution was not
