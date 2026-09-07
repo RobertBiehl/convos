@@ -879,6 +879,13 @@ def enqueue_hook(source, payload):
     path,root=Path(payload["transcript_path"]).expanduser().resolve(),hook_root(source).expanduser().resolve()
     if source not in ("claude-code", "codex") or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")
     st,key=path.stat(),gen_id("hook",f"{source}:{path}")
+    if payload.get("hook_event_name", "Stop") not in ("Stop","SessionEnd"):
+        with operation_lock(HOOK_DIR/".flush.lock","hooks.flush",0,mandatory=False) as pulse:
+            if not pulse: return
+            tick,now=HOOK_DIR/f"{key}.tick",time.time()
+            if tick.exists() and now-json.loads(tick.read_text())<60: return
+            atomic_json(tick,now)
+    if HOOK_STATE.exists() and json.loads(HOOK_STATE.read_text()).get(key)==[st.st_mtime_ns,st.st_size] and not (HOOK_DIR/f"{key}.work").exists() and not (HOOK_DIR/f"{key}.json").exists(): return
     atomic_json(HOOK_DIR/f"{key}.json",dict(source=source,path=str(path),mtime=st.st_mtime_ns,size=st.st_size))
     subprocess.Popen([sys.executable, "-m", "ai_convos", "drain-hooks", "--no-block"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 def retry_hook(work, force=False):
@@ -893,8 +900,7 @@ def drain_hooks(embed=False, local_only=False,block=False):
             state=json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}
             [done.append((work,work.stem,event["snap"],set(event["changed"]))) if "changed" in event else retry_hook(work,True) for work in HOOK_DIR.glob("*.work") for event in [json.loads(work.read_text())]]
             claims=[work for queue in sorted(HOOK_DIR.glob("*.json"),key=lambda p:(p.stat().st_mtime_ns,p.name))[:HOOK_DRAIN_EVENTS] for work in [queue.with_suffix(".work")] if os.replace(queue,work) is None]
-        if claims:
-            with _core(ready=True,purpose="hooks.schema") as conn: bindings=session_bindings(conn)
+        bindings=None
         for n,work in enumerate(claims):
             if n and time.monotonic()-started>=HOOK_DRAIN_SECONDS: break
             try:
@@ -903,6 +909,8 @@ def drain_hooks(embed=False, local_only=False,block=False):
                 if state.get(key)==snap:
                     work.unlink()
                     continue
+                if bindings is None:
+                    with _core(ready=True,purpose="hooks.schema") as conn: bindings=session_bindings(conn)
                 r,st2=hook_result(e["source"],path,bindings),path.stat()
                 if snap!=[st2.st_mtime_ns,st2.st_size]:
                     with operation_lock(HOOK_DIR/".lock","hooks.queue"): retry_hook(work)

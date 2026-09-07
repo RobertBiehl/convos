@@ -32,6 +32,23 @@ def test_hook_is_nonblocking_coalesced_and_private(hooks, monkeypatch):
 def test_explicit_drain_is_nonblocking_unless_requested(hooks,monkeypatch):
     calls=[]; monkeypatch.setattr(cli,"drain_hooks",lambda **kwargs:calls.append(kwargs)); runner=CliRunner(); assert runner.invoke(cli.app,["drain-hooks"]).exit_code==runner.invoke(cli.app,["drain-hooks","--block"]).exit_code==0 and calls==[{"block":False},{"block":True}]
 
+def test_intermediate_capture_minute_limit_and_completion_bypass(hooks,monkeypatch):
+    sessions,_=hooks; transcript(path:=sessions/"rate.jsonl"); launched=[]; now=[1000.0]
+    monkeypatch.setattr(cli.time,"time",lambda:now[0]); monkeypatch.setattr(cli.subprocess,"Popen",lambda *a,**k:launched.append(a))
+    event=lambda name:cli.enqueue_hook("codex",dict(transcript_path=str(path),hook_event_name=name))
+    event("PostToolUse")
+    for offset in (1,20,59.99): now[0]=1000+offset; event("PostToolUse")
+    assert len(launched)==1
+    event("Stop"); event("SessionEnd"); assert len(launched)==3
+    now[0]=1060; event("PostToolUse"); assert len(launched)==4
+
+def test_unchanged_capture_and_queued_duplicate_do_not_open_archive(hooks,monkeypatch):
+    sessions,data=hooks; transcript(path:=sessions/"duplicate.jsonl"); enqueue(path); assert cli.drain_hooks()==1
+    launched=[]; monkeypatch.setattr(cli.subprocess,"Popen",lambda *a,**k:launched.append(a)); monkeypatch.setattr(cli,"_core",lambda **k:pytest.fail("unchanged hook opened archive"))
+    enqueue(path); assert not launched and not list(cli.HOOK_DIR.glob("*.json"))
+    st=path.stat(); cli.atomic_json(cli.HOOK_DIR/f"{cli.gen_id('hook',f'codex:{path}')}.json",dict(source="codex",path=str(path),mtime=st.st_mtime_ns,size=st.st_size))
+    assert cli.drain_hooks()==0 and not list(cli.HOOK_DIR.glob("*.json"))
+
 def test_incidental_drain_and_manual_sync_do_not_wait_for_worker(hooks, monkeypatch):
     _,data=hooks; (data/"hook_inbox").mkdir(parents=True); hold=POPEN([sys.executable,"-c","import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); input()",str(data/"hook_inbox/.drain.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); monkeypatch.setattr(cli,"capture_provenance",lambda *a,**k:[]); threads=[]
     try:
