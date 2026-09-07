@@ -311,9 +311,9 @@ def test_git_checkpoint_is_capture_observation_not_dirty_path_gap(tmp_path):
 
 def test_provenance_failure_rolls_back_only_enrichment(tmp_path,monkeypatch):
     root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); write=core_module.project_provenance; generation=archive_state(db)[1]; db.close()
-    def fail(conn,value,*args):
+    def fail(conn,value,*args,**kwargs):
         if value["kind"]=="file.observed": raise OSError("git evidence failed")
-        return write(conn,value,*args)
+        return write(conn,value,*args,**kwargs)
     monkeypatch.setattr(core_module,"project_provenance",fail)
     with pytest.raises(OSError,match="evidence"): capture(path)
     db=duckdb.connect(str(path))

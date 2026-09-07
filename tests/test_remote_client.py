@@ -109,7 +109,7 @@ def test_legacy_replica_batch_stream_splits_and_resumes(tmp_path,monkeypatch):
     monkeypatch.setattr(remote_client,"request",lambda cfg,body,auth=True:{"present":{rid:i+100 for i,rid in enumerate(body["replicas"])}} if body["op"]=="replica_reconcile" else {"replicas":[]}); remote_client.upload_replicas({},state,root); assert state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]==len(envs) and not list((root/"remote/outbox").glob("replica-*")); state.close()
 
 def test_remote_timeout_names_operation(monkeypatch):
-    monkeypatch.setattr("urllib.request.urlopen",lambda *args,**kwargs:(_ for _ in ()).throw(urllib.error.URLError(TimeoutError("write timed out"))))
+    monkeypatch.setattr(remote_client._HTTP,"open",lambda *args,**kwargs:(_ for _ in ()).throw(urllib.error.URLError(TimeoutError("write timed out"))))
     with pytest.raises(ConnectionError,match="replica_upload_many.*120s.*write timed out"): remote_client.request({"url":"http://localhost","token":"t"},{"op":"replica_upload_many","envelopes":[]})
 
 

@@ -155,7 +155,8 @@ def test_remote_progress_replaces_one_line_and_throttles_same_stage(tmp_path,mon
 
 def test_remote_internal_requests_heartbeat_without_rendering(tmp_path,monkeypatch,capsys):
     import ai_convos_remote
-    monkeypatch.setattr(ai_convos_remote.sys.stderr,"isatty",lambda:True); monkeypatch.setattr(ai_convos_remote.urllib.request,"urlopen",lambda *a,**k:type("Response",(),{"read":lambda self:b"{}"})())
+    import io
+    monkeypatch.setattr(ai_convos_remote.sys.stderr,"isatty",lambda:True); monkeypatch.setattr(ai_convos_remote._HTTP,"open",lambda *a,**k:io.BytesIO(b"{}"))
     with ai_convos_remote.sync_run(tmp_path,True): ai_convos_remote._progress("preparing rows 500/1000"); ai_convos_remote.request({"url":"http://localhost","token":"t"},{"op":"replica_reconcile"})
     output=capsys.readouterr().err; assert output.count("\r\033[2KRemote ")==1 and "request replica_reconcile" not in output
 

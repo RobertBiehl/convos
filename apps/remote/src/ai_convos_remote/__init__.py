@@ -1,5 +1,5 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
-import contextvars, duckdb, hashlib, itertools, json, os, re, shutil, sqlite3, sys, time, traceback, urllib.error, urllib.parse, urllib.request
+import contextvars, duckdb, hashlib, http.client, itertools, json, os, re, shutil, sqlite3, sys, time, traceback, urllib.error, urllib.parse, urllib.request
 from contextlib import ExitStack, closing, contextmanager
 from functools import wraps
 from pathlib import Path
@@ -9,7 +9,7 @@ import typer
 from ai_convos_redact import protect_all
 _pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases",default=()),[0,0,""],5
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_file_edit_evidence_many, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
+from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_file_edit_evidence_many, project_provider_alias, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .projection import PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
@@ -39,7 +39,7 @@ def _sync_marker(cfg,root,archive): return (lambda bridges:digest({"v":2,"archiv
 def _meta(state,key,default=0): return (state.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone() or [default])[0]
 def _local_tails(state,ws): return {"events":(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(ws,)).fetchone() or [0])[0],"replicas":int(_meta(state,f"replica_cursor:{ws}")),"blobs":int(_meta(state,f"blob_cursor:{ws}")),"origins":state.execute("SELECT COALESCE(MAX(cursor),0) FROM (SELECT cursor FROM origin_bindings WHERE workspace=? UNION ALL SELECT cursor FROM control_dependencies WHERE workspace=?)",(ws,ws)).fetchone()[0]}
 def _settled(cfg,state,root):
-    if cfg["server_state"].get("capabilities",{}).get("sync_tails")!=1 or not (archive:=_archive_marker(root)) or archive[2]!=11: return False
+    if cfg["server_state"].get("capabilities",{}).get("sync_tails")!=1 or not (archive:=_archive_marker(root)) or archive[2]!=CORE_VERSION: return False
     active={w["id"]:w for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
     dirty=not active or any(state.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() for table in ("outbox","blob_outbox","lazy_events","sequence_gaps")) or any(path.exists() and any(path.iterdir()) for path in (paths(root)[0]/"outbox",paths(root)[0]/"attachments")) or state.execute("SELECT 1 FROM meta WHERE key LIKE 'replica_repair:%' OR key LIKE 'archive_mode:%' OR key LIKE 'replica_upload_blocked:%' LIMIT 1").fetchone() or any(event_support(row)!=("required" if row[2] else "optional") for row in state.execute("SELECT kind,payload_v,required FROM deferred_events"))
     ready=all((lifecycle:=state.execute("SELECT lifecycle,error FROM sync_states WHERE workspace=?",(ws,)).fetchone()) and lifecycle[0]=="ready" and not lifecycle[1] and remote.get("sync")==_local_tails(state,ws) and int(_meta(state,f"core_generation:{ws}"))==archive[1] and _meta(state,f"replica_projection:{ws}",None)==bridge_stamp(root) for ws,remote in active.items())
@@ -238,17 +238,29 @@ def upload_replicas(cfg,state,root=None,workspaces=None,direct=()):
         done=(path.unlink(missing_ok=True) or done)+count
         if total>=500: _progress(f"uploading rows {done}/{total}")
 def receipt(state,ws,value,cursor,epoch): state.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],cursor,value["author"],value["seq"],epoch,value["kind"],value["payload_v"],value["entity"],value["revision"],value["payload"].get("status") if isinstance(value["payload"],dict) and value["payload"].get("status") in ("active","deleted") else None))
-def safe_url(url): return required((parsed:=urllib.parse.urlparse(url)).scheme=="https" or parsed.hostname in ("127.0.0.1","localhost","::1") or os.environ.get("CONVOS_REMOTE_INSECURE")=="1",ValueError("Remote URL must use HTTPS (set CONVOS_REMOTE_INSECURE=1 only on a trusted test network)"))
+def safe_url(url): return required((parsed:=urllib.parse.urlparse(url)).scheme in ("http","https") and parsed.hostname and not parsed.username and not parsed.password and (parsed.scheme=="https" or parsed.hostname in ("127.0.0.1","localhost","::1") or os.environ.get("CONVOS_REMOTE_INSECURE")=="1"),ValueError("Remote URL must use HTTPS without credentials (set CONVOS_REMOTE_INSECURE=1 only on a trusted test network)"))
+class _RelayRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,req,fp,*args): raise (fp.close(),ValueError("Relay redirects are not allowed; configure the final HTTPS endpoint"))[-1]
+_HTTP=urllib.request.build_opener(_RelayRedirect())
+def _response_json(response,limit=64*1024**2):
+    with closing(response): raw=response.read(-1 if limit is None else limit+1)
+    required(limit is None or len(raw)<=limit,ValueError("Relay response exceeds its byte limit"))
+    try: value=json.loads(raw)
+    except (ValueError,UnicodeError) as e: raise ValueError("Relay returned invalid JSON") from e
+    return required(isinstance(value,dict),ValueError("Relay response must be a JSON object")) and value
 def request(cfg,body,auth=True):
     _heartbeat(f"request {body['op']}")
     safe_url(cfg["url"])
     headers={"Content-Type":"application/json"}
     if auth: headers["Authorization"]="Bearer "+cfg["token"]
     req=urllib.request.Request(cfg["url"].rstrip("/")+"/v1",data=json.dumps(body,separators=(",",":")).encode(),headers=headers,method="POST")
-    try: return json.loads(urllib.request.urlopen(req,timeout=(timeout:=120 if body["op"] in {"upload_many","replica_upload_many","blob_upload","origin_upload"} else 30)).read())
-    except urllib.error.HTTPError as e: raise ValueError(json.loads(e.read())["error"]) from e
-    except (urllib.error.URLError,TimeoutError) as e: raise ConnectionError(f"Remote {body['op']} failed (socket timeout {timeout}s): {e}") from e
-def health(cfg): return (safe_url(cfg["url"]),(lambda result:(required(result.get("version")==1,ValueError("relay protocol v1 required")),result)[-1])(json.loads(urllib.request.urlopen(cfg["url"].rstrip("/")+"/v1/health",timeout=3).read())))[-1]
+    try: return _response_json(_HTTP.open(req,timeout=(timeout:=120 if body["op"] in {"upload_many","replica_upload_many","blob_upload","origin_upload"} else 30)),None if body["op"]=="origin_pull" else 64*1024**2)
+    except urllib.error.HTTPError as e:
+        try: message=_response_json(e,64*1024).get("error",e.reason)
+        except ValueError: message=e.reason
+        raise (ConnectionError if e.code in (408,429) or e.code>=500 else ValueError)(f"Remote {body['op']} HTTP {e.code}: {str(message)[:1000]}") from e
+    except (urllib.error.URLError,TimeoutError,ConnectionError,http.client.HTTPException) as e: raise ConnectionError(f"Remote {body['op']} failed (socket timeout {timeout}s): {e}") from e
+def health(cfg): return (safe_url(cfg["url"]),(lambda result:(required(result.get("version")==1,ValueError("relay protocol v1 required")),result)[-1])(_response_json(_HTTP.open(cfg["url"].rstrip("/")+"/v1/health",timeout=3))))[-1]
 def _manual_waiting(root):
     path=paths(root)[0]/"manual.lock"
     with operation_lock(path,"remote background admission",0,_lock_identity(root),False) as pulse:

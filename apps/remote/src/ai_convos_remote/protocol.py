@@ -3,12 +3,10 @@ import base64, datetime, functools, hashlib, hmac, json, os, cryptography.except
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from ai_convos.cli import required
+from ai_convos.cli import PROVENANCE_FIELDS_V1, ROW_FIELDS_V1, ROW_JSON_V1, ROW_TIME_V1, logical_fact, logical_row, required
 
 V = 1
-ROW_FIELDS_V1={"conversations":("source","title","created_at","updated_at","model","project_id","metadata"),"messages":("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"),"tool_calls":("message_id","tool_name","input","output","status","duration_ms","created_at"),"attachments":("message_id","filename","mime_type","size","body_hash","created_at"),"artifacts":("conversation_id","artifact_type","title","content","language","created_at","version"),"file_edits":("message_id","file_path","edit_type","content","created_at","old_content")}
-PROVENANCE_FIELDS_V1,SEMANTIC_FIELDS_V1=(provenance:={"repository.observed":("lineage","roots","remotes"),"file.observed":("repository","path","kind"),"file.version":("file","content_hash","observed_at"),"edit.observed":("turn","file","repository","old_content_hash","new_content_hash","evidence"),"git.checkpoint":("repository","head","state_hash","paths","observed_at","capture_source"),"checkpoint.link":("checkpoint","edit","evidence")}),ROW_FIELDS_V1|provenance
-ROW_JSON_V1,ROW_TIME_V1={"metadata","input","output"},{"created_at","updated_at"}
+SEMANTIC_FIELDS_V1=ROW_FIELDS_V1|PROVENANCE_FIELDS_V1
 ROW_PROOF_FIELDS={"v","kind","workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"}
 SEMANTIC_PROOF_FIELDS={"v","kind","workspace","object_kind","object_id","encoding_v","content_hash","revision","previous_revision","ancestors","state","author_user_id","author_device_id","authorization_epoch","root_public","signature"}
 def canon(v): return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
@@ -17,17 +15,6 @@ def unb64(v): return base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))
 def digest(v): return hashlib.sha256(v if isinstance(v, bytes) else canon(v)).hexdigest()
 def public_id(value): return digest(unb64(value))[:32]
 def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-def logical_row(table,columns=(),values=(),identity=None,v=1,state="active"):
-    if v!=1 or table not in ROW_FIELDS_V1 or state not in ("active","deleted") or state=="deleted" and (not identity or columns or values) or len(columns)!=len(values) or len(set(columns))!=len(columns): raise ValueError("invalid logical row schema")
-    if state=="deleted": return {"v":v,"kind":table,"id":identity,"state":state,"data":None}
-    row,required=dict(zip(columns,values)),{"id",*ROW_FIELDS_V1[table]}
-    if not required<=set(row): raise ValueError("incomplete logical row")
-    norm=lambda k,v: json.loads(v) if v is not None and k in ROW_JSON_V1 and isinstance(v,str) else v.isoformat(timespec="microseconds") if v is not None and k in ROW_TIME_V1 and isinstance(v,datetime.datetime) else v
-    return {"v":v,"kind":table,"id":identity or row["id"],"state":state,"data":{k:norm(k,row[k]) for k in ROW_FIELDS_V1[table]}}
-def logical_fact(record):
-    kind,p=record["kind"],record["payload"]
-    if kind not in PROVENANCE_FIELDS_V1 or record["entity"]!=(p.get("id") if kind!="checkpoint.link" else digest({"checkpoint":p["checkpoint"],"edit":p["edit"]})): raise ValueError("invalid provenance fact")
-    return {"v":1,"kind":kind,"id":record["entity"],"state":"active","data":{k:(v.isoformat(timespec="microseconds") if isinstance(v,datetime.datetime) else v) for k in PROVENANCE_FIELDS_V1[kind] for v in [record["observed_at"] if k=="observed_at" else p[k]]}}
 def _priv(cls, value): return cls.from_private_bytes(unb64(value))
 def _pub(cls, value): return cls.from_public_bytes(unb64(value))
 def _raw(k): return b64(k.private_bytes_raw() if hasattr(k, "private_bytes_raw") else k.public_bytes_raw())
