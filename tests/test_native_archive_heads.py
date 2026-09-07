@@ -7,7 +7,7 @@ import duckdb
 import pytest
 
 from ai_convos import cli as core
-from ai_convos_remote.projection import attest_rows, audit_rows, row_replicas, signed_row
+from ai_convos_remote.projection import apply_row_replicas, attest_rows, audit_rows, row_replicas, signed_row
 from ai_convos_remote.protocol import digest, open_replica, row_proof
 from tests.test_native_provenance import people, scanned
 
@@ -137,10 +137,10 @@ def test_unchanged_ingestion_never_looks_up_proof_heads(tmp_path,monkeypatch):
     path,body,cfg,state,result,records=native_archive(tmp_path,monkeypatch)
     assert attest_rows(path,cfg,'w',records)>0
     guard=core.preserve_fact_heads
-    def unchanged(db,keys):
+    def unchanged(db,keys,**kwargs):
         keys=list(keys)
         assert not keys
-        return guard(db,keys)
+        return guard(db,keys,**kwargs)
     monkeypatch.setattr(core,'preserve_fact_heads',unchanged)
     assert core.commit_result(result,'test.native.unchanged')[:5]==(0,0,0,0,0)
 
@@ -183,3 +183,28 @@ def test_signed_chatgpt_timestamp_repair_preserves_original(tmp_path,monkeypatch
     assert before in [v['row'] for v in retained(path,cfg)]
     assert archive_row(scanned(path,state),'conversations')['data']['created_at'] is not None
     assert audit_rows(path,local_user=cfg['user'])['totals']['unavailable']==0
+
+
+def test_received_own_conflict_cannot_seed_a_local_observation(tmp_path,monkeypatch):
+    path,body,cfg,state,result,records=native_archive(tmp_path,monkeypatch); before=archive_row(records,'conversations')
+    assert attest_rows(path,cfg,'w',records)>0
+    with core.open_db(path,purpose='test.native.missing.bases') as db:
+        previous=db.execute("SELECT revision FROM remote.row_proofs WHERE row_kind='conversations'").fetchone()[0]
+        db.execute('DROP TABLE remote.local_row_bases'); core.init_schema(db)
+    received=before|{'data':before['data']|{'title':'received branch'}}; proof=row_proof(cfg['device'],cfg['user'],'w',1,received,previous)
+    for _ in range(2): apply_row_replicas(path,[dict(row=received,proof=proof)],'w',[cfg['controls']['w']],local_user=cfg['user'],local_device=cfg['device']['id'])
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT count(*) FROM remote.local_row_bases').fetchone()[0]==0
+        assert db.execute("SELECT title FROM conversations WHERE id='c'").fetchone()[0]==before['data']['title']
+    assert received in [v['row'] for v in retained(path,cfg)]
+
+
+def test_generic_native_replica_projection_cannot_establish_source_base(tmp_path,monkeypatch):
+    path,body,cfg,state,result,records=native_archive(tmp_path,monkeypatch); before=archive_row(records,'conversations')
+    assert attest_rows(path,cfg,'w',records)>0
+    changed=before|{'data':before['data']|{'title':'projected'}}; proof=row_proof(cfg['device'],cfg['user'],'w',1,changed)
+    with core.open_db(path,purpose='test.native.projection') as db,core._transaction(db):
+        db.execute('DELETE FROM remote.local_row_bases')
+        core.project_logical_row(db,changed,proof,digest(proof),native=True)
+        assert db.execute('SELECT count(*) FROM remote.local_row_bases').fetchone()[0]==0
+    assert before in [v['row'] for v in retained(path,cfg)]
