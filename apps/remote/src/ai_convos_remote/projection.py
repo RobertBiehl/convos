@@ -596,9 +596,9 @@ def _edit_retry_work(db):
     seed=db.execute("SELECT after_proof_id FROM remote.edit_ready WHERE dependency_key=''").fetchone()[0]
     if seed!='done':
         rows=db.execute("SELECT p.id,'' FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.row_kind='edit.observed' AND p.id>? ORDER BY p.id LIMIT 500",[seed]).fetchall()
-        return rows,[('',rows[-1][0] if len(rows)==500 else 'done')]
+        if rows: return rows,[('',rows[-1][0] if len(rows)==500 else 'done')]
     rows=db.execute("SELECT d.proof_id,r.dependency_key FROM remote.edit_ready r JOIN remote.edit_dependencies d ON d.dependency_key=r.dependency_key WHERE r.dependency_key<>'' AND d.proof_id>r.after_proof_id ORDER BY r.dependency_key,d.proof_id LIMIT 500").fetchall()
-    return rows,list({key:pid for pid,key in rows}.items())
+    return rows,([('','done')] if seed!='done' else [])+list({key:pid for pid,key in rows}.items())
 def retry_edit_replicas(db_path,local_user,local_device=None,root=None,progress=lambda stage:None):
     done=0
     while count:=apply_row_replicas(db_path,[],None,[],local_user=local_user,root=root,ready=False,local_device=local_device,retry=True):

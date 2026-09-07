@@ -99,6 +99,48 @@ print(json.dumps(sizes))
         assert db.execute('SELECT * FROM remote.edit_ready').fetchall()==[('','done')]
 
 
+@pytest.mark.parametrize('count',[500,1000])
+def test_exact_seed_page_drains_committed_wakeup_after_restart(tmp_path,monkeypatch,count):
+    user,control,rows,bodies,file,fact,signed=graph(); path=tmp_path/'db'
+    apply=lambda values:projection.apply_row_replicas(path,values,'w',[control],local_user='receiver')
+    apply(bodies[:-1]+[signed(dict(rows['file_edits'],id=f'e{i}')) for i in range(count-1)])
+    facts=[signed(fact(f'e{i}')) for i in range(count)]
+    apply(facts)
+    assert remaining(path)==count
+    with duckdb.connect(str(path)) as db,core._transaction(db):
+        core.project_edit_dependencies(db,advanced=[('','')])
+    for _ in range(count//500):
+        assert projection.apply_row_replicas(path,[],None,[],local_user='receiver',ready=False,retry=True)==500
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT after_proof_id FROM remote.edit_ready WHERE dependency_key=''").fetchone()==(max(digest(body['proof']) for body in facts),)
+    monkeypatch.setattr(projection,'_edit_retry_work',lambda db:(_ for _ in ()).throw(RuntimeError('interrupted after parent commit')))
+    with pytest.raises(RuntimeError,match='after parent commit'): apply([signed(file,True)])
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT id FROM provenance.files WHERE id=?',[file['id']]).fetchone()==(file['id'],)
+        assert db.execute("SELECT count(*) FROM remote.edit_ready WHERE dependency_key<>''").fetchone()[0]==1
+    code="""import json,sys
+from pathlib import Path
+import ai_convos_remote.projection as p
+sizes=[]
+real=p.project_logical_rows
+def project(db,items,**kw):
+ sizes.append(len(items))
+ return real(db,items,**kw)
+p.project_logical_rows=project
+p.retry_edit_replicas(Path(sys.argv[1]),'receiver')
+print(json.dumps(sizes))
+"""
+    child=subprocess.run([sys.executable,'-c',code,str(path)],capture_output=True,text=True,timeout=60)
+    assert child.returncode==0,child.stderr
+    assert json.loads(child.stdout)==[500]*(count//500)+[0]
+    assert remaining(path)==1
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT count(*) FROM provenance.file_edit_files').fetchone()[0]==count-1
+        assert db.execute('SELECT * FROM remote.edit_ready').fetchall()==[('','done')]
+        assert db.execute('SELECT DISTINCT proof_id FROM remote.edit_dependencies').fetchall()==[(digest(facts[-1]['proof']),)]
+        assert json.loads(db.execute('SELECT body FROM remote.row_conflicts WHERE proof_id=?',[digest(facts[-1]['proof'])]).fetchone()[0])==facts[-1]['row']
+
+
 def test_retry_projection_and_cursor_roll_back_together(tmp_path,monkeypatch):
     user,control,rows,bodies,file,fact,signed=graph(); path=tmp_path/'db'
     apply=lambda values:projection.apply_row_replicas(path,values,'w',[control],local_user='receiver')
