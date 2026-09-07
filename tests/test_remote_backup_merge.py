@@ -16,6 +16,11 @@ def variants():
     return people,control
 
 
+def capture_native(path,rows):
+    with duckdb.connect(str(path)) as db,core._transaction(db):
+        core.project_native_provenance(db,[dict(kind=row["kind"],entity=row["id"],payload={"id":row["id"],**row["data"]},observed_at=None) for row in rows])
+
+
 @pytest.mark.parametrize("same",[False,True])
 @pytest.mark.parametrize("native",["neither","donor","current"])
 def test_donor_repairs_typed_repository_variant_and_replay_is_idempotent(tmp_path,same,native):
@@ -25,6 +30,8 @@ def test_donor_repairs_typed_repository_variant_and_replay_is_idempotent(tmp_pat
     path,donor=tmp_path/"current.db",tmp_path/"donor.bak"
     with duckdb.connect(str(path)) as db: core.init_schema(db)
     shutil.copyfile(path,donor)
+    if native=="donor": capture_native(donor,rows[0])
+    if native=="current": capture_native(path,rows[1])
     apply_row_replicas(donor,bodies[0],"w",[control],local_user=people[0][0] if native=="donor" else "receiver")
     apply_row_replicas(path,bodies[1],"w",[control],local_user=people[1][0] if native=="current" else "receiver")
     before=hashlib.sha256(donor.read_bytes()).hexdigest()
@@ -54,6 +61,7 @@ def test_donor_restores_missing_native_repository_and_marker(tmp_path):
     with duckdb.connect(str(path)) as db: core.init_schema(db)
     shutil.copyfile(path,donor)
     body=dict(row=row,proof=row_proof(device,user,"w",1,row))
+    capture_native(donor,[row])
     apply_row_replicas(donor,[body],"w",[control],local_user=user)
     for _ in range(2):
         core.merge_archive_backup(path,donor,page=1)
