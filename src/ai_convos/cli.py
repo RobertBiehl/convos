@@ -350,6 +350,12 @@ def project_row_proofs(db,proofs,root_public,certificate):
     _insert_pages(db,"remote.row_proofs",[(pid,*(proof[k] for k in fields)) for pid,proof in zip(ids,proofs)],("id",*columns),mode=" OR IGNORE")
     return ids
 def project_row_proof(db,proof,root_public,certificate): return project_row_proofs(db,[proof],root_public,certificate)[0]
+def project_attested_rows(db,records,root_public,certificate):
+    proofs,pending=[proof for row,proof in records],set()
+    required(all((row["kind"],row["id"],row["v"],row["state"],provenance_digest(row))==(proof["row_kind"],proof["row_id"],proof["encoding_v"],proof["state"],proof["content_hash"]) for row,proof in records),ValueError("attestation snapshot/proof mismatch"))
+    items=[(row,proof,pid,True) for (row,proof),pid in zip(records,project_row_proofs(db,proofs,root_public,certificate))]
+    _retain_lossy_replicas(db,_protect_native_replicas(db,items,pending.add),pending.add)
+    return (_insert_pages(db,"remote.row_conflicts",[(pid,json.dumps(row,sort_keys=True,separators=(",",":"))) for row,proof,pid,native in items if pid in pending],mode=" OR IGNORE"),record_local_row_bases(db,proofs))[-1]
 def record_local_row_bases(db,proofs,seed=False):
     rows=db.execute("SELECT p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p WHERE p.id IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_conflicts c WHERE c.proof_id=p.id) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision))",[[provenance_digest(p) for p in proofs]]).fetchall() if seed else [(p["row_kind"],p["row_id"],p["author_user_id"],p["revision"]) for p in proofs]
     return _insert_pages(db,"remote.local_row_bases",rows,mode=" OR IGNORE" if seed else " OR REPLACE")
@@ -413,7 +419,7 @@ def _logical_archive(row,proof,proof_id,native=False,parent_map=None):
 def _protect_native_replicas(db,items,defer):
     refs={"conversation_id":"conversations","message_id":"messages","parent_id":"messages","turn":"messages","edit":"file_edits"}
     wanted={(row["kind"],row["id"]) for row,p,pid,native,*maps in items if native}|{(refs[key],value) for row,p,pid,native,*maps in items if native for key,value in (row["data"] or {}).items() if key in refs and value}
-    existing={table:_rows_by_id(db,table,[value for kind,value in wanted if kind==table]) for table in ARCHIVE_COLUMNS}
+    existing={table:{row[0]:row for row in db.execute(f"SELECT {','.join(ARCHIVE_COLUMNS[table])} FROM {table} WHERE id IN (SELECT UNNEST(?))",[ids]).fetchall()} if (ids:=[value for kind,value in wanted if kind==table]) else {} for table in ARCHIVE_COLUMNS}
     bindings={(kind,source):physical for kind,source,physical in db.execute("SELECT table_name,source_row_id,physical_row_id FROM remote.row_origins WHERE author_user_id IN (SELECT UNNEST(?)) AND source_row_id IN (SELECT UNNEST(?))",([p["author_user_id"] for row,p,pid,native,*maps in items if native],[value for kind,value in wanted])).fetchall() if source not in existing[kind]}
     paths=captured_edit_paths(db,list(existing["file_edits"]))
     selected=[]
@@ -424,7 +430,7 @@ def _protect_native_replicas(db,items,defer):
             selected.append(item)
             continue
         columns=[*ARCHIVE_COLUMNS[row["kind"]]]
-        raw=dict(zip(columns,old[:8]+old[9:] if row["kind"]=="messages" else old))
+        raw=dict(zip(columns,old))
         norm=lambda key,value:row["data"][key] if row["data"] and key in refs and value==bindings.get((refs[key],row["data"][key]),row["data"][key]) else json.loads(value) if key in ("metadata","input","output") and isinstance(value,str) else value.isoformat() if isinstance(value,datetime) else value
         data={key:norm(key,raw.get(key)) for key in (row["data"] or {})}
         if row["kind"]=="file_edits" and row["id"] in paths and row["data"] and row["data"]["file_path"]==paths[row["id"]]: data["file_path"]=paths[row["id"]]

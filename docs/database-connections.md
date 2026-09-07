@@ -50,7 +50,9 @@ the queue remains the durable input record.
 3. Ordinary canonical writes are bounded transactions and revalidate the archive generation
    or exact rows on which unlocked preparation depended. Remote publication may instead persist
    an immutable signed revision already captured at watermark `G`; it records only `G`, so later
-   archive changes remain pending for the next idempotent sync.
+   archive changes remain pending for the next idempotent sync. Attestation stores exact
+   scanned bodies that no longer match the current archive alongside their signatures in
+   the same transaction; a restart before sealing cannot lose them or replace newer input.
 4. Read snapshots are materialized and closed before expensive Python processing. A read
    lock is not harmless: DuckDB cannot admit a writer from another process while it is open.
 5. DuckDB's native cross-process lock is authoritative. After a real native conflict, Convos
