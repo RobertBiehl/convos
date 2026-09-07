@@ -24,6 +24,23 @@ def signed_edit_graph():
     proofs={kind:row_proof(device,user,"w",1,row) for kind,row in rows.items()}; bodies=[{"row":rows[k],"proof":proofs[k]} for k in rows]; evidence=lambda edit,tool,status="confirmed",reason="provider_success":{"v":1,"kind":"file-edit.evidence","id":"file-edit-evidence:"+core_module.provenance_digest("e"),"state":"active","data":{"edit":"e","edit_revision":edit,"status":status,"reason":reason,"tool_call":"t","tool_revision":tool}}
     return root,device,user,control,rows,proofs,bodies,evidence
 
+def test_personal_edit_body_is_independent_of_scan_batch(tmp_path):
+    _,core=source(tmp_path)
+    with core,connect(tmp_path/"state.db") as state:
+        edit=lambda changes:next(projection_module.signed_row(r) for r in scan(core,state,changes=changes) if r["kind"]=="file_edit.record")
+        assert edit(None)==edit({("file_edits","e")})==edit({("file_edits","e"),("edit.observed","e")})
+
+@pytest.mark.parametrize("timestamp",["2026-01-01 00:00:00","2026-01-01 00:00:00.123456"])
+def test_alias_page_matches_sealed_timestamp_encoding(tmp_path,timestamp):
+    archive,path,root,device,user,cfg,entry=_provider_alias_archive(tmp_path)
+    with duckdb.connect(str(path)) as db:
+        db.execute("UPDATE messages SET created_at=?",[timestamp])
+        with connect(tmp_path/"timestamp-state.db") as state: records=scan(db,state)
+    attest_rows(path,cfg,"personal",records)
+    with duckdb.connect(str(path),read_only=True) as db:
+        rows,_=projection_module._alias_page(db,user,{"a":"a","b":"b"},("",""))
+        assert len(rows)==3 and all(digest(row)==proof["content_hash"] for row,proof,*_ in rows)
+
 
 def test_personal_scan_strips_local_roots_and_projects_duckdb(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); records=scan(core,state); raw=json.dumps(records)
