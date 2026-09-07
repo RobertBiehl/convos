@@ -290,7 +290,7 @@ def test_core_upgrade_adds_origin_proof_link_without_losing_attribution(tmp_path
 
 
 def test_core_upgrade_backfills_proof_authorization_workspace(tmp_path):
-    db=graph(tmp_path/"graph.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); proof=row_proof(device,user,"origin",1,logical_row("messages",identity="m",state="deleted")); cert=certificate(root,user,device); project_row_proof(db,proof,root["sign_public"],cert); db.execute("ALTER TABLE remote.row_proofs DROP COLUMN authorization_workspace_id"); init_schema(db); project_row_proof(db,row_proof(device,user,"origin",1,logical_row("messages",identity="n",state="deleted")),root["sign_public"],cert); assert db.execute("SELECT workspace_id,authorization_workspace_id FROM remote.row_proofs ORDER BY source_row_id").fetchall()==[("origin","origin"),("origin","origin")]
+    db=graph(tmp_path/"graph.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); proof=row_proof(device,user,"origin",1,logical_row("messages",identity="m",state="deleted")); cert=certificate(root,user,device); project_row_proof(db,proof,root["sign_public"],cert); db.execute("DROP INDEX remote.row_proofs_source; ALTER TABLE remote.row_proofs DROP COLUMN authorization_workspace_id"); init_schema(db); project_row_proof(db,row_proof(device,user,"origin",1,logical_row("messages",identity="n",state="deleted")),root["sign_public"],cert); assert db.execute("SELECT workspace_id,authorization_workspace_id FROM remote.row_proofs ORDER BY source_row_id").fetchall()==[("origin","origin"),("origin","origin")]
 
 
 def test_core_upgrade_indexes_existing_retained_attachment_body(tmp_path):
