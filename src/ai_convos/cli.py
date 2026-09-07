@@ -577,6 +577,7 @@ def _migration_backup(conn,version=1):
     atomic_publish(backup,lambda tmp:(_backup_copy(path,tmp),required(_file_sha256(tmp)==source,ValueError("archive backup verification failed")),_check_archive(tmp)))
     return backup
 def merge_archive_backup(path,backup,page=500):
+    def restore(db,table,rows,columns=None): return (_insert_pages(db,table,rows,columns,mode=" OR IGNORE"),project_edit_dependencies(db,advanced=[('', '')]))[0]
     path,backup=Path(path).resolve(),Path(backup).resolve()
     required(path!=backup and backup.is_file(),ValueError("Repair donor must be a separate existing archive backup"))
     with contextlib.closing(open_db(backup,True,purpose="remote.repair.donor.read")) as donor:
@@ -602,7 +603,7 @@ def merge_archive_backup(path,backup,page=500):
                             claims=[(kind,entity,entity,"","active") for kind,entity in rows]
                             original,current=typed_logical_rows(donor,claims,"remote.row_references" in available),typed_logical_rows(db,claims,"remote.row_references" in targets)
                             rows=[row for row,claim in zip(rows,claims) if original[claim] is not None and current[claim]==original[claim]]
-                        _insert_pages(db,table,rows,columns,mode=" OR IGNORE")
+                        restore(db,table,rows,columns)
                         if missing: _archive_touch(db,[(kind,row_id) for row_id in missing])
                     restored+=len(rows)
                     archive_yield(path)
@@ -610,7 +611,7 @@ def merge_archive_backup(path,backup,page=500):
             reader=donor.execute("SELECT b.proof_id,b.body,p.content_hash FROM remote.row_bodies b JOIN remote.row_proofs p ON p.id=b.proof_id")
             while rows:=reader.fetchmany(page):
                 exact=[(pid,body) for pid,body,expected in rows if provenance_digest(json.loads(body))==expected]
-                with contextlib.closing(open_db(path,purpose="remote.repair.bodies")) as db,_transaction(db): _insert_pages(db,"remote.row_conflicts",exact,mode=" OR IGNORE")
+                with contextlib.closing(open_db(path,purpose="remote.repair.bodies")) as db,_transaction(db): restore(db,"remote.row_conflicts",exact)
                 archive_yield(path)
         if {"remote.row_proofs","remote.row_origins","remote.provenance_origins"}<=available:
             with contextlib.closing(donor.cursor()) as reader:
@@ -622,7 +623,7 @@ def merge_archive_backup(path,backup,page=500):
                     if exact:
                         with contextlib.closing(open_db(path,purpose="remote.repair.bodies")) as db,_transaction(db):
                             current,paths=typed_logical_rows(db,[claim for pid,expected,claim,row in exact],"remote.row_references" in targets),captured_edit_paths(db,[claim[1] for pid,expected,claim,row in exact if claim[0]=="file_edits"])
-                            _insert_pages(db,"remote.row_conflicts",[(pid,json.dumps(row,sort_keys=True,separators=(",",":"))) for pid,expected,claim,row in exact if matching_logical_row(current[claim],expected,[paths[claim[1]]] if paths.get(claim[1]) else ()) is None],mode=" OR IGNORE")
+                            restore(db,"remote.row_conflicts",[(pid,json.dumps(row,sort_keys=True,separators=(",",":"))) for pid,expected,claim,row in exact if matching_logical_row(current[claim],expected,[paths[claim[1]]] if paths.get(claim[1]) else ()) is None])
                     archive_yield(path)
         bundle=backup.with_name(backup.name+".attachments")
         for ref,body_hash,size,original in bodies:
