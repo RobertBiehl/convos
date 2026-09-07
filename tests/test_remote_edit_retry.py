@@ -145,6 +145,25 @@ def test_late_ancestor_body_is_kept_when_the_current_head_cannot_reconstruct(tmp
         assert json.loads(db.execute('SELECT body FROM remote.row_conflicts WHERE proof_id=?',[digest(original['proof'])]).fetchone()[0])==original['row']
 
 
+def test_core_body_retirement_is_exact_and_transactional():
+    revision=('conversations',"quoted'source",'author','head')
+    rows=[(f'p{i}',*value) for i,value in enumerate([revision,revision,('messages',*revision[1:]),(revision[0],'other',*revision[2:]),(*revision[:2],'other',revision[3]),(*revision[:3],'fork')])]
+    with duckdb.connect() as db:
+        core.init_schema(db)
+        core._insert_pages(db,'remote.row_proofs',rows,('id','row_kind','source_row_id','author_user_id','revision'))
+        core._insert_pages(db,'remote.row_conflicts',[(r[0],json.dumps({'id':r[0]})) for r in rows])
+        with pytest.raises(RuntimeError,match='rollback'):
+            with core._transaction(db):
+                core.retire_row_bodies(db,[revision,revision])
+                assert db.execute('SELECT proof_id FROM remote.row_conflicts ORDER BY proof_id').fetchall()==[(f'p{i}',) for i in range(2,6)]
+                raise RuntimeError('rollback')
+        assert db.execute('SELECT count(*) FROM remote.row_conflicts').fetchone()[0]==6
+        with core._transaction(db): core.retire_row_bodies(db,[revision])
+        core.retire_row_bodies(db,[])
+        with pytest.raises(ValueError): core.retire_row_bodies(db,[revision[:3]])
+        assert db.execute('SELECT proof_id FROM remote.row_conflicts ORDER BY proof_id').fetchall()==[(f'p{i}',) for i in range(2,6)]
+
+
 def test_settled_sync_resumes_ready_metadata_without_generation_change(tmp_path,monkeypatch):
     from tests.test_remote_client import server_connect, transport, write_archive
     server=server_connect(tmp_path/'server.db'); direct,calls=transport(server),[]

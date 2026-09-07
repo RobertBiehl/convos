@@ -445,6 +445,7 @@ def project_logical_rows(db,items,defer=False):
         _insert_pages(db,"remote.provenance_origins",[(item[0]["kind"],physical,item[1]["workspace"],item[1]["author_user_id"],item[0]["id"],item[2]) for item,physical in facts if item[0]["kind"] in PROVENANCE_KINDS],mode=" OR REPLACE")
         if defer: _retain_lossy_replicas(db,items,defer)
     return (out and _archive_touch(db,out),out)[-1]
+def retire_row_bodies(db,revisions): return db.execute("DELETE FROM remote.row_conflicts c USING remote.row_proofs p,(SELECT x.* FROM UNNEST(from_json(?,?)) t(x)) r WHERE c.proof_id=p.id AND (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(r.kind,r.source,r.author,r.revision)",(json.dumps([dict(kind=kind,source=source,author=author,revision=revision) for kind,source,author,revision in revisions],separators=(",",":")),'[{"kind":"VARCHAR","source":"VARCHAR","author":"VARCHAR","revision":"VARCHAR"}]'))
 def project_edit_dependencies(db,waiting=(),arrived=(),processed=(),advanced=()):
     clean={key for key,pid in waiting}|{key for key,pid in advanced}|{r[0] for r in db.execute("SELECT dependency_key FROM remote.edit_dependencies WHERE proof_id IN (SELECT UNNEST(?))",[list(processed)]).fetchall()} if waiting or processed or advanced else set()
     if processed: db.execute("DELETE FROM remote.edit_dependencies WHERE proof_id IN (SELECT UNNEST(?))",[list(processed)])

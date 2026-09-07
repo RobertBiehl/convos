@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, set_attachment_path, typed_logical_rows
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
@@ -660,8 +660,7 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
                     while revision in chains[scope]:
                         retired.append((*scope,revision))
                         revision=chains[scope][revision][2]["previous_revision"]
-                temp_rows(db,"resolved_revisions",(*columns[1:4],"revision"),retired)
-                db.execute("DELETE FROM remote.row_conflicts c USING remote.row_proofs p,resolved_revisions r WHERE c.proof_id=p.id AND (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(r.kind,r.row_id,r.author,r.revision)")
+                retire_row_bodies(db,retired)
             dependency=lambda kind,entity,author:digest([kind,author if kind=='file_edits' else None,entity])
             waiting=[(dependency(kind,entity,p['author_user_id']),pid) for row,p,pid,native in projected if pid in pending and row['kind']=='edit.observed' for kind,entity in (('file_edits',row['id']),('file.observed',row['data']['file']))]
             again=project_edit_dependencies(db,waiting,[dependency(row['kind'],row['id'],p['author_user_id']) for row,p,pid,native in projected if pid not in pending and row['kind'] in ('file_edits','file.observed')],[pid for pid,key in work]+[digest(p) for row,p,signer_,lineage in items if row['kind']=='edit.observed'],advanced)
