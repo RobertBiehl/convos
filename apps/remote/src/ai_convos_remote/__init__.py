@@ -667,6 +667,7 @@ def upload(cfg,state,root=None,workspaces=None,concurrent=False,server=None):
 def reconcile_replicas(cfg,state,root,ws,envelopes,semantic=False):
     stage_replicas(root,envelopes,semantic)
     upload_replicas(cfg,state,root,{ws})
+def local_receipts(state,kind,ws,candidates): return {tuple(r) for r in state.execute(f"SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?) WHERE EXISTS (SELECT 1 FROM {kind}_receipts r WHERE r.workspace=? AND r.{kind}=json_extract(value,'$[0]') AND r.epoch=json_extract(value,'$[1]'))",(json.dumps(candidates),ws))} if candidates else set()
 def replica_inventory(cfg,state,ws,candidates):
     found,limit={},min(2500,max(1,cfg.get("server_state",{}).get("capabilities",{}).get("replica_reconcile_limit",500)))
     for rows in (candidates[i:i+limit] for i in range(0,len(candidates),limit)):
@@ -741,25 +742,25 @@ def pull_origins(cfg,state,root,ws):
 def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
     sid,stamp=ws["id"],bridge_stamp(root)
     saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]
-    reset=fresh or saved!=stamp
-    after=0 if reset else int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0])
+    repair=fresh or saved!=stamp or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{sid}",)).fetchone())
+    after=0 if repair else int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0])
     dependencies={r[0] for r in state.execute("SELECT origin FROM control_dependencies WHERE workspace=?",(sid,)).fetchall()}
     controls=ws["controls"]+stored_controls(core_path(root),set(origins)|dependencies)
-    known=set() if reset else {(r[0],r[1]) for r in state.execute("SELECT replica,epoch FROM replica_receipts WHERE workspace=?",(sid,)).fetchall()}
-    repair=reset or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{sid}",)).fetchone())
-    if repair: known,after=set(),0
-    cursor,total,valid,invalid=after,0,set(known),{}
+    cursor,total,known,valid,invalid=after,0,set(),set(),{}
     while True:
         result=request(cfg,{"op":"replica_pull","workspace":sid,"after":cursor,"limit":min(2500,max(1,cfg.get("server_state",{}).get("capabilities",{}).get("replica_pull_limit",500))),"semantic":True})
         floor,tail=result["floor"],result["tail"]
         if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail: raise ValueError("relay replica cursor window is invalid")
         if cursor>tail:
             cursor=after=0
-            known,valid,invalid=set(),set(),{}
+            known,valid,invalid,repair=set(),set(),{},True
             state.execute("DELETE FROM meta WHERE key=?",(f"replica_cursor:{sid}",))
             state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_repair:{sid}","1"))
             state.commit()
             continue
+        found=local_receipts(state,"replica",sid,[(item["envelope"]["replica"],item["envelope"]["epoch"]) for item in result["replicas"]]) if not repair else set()
+        known.update(found)
+        valid.update(found)
         opened,received=[],[]
         for item in result["replicas"]:
             env=item["envelope"]
@@ -1041,10 +1042,9 @@ def sync_once(root=None,repair=False,manual=False):
                     retained=full
                     sum((count:=attest_rows(path,cfg,ws,records[i:i+REPLICA_DB_PAGE],origins),_progress(f"attesting rows {min(i+REPLICA_DB_PAGE,len(records))}/{len(records)}"),count)[-1] for i in range(0,len(records),REPLICA_DB_PAGE))
                     keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}
-                    known_replicas={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
                     upload_blocked=[]
-                    inventory=(lambda ids:replica_inventory(cfg,state,ws,ids)) if verify else None
-                    prepared=[pair for i in range(0,max(len(records),1),REPLICA_DB_PAGE) for envelopes in [(row_replicas(path,cfg,ws,records[i:i+REPLICA_DB_PAGE],keys,known_replicas,origins,bindings,inventory,False,upload_blocked),_progress(f"preparing rows {min(i+REPLICA_DB_PAGE,len(records))}/{len(records)}"))[0]] for pair in prepare_replicas(root,envelopes)]+[pair for page in (retained_proof_pages(path,ws,origins,cfg["user"],REPLICA_DB_PAGE) if retained else ()) for envelopes in [(row_replicas(path,cfg,ws,[],keys,known_replicas,origins,bindings,inventory,page,upload_blocked),_progress("preparing retained rows"))[0]] for pair in prepare_replicas(root,envelopes)]
+                    inventory=lambda ids:replica_inventory(cfg,state,ws,ids) if verify else {rid for rid,epoch in local_receipts(state,"replica",ws,ids)}
+                    prepared=[pair for i in range(0,max(len(records),1),REPLICA_DB_PAGE) for envelopes in [(row_replicas(path,cfg,ws,records[i:i+REPLICA_DB_PAGE],keys,(),origins,bindings,inventory,False,upload_blocked),_progress(f"preparing rows {min(i+REPLICA_DB_PAGE,len(records))}/{len(records)}"))[0]] for pair in prepare_replicas(root,envelopes)]+[pair for page in (retained_proof_pages(path,ws,origins,cfg["user"],REPLICA_DB_PAGE) if retained else ()) for envelopes in [(row_replicas(path,cfg,ws,[],keys,(),origins,bindings,inventory,page,upload_blocked),_progress("preparing retained rows"))[0]] for pair in prepare_replicas(root,envelopes)]
                     try:
                         with local_lock(root,"mutation",True):
                             current=load(root)
@@ -1063,13 +1063,11 @@ def sync_once(root=None,repair=False,manual=False):
                     upload_replicas(cfg,state,root,{ws},{final for tmp,final in prepared} if full else ())
                     state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_upload_blocked:{ws}",json.dumps(sorted(set(upload_blocked))))) if upload_blocked else state.execute("DELETE FROM meta WHERE key=?",(f"replica_upload_blocked:{ws}",))
                     if upload_blocked: typer.echo(f"Remote upload skipped {len(set(upload_blocked))} received row(s) whose local projection does not match the author's proof; run `convos remote repull` to restore them.",err=True)
-                    known_blobs={r[0] for r in state.execute("SELECT blob FROM blob_receipts WHERE workspace=? UNION SELECT blob FROM blob_outbox WHERE workspace=?",(ws,ws)).fetchall()}
-                    reconcile_blobs(cfg,state,root,ws,blob_replicas(path,cfg,ws,records,keys,known_blobs,origins,bindings,repair))
+                    reconcile_blobs(cfg,state,root,ws,blob_replicas(path,cfg,ws,records,keys,(),origins,bindings,repair))
             for ws,meta in cfg["workspaces"].items():
                 if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]:
-                    known={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}
                     repair=bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone())
-                    reconcile_replicas(cfg,state,root,ws,bridge_replicas(root,cfg,ws,meta["kind"],key(cfg,ws,meta["epoch"]),known,lambda ids:replica_inventory(cfg,state,ws,ids) if repair else set(known),ws in deltas,deltas.get(ws)),True)
+                    reconcile_replicas(cfg,state,root,ws,bridge_replicas(root,cfg,ws,meta["kind"],key(cfg,ws,meta["epoch"]),(),lambda ids:replica_inventory(cfg,state,ws,ids) if repair else {rid for rid,epoch in local_receipts(state,"replica",ws,ids)},ws in deltas,deltas.get(ws)),True)
                     if ws in deltas: (state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation))),state.commit())
             for ws in ready&active: state.execute("DELETE FROM meta WHERE key=?",(f"replica_repair:{ws}",))
             state.commit()

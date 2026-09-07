@@ -60,6 +60,36 @@ def test_replica_inventory_uses_server_limit_and_legacy_default(tmp_path,monkeyp
     assert len(remote_client.replica_inventory({"server_state":{"capabilities":{"replica_reconcile_limit":2500}}},state,"w",candidates))==5001 and calls==[2500,2500,1]
     calls.clear(); assert len(remote_client.replica_inventory({},state,"w",candidates[:1001]))==1001 and calls==[500,500,1]; state.close()
 
+
+def test_local_receipt_lookup_is_scoped_to_requested_keys_and_epochs(tmp_path):
+    state=connect(tmp_path/"state.db"); state.executemany("INSERT INTO replica_receipts VALUES (?,?,?,?)",[("w",f"{i:064x}",1,i+1) for i in range(20000)]+[("w","epoch",2,20001),("other","elsewhere",1,1)])
+    steps=[]; state.set_progress_handler(lambda:steps.append(1) or 0,1)
+    assert remote_client.local_receipts(state,"replica","w",[(f"{i:064x}",1) for i in (1,19999)]+[("epoch",1),("elsewhere",1)])=={(f"{i:064x}",1) for i in (1,19999)}
+    assert len(steps)<1000, "receipt membership scanned the archive instead of requested keys"
+    state.close()
+
+
+def test_empty_row_pull_does_not_inventory_existing_receipts(tmp_path,monkeypatch):
+    state=connect(tmp_path/"state.db"); state.executemany("INSERT INTO replica_receipts VALUES (?,?,?,?)",[("w",f"{i:064x}",1,i+1) for i in range(20000)]); state.execute("INSERT INTO meta VALUES ('replica_projection:w','stamp')"); state.commit()
+    monkeypatch.setattr(remote_client,"bridge_stamp",lambda root:"stamp"); monkeypatch.setattr(remote_client,"request",lambda *args:{"replicas":[],"floor":0,"tail":0})
+    steps=[]; state.set_progress_handler(lambda:steps.append(1) or 0,1)
+    assert remote_client.pull_row_replicas({"device":{"id":"device"},"user":"user"},state,tmp_path,{"id":"w","controls":[]})==0
+    assert len(steps)<1000, "empty pull read an archive-sized receipt inventory"
+    state.close()
+
+
+def test_row_cursor_rollback_revalidates_receipted_bodies(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr(remote_client,"request",transport(server)); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
+    root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); sid=workspace(cfg,"Personal"); write_archive(root/"data/convos.db","restore me"); sync_once(root)
+    with duckdb.connect(str(root/"data/convos.db")) as core: core.execute("DELETE FROM conversations")
+    cfg=load(root); ws=next(w for w in refresh(cfg,root)["workspaces"] if w["id"]==sid)
+    with connect(root/"remote/state.db") as state:
+        assert state.execute("SELECT COUNT(*) FROM replica_receipts WHERE workspace=?",[sid]).fetchone()[0]>0
+        state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_cursor:{sid}","999999")); state.commit()
+        assert remote_client.pull_row_replicas(cfg,state,root,ws)>0
+    with duckdb.connect(str(root/"data/convos.db"),read_only=True) as core: assert core.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==("restore me",)
+
+
 def test_first_publication_does_not_reconcile_each_preparation_page(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); direct=transport(server); calls=[]
     monkeypatch.setattr("ai_convos_remote.request",lambda cfg,body,auth=True:calls.append(body["op"]) or direct(cfg,body,auth)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","first publication"); orphan=root/"remote/outbox/.replica-batch-orphan.json.1.1"; orphan.write_text("ignored staging data"); calls.clear(); sync_once(root)
