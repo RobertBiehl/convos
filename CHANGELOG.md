@@ -2,11 +2,13 @@
 
 ## 0.11.6b7
 
-- Preserve exact signed repository variants and joined edit facts across native
-  capture, foreign projection, edit reparenting, deletion, and backup recovery.
+- Preserve exact signed archive rows, repository variants, and joined edit facts
+  across native capture, attachment indexing, foreign projection, reparenting,
+  deletion, timestamp repair, and backup recovery.
   Receiving a replica no longer establishes independent local provenance.
   Attestation retains a scanned snapshot atomically if source capture changes
-  its typed row before the signature is stored.
+  its typed row before the signature is stored, and retires the direct
+  predecessor body only after its replacement is durable.
 - Keep durable reverse references when a child arrives before its parent; audit
   and retained publication share core's released logical-row encoders.
 - Resume missing edit dependencies in bounded, durable pages after restart,

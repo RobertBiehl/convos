@@ -20,9 +20,16 @@ operations only.
 | One-message team selection with 100,000 conversation scopes | 7.57 s | 0.006 s |
 | Settled receipt membership with 1,000,000 entries | 0.61 s | 0.00002 s |
 | New edit capture, 30 alternating samples | 219.84 ms | 186.05 ms |
+| Signed hook capture, 40 alternating samples | 89.36 ms | 76.23 ms |
 | First attestation, 501 rows with 4 KiB bodies, eight alternating samples | 252.64 ms | 206.45 ms |
 | Two-key preservation lookup in 548,389 proof headers | 31-44 ms | 6.35 ms |
 | Insert 500 proof headers, without/with the source index | 4.28 ms | 4.34 ms |
+
+The signed-hook comparison includes preservation of the preceding signed body.
+Unchanged ingestion has a regression check proving that it performs no proof
+head lookup. An updated native row keeps its current signed body recoverable
+until a durable replacement attestation permits that predecessor body to retire;
+independent revision branches remain preserved.
 
 The preservation comparison isolates the new guard before and after query
 optimization, rather than comparing a missing safety check with a complete one.
