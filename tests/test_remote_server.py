@@ -1,9 +1,9 @@
-import copy, json, sqlite3, threading, tracemalloc
+import copy, json, sqlite3, threading, time, tracemalloc
 from contextlib import closing
 
 import pytest
 import ai_convos_remote_server as server_module
-from ai_convos_remote.control import CONTROL_V, record, sign, state_hash
+from ai_convos_remote.control import CONTROL_V, proposal, record, sign, state_hash, verify_state, vote
 from ai_convos_remote.protocol import certificate, digest, event, identity, logical_row, open_blob, registration_proof, row_proof, seal_blob, seal_event, seal_key, seal_replica, sign_control
 from ai_convos_remote_server import action, bounded, connect, ledger_state
 
@@ -79,6 +79,61 @@ def test_response_byte_bound_stops_before_materializing_rest():
     def values():
         for value in ("aaa","bbb","should-not-be-read"): seen.append(value); yield value
     assert bounded(values(),len,5)==["aaa"] and seen==["aaa","bbb"]
+
+
+@pytest.mark.parametrize('approval',['self_approve','quorum_approve','personal_recover'])
+def test_device_approval_preserves_existing_authorization_records(tmp_path,approval):
+    with closing(connect(tmp_path/'server.db')) as db:
+        alice,bob,carol=account(db,'alice'),account(db,'bob'),account(db,'carol')
+        base=create_ws(db,alice,'w',bytes(32),'personal' if approval=='personal_recover' else 'team')
+        if approval!='personal_recover': base=rotate_ws(db,alice,base,bytes([1])*32,((alice,'admin'),(bob,'member'),(carol,'member')))
+        def advance(actor,action,devices,removed=None,approval=None):
+            return sign(actor['device'],{'v':1,'kind':'workspace.state','workspace':'w','scope':base['scope'],'revision':base['revision']+1,'prev':state_hash(base),'epoch':base['epoch']+1,'boundary':{'epoch':base['epoch']+1,**ledger_state(db,'w')},'key_commitment':digest(bytes([2])*32),'members':base['members'],'devices':devices,'removed':base['removed'] if removed is None else removed,'action':action,'approval':approval,'approved_at':time.time()})
+        def rotate_request(actor,state,history=None):
+            envelopes={key:seal_key(bytes([2])*32,entry['device']['box_public'],f'workspace:w:epoch:{state["epoch"]}') for key,entry in state['devices'].items()}
+            return sign_control(actor['device'],{'op':'rotate','workspace':'w','control':state,'envelopes':envelopes,'history_envelopes':history or {}})
+        if approval=='quorum_approve':
+            removal=advance(alice,'remove',{key:value for key,value in base['devices'].items() if key!=bob['device']['id']},[bob['device']['id']])
+            action(db,rotate_request(alice,removal),alice['token']); base=removal
+        owner=alice if approval=='personal_recover' else bob
+        target=identity('second-device'); registered=register_device(db,owner['user'],owner['root'],target)
+        entry=record(owner['user'],owner['root']['sign_public'],target,certificate(owner['root'],owner['user'],target),False)
+        request=proposal(target,'w',base,entry,time.time()+60)
+        if approval!='personal_recover': action(db,{'op':'propose','proposal':request},registered['token'])
+        author=carol if approval=='quorum_approve' else bob if approval=='self_approve' else {'device':target,'token':registered['token']}
+        votes=[vote(person['device'],person['user'],request) for person in (alice,carol)] if approval=='quorum_approve' else []
+        devices={**base['devices'],target['id']:{**entry,'history':approval!='quorum_approve'}}
+        clean=advance(author,approval,devices,approval={'proposal':request,'votes':votes})
+        history={target['id']:{str(epoch):seal_key(bytes([1])*32,target['box_public'],f'workspace:w:epoch:{epoch}') for epoch in range(base['members'][owner['user']]['history_from'],clean['epoch'])}} if approval=='self_approve' else {}
+        changed=copy.deepcopy(devices); changed[alice['device']['id']]['history']=False
+        corrupted=advance(author,approval,changed,approval={'proposal':request,'votes':votes})
+        with pytest.raises(ValueError,match='preserve existing devices'): verify_state(corrupted,base)
+        with pytest.raises(ValueError,match='preserve existing devices'): action(db,rotate_request(author,corrupted,history),author['token'])
+        assert action(db,{'op':'state'},alice['token'])['workspaces'][0]['controls'][-1]==base
+        assert verify_state(clean,base)==clean
+        action(db,rotate_request(author,clean,history),author['token'])
+        stored=action(db,{'op':'state'},alice['token'])['workspaces'][0]['controls'][-1]
+        assert stored==clean and all(stored['devices'][key]==value for key,value in base['devices'].items())
+
+
+def test_device_removal_cannot_approve_a_replacement(tmp_path):
+    with closing(connect(tmp_path/'server.db')) as db:
+        alice,bob=account(db,'alice'),account(db,'bob')
+        base=create_ws(db,alice,'w',bytes(32),'team'); base=rotate_ws(db,alice,base,bytes([1])*32,((alice,'admin'),(bob,'member')))
+        target=identity('unapproved-bob'); register_device(db,'bob',bob['root'],target)
+        entry=record(bob['user'],bob['root']['sign_public'],target,certificate(bob['root'],bob['user'],target))
+        def removal(devices):
+            return sign(alice['device'],{'v':1,'kind':'workspace.state','workspace':'w','scope':'team','revision':base['revision']+1,'prev':state_hash(base),'epoch':base['epoch']+1,'boundary':{'epoch':base['epoch']+1,**ledger_state(db,'w')},'key_commitment':digest(bytes([2])*32),'members':base['members'],'devices':devices,'removed':[bob['device']['id']],'action':'remove','approval':None,'approved_at':time.time()})
+        def request(state):
+            envelopes={key:seal_key(bytes([2])*32,value['device']['box_public'],f'workspace:w:epoch:{state["epoch"]}') for key,value in state['devices'].items()}
+            return sign_control(alice['device'],{'op':'rotate','workspace':'w','control':state,'envelopes':envelopes})
+        kept={alice['device']['id']:base['devices'][alice['device']['id']]}; corrupted=removal(kept|{target['id']:entry})
+        with pytest.raises(ValueError,match='invalid device removal'): verify_state(corrupted,base)
+        with pytest.raises(ValueError,match='invalid device removal'): action(db,request(corrupted),alice['token'])
+        assert action(db,{'op':'state'},alice['token'])['workspaces'][0]['controls'][-1]==base
+        clean=removal(kept); assert verify_state(clean,base)==clean
+        action(db,request(clean),alice['token'])
+        assert action(db,{'op':'state'},alice['token'])['workspaces'][0]['controls'][-1]==clean
 
 
 def test_blob_replica_is_raw_bounded_repairable_and_history_scoped(tmp_path,monkeypatch):

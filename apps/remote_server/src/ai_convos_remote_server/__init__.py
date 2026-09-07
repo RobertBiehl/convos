@@ -160,7 +160,7 @@ def verify_control(db,actor,value,previous=None):
         if abs(float(value["approved_at"])-now)>CLOCK_SKEW: raise ValueError("approval clock mismatch")
         if value["members"]!=previous["members"] or value["removed"]!=previous["removed"] or value["epoch"]!=previous["epoch"]+1: raise ValueError("approval changed workspace policy")
         added=set(value["devices"])-set(previous["devices"])
-        if len(added)!=1 or set(previous["devices"])-set(value["devices"]): raise ValueError("approval must add exactly one device")
+        if len(added)!=1 or any(value["devices"].get(d)!=r for d,r in previous["devices"].items()): raise ValueError("approval must add exactly one device and preserve existing devices")
         target=value["approval"]["proposal"]["target"]
         device=next(iter(added))
         if device!=target["device"]["id"] or {k:v for k,v in value["devices"][device].items() if k!="history"}!={k:v for k,v in target.items() if k!="history"} or device in previous["removed"]: raise ValueError("approval target mismatch")
@@ -183,7 +183,7 @@ def verify_control(db,actor,value,previous=None):
         verify_window(db,value["approval"]["proposal"],now)
     elif action=="remove":
         removed=set(previous["devices"])-set(value["devices"])
-        if value["members"]!=previous["members"] or value["epoch"]!=previous["epoch"]+1 or not removed or not removed<=set(value["removed"]) or not set(previous["removed"])<=set(value["removed"]) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if d not in removed): raise ValueError("invalid device removal")
+        if value["members"]!=previous["members"] or value["epoch"]!=previous["epoch"]+1 or set(value["devices"])-set(previous["devices"]) or not removed or not removed<=set(value["removed"]) or not set(previous["removed"])<=set(value["removed"]) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if d not in removed): raise ValueError("invalid device removal")
     elif action=="membership":
         added_users=set(value["members"])-set(previous["members"])
         removed_users=set(previous["members"])-set(value["members"])
