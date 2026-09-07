@@ -111,7 +111,7 @@ def test_sql_conversion_cannot_discard_the_exact_verified_body(tmp_path):
     apply_row_replicas(path,[bodies[0],dict(row=row,proof=proof)],"w",[control],local_user="other")
     with duckdb.connect(str(path),read_only=True) as db: assert json.loads(db.execute("SELECT body FROM remote.row_conflicts WHERE proof_id=?",[digest(proof)]).fetchone()[0])==row
     audit=audit_rows(path,local_user="other"); assert audit["totals"]["unavailable"]==0 and audit["totals"]["retained_variants"]==1
-    keys={1:b64(os.urandom(32))}; replicas=row_replicas(path,dict(user="other",device=device),"w",[],keys)
+    keys={1:os.urandom(32)}; replicas=row_replicas(path,dict(user="other",device=device),"w",[],keys)
     assert row in [open_replica(env,keys[1])["row"] for env in replicas]
 
 @pytest.mark.parametrize("timestamp",["2026-01-01 00:00:00","2026-01-01 00:00:00.123456"])
