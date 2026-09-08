@@ -446,6 +446,73 @@ encrypted active replica. Treat relay-backup retention as part of the deletion
 policy; restoring such a backup without a surviving tombstone can make that
 historical object current again.
 
+### Binary storage migration and replica compression
+
+The relay stores encrypted event, row, semantic, and origin payloads as SQLite
+`BLOB` values, with small JSON headers kept separately. Attachment ciphertext
+already uses binary storage. HTTP envelopes still use base64url, so moving to
+binary storage preserves the exact envelopes that existing clients receive.
+Quota accounting charges the stored header and ciphertext bytes; transfer limits
+continue to account for the larger HTTP representation.
+
+Storage schema 1 must be migrated before starting this server version. Create a
+verified, compacted copy with:
+
+```bash
+convos-server migrate --db /path/to/server.db --output /path/to/server.binary.db
+```
+
+The output path must be new. The command opens the source read-only, takes a
+consistent SQLite snapshot, converts payloads in bounded batches, verifies every
+reconstructed envelope against its retained wire digest, rebuilds storage usage,
+and compacts the copy. It preserves ledger cursors, replica identities, authority
+records, timestamps, and signatures. Only a complete copy that passes SQLite
+integrity checks is published, with private permissions and durable file and
+directory synchronization. A failed migration preserves the original database.
+
+A copy made while the relay runs is suitable for validation. For the final
+cutover, stop the relay, run the migration again to a fresh output path, configure
+the service to use that output, and restart it. This prevents writes after the
+snapshot from being left behind. Keep the original database as a recovery copy;
+after new writes, switching back to an older snapshot is not a lossless rollback.
+
+New clients read both legacy uncompressed replicas and compressed replicas.
+Compression is disabled for uploads until selected for a workspace on a device:
+
+```bash
+convos remote compression personal --codec zstd
+convos remote compression personal --codec zstd --migrate
+```
+
+Upgrade every receiving client in that workspace before enabling compression.
+The relay advertises its supported codecs, but it cannot translate an encrypted
+compressed replica for an old client. Client upgrade readiness is an operational
+requirement; the relay does not currently enforce a workspace minimum version.
+
+Zstd level 1 is used without external dictionaries, independently for each
+replica. Incompressible records retain the uncompressed representation. Envelope
+version 2 carries `compression: "zstd"` and `plaintext_size`; these fields are
+authenticated by AES-GCM along with the rest of the header. The signed logical
+row format remains version 1. Compression level is an encoder choice and is not
+needed to decode a frame. Future codecs require explicit reader support.
+
+`--migrate` reads this device's retained row and semantic replicas, checks their
+authenticated plaintext, and verifies exact decompression before uploading a
+smaller representation. The replacement names the expected old wire digest and
+is atomic: a concurrent change cannot be overwritten. The original uploader,
+workspace, key epoch, logical identity, signed bytes, and ledger cursor remain
+unchanged. Another device's retained copy is not replaced. An acknowledgment
+loss is safe to retry; a content-free local cursor resumes completed pages.
+Use `--restart` with `--migrate` to rescan the device's earlier retained copies.
+Selecting `--codec none` affects future uploads and leaves retained compressed
+replicas readable by upgraded clients.
+
+Both relay and client bound pages by expanded payload size as well as transfer
+size. Clients authenticate before decompressing, limit frame size and window
+memory, and reject unknown codecs, truncated or concatenated frames, trailing
+data, and size mismatches. Compression does not alter event history, workspace
+controls, or attachment encodings.
+
 If the relay itself is lost, a surviving device can establish fresh relay
 credentials without changing its signing identity, then explicitly re-found a
 team from the copies held by the members it still trusts:

@@ -8,7 +8,7 @@ from pathlib import Path
 from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows
 from .control import verify_state
 from .migrations import migrate_state
-from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
+from .protocol import digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
 STATE_VERSION="4"
 STATE = """
@@ -206,7 +206,7 @@ def bridge_replicas(root,cfg,workspace,kind,key_,known=(),inventory=None,archive
     bridge_accept_many(root,fresh,False)
     values=[(value,fingerprint(key_,digest(value["proof"]))) for value in values if value["proof"]]
     present=set(inventory([(replica,cfg["workspaces"][workspace]["epoch"]) for value,replica in values])) if inventory else set(known)
-    return [seal_replica(value["row"],value["proof"],workspace,cfg["workspaces"][workspace]["epoch"],key_,cfg["device"]["id"]) for value,replica in values if replica not in present]
+    return [seal_replica(value["row"],value["proof"],workspace,cfg["workspaces"][workspace]["epoch"],key_,cfg["device"]["id"],compression=replica_compression(cfg,workspace)) for value,replica in values if replica not in present]
 def clean(v):
     if isinstance(v,datetime): return v.isoformat()
     if isinstance(v,date): return v.isoformat()
@@ -451,7 +451,7 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
             if content_hash is None and digest(row)!=p["content_hash"]:
                 if blocked is not None: return blocked.append((p["row_kind"],p["row_id"]))
                 raise ValueError(f"typed projection differs from author proof: {p['row_kind']}:{p['row_id']}")
-            return seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"],content_hash,lineage(p) if p["kind"]=="row.proof" else ())
+            return seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"],content_hash,lineage(p) if p["kind"]=="row.proof" else (),replica_compression(cfg,workspace))
         return [env for row,p,content_hash,epoch,replica in candidates if (env:=seal(row,p,content_hash,epoch))]
     finally: db and db.close()
 def _proof(values):

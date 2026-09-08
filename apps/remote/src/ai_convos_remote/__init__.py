@@ -13,7 +13,7 @@ from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backu
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .projection import PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, retry_edit_replicas, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
-                       recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
+                       recovery_bundle, registration_proof, repack_replica, replica_compression, replica_plain_size, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
 def cli_error(message): raise typer.Exit(typer.echo(f"Error: {message}",err=True) or 1)
 
@@ -254,7 +254,7 @@ def request(cfg,body,auth=True):
     headers={"Content-Type":"application/json"}
     if auth: headers["Authorization"]="Bearer "+cfg["token"]
     req=urllib.request.Request(cfg["url"].rstrip("/")+"/v1",data=json.dumps(body,separators=(",",":")).encode(),headers=headers,method="POST")
-    try: return _response_json(_HTTP.open(req,timeout=(timeout:=120 if body["op"] in {"upload_many","replica_upload_many","blob_upload","origin_upload"} else 30)),None if body["op"]=="origin_pull" else 64*1024**2)
+    try: return _response_json(_HTTP.open(req,timeout=(timeout:=120 if body["op"] in {"upload_many","replica_upload_many","replica_replace_many","blob_upload","origin_upload"} else 30)),None if body["op"]=="origin_pull" else 64*1024**2)
     except urllib.error.HTTPError as e:
         try: message=_response_json(e,64*1024).get("error",e.reason)
         except ValueError: message=e.reason
@@ -751,6 +751,7 @@ def pull_origins(cfg,state,root,ws):
             with __import__("contextlib").suppress(Exception): state.rollback()
             raise
     return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
+def replica_page(items,count=2500): return required(isinstance(items,list) and len(items)<=count and sum(replica_plain_size(item["envelope"]) for item in items)<=REPLICA_ITEM_BYTES,ValueError("replica page exceeds decompression limits")) and items
 def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
     sid,stamp=ws["id"],bridge_stamp(root)
     saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]
@@ -761,6 +762,7 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
     cursor,total,known,valid,invalid=after,0,set(),set(),{}
     while True:
         result=request(cfg,{"op":"replica_pull","workspace":sid,"after":cursor,"limit":min(2500,max(1,cfg.get("server_state",{}).get("capabilities",{}).get("replica_pull_limit",500))),"semantic":True})
+        replica_page(result["replicas"])
         floor,tail=result["floor"],result["tail"]
         if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail: raise ValueError("relay replica cursor window is invalid")
         if cursor>tail:
@@ -1314,6 +1316,50 @@ def config_cmd(space:str,auto_contribute:Optional[bool]=typer.Option(None,"--aut
         if inherit and auto_contribute is not None: raise typer.BadParameter("cannot combine with auto-contribute override","--inherit")
         result=configure_sharing(cfg,state,ws,None if inherit else auto_contribute if auto_contribute is not None else current["auto_contribute"],[m for m in ("cwd","edit") if m in requested]) if inherit or auto_contribute is not None or match is not None else current
     typer.echo(json.dumps({k:result[k] for k in ("auto_contribute","effective_auto_contribute","match","conflict")}))
+def configure_compression(cfg,ws,codec,root=None):
+    if codec not in ("none","zstd"): raise ValueError("compression must be none or zstd")
+    selected={**cfg,"replica_compression":{**cfg.get("replica_compression",{}),ws:codec}}
+    replica_compression(selected,ws)
+    save(selected,root)
+    cfg.update(selected)
+def repack_replicas(cfg,state,ws,root=None,restart=False):
+    if cfg["server_state"].get("capabilities",{}).get("replica_repack")!=1: raise ValueError("relay does not support replica migration; upgrade the relay")
+    codec=replica_compression(cfg,ws)
+    if codec=="none": raise ValueError("select a compression scheme before migrating retained replicas")
+    marker=f"replica_compression_cursor:{ws}:{codec}"
+    cursor,scanned,replaced,saved=0 if restart else int(_meta(state,marker)),0,0,0
+    while page:=replica_page(request(cfg,{"op":"replica_repack_pull","workspace":ws,"after":cursor})["replicas"],500):
+        candidates=[]
+        for item in page:
+            env=item["envelope"]
+            required(type(item["cursor"]) is int and item["cursor"]>cursor and type(item["semantic"]) is bool and (env["workspace"],env["uploader"])==(ws,cfg["device"]["id"]) and access_from(cfg,ws)<=env["epoch"]<=cfg["controls"][ws]["epoch"] and digest(env)==item["wire_hash"],ValueError("replica migration response mismatch"))
+            cursor,scanned=item["cursor"],scanned+1
+            if env.get("compression","none")==codec: continue
+            encoded=repack_replica(env,key(cfg,ws,env["epoch"]),codec)
+            required(open_replica(encoded,key(cfg,ws,env["epoch"]),True)==open_replica(env,key(cfg,ws,env["epoch"]),True),ValueError("replica compression round trip mismatch"))
+            if (gain:=_replica_size(env)-_replica_size(encoded))>0: candidates.append((dict(semantic=item["semantic"],expected_wire_hash=item["wire_hash"],envelope=encoded),gain,item["cursor"]))
+        for batch in _upload_batches(candidates,REPLICA_BATCH_BYTES-256,lambda v:_replica_size(v[0]["envelope"])+256,REPLICA_ITEM_BYTES+256):
+            result=request(cfg,{"op":"replica_replace_many","replacements":[v[0] for v in batch]})["replicas"]
+            required(len(result)==len(batch) and all(type(r.get("cursor")) is int and r["cursor"]==v[2] and type(r.get("replaced")) is bool and r.get("created") is False and not r.get("conflict") for r,v in zip(result,batch)),ValueError("replica changed during migration or acknowledgement mismatch; retry"))
+            replaced+=sum(r["replaced"] for r in result)
+            saved+=sum(v[1] for r,v in zip(result,batch) if r["replaced"])
+        state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(marker,str(cursor)))
+        state.commit()
+        _progress(f"compressing retained replicas {scanned}")
+    return {"scanned":scanned,"replaced":replaced,"wire_bytes_saved":saved,"cursor":cursor}
+@remote.command("compression")
+def compression_cmd(space:str,codec:str="zstd",migrate:bool=False,restart:bool=False):
+    """Choose none/zstd for future uploads; --migrate rewrites this device's retained copies. Upgrade all readers first."""
+    try:
+        with sync_run(None,True,"compression"):
+            with mutation_lock(None):
+                cfg=load()
+                refresh(cfg)
+                ws=workspace(cfg,space)
+                configure_compression(cfg,ws,codec)
+            with closing(connect(paths()[2])) as state: result=repack_replicas(cfg,state,ws,restart=restart) if migrate else {"compression":codec}
+    except (ConnectionError,ValueError,RuntimeError) as error: cli_error(error)
+    typer.echo(json.dumps(result))
 @remote.command("sync")
 def sync_cmd(repair:bool=False):
     try: result=sync_once(repair=repair,manual=True)
