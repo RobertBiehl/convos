@@ -476,15 +476,23 @@ def dispatch(db, req, token):
         if not isinstance(req["replacements"],list) or not 1<=len(req["replacements"])<=500: raise ValueError("replacement batch limit is 1 to 500")
         if any(set(v)!={"semantic","expected_wire_hash","envelope"} or type(v["semantic"]) is not bool or v["expected_wire_hash"] is None for v in req["replacements"]): raise ValueError("invalid replica replacement")
         return {"replicas":[store_replica(db,actor,v["envelope"],v["semantic"],v["expected_wire_hash"]) for v in req["replacements"]]}
-    if op=="replica_repack_pull":
+    if op in {"replica_repack_pull","replica_repack_get"}:
         ws,after=req["workspace"],req.get("after",0)
         m=device_member(db,ws,actor)
         if type(after) is not int or after<0: raise ValueError("invalid replica repack cursor")
-        table="(SELECT 0 semantic,* FROM row_replicas UNION ALL SELECT 1 semantic,* FROM semantic_replicas)"
+        columns="cursor,workspace,uploader,epoch,envelope,wire_size,wire_hash"+(",ciphertext" if op=="replica_repack_get" else "")
+        table=f"(SELECT 0 semantic,{columns} FROM row_replicas UNION ALL SELECT 1 semantic,{columns} FROM semantic_replicas)"
         access="x.workspace=? AND x.uploader=? AND x.epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?)"
         args=(ws,actor["id"],m["history_from"],actor["id"])
-        values=bounded(db.execute(f"SELECT semantic,cursor,envelope,ciphertext,wire_size,wire_hash FROM {table} x WHERE {access} AND cursor>? ORDER BY cursor LIMIT 500",(*args,after)),replica_page_size,4*1024**2)
-        return {"replicas":[{"semantic":bool(r["semantic"]),"cursor":r["cursor"],"wire_hash":r["wire_hash"],"envelope":stored_envelope(r)} for r in values]}
+        if op=="replica_repack_get":
+            if type(req["cursor"]) is not int or type(req["semantic"]) is not bool: raise ValueError("invalid replica locator")
+            row=db.execute(f"SELECT envelope,ciphertext,wire_hash FROM {table} x WHERE {access} AND cursor=? AND semantic=?",(*args,req["cursor"],req["semantic"])).fetchone()
+            if not row or row["wire_hash"]!=req["wire_hash"]: raise ValueError("replica unavailable or changed during compaction; retry")
+            return {"envelope":stored_envelope(row)}
+        tail=db.execute("SELECT COALESCE(MAX(cursor),0) FROM ledger_cursors").fetchone()[0]
+        if after>tail: raise ValueError("compaction cursor exceeds relay history; use --restart")
+        values=bounded(db.execute(f"SELECT semantic,cursor,envelope,wire_size,wire_hash FROM {table} x WHERE {access} AND cursor>? AND cursor<=? AND json_extract(envelope,'$.compression') IS NOT 'zstd' ORDER BY cursor LIMIT 500",(*args,after,tail)),lambda r:r["wire_size"],4*1024**2)
+        return {"cursor":values[-1]["cursor"] if values else tail,"replicas":[{"semantic":bool(r["semantic"]),"cursor":r["cursor"],"wire_hash":r["wire_hash"],"wire_size":r["wire_size"],"header":json.loads(r["envelope"])} for r in values]}
     if op == "ledger":
         member(db,req["workspace"],actor["user_id"])
         return ledger_state(db,req["workspace"])

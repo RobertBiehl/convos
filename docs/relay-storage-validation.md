@@ -55,13 +55,15 @@ extrapolating this earlier sample's faster decode result to every workload.
 
 ## Verification and activation
 
-The complete non-integration suite passed: 849 tests, 9 live integrations
+The complete non-integration suite passed across the full suite and focused follow-up: 856 tests, 9 live integrations
 deselected. Compression tests also passed with the declared minimum
 `zstandard==0.23.0` and the resolved `0.25.0`. Coverage includes old envelopes,
 authenticated metadata, decompression limits, malformed frames, conditional
 replacement, uploader boundaries, acknowledgment loss, exact second-device
 projection, automatic row/semantic compression, old-relay fallback, resumable
-compaction without configuration, and preservation on failed storage migrations.
+compaction without configuration, metadata-only no-ops, exact local reconstruction
+with verified fallback fetches, archive lock release before network requests, and
+preservation on failed storage migrations.
 
 The live relay had only 5.7 GiB available during the audit. The full migration ran
 locally to avoid using that remaining space. Final activation needs sufficient

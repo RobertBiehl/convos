@@ -4,8 +4,9 @@ New uploads use **Zstd level 1**, automatically negotiated with the relay. There
 is no per-workspace setting and no level to tune. An older relay without the
 capability receives the existing uncompressed envelopes. This applies to both
 archive rows and semantic replicas; event history and attachment bodies retain
-their encodings. Existing data can be compacted with `convos remote compact
-personal`, with resumable progress and conditional replacement.
+their encodings. Existing data can be compacted with `convos remote compact`,
+with an optional workspace argument, resumable progress, and conditional
+replacement.
 
 Each replica is an independent frame, compressed before encryption without an
 external dictionary. Compression uses the native extension and its single-thread
@@ -81,6 +82,41 @@ sender CPU-path wall time and 45 ms on receipt. Level 3 saves only another
 DuckDB projection are excluded; the receive CPU overhead must not be described
 as a CPU speedup. These numbers are measured samples, not a forecast of total
 database savings or end-to-end sync latency.
+
+## Compaction without body downloads
+
+Compaction inventories only uncompressed replicas and receives headers, wire
+hashes, sizes, and cursors. It first reconstructs each signed payload locally;
+re-encryption with the retained header and nonce must match the original wire
+hash before that copy can be used. A verified fallback fetch is needed only when
+the exact local payload or lineage is unavailable. Replacements still compare
+the expected old digest atomically. No local archive mutation or new signature
+is needed.
+
+Archive proofs are indexed in bounded pages into a temporary SQLite lookup.
+Archive bodies are read in batches; current semantic payloads use a temporary
+lookup during the operation. These lookups are discarded when compaction ends.
+Already-compressed inventories need no local archive scan or lookup construction.
+
+Measured on the same M4 with real retained envelopes and JSON serialization:
+
+| No-op case | Response body bytes | Compaction requests | Local median |
+| --- | ---: | ---: | ---: |
+| Previous rescan of 2,411 already compressed replicas | 6,163,343 | 6 | 47.13 ms |
+| Metadata-only rescan of the same replicas | 29 | 1 | 1.44 ms |
+
+These are compaction-engine timings, excluding CLI startup, network latency,
+HTTP headers, and the initial workspace refresh. The complete warm CLI with an
+already-caught-up cursor measured 3.18 ms against the 590,274-replica snapshot,
+with one state request and one inventory request, using an in-process transport.
+An unchanged cursor is not rewritten. A first scan of a larger compressed
+archive still scans its eligible headers on the relay; this small sample's time
+must not be extrapolated as a constant-time guarantee.
+
+Tests verify byte-exact local reconstruction for current rows, proof lineage,
+and semantic payloads; fallback for changed or unavailable historical bodies;
+no ciphertext reads for already-compressed inventories; uploader boundaries;
+conditional fetch/replacement; and recovery after lost acknowledgments.
 
 ## Rollout
 

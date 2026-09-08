@@ -481,11 +481,14 @@ New row and semantic uploads automatically use Zstd when the relay advertises
 support. There is no workspace opt-in or compression-level setting. Older relays
 continue to receive the uncompressed format until upgraded.
 
-To compress this device's existing retained replicas:
+To compress this device's existing retained replicas in all accessible workspaces:
 
 ```bash
-convos remote compact personal
+convos remote compact
 ```
+
+Pass a workspace name or ID to limit the operation, for example
+`convos remote compact Personal`.
 
 Upgrade every receiving client before upgrading the relay to advertise
 compression support. The relay cannot translate an encrypted compressed replica
@@ -502,13 +505,24 @@ authenticated by AES-GCM along with the rest of the header. The signed logical
 row format remains version 1. Compression level is an encoder choice and is not
 needed to decode a frame. Future codecs require explicit reader support.
 
-`compact` reads this device's retained row and semantic replicas, checks their
-authenticated plaintext, and verifies exact decompression before uploading a
-smaller representation. The replacement names the expected old wire digest and
+`compact` asks for metadata about this device's uncompressed replicas. Already
+compressed records are filtered on the relay without reading or transferring
+their ciphertext. The client reconstructs original payloads from local records,
+retained proofs, and lineage. Re-encryption with the original header and nonce
+must reproduce the retained wire digest exactly; a matching row hash alone is
+not sufficient. Only unavailable exact copies are downloaded as a fallback.
+The archive is read in batches and its connections are closed before network
+requests. A temporary lookup is built only when there is uncompacted data.
+
+The client verifies exact decompression before uploading a smaller
+representation. The replacement names the expected old wire digest and
 is atomic: a concurrent change cannot be overwritten. The original uploader,
 workspace, key epoch, logical identity, signed bytes, and ledger cursor remain
 unchanged. Another device's retained copy is not replaced. An acknowledgment
 loss is safe to retry; a content-free local cursor resumes completed pages.
+The result reports `local` and `downloaded` counts as well as replaced records
+and saved wire bytes. The relay advances the scan cursor past compressed records,
+including when an inventory page is empty.
 Use `compact --restart` to rescan the device's earlier retained copies. Compaction
 is separate from normal sync; it does not run implicitly on a hook or first sync.
 

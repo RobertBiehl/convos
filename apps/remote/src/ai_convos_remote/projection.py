@@ -8,7 +8,7 @@ from pathlib import Path
 from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows
 from .control import verify_state
 from .migrations import migrate_state
-from .protocol import digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
+from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
 STATE_VERSION="4"
 STATE = """
@@ -456,6 +456,52 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
     finally: db and db.close()
 def _proof(values):
     return {"v":1,"kind":"row.proof",**dict(zip(PROOF_FIELDS,values))}
+REPACK_PROOF_COLUMNS="workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature"
+def repack_index(db_path,state,cfg,workspace,keys,root,origins=()):
+    state.execute("CREATE TEMP TABLE compact_local(semantic INT,replica TEXT,epoch INT,proof_id TEXT,payload BLOB,PRIMARY KEY(semantic,replica,epoch)) WITHOUT ROWID")
+    after,scopes="",[workspace,*origins]
+    while Path(db_path).is_file():
+        with contextlib.closing(open_db(db_path,True,purpose="remote.compact.index")) as db: rows=db.execute(f"SELECT id,{REPACK_PROOF_COLUMNS} FROM remote.row_proofs WHERE id>? AND workspace_id IN (SELECT UNNEST(?)) ORDER BY id LIMIT 5000",[after,scopes]).fetchall()
+        if not rows: break
+        state.executemany("INSERT OR IGNORE INTO compact_local VALUES (0,?,?,?,NULL)",[(fingerprint(key_,digest(_proof(values))),epoch,pid) for pid,*values in rows for epoch,key_ in keys.items()])
+        after=rows[-1][0]
+        archive_yield(db_path)
+    for value in bridge_records(root,cfg,workspace,cfg["workspaces"][workspace]["kind"]):
+        if (p:=value["proof"]) is None: continue
+        raw=canon({"row":value["row"],"proof":p,"lineage":[]})
+        state.executemany("INSERT OR IGNORE INTO compact_local VALUES (1,?,?,NULL,?)",[(fingerprint(key_,digest(p)),epoch,raw) for epoch,key_ in keys.items()])
+    state.commit()
+def local_repack_envelopes(db_path,state,cfg,page,keys):
+    entries=[(item,entry) for item in page if (entry:=state.execute("SELECT proof_id,payload FROM compact_local WHERE semantic=? AND replica=? AND epoch=?",(item["semantic"],item["header"]["replica"],item["header"]["epoch"])).fetchone())]
+    bodies={item["cursor"]:entry[1] for item,entry in entries if entry[1] is not None}
+    pids=[entry[0] for item,entry in entries if entry[0] is not None]
+    if pids:
+        with contextlib.closing(open_db(db_path,True,purpose="remote.compact.bodies")) as db:
+            proofs={pid:_proof(values) for pid,*values in db.execute(f"SELECT id,{REPACK_PROOF_COLUMNS} FROM remote.row_proofs WHERE id IN (SELECT UNNEST(?))",[pids]).fetchall()}
+            physical=dict(db.execute("SELECT proof_id,physical_row_id FROM remote.row_origins WHERE proof_id IN (SELECT UNNEST(?)) UNION ALL SELECT proof_id,physical_entity FROM remote.provenance_origins WHERE proof_id IN (SELECT UNNEST(?))",[pids,pids]).fetchall())
+            claims={pid:(p["row_kind"],physical.get(pid,p["row_id"] if p["author_user_id"]==cfg["user"] or p["row_kind"] in PROVENANCE-{'edit.observed','checkpoint.link'} else foreign_id(p["author_user_id"],"file_edits" if p["row_kind"]=="edit.observed" else p["row_kind"],p["row_id"])),p["row_id"],p["author_user_id"],p["state"]) for pid,p in proofs.items()}
+            found=typed_logical_rows(db,claims.values())
+            paths=captured_edit_paths(db,[c[1] for c in claims.values() if c[0]=="file_edits"])
+            retained={pid:json.loads(raw) for pid,raw in db.execute("SELECT proof_id,CAST(body AS VARCHAR) FROM remote.row_conflicts WHERE proof_id IN (SELECT UNNEST(?))",[pids]).fetchall()}
+            parents=[p for p in proofs.values() if p["previous_revision"]]
+            history={(v[0],v[2],v[3],v[9],v[6]):_proof(v) for v in db.execute(f"SELECT {REPACK_PROOF_COLUMNS} FROM remote.row_proofs WHERE workspace_id IN (SELECT UNNEST(?)) AND source_row_id IN (SELECT UNNEST(?)) AND author_user_id IN (SELECT UNNEST(?))",[[p["workspace"] for p in parents],[p["row_id"] for p in parents],[p["author_user_id"] for p in parents]]).fetchall()} if parents else {}
+            for item,entry in entries:
+                if entry[0] not in proofs: continue
+                p,claim=proofs[entry[0]],claims[entry[0]]
+                row=retained.get(entry[0])
+                if row is None or digest(row)!=p["content_hash"]: row=matching_logical_row(found[claim],p["content_hash"],[paths[claim[1]]] if claim[1] in paths else ())
+                if row is None or digest(row)!=p["content_hash"]: continue
+                lineage,revision,seen=[],p["previous_revision"],set()
+                while revision:
+                    parent=history.get((p["workspace"],p["row_kind"],p["row_id"],p["author_user_id"],revision))
+                    if revision in seen or parent is None: break
+                    lineage.append(parent)
+                    seen.add(revision)
+                    revision=parent["previous_revision"]
+                if revision is None: bodies[item["cursor"]]=canon({"row":row,"proof":p,"lineage":lineage})
+        archive_yield(db_path)
+    # The old nonce is used only for local equality checks; replacements use a fresh nonce.
+    return {item["cursor"]:_seal(item["header"],bodies[item["cursor"]],keys[item["header"]["epoch"]]) for item in page if item["cursor"] in bodies}
 def _heads(db,user,ids):
     out={}
     for table,sources in ids.items():

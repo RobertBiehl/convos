@@ -107,8 +107,7 @@ def test_replica_replacement_is_conditional_smaller_and_preserves_cursors(tmp_pa
 
 
 def test_client_migrates_both_channels_and_resumes_after_lost_ack(tmp_path,monkeypatch):
-    with closing(server.connect(tmp_path/"relay.db")) as db,closing(sqlite3.connect(":memory:")) as state:
-        state.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)")
+    with closing(server.connect(tmp_path/"relay.db")) as db,closing(client.connect(tmp_path/"state.db")) as state:
         cfg,ws,key=configured(db)
         original=[message(cfg,ws,key,str(i)) for i in range(2)]
         for semantic,env in enumerate(original): server.action(db,{"op":"replica_upload_many","envelopes":[env],"semantic":bool(semantic)},cfg["token"])
@@ -121,9 +120,9 @@ def test_client_migrates_both_channels_and_resumes_after_lost_ack(tmp_path,monke
             return result
         monkeypatch.setattr(client,"request",request)
         with pytest.raises(ConnectionError): client.repack_replicas(cfg,state,ws)
-        assert state.execute("SELECT * FROM meta").fetchall()==[]
+        assert state.execute("SELECT * FROM meta WHERE key LIKE 'replica_compression_cursor:%'").fetchall()==[]
         resumed=client.repack_replicas(cfg,state,ws)
-        assert resumed["scanned"]==2 and resumed["replaced"]==0
+        assert resumed["scanned"]==0 and resumed["replaced"]==0
         assert client.repack_replicas(cfg,state,ws)["scanned"]==0
         retained=server.action(db,{"op":"replica_pull","workspace":ws,"semantic":True},cfg["token"])["replicas"]
         assert len(retained)==2
@@ -208,15 +207,14 @@ def test_compact_command_migrates_existing_replicas_without_configuration(tmp_pa
         second=runner.invoke(client.remote,["compact","Personal"])
         assert second.exit_code==0 and json.loads(second.stdout)["scanned"]==0
         restart=runner.invoke(client.remote,["compact","Personal","--restart"])
-        assert restart.exit_code==0 and json.loads(restart.stdout)["scanned"]==1 and json.loads(restart.stdout)["replaced"]==0
+        assert restart.exit_code==0 and json.loads(restart.stdout)["scanned"]==0 and json.loads(restart.stdout)["replaced"]==0
         stored=server.stored_envelope(db.execute("SELECT * FROM row_replicas").fetchone())
         assert stored["v"]==2 and protocol.open_replica(stored,key,True)==protocol.open_replica(original,key,True)
         assert "replica_compression" not in client.load(root)
 
 
 def test_client_does_not_rewrite_or_advance_past_an_unauthentic_replica(tmp_path,monkeypatch):
-    with closing(server.connect(tmp_path/"relay.db")) as db,closing(sqlite3.connect(":memory:")) as state:
-        state.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)")
+    with closing(server.connect(tmp_path/"relay.db")) as db,closing(client.connect(tmp_path/"state.db")) as state:
         cfg,ws,key=configured(db)
         env=message(cfg,ws,key)
         raw=protocol.unb64(env["ciphertext"])
@@ -224,5 +222,130 @@ def test_client_does_not_rewrite_or_advance_past_an_unauthentic_replica(tmp_path
         server.action(db,{"op":"replica_upload_many","envelopes":[corrupted]},cfg["token"])
         monkeypatch.setattr(client,"request",lambda cfg,body:server.action(db,body,cfg["token"]))
         with pytest.raises(ValueError,match="invalid row replica"): client.repack_replicas(cfg,state,ws)
-        assert not state.execute("SELECT * FROM meta").fetchall()
+        assert not state.execute("SELECT * FROM meta WHERE key LIKE 'replica_compression_cursor:%'").fetchall()
         assert server.stored_envelope(db.execute("SELECT * FROM row_replicas").fetchone())==corrupted
+
+
+def test_compaction_skips_compressed_bodies_on_relay_and_advances_without_local_scan(tmp_path,monkeypatch):
+    with closing(server.connect(tmp_path/"relay.db")) as db,closing(client.connect(tmp_path/"state.db")) as state:
+        cfg,ws,key=configured(db)
+        env=message(cfg,ws,key,compression="zstd")
+        server.action(db,{"op":"replica_upload_many","envelopes":[env]},cfg["token"])
+        calls=[]
+        def request(cfg,body):
+            assert body["op"]=="replica_repack_pull"
+            response=server.action(db,body,cfg["token"])
+            calls.append(response)
+            return response
+        monkeypatch.setattr(client,"request",request)
+        monkeypatch.setattr(client,"repack_index",lambda *args:pytest.fail("no local archive scan for compressed replicas"))
+        db.set_authorizer(lambda op,table,column,*args:sqlite3.SQLITE_DENY if op==sqlite3.SQLITE_READ and table in ("row_replicas","semantic_replicas") and column=="ciphertext" else sqlite3.SQLITE_OK)
+        result=client.repack_replicas(cfg,state,ws)
+        assert result["cursor"]>0 and result["scanned"]==result["downloaded"]==0
+        assert calls==[{"cursor":result["cursor"],"replicas":[]}]
+        assert client.repack_replicas(cfg,state,ws,restart=True)==result
+
+
+@pytest.mark.parametrize("change",["none","changed","history"])
+def test_compaction_reconstructs_exact_local_rows_and_fetches_only_unavailable_bodies(tmp_path,monkeypatch,change):
+    from ai_convos.cli import open_db
+    from tests.test_remote_client import replicate_conversation, transport
+    with closing(server.connect(tmp_path/"relay.db")) as db:
+        author=tmp_path/"author"
+        direct=transport(db)
+        modern=False
+        calls=[]
+        def request(cfg,body,auth=True):
+            if modern:
+                with open_db(author/"data/convos.db",wait=0,purpose="test.compaction.concurrent-writer"): pass
+            calls.append(body["op"])
+            response=direct(cfg,body,auth)
+            if body["op"]=="state" and not modern: response["capabilities"].pop("replica_compression")
+            return response
+        monkeypatch.setattr(client,"request",request)
+        cfg,_=client.setup_client("http://server","alice",root=author)
+        ws=client.workspace(cfg,"Personal")
+        original=replicate_conversation(author,ws,"original signed title "*1000)
+        if change=="history": original+=replicate_conversation(author,ws,"new signed title "*1000)
+        if change=="changed":
+            with closing(duckdb.connect(str(author/"data/convos.db"))) as local: local.execute("UPDATE conversations SET title='changed after upload'")
+        modern=True
+        cfg=client.load(author)
+        client.refresh(cfg,author)
+        before=protocol.digest((author/"data/convos.db").read_bytes())
+        calls.clear()
+        with closing(client.connect(author/"remote/state.db")) as state: result=client.repack_replicas(cfg,state,ws,author)
+        assert result["replaced"]==len(original)
+        assert result["local"]==(0 if change=="changed" else 1)
+        assert result["downloaded"]==(0 if change=="none" else 1)==calls.count("replica_repack_get")
+        assert protocol.digest((author/"data/convos.db").read_bytes())==before
+        stored=[server.stored_envelope(r) for r in db.execute("SELECT * FROM row_replicas ORDER BY cursor")]
+        key=client.key(cfg,ws,1)
+        assert [protocol.open_replica(e,key,True) for e in stored]==[protocol.open_replica(e,key,True) for e in original]
+
+
+def test_compaction_reconstructs_local_semantic_payload_without_downloading(tmp_path,monkeypatch):
+    import ai_convos_memory as memory
+    from tests.test_remote_client import transport
+    with closing(server.connect(tmp_path/"relay.db")) as db:
+        author=tmp_path/"author"
+        monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(author))
+        monkeypatch.setattr(client,"drain_hooks",lambda:None)
+        direct=transport(db)
+        modern=False
+        def request(cfg,body,auth=True):
+            assert body["op"]!="replica_repack_get","semantic payload should be local"
+            response=direct(cfg,body,auth)
+            if body["op"]=="state" and not modern: response["capabilities"].pop("replica_compression")
+            return response
+        monkeypatch.setattr(client,"request",request)
+        cfg,_=client.setup_client("http://server","alice",root=author)
+        ws=client.workspace(cfg,"Personal")
+        memory.remember_data("exact semantic body "*1000,"global")
+        client.sync_once(author,True)
+        original=[server.stored_envelope(r) for r in db.execute("SELECT * FROM semantic_replicas ORDER BY cursor")]
+        assert original and all(e["v"]==1 for e in original)
+        modern=True
+        cfg=client.load(author)
+        client.refresh(cfg,author)
+        with closing(client.connect(author/"remote/state.db")) as state:
+            result=client.repack_replicas(cfg,state,ws,author)
+            assert not state.execute("SELECT name FROM sqlite_temp_master WHERE name='compact_local'").fetchall()
+        assert result["local"]==result["replaced"]==len(original) and result["downloaded"]==0
+        stored=[server.stored_envelope(r) for r in db.execute("SELECT * FROM semantic_replicas ORDER BY cursor")]
+        key=client.key(cfg,ws,1)
+        assert [protocol.open_replica(e,key,True) for e in stored]==[protocol.open_replica(e,key,True) for e in original]
+
+
+def test_compact_without_workspace_processes_all_accessible_workspaces(tmp_path,monkeypatch):
+    from typer.testing import CliRunner
+    from tests.test_remote_client import transport
+    with closing(server.connect(tmp_path/"relay.db")) as db:
+        monkeypatch.setattr(client,"request",transport(db))
+        root=tmp_path/"client"
+        monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(root))
+        cfg,_=client.setup_client("http://server","alice",root=root)
+        team=client.create(cfg,"Team",root=root)
+        for ws in cfg["workspaces"]:
+            env=message(cfg,ws,client.key(cfg,ws,1))
+            server.action(db,{"op":"replica_upload_many","envelopes":[env]},cfg["token"])
+        result=CliRunner().invoke(client.remote,["compact"])
+        assert result.exit_code==0,result.output
+        workspaces=json.loads(result.stdout)["workspaces"]
+        assert set(workspaces)==set(cfg["workspaces"]) and team in workspaces
+        assert all(r["replaced"]==1 for r in workspaces.values())
+
+
+def test_fallback_fetch_checks_uploader_epoch_and_expected_digest(tmp_path):
+    with closing(server.connect(tmp_path/"relay.db")) as db:
+        cfg,ws,key=configured(db,"team")
+        other=account(db,"bob")
+        rotate_ws(db,cfg,cfg["controls"][ws],key,((cfg,"admin"),(other,"member")))
+        env=message(cfg,ws,key,epoch=2)
+        server.action(db,{"op":"replica_upload_many","envelopes":[env]},cfg["token"])
+        item=server.action(db,{"op":"replica_repack_pull","workspace":ws},cfg["token"])["replicas"][0]
+        assert "envelope" not in item and "ciphertext" not in item["header"]
+        req={"op":"replica_repack_get","workspace":ws,"cursor":item["cursor"],"semantic":False,"wire_hash":item["wire_hash"]}
+        assert server.action(db,req,cfg["token"])["envelope"]==env
+        with pytest.raises(ValueError,match="unavailable or changed"): server.action(db,req,other["token"])
+        with pytest.raises(ValueError,match="unavailable or changed"): server.action(db,{**req,"wire_hash":"0"*64},cfg["token"])
