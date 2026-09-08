@@ -206,7 +206,7 @@ def bridge_replicas(root,cfg,workspace,kind,key_,known=(),inventory=None,archive
     bridge_accept_many(root,fresh,False)
     values=[(value,fingerprint(key_,digest(value["proof"]))) for value in values if value["proof"]]
     present=set(inventory([(replica,cfg["workspaces"][workspace]["epoch"]) for value,replica in values])) if inventory else set(known)
-    return [seal_replica(value["row"],value["proof"],workspace,cfg["workspaces"][workspace]["epoch"],key_,cfg["device"]["id"],compression=replica_compression(cfg,workspace)) for value,replica in values if replica not in present]
+    return [seal_replica(value["row"],value["proof"],workspace,cfg["workspaces"][workspace]["epoch"],key_,cfg["device"]["id"],compression=replica_compression(cfg)) for value,replica in values if replica not in present]
 def clean(v):
     if isinstance(v,datetime): return v.isoformat()
     if isinstance(v,date): return v.isoformat()
@@ -451,7 +451,7 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
             if content_hash is None and digest(row)!=p["content_hash"]:
                 if blocked is not None: return blocked.append((p["row_kind"],p["row_id"]))
                 raise ValueError(f"typed projection differs from author proof: {p['row_kind']}:{p['row_id']}")
-            return seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"],content_hash,lineage(p) if p["kind"]=="row.proof" else (),replica_compression(cfg,workspace))
+            return seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"],content_hash,lineage(p) if p["kind"]=="row.proof" else (),replica_compression(cfg))
         return [env for row,p,content_hash,epoch,replica in candidates if (env:=seal(row,p,content_hash,epoch))]
     finally: db and db.close()
 def _proof(values):

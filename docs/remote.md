@@ -477,35 +477,40 @@ snapshot from being left behind. Keep the original database as a recovery copy;
 after new writes, switching back to an older snapshot is not a lossless rollback.
 
 New clients read both legacy uncompressed replicas and compressed replicas.
-Compression is disabled for uploads until selected for a workspace on a device:
+New row and semantic uploads automatically use Zstd when the relay advertises
+support. There is no workspace opt-in or compression-level setting. Older relays
+continue to receive the uncompressed format until upgraded.
+
+To compress this device's existing retained replicas:
 
 ```bash
-convos remote compression personal --codec zstd
-convos remote compression personal --codec zstd --migrate
+convos remote compact personal
 ```
 
-Upgrade every receiving client in that workspace before enabling compression.
-The relay advertises its supported codecs, but it cannot translate an encrypted
-compressed replica for an old client. Client upgrade readiness is an operational
-requirement; the relay does not currently enforce a workspace minimum version.
+Upgrade every receiving client before upgrading the relay to advertise
+compression support. The relay cannot translate an encrypted compressed replica
+for an old client. Client upgrade readiness is an operational requirement; the
+relay does not currently enforce a workspace minimum version.
 
-Zstd level 1 is used without external dictionaries, independently for each
-replica. Incompressible records retain the uncompressed representation. Envelope
+Zstd level 1 is used without external dictionaries, independently and with one
+thread per replica. Apple M4 measurements across 12,586 retained replicas favored
+this balance: stronger levels saved little extra space and required more CPU.
+See [the default compression benchmark](remote-compression.md). Incompressible
+records retain the uncompressed representation. Envelope
 version 2 carries `compression: "zstd"` and `plaintext_size`; these fields are
 authenticated by AES-GCM along with the rest of the header. The signed logical
 row format remains version 1. Compression level is an encoder choice and is not
 needed to decode a frame. Future codecs require explicit reader support.
 
-`--migrate` reads this device's retained row and semantic replicas, checks their
+`compact` reads this device's retained row and semantic replicas, checks their
 authenticated plaintext, and verifies exact decompression before uploading a
 smaller representation. The replacement names the expected old wire digest and
 is atomic: a concurrent change cannot be overwritten. The original uploader,
 workspace, key epoch, logical identity, signed bytes, and ledger cursor remain
 unchanged. Another device's retained copy is not replaced. An acknowledgment
 loss is safe to retry; a content-free local cursor resumes completed pages.
-Use `--restart` with `--migrate` to rescan the device's earlier retained copies.
-Selecting `--codec none` affects future uploads and leaves retained compressed
-replicas readable by upgraded clients.
+Use `compact --restart` to rescan the device's earlier retained copies. Compaction
+is separate from normal sync; it does not run implicitly on a hook or first sync.
 
 Both relay and client bound pages by expanded payload size as well as transfer
 size. Clients authenticate before decompressing, limit frame size and window

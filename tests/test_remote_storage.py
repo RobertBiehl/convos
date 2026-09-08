@@ -19,7 +19,7 @@ def legacy_relay(path):
         db.execute("PRAGMA user_version=1")
         row=logical_row("messages",identity="message",state="deleted")
         proof=row_proof(author["device"],author["user"],workspace,1,row)
-        replica=seal_replica(row,proof,workspace,1,key,author["device"]["id"])
+        replica=seal_replica(row,proof,workspace,1,key,author["device"]["id"],compression="none")
         envelopes={"events":seal_event(event(author["device"],1,"test","message",{"text":"private data"*1000}),workspace,1,key),
                    "row_replicas":replica,"semantic_replicas":replica,
                    "origin_bundles":seal_origin([control],workspace,1,key,author["device"]["id"])}

@@ -1,4 +1,4 @@
-"""Canonical signed/encrypted event protocol. Wire format v1; server sees envelopes only."""
+"""Signed payloads v1, versioned encrypted envelopes; server sees ciphertext only."""
 import base64, datetime, functools, hashlib, hmac, json, os, cryptography.exceptions as crypto_errors, cryptography.hazmat.primitives.hashes as hashes, cryptography.hazmat.primitives.asymmetric.ed25519 as ed25519, cryptography.hazmat.primitives.asymmetric.x25519 as x25519
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -7,6 +7,7 @@ from ai_convos.cli import PROVENANCE_FIELDS_V1, ROW_FIELDS_V1, ROW_JSON_V1, ROW_
 
 V = 1
 REPLICA_PLAIN_LIMIT=48*1024**2
+REPLICA_ZSTD_LEVEL=1
 SEMANTIC_FIELDS_V1=ROW_FIELDS_V1|PROVENANCE_FIELDS_V1
 ROW_PROOF_FIELDS={"v","kind","workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"}
 SEMANTIC_PROOF_FIELDS={"v","kind","workspace","object_kind","object_id","encoding_v","content_hash","revision","previous_revision","ancestors","state","author_user_id","author_device_id","authorization_epoch","root_public","signature"}
@@ -108,13 +109,10 @@ def _seal_replica(header,raw,key,compression):
     if compression not in ("none","zstd"): raise ValueError("unsupported replica compression")
     if compression=="zstd" and len(raw)<=REPLICA_PLAIN_LIMIT:
         import zstandard
-        packed=zstandard.ZstdCompressor(level=1).compress(raw)
+        packed=zstandard.ZstdCompressor(level=REPLICA_ZSTD_LEVEL).compress(raw)
         if len(packed)+100<len(raw): header,raw={**header,"v":2,"compression":"zstd","plaintext_size":len(raw)},packed
     return _seal(header,raw,key)
-def replica_compression(cfg,workspace):
-    value=cfg.get("replica_compression",{}).get(workspace,"none")
-    if value!="none" and value not in cfg.get("server_state",{}).get("capabilities",{}).get("replica_compression",[]): raise ValueError("relay does not support the configured replica compression; upgrade the relay")
-    return value
+def replica_compression(cfg): return "zstd" if "zstd" in cfg.get("server_state",{}).get("capabilities",{}).get("replica_compression",[]) else "none"
 def replica_plain_size(value):
     if value["v"]==2:
         if type(value["plaintext_size"]) is not int or not 0<value["plaintext_size"]<=REPLICA_PLAIN_LIMIT: raise ValueError("invalid replica decompression size")
@@ -128,7 +126,7 @@ def _decompress_replica(header,payload):
         if frame.content_size!=header["plaintext_size"] or frame.window_size>REPLICA_PLAIN_LIMIT or frame.dict_id: raise ValueError("invalid compressed replica frame")
         return zstandard.ZstdDecompressor().decompress(payload,max_output_size=header["plaintext_size"],allow_extra_data=False)
     except zstandard.ZstdError as error: raise ValueError("invalid compressed replica frame") from error
-def seal_replica(row,proof,workspace,epoch,key,uploader,content_hash=None,lineage=(),compression="none"):
+def seal_replica(row,proof,workspace,epoch,key,uploader,content_hash=None,lineage=(),compression="zstd"):
     if proof["content_hash"]!=(content_hash if content_hash is not None else digest(row)): raise ValueError("row replica proof mismatch")
     return _seal_replica({"v":1,"kind":"row.replica","workspace":workspace,"replica":fingerprint(key,digest(proof)),"epoch":epoch,"uploader":uploader,"nonce":b64(os.urandom(12))},canon({"row":row,"proof":proof,"lineage":list(lineage)}),key,compression)
 

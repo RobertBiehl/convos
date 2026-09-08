@@ -1316,16 +1316,10 @@ def config_cmd(space:str,auto_contribute:Optional[bool]=typer.Option(None,"--aut
         if inherit and auto_contribute is not None: raise typer.BadParameter("cannot combine with auto-contribute override","--inherit")
         result=configure_sharing(cfg,state,ws,None if inherit else auto_contribute if auto_contribute is not None else current["auto_contribute"],[m for m in ("cwd","edit") if m in requested]) if inherit or auto_contribute is not None or match is not None else current
     typer.echo(json.dumps({k:result[k] for k in ("auto_contribute","effective_auto_contribute","match","conflict")}))
-def configure_compression(cfg,ws,codec,root=None):
-    if codec not in ("none","zstd"): raise ValueError("compression must be none or zstd")
-    selected={**cfg,"replica_compression":{**cfg.get("replica_compression",{}),ws:codec}}
-    replica_compression(selected,ws)
-    save(selected,root)
-    cfg.update(selected)
 def repack_replicas(cfg,state,ws,root=None,restart=False):
     if cfg["server_state"].get("capabilities",{}).get("replica_repack")!=1: raise ValueError("relay does not support replica migration; upgrade the relay")
-    codec=replica_compression(cfg,ws)
-    if codec=="none": raise ValueError("select a compression scheme before migrating retained replicas")
+    codec=replica_compression(cfg)
+    if codec=="none": raise ValueError("relay does not support replica compression; upgrade the relay")
     marker=f"replica_compression_cursor:{ws}:{codec}"
     cursor,scanned,replaced,saved=0 if restart else int(_meta(state,marker)),0,0,0
     while page:=replica_page(request(cfg,{"op":"replica_repack_pull","workspace":ws,"after":cursor})["replicas"],500):
@@ -1347,17 +1341,16 @@ def repack_replicas(cfg,state,ws,root=None,restart=False):
         state.commit()
         _progress(f"compressing retained replicas {scanned}")
     return {"scanned":scanned,"replaced":replaced,"wire_bytes_saved":saved,"cursor":cursor}
-@remote.command("compression")
-def compression_cmd(space:str,codec:str="zstd",migrate:bool=False,restart:bool=False):
-    """Choose none/zstd for future uploads; --migrate rewrites this device's retained copies. Upgrade all readers first."""
+@remote.command("compact")
+def compact_cmd(space:str,restart:bool=False):
+    """Compress this device's retained replicas; new uploads compress automatically. Upgrade all readers first."""
     try:
-        with sync_run(None,True,"compression"):
+        with sync_run(None,True,"compact"):
             with mutation_lock(None):
                 cfg=load()
                 refresh(cfg)
                 ws=workspace(cfg,space)
-                configure_compression(cfg,ws,codec)
-            with closing(connect(paths()[2])) as state: result=repack_replicas(cfg,state,ws,restart=restart) if migrate else {"compression":codec}
+            with closing(connect(paths()[2])) as state: result=repack_replicas(cfg,state,ws,restart=restart)
     except (ConnectionError,ValueError,RuntimeError) as error: cli_error(error)
     typer.echo(json.dumps(result))
 @remote.command("sync")

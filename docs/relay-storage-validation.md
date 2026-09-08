@@ -47,18 +47,25 @@ HTTP protocol. The combined compressed path was faster in this sample and used
 projection; they are not a guarantee for every payload or deployment. Zstd is
 loaded only when compression is used, avoiding an import on legacy-only paths.
 
+The default is now automatic Zstd level 1 on supporting relays. A subsequent
+[Apple M4 comparison](remote-compression.md) measured eight Zstd levels across
+12,586 records, including a systematic archive sample and the largest replicas.
+It also records the modest CPU overhead in the larger stress sample rather than
+extrapolating this earlier sample's faster decode result to every workload.
+
 ## Verification and activation
 
-The complete non-integration suite passed: 846 tests, 9 live integrations
+The complete non-integration suite passed: 849 tests, 9 live integrations
 deselected. Compression tests also passed with the declared minimum
 `zstandard==0.23.0` and the resolved `0.25.0`. Coverage includes old envelopes,
 authenticated metadata, decompression limits, malformed frames, conditional
 replacement, uploader boundaries, acknowledgment loss, exact second-device
-projection, and preservation on failed storage migrations.
+projection, automatic row/semantic compression, old-relay fallback, resumable
+compaction without configuration, and preservation on failed storage migrations.
 
 The live relay had only 5.7 GiB available during the audit. The full migration ran
 locally to avoid using that remaining space. Final activation needs sufficient
 staging space and a stopped-relay snapshot/cutover; a snapshot taken while writes
-continue must not later replace the active database. Compression remains opt-in
-and requires all receiving clients to have been upgraded. No workspace minimum
-reader version is enforced by the current relay.
+continue must not later replace the active database. Compression is automatic
+once the relay advertises support, so upgrade all receiving clients before the
+relay. No workspace minimum reader version is enforced by the current relay.

@@ -11,18 +11,18 @@ import ai_convos_remote_server as server
 from tests.test_remote_server import account, create_ws, rotate_ws
 
 
-def message(author,workspace,key,identity="m",epoch=1):
+def message(author,workspace,key,identity="m",epoch=1,compression="none"):
     columns=["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"]
     row=protocol.logical_row("messages",columns,[identity,"c","assistant","repeated tool output\n"*10000,None,None,None,'{"original":"unchanged"}',None])
     proof=protocol.row_proof(author["device"],author["user"],workspace,epoch,row)
-    return protocol.seal_replica(row,proof,workspace,epoch,key,author["device"]["id"])
+    return protocol.seal_replica(row,proof,workspace,epoch,key,author["device"]["id"],compression=compression)
 
 
 def configured(db,kind="personal"):
     author=account(db,"alice")
     ws,key="personal",bytes(range(32))
     control=create_ws(db,author,ws,key,kind)
-    cfg={**author,"controls":{ws:control},"keys":{f"{ws}:1":protocol.b64(key)},"workspaces":{ws:{"kind":"personal","epoch":1}},"replica_compression":{ws:"zstd"}}
+    cfg={**author,"controls":{ws:control},"keys":{f"{ws}:1":protocol.b64(key)},"workspaces":{ws:{"kind":"personal","epoch":1}}}
     cfg["server_state"]=server.action(db,{"op":"state"},author["token"])
     return cfg,ws,key
 
@@ -37,6 +37,8 @@ def test_compressed_and_legacy_replicas_have_identical_signed_bytes(tmp_path):
         assert len(protocol.canon(compressed))<len(protocol.canon(legacy))//10
         assert protocol.open_replica(legacy,key,True)==protocol.open_replica(compressed,key,True)
         body=protocol.open_replica(compressed,key)
+        default=protocol.seal_replica(body["row"],body["proof"],ws,1,key,cfg["device"]["id"])
+        assert default["v"]==2 and protocol.open_replica(default,key,True)==protocol.open_replica(legacy,key,True)
         assert protocol.verify_row_proof(body["proof"],body["row"],protocol.certificate(cfg["root"],cfg["user"],cfg["device"]),cfg["root"]["sign_public"])
         assert protocol.open_replica(protocol.repack_replica(compressed,key,"none"),key)==body
 
@@ -142,11 +144,12 @@ def test_repack_inventory_and_replacement_cannot_touch_another_uploader(tmp_path
         assert server.stored_envelope(db.execute("SELECT * FROM row_replicas").fetchone())==env
 
 
-def test_compression_selection_requires_relay_capability_and_does_not_mutate_on_failure(tmp_path):
-    cfg={"server_state":{"capabilities":{}},"replica_compression":{}}
+@pytest.mark.parametrize("capabilities",[{}, {"replica_repack":1}])
+def test_compaction_requires_relay_capability_before_touching_state(capabilities):
+    cfg={"server_state":{"capabilities":capabilities}}
     original=copy.deepcopy(cfg)
-    with pytest.raises(ValueError,match="upgrade the relay"): client.configure_compression(cfg,"ws","zstd",tmp_path)
-    assert cfg==original and not (tmp_path/"remote/config.json").exists()
+    with pytest.raises(ValueError,match="upgrade the relay"): client.repack_replicas(cfg,None,"ws")
+    assert cfg==original
 
 
 def test_pages_bound_expanded_bytes_even_for_small_encrypted_payloads(tmp_path):
@@ -161,22 +164,54 @@ def test_pages_bound_expanded_bytes_even_for_small_encrypted_payloads(tmp_path):
         with pytest.raises(ValueError,match="decompression limits"): client.replica_page([{"envelope":env} for env in envs])
 
 
-def test_compressed_normal_upload_projects_exactly_on_a_second_device(tmp_path,monkeypatch):
+@pytest.mark.parametrize("supports_compression",[True,False])
+def test_normal_upload_automatically_negotiates_compression_and_projects_exactly(tmp_path,monkeypatch,supports_compression):
     from tests.test_remote_client import replicate_conversation, transport
     with closing(server.connect(tmp_path/"relay.db")) as db:
-        monkeypatch.setattr(client,"request",transport(db))
+        direct=transport(db)
+        def request(cfg,body,auth=True):
+            if body["op"]=="replica_upload_many" and not supports_compression: assert all(env["v"]==1 for env in body["envelopes"])
+            response=direct(cfg,body,auth)
+            if body["op"]=="state" and not supports_compression: response["capabilities"].pop("replica_compression")
+            return response
+        monkeypatch.setattr(client,"request",request)
         monkeypatch.setattr(client,"drain_hooks",lambda:None)
         author,reader=tmp_path/"author",tmp_path/"reader"
         cfg,recovery=client.setup_client("http://server","alice","laptop",root=author)
         ws=client.workspace(cfg,"Personal")
-        client.configure_compression(cfg,ws,"zstd",author)
         title="An exact retained conversation title. "*1000
         envs=replicate_conversation(author,ws,title)
-        assert envs and all(env["v"]==2 for env in envs)
+        assert envs and all(env["v"]==(2 if supports_compression else 1) for env in envs)
+        assert "replica_compression" not in client.load(author)
         client.setup_client("http://server","alice","desktop",recovery,root=reader)
         client.sync_once(reader,manual=True)
         with closing(duckdb.connect(str(reader/"data/convos.db"),read_only=True)) as archive:
             assert archive.execute("SELECT title FROM conversations").fetchall()==[(title,)]
+
+
+def test_compact_command_migrates_existing_replicas_without_configuration(tmp_path,monkeypatch):
+    from typer.testing import CliRunner
+    from tests.test_remote_client import transport
+    with closing(server.connect(tmp_path/"relay.db")) as db:
+        monkeypatch.setattr(client,"request",transport(db))
+        root=tmp_path/"client"
+        monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(root))
+        cfg,_=client.setup_client("http://server","alice",root=root)
+        ws=client.workspace(cfg,"Personal")
+        key=client.key(cfg,ws,1)
+        original=message(cfg,ws,key)
+        server.action(db,{"op":"replica_upload_many","envelopes":[original]},cfg["token"])
+        runner=CliRunner()
+        first=runner.invoke(client.remote,["compact","Personal"])
+        assert first.exit_code==0,first.output
+        assert json.loads(first.stdout)["replaced"]==1
+        second=runner.invoke(client.remote,["compact","Personal"])
+        assert second.exit_code==0 and json.loads(second.stdout)["scanned"]==0
+        restart=runner.invoke(client.remote,["compact","Personal","--restart"])
+        assert restart.exit_code==0 and json.loads(restart.stdout)["scanned"]==1 and json.loads(restart.stdout)["replaced"]==0
+        stored=server.stored_envelope(db.execute("SELECT * FROM row_replicas").fetchone())
+        assert stored["v"]==2 and protocol.open_replica(stored,key,True)==protocol.open_replica(original,key,True)
+        assert "replica_compression" not in client.load(root)
 
 
 def test_client_does_not_rewrite_or_advance_past_an_unauthentic_replica(tmp_path,monkeypatch):
