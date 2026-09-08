@@ -5,10 +5,10 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, set_attachment_path
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows
 from .control import verify_state
 from .migrations import migrate_state
-from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
+from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
 STATE_VERSION="4"
 STATE = """
@@ -37,7 +37,6 @@ STATE_TABLES={"outbox","receipts","publication_heads","cursors","lazy_events","d
 STATE_FORBIDDEN={"published","event_log","history_material","history_outbox","history_queue","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries","sharing_boundaries"}
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
 CORE_EVENTS,SIGNED={(kind,1) for kind in {"workspace.policy","workspace.preference","workspace.membership","workspace.device"}}|{("workspace.policy",2)},set(TABLES)|PROVENANCE
-FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 PROOF_FIELDS=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
 TEXT_IDS="SELECT json_extract_string(value,'$') FROM json_each(?)"
 def packed(values): return json.dumps(list(values),separators=(",",":"))
@@ -172,30 +171,15 @@ def audit_rows(db_path,page=5000,progress=None,local_user=None):
             origins += [(kind,source if user==local_user or kind in PROVENANCE-{'edit.observed','checkpoint.link'} else foreign_id(user,"file_edits" if kind=="edit.observed" else kind,source),source,user,pid,expected,state) for kind,source,user,pid,expected,state in heads if pid not in seen]
             cursor=heads[-1][3]
             archive_yield(db_path)
-    mapped,tables,examples={(kind,physical,user):source for kind,physical,source,user,pid,expected,state in origins if kind in COLUMNS},{},[]
+    tables,examples={},[]
     for at in range(0,len(origins),page):
-        batch,found,facts=origins[at:at+page],{},{}
+        batch=origins[at:at+page]
         with contextlib.closing(open_db(db_path,True,purpose="remote.audit.rows")) as db:
             required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote audit; retry"))
-            for table in COLUMNS:
-                if not (ids:=[physical for kind,physical,source,user,pid,expected,state in batch if kind==table]): continue
-                cur=db.execute(f"SELECT * EXCLUDE (embedding) FROM {table} WHERE id IN (SELECT UNNEST(?))",[ids]) if table=="messages" else db.execute("SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id WHERE a.id IN (SELECT UNNEST(?))",[ids]) if table=="attachments" else db.execute(f"SELECT * FROM {table} WHERE id IN (SELECT UNNEST(?))",[ids])
-                cols=[d[0] for d in cur.description]
-                found.update(((table,r[0]),(cols,list(map(clean,r)))) for r in cur.fetchall())
-            facts={(r["kind"],r["entity"]):r for r in provenance_records(db,{(kind,physical) for kind,physical,source,user,pid,expected,state in batch if kind in PROVENANCE})}
+            found=typed_logical_rows(db,[(kind,physical,source,user,state) for kind,physical,source,user,pid,expected,state in batch])
             retained,paths={pid:json.loads(body) for pid,body in db.execute("SELECT proof_id,body FROM remote.row_conflicts WHERE proof_id IN (SELECT UNNEST(?))",[[r[4] for r in batch]]).fetchall()},captured_edit_paths(db,[r[1] for r in batch if r[0]=="file_edits"])
         for kind,physical,source,user,pid,expected,state in batch:
-            if kind in COLUMNS and state=="deleted": row=logical_row(kind,identity=source,state="deleted")
-            elif kind in COLUMNS and (value:=found.get((kind,physical))):
-                cols,raw=value
-                parents=dict(FKS.get(kind,()))
-                row=logical_row(kind,cols,[source if column=="id" else mapped.get((parents[column],item,user),item) if column in parents else item for column,item in zip(cols,raw)],source)
-            elif kind in PROVENANCE and (record:=facts.get((kind,physical))):
-                payload={**record["payload"],**({"id":source} if kind!="checkpoint.link" else {})}
-                for field,parent in (("turn","messages"),("edit","file_edits")):
-                    if field in payload and (source_id:=mapped.get((parent,payload[field],user))): payload[field]=source_id
-                row=logical_fact({**record,"entity":source,"payload":payload})
-            else: row=None
+            row=found[(kind,physical,source,user,state)]
             projection=row is not None and expected is not None and matching_logical_row(row,expected,[paths[physical]] if kind=="file_edits" and physical in paths else ()) is not None
             kept=pid in retained and digest(retained[pid])==expected
             stat=tables.setdefault(kind,dict(origins=0,projection_match=0,projection_mismatch=0,projection_missing=0,proof_missing=0,retained_variants=0,unavailable=0))
@@ -211,7 +195,6 @@ def event_support(value):
 def bridge_records(root,cfg,workspace,kind,archive=True,changes=None): return [record for bridge in bridges() if archive or bridge.get("source")!="archive" for record in (bridge["delta"](root,cfg["user"],workspace,kind,changes) if changes is not None and "delta" in bridge else bridge["records"](root,cfg["user"],workspace,kind))]
 def bridge_stamp(root): return digest({kind:(bridge["v"],bridge["schema"]) for bridge in bridges() for kind in bridge["objects"]})
 def bridge_state(root,cfg,workspace,kind,generation): return digest((generation,bridge_stamp(root),bridge_records(root,cfg,workspace,kind,False)))
-def bridge_accept(root,row,proof,project=True): return bool((found:=[bridge for bridge in bridges() if row["kind"] in bridge["objects"]]) and found[0]["accept"](root,row,proof,project))
 def bridge_accept_many(root,values,project=True):
     groups=[(bridge,selected) for bridge in bridges() if (selected:=[(i,value) for i,value in enumerate(values) if value[0]["kind"] in bridge["objects"]])]
     batches=[(selected,bridge["accept_many"](root,[value for _,value in selected],project) if "accept_many" in bridge else [bridge["accept"](root,*value,project) for _,value in selected]) for bridge,selected in groups]
@@ -288,10 +271,6 @@ def _logical_record(record,aliases):
 def logical_records(db,records,author):
     aliases={(table,physical):source for table,physical,source in db.execute(f"SELECT table_name,physical_row_id,source_row_id FROM remote.row_origins WHERE author_user_id=? AND physical_row_id IN ({TEXT_IDS})",(author,packed(refs))).fetchall()} if (refs:={value for record in records if record["kind"] in TABLES and record["payload"].get("state")!="deleted" for column,value in zip(record["payload"]["columns"],record["payload"]["row"]) if column in dict(FKS.get(record["payload"]["table"],())) and value is not None}) else {}
     return [_logical_record(record,aliases) for record in records]
-def _under(path,cwd,roots):
-    p=Path(path)
-    p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve()
-    return any(p.is_relative_to(root) for root in roots)
 def sharing(state,workspace,user):
     rows=state.execute("SELECT revision,auto_contribute,match,proof FROM sharing_preferences WHERE workspace=? AND user=?",(workspace,user)).fetchall()
     proofs=[json.loads(r[3]) for r in rows]
@@ -324,20 +303,22 @@ def sharing_object(state,workspace,row,proof,authors):
     return True
 def _team_scope(core,provenance,repositories,roots,candidates=None,match=("cwd","edit")):
     roots=[Path(p).expanduser() for p in roots]
-    where=" WHERE c.id IN (SELECT UNNEST(?))" if candidates is not None else ""
-    args=[list(candidates)] if candidates is not None else []
+    where=f" WHERE c.id IN ({TEXT_IDS})" if candidates is not None else ""
+    args=[packed(candidates)] if candidates is not None else []
     rows=core.execute("SELECT s.route,m.conversation_id,s.repository FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN provenance.file_edit_scopes s ON s.file_edit_id=fe.id JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id"+where,args).fetchall()
     cwd_rows=core.execute("SELECT c.id,s.cwd,s.repository FROM conversations c JOIN provenance.conversation_scopes s ON s.conversation=c.id"+where,args).fetchall()
     return ({cid for route,cid,repo in rows if repo in repositories or route and any(Path(route).is_relative_to(root) for root in roots)} if "edit" in match else set())|({cid for cid,cwd,repo in cwd_rows if repo in repositories or cwd and any(Path(cwd).is_relative_to(root) for root in roots)} if "cwd" in match else set())
 def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,workspace=None,new_scope=None,match=("cwd","edit"),user=None,selected=None):
     local={tuple(r) for r in core.execute("SELECT kind,entity FROM provenance.local_facts"+(f" WHERE entity IN ({TEXT_IDS})" if facts is not None else ""),[packed(r[1] for r in facts)] if facts is not None else []).fetchall()} if (facts:=None if changes is None else {r for r in changes if r[0] in PROVENANCE}) is None or facts else set()
     all_provenance=[clean(r) for r in provenance_records(core,facts) if (r["kind"],r["entity"]) in local] if local else []
-    prior={r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()} if kind=="team" and workspace and changes is not None else set()
-    admitted={r[0] for r in core.execute("SELECT source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=? AND author_user_id=? AND row_kind='conversations' AND state='active'",(workspace,user)).fetchall()} if kind=="team" and workspace and user else set()
     changed={table:{entity for name,entity in changes or () if name==table} for table in TABLES.values()}
-    candidates=changed["conversations"]|{r[0] for r in core.execute("SELECT conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(changed["messages"])]).fetchall()}|{r[0] for r in core.execute("SELECT m.conversation_id FROM messages m JOIN (SELECT message_id FROM tool_calls WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM attachments WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM file_edits WHERE id IN (SELECT UNNEST(?))) x ON x.message_id=m.id",[list(changed["tool_calls"]),list(changed["attachments"]),list(changed["file_edits"])]).fetchall()}|{r[0] for r in core.execute("SELECT conversation_id FROM artifacts WHERE id IN (SELECT UNNEST(?))",[list(changed["artifacts"])]).fetchall()} if kind=="team" and changes is not None else None
+    edit_ids,file_ids,repo_ids=changed["file_edits"]|{r["payload"]["id"] if r["kind"]=="edit.observed" else r["payload"]["edit"] for r in all_provenance if r["kind"] in ("edit.observed","checkpoint.link")},{r["payload"]["id"] if r["kind"]=="file.observed" else r["payload"]["file"] for r in all_provenance if r["kind"] in ("file.observed","file.version")},{r["payload"]["id"] if r["kind"]=="repository.observed" else r["payload"]["repository"] for r in all_provenance if r["kind"] in ("repository.observed","git.checkpoint")}
+    linked=core.execute(f"SELECT fe.id,m.conversation_id,x.file_id,f.repository FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN messages m ON m.id=fe.message_id LEFT JOIN provenance.file_edit_files x ON x.file_edit_id=fe.id LEFT JOIN provenance.files f ON f.id=x.file_id"+(f" WHERE fe.id IN ({TEXT_IDS}) OR x.file_id IN ({TEXT_IDS}) OR f.repository IN ({TEXT_IDS})" if changes is not None else ""),[packed(ids) for ids in (edit_ids,file_ids,repo_ids)] if changes is not None else []).fetchall() if kind=="team" and selected is None and (changes is None or edit_ids or file_ids or repo_ids) else []
+    candidates=changed["conversations"]|{r[1] for r in linked}|{r[0] for r in core.execute(f"SELECT conversation_id FROM messages WHERE id IN ({TEXT_IDS}) UNION SELECT m.conversation_id FROM messages m JOIN (SELECT message_id FROM tool_calls WHERE id IN ({TEXT_IDS}) UNION SELECT message_id FROM attachments WHERE id IN ({TEXT_IDS}) UNION SELECT message_id FROM file_edits WHERE id IN ({TEXT_IDS})) x ON x.message_id=m.id UNION SELECT conversation_id FROM artifacts WHERE id IN ({TEXT_IDS})",[packed(changed[table]) for table in ("messages","tool_calls","attachments","file_edits","artifacts")]).fetchall()} if kind=="team" and changes is not None and selected is None else None
+    prior={r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?"+(" AND conversation IN (SELECT value FROM json_each(?))" if candidates is not None else ""),(workspace,*([packed(candidates)] if candidates is not None else []))).fetchall()} if kind=="team" and workspace and changes is not None and selected is None else set()
+    admitted={r[0] for r in core.execute("SELECT source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=? AND author_user_id=? AND row_kind='conversations' AND state='active'"+(f" AND source_row_id IN ({TEXT_IDS})" if candidates is not None else ""),(workspace,user,*([packed(candidates)] if candidates is not None else []))).fetchall()} if kind=="team" and workspace and user and selected is None else set()
     convs=set(selected) if selected is not None else (admitted|prior|_team_scope(core,all_provenance,set(repositories),roots,candidates,match)) if kind=="team" else set()
-    if workspace and new_scope is not None: new_scope.update(convs)
+    if workspace and new_scope is not None: new_scope.update(convs-prior)
     provenance=[r for r in all_provenance if changes is None or (r["kind"],r["entity"]) in changes]
     records=_records(core,graph,kind=="personal",changes)
     if user and records:
@@ -350,13 +331,11 @@ def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,worksp
     keep=[]
     parents={r["payload"]["row"][1] for r in records if r["payload"]["table"] in ("tool_calls","attachments","file_edits") and r["payload"].get("state")!="deleted"}
     msg_convs=dict(core.execute("SELECT id,conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(parents)]).fetchall()) if parents else {}
-    edits={r[0] for r in core.execute("SELECT fe.id FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN messages m ON m.id=fe.message_id WHERE m.conversation_id IN (SELECT UNNEST(?))",[list(convs)]).fetchall()}
-    shared=set(core.execute("SELECT row_kind,source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=?",(workspace,)).fetchall()) if workspace else set()
+    edits,allowed_files,allowed_repos=({r[column] for r in linked if r[1] in convs} for column in (0,2,3))
+    shared=set(core.execute(f"SELECT row_kind,source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=? AND source_row_id IN ({TEXT_IDS})",(workspace,packed(deleted))).fetchall()) if workspace and (deleted:={r["payload"]["id"] for r in records if r["payload"].get("state")=="deleted"}) else set()
     for r in records:
         table,row=r["payload"]["table"],r["payload"]["row"] if "row" in r["payload"] else [r["payload"]["id"]]
         if r["payload"].get("state")=="deleted" and (table,row[0]) in shared or table=="conversations" and row[0] in convs or len(row)>1 and (table=="messages" and row[1] in convs or table in ("tool_calls","attachments") and msg_convs.get(row[1]) in convs or table=="file_edits" and row[0] in edits or table=="artifacts" and row[1] in convs): keep.append(r)
-    allowed_files={r["payload"]["file"] for r in all_provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}
-    allowed_repos={r["payload"]["repository"] for r in all_provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}
     for r in provenance:
         p,k=r["payload"],r["kind"]
         if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits: keep.append(r)
@@ -367,7 +346,7 @@ def _team_page(core,conversations,after,page):
     return core.execute(query,(convs,after[0],after[0],after[1],page)).fetchall()
 def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspace=None,new_scope=None,match=("cwd","edit"),user=None,generation=None,progress=None,page=2500,since=None):
     sources=required(generation is not None,ValueError("archive scan requires a generation watermark")) and ([*((f"SELECT '{table}' kind,id entity FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='{table}' AND o.physical_row_id=x.id) AND NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=('{table}',x.id) AND c.generation>?)",(generation,)) for table in TABLES.values()),("SELECT kind,entity FROM provenance.local_facts x WHERE NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=(x.kind,x.entity) AND c.generation>?)",(generation,))] if since is None else [("SELECT kind,entity FROM archive_changes WHERE generation>? AND generation<=?",(since,generation))])
-    out,done,prior,scope=[],0,{r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()} if kind=="team" and workspace else set(),new_scope if new_scope is not None else set()
+    out,done,scope=[],0,new_scope if new_scope is not None else set()
     for query,args in sources:
         after,limit=("",""),page
         while True:
@@ -378,41 +357,42 @@ def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspac
             out+=batch
             if not changes: break
             after,done,limit,_=changes[-1],done+len(changes),max(100,min(5000,int(limit*.5/max(time.monotonic()-started,.001)))),(progress and progress(f"scanning archive {done+len(changes)}"),archive_yield(db_path))
-    if new:=scope-prior:
+    if scope:
         after=("","")
         while True:
             with contextlib.closing(open_db(db_path,True,purpose="remote.scan.team-page")) as core:
-                changes=_team_page(core,new,after,page)
-                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,None,match,user,new) if changes else []
+                changes=_team_page(core,scope,after,page)
+                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,None,match,user,scope) if changes else []
             out+=batch
             if not changes: break
             after=changes[-1]
             progress and progress(f"scanning admitted conversations {after[0]}")
             archive_yield(db_path)
     return list({(r["kind"],r["entity"]):r for r in out}.values())
-def _store_proofs(db_path,proofs,signer,controls):
+def _store_proofs(db_path,records,signer,controls):
     with contextlib.closing(open_db(db_path,purpose="remote.attest.write")) as db,_transaction(db):
         project_workspace_controls(db,controls)
-        (project_row_proofs(db,proofs,signer["root_public"],signer["certificate"]),record_local_row_bases(db,proofs))
+        project_attested_rows(db,records,signer["root_public"],signer["certificate"])
     archive_yield(db_path)
 def attest_rows(db_path,cfg,workspace,records,origins=()):
     controls,device,signer=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace),cfg["device"],cfg["controls"][workspace]["devices"][cfg["device"]["id"]]
     wanted={value for r in records if r["kind"] in TABLES and r["payload"].get("state")!="deleted" for column,value in zip(r["payload"]["columns"],r["payload"]["row"]) if value is not None and (column=="id" or column in dict(FKS.get(r["payload"]["table"],())))}
-    with contextlib.closing(open_db(db_path,True,purpose="remote.attest.plan")) as db: aliases={(table,physical):source for table,physical,source in db.execute(f"SELECT table_name,physical_row_id,source_row_id FROM remote.row_origins WHERE author_user_id=? AND physical_row_id IN ({TEXT_IDS})",(cfg["user"],packed(wanted))).fetchall()}
-    selected=[_logical_record(r,aliases) for r in records if r["kind"] in SIGNED]
-    rows=[signed_row(r) if r["kind"] in TABLES else logical_fact(r) for r in selected]
-    scopes,ids=(workspace,*origins),[r["id"] for r in rows]
-    with contextlib.closing(open_db(db_path,True,purpose="remote.attest.heads")) as db: found=db.execute(f"SELECT DISTINCT p.workspace_id,p.row_kind,p.source_row_id,p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id IN ({','.join('?'*len(scopes))}) AND p.author_user_id=? AND p.source_row_id IN ({TEXT_IDS}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],packed(ids))).fetchall() if rows else []
+    with contextlib.closing(open_db(db_path,True,purpose="remote.attest.plan")) as db:
+        aliases={(table,physical):source for table,physical,source in db.execute(f"SELECT table_name,physical_row_id,source_row_id FROM remote.row_origins WHERE author_user_id=? AND physical_row_id IN ({TEXT_IDS})",(cfg["user"],packed(wanted))).fetchall()}
+        selected=[_logical_record(r,aliases) for r in records if r["kind"] in SIGNED]
+        rows=[signed_row(r) if r["kind"] in TABLES else logical_fact(r) for r in selected]
+        scopes,ids=(workspace,*origins),[r["id"] for r in rows]
+        found=db.execute(f"SELECT DISTINCT p.workspace_id,p.row_kind,p.source_row_id,p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id IN ({','.join('?'*len(scopes))}) AND p.author_user_id=? AND p.source_row_id IN ({TEXT_IDS}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],packed(ids))).fetchall() if rows else []
     heads={}
     [heads.setdefault((r[1],r[2]),{}).setdefault(r[3],(r[0],r[3],r[4])) for r in sorted(found,key=lambda r:(r[0]!=workspace,r[0]))]
-    proofs=[]
+    snapshots,signing_key=[],None
     for row in rows:
         prior,current=list(heads.get((row["kind"],row["id"]),{}).values()),digest(row)
         if any(h[2]==current for h in prior): continue
         if len(prior)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
-        proofs.append(row_proof(device,cfg["user"],prior[0][0] if prior else workspace,cfg["workspaces"][workspace]["epoch"],row,prior[0][1] if prior else None,workspace,current))
-    [_store_proofs(db_path,proofs[i:i+500],signer,controls) for i in range(0,len(proofs),500)]
-    return len(proofs)
+        snapshots.append((row,row_proof(device,cfg["user"],prior[0][0] if prior else workspace,cfg["workspaces"][workspace]["epoch"],row,prior[0][1] if prior else None,workspace,current,signing_key=(signing_key:=signing_key or row_signing_key(device)))))
+    [_store_proofs(db_path,snapshots[i:i+500],signer,controls) for i in range(0,len(snapshots),500)]
+    return len(snapshots)
 def retained_proof_pages(db_path,workspace,origins=(),author=None,page=5000):
     scopes,after,marks=(scopes:=(workspace,*origins)),"",','.join('?'*len(scopes))
     sql=f"SELECT id FROM (SELECT p.id FROM remote.row_proofs p WHERE p.workspace_id IN ({marks}) AND p.author_user_id=? AND p.state='deleted' AND p.row_kind IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision) UNION SELECT p.id FROM remote.row_origins o JOIN remote.row_proofs q ON q.id=o.proof_id JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.content_hash)=(o.table_name,o.source_row_id,o.author_user_id,q.content_hash) WHERE p.workspace_id IN ({marks}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision) UNION SELECT p.id FROM remote.provenance_origins o JOIN remote.row_proofs q ON q.id=o.proof_id JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.content_hash)=(o.kind,o.source_entity,o.author_user_id,q.content_hash) WHERE p.workspace_id IN ({marks}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision) UNION SELECT p.id FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks})) retained WHERE id>? ORDER BY id LIMIT ?"
@@ -442,35 +422,10 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
             p=proof(values)
             keep(logical_row(p["row_kind"],identity=p["row_id"],state="deleted"),p)
         imported=db.execute(f"SELECT o.table_name,o.physical_row_id,o.source_row_id,o.author_user_id,p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_origins o JOIN remote.row_proofs q ON q.id=o.proof_id JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.content_hash)=(o.table_name,o.source_row_id,o.author_user_id,q.content_hash) WHERE p.workspace_id IN ({marks}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision){only_sql}",(*scopes,*([packed(only)] if only else []))).fetchall() if retained else []
-        mapped={(r[0],r[1],r[3]):r[2] for r in imported}
-        for table in TABLES.values():
-            selected=[r for r in imported if r[0]==table]
-            ids=[r[1] for r in selected]
-            cur=db.execute(f"SELECT * EXCLUDE (embedding) FROM {table} WHERE id IN (SELECT UNNEST(?))",[ids]) if table=="messages" else db.execute("SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id WHERE a.id IN (SELECT UNNEST(?))",[ids]) if table=="attachments" else db.execute(f"SELECT * FROM {table} WHERE id IN (SELECT UNNEST(?))",[ids])
-            cols=[d[0] for d in cur.description]
-            raws={r[0]:list(map(clean,r)) for r in cur.fetchall()}
-            for column,parent in FKS.get(table,()):
-                if refs:={(raw[cols.index(column)]) for raw in raws.values() if raw[cols.index(column)] is not None}: mapped.update({(parent,physical,user):source for physical,source,user in db.execute("SELECT physical_row_id,source_row_id,author_user_id FROM remote.row_origins WHERE table_name=? AND physical_row_id IN (SELECT UNNEST(?))",(parent,list(refs))).fetchall()})
-            for name,physical,source,user,*values in selected:
-                p,raw=proof(values),raws.get(physical)
-                if p["state"]=="deleted": row=logical_row(table,identity=source,state="deleted")
-                elif raw:
-                    parents=dict(FKS.get(table,()))
-                    raw=[source if column=="id" else mapped.get((parents[column],value,user),value) if column in parents else value for column,value in zip(cols,raw)]
-                    row=logical_row(table,cols,raw,source)
-                else: continue
-                keep(matching_logical_row(row,p["content_hash"]) or row,p)
         imported_facts=db.execute(f"SELECT o.kind,o.physical_entity,o.source_entity,o.author_user_id,p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.provenance_origins o JOIN remote.row_proofs q ON q.id=o.proof_id JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.content_hash)=(o.kind,o.source_entity,o.author_user_id,q.content_hash) WHERE p.workspace_id IN ({marks}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision){only_sql}",(*scopes,*([packed(only)] if only else []))).fetchall() if retained else []
-        facts={(r["kind"],r["entity"]):r for r in provenance_records(db,{(r[0],r[1]) for r in imported_facts})}
-        for field,parent in (("turn","messages"),("edit","file_edits")):
-            if refs:={record["payload"][field] for kind,physical,source,user,*values in imported_facts if (record:=facts.get((kind,physical))) and field in record["payload"]}: mapped.update({(parent,physical,user):source for physical,source,user in db.execute("SELECT physical_row_id,source_row_id,author_user_id FROM remote.row_origins WHERE table_name=? AND physical_row_id IN (SELECT UNNEST(?))",(parent,list(refs))).fetchall()})
-        for kind,physical,source,user,*values in imported_facts:
-            p,record=proof(values),facts.get((kind,physical))
-            if not record: continue
-            payload={**record["payload"],**({"id":source} if kind!="checkpoint.link" else {})}
-            for field,parent in (("turn","messages"),("edit","file_edits")):
-                if field in payload and (source_id:=mapped.get((parent,payload[field],user))): payload[field]=source_id
-            keep((lambda row:matching_logical_row(row,p["content_hash"]) or row)(logical_fact({**record,"entity":source,"payload":payload})),p)
+        claims=[(proof(values),(kind,physical,source,user,values[8])) for kind,physical,source,user,*values in [*imported,*imported_facts]]
+        found=typed_logical_rows(db,[claim for p,claim in claims])
+        for p,claim in claims: keep(matching_logical_row(found[claim],p["content_hash"]) or found[claim],p)
         for raw,*values in (db.execute(f"SELECT CAST(c.body AS VARCHAR),p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks}){only_sql}",(*scopes,*([packed(only)] if only else []))).fetchall() if retained else []): keep(json.loads(raw),proof(values))
         delivery=lambda p:p["authorization_epoch"] if p["authorization_workspace"]==workspace else (origin_epochs or {})[p["workspace"]]
         candidates=[(row,p,content_hash,epoch,fingerprint(keys[epoch],digest(p))) for row,p,content_hash in bodies.values() for epoch in [delivery(p)] if epoch in keys]
@@ -637,14 +592,28 @@ def verified_replica(body,workspace,controls,user):
         if expected is not None: raise ValueError("incomplete row proof lineage")
     return row,proof,signer_,verified
 def temp_rows(db,name,columns,rows): db.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT x.* FROM UNNEST(from_json(?,?)) t(x)",(json.dumps([dict(zip(columns,row)) for row in rows]),json.dumps([{c:"VARCHAR" for c in columns}])))
-def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None,root=None,ready=True,local_device=None):
-    if not bodies: return []
+def _edit_retry_work(db):
+    seed=db.execute("SELECT after_proof_id FROM remote.edit_ready WHERE dependency_key=''").fetchone()[0]
+    if seed!='done':
+        rows=db.execute("SELECT p.id,'' FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.row_kind='edit.observed' AND p.id>? ORDER BY p.id LIMIT 500",[seed]).fetchall()
+        if rows: return rows,[('',rows[-1][0] if len(rows)==500 else 'done')]
+    rows=db.execute("SELECT d.proof_id,r.dependency_key FROM remote.edit_ready r JOIN remote.edit_dependencies d ON d.dependency_key=r.dependency_key WHERE r.dependency_key<>'' AND d.proof_id>r.after_proof_id ORDER BY r.dependency_key,d.proof_id LIMIT 500").fetchall()
+    return rows,([('','done')] if seed!='done' else [])+list({key:pid for pid,key in rows}.items())
+def retry_edit_replicas(db_path,local_user,local_device=None,root=None,progress=lambda stage:None):
+    done=0
+    while count:=apply_row_replicas(db_path,[],None,[],local_user=local_user,root=root,ready=False,local_device=local_device,retry=True):
+        done+=count
+        progress(f"retrying edit facts {done}")
+        archive_yield(db_path)
+def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None,root=None,ready=True,local_device=None,retry=False):
+    if not bodies and not retry: return []
+    if len(bodies)>500: return [value for at in range(0,len(bodies),500) for value in apply_row_replicas(db_path,bodies[at:at+500],workspace,controls,recover,local_user,db,root,ready,local_device)]
     values=[verified_replica(body,workspace,controls,local_user) for body in bodies]
     if ready and Path(db_path).is_file() and any(value[1]["kind"]=="semantic.proof" for value in values):
         with contextlib.closing(open_db(db_path,purpose="schema.remote.rows")) as schema: ready=(init_schema(schema),False)[-1]
     semantic_ids,semantic=(semantic_ids:=[i for i,value in enumerate(values) if value[1]["kind"]=="semantic.proof"]),dict(zip(semantic_ids,bridge_accept_many(root,[(values[i][0],values[i][1]) for i in semantic_ids])))
     indexes=[i for i in range(len(values)) if i not in semantic]
-    if not indexes: return list(semantic.values())
+    if not indexes and not retry: return list(semantic.values())
     names=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
     proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(names,values))}
     own=db is None
@@ -653,8 +622,10 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
     try:
         with _transaction(db):
             items=[values[i] for i in indexes]
+            work,advanced=_edit_retry_work(db) if retry else ([],[])
             columns=("workspace","kind","row_id","author","revision")
             temp_rows(db,"incoming",columns,[tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id","revision")) for row,p,signer_,lineage in items])
+            if work: db.execute("INSERT INTO incoming SELECT workspace_id,row_kind,source_row_id,author_user_id,revision FROM remote.row_proofs WHERE id IN (SELECT UNNEST(?))",[[pid for pid,key in work]])
             old={tuple(r) for r in db.execute("SELECT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p JOIN incoming i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(i.workspace,i.kind,i.row_id,i.author,i.revision)").fetchall()}
             record_local_row_bases(db,[p for row,p,signer_,lineage in items if p["author_user_id"]==local_user and p["author_device_id"]==local_device],True)
             project_workspace_controls(db,controls)
@@ -663,7 +634,6 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
                 for p,signer_ in [*lineage,(head,head_signer)]: groups.setdefault((p["author_user_id"],p["author_device_id"]),(signer_,[]))[1].append(p)
             [project_row_proofs(db,proofs,signer_["root_public"],signer_["certificate"]) for signer_,proofs in groups.values()]
             _insert_pages(db,"remote.row_conflicts",[(digest(p),json.dumps(row,sort_keys=True,separators=(",",":"))) for row,p,signer_,lineage in items],("proof_id","body"),mode=" OR IGNORE")
-            db.execute("INSERT INTO incoming SELECT DISTINCT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id JOIN incoming i ON p.author_user_id=i.author AND ((i.kind='file_edits' AND p.row_kind='edit.observed' AND p.source_row_id=i.row_id) OR (i.kind='file.observed' AND p.row_kind='edit.observed' AND json_extract_string(c.body,'$.data.file')=i.row_id) OR (i.kind='messages' AND p.row_kind='edit.observed' AND json_extract_string(c.body,'$.data.turn')=i.row_id)) ORDER BY p.workspace_id,p.source_row_id LIMIT 500")
             projected,chosen=[],{}
             fields="p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature"
             chains={}
@@ -678,15 +648,29 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
             pending=set()
             project_logical_rows(db,projected,defer=pending.add)
             resolved=[(row["kind"],row["id"],p["author_user_id"]) for row,p,pid,native in projected if pid not in pending]
-            resolved += [scope for scope,revision in chosen.items() if (node:=chains[scope][revision])[1] is None and (node[2]["state"]=="deleted" or db.execute("SELECT 1 FROM remote.row_origins WHERE proof_id=? UNION ALL SELECT 1 FROM remote.provenance_origins WHERE proof_id=?",[node[0],node[0]]).fetchone())]
+            missing={scope:chains[scope][revision] for scope,revision in chosen.items() if chains[scope][revision][1] is None}
+            physical=dict(db.execute("SELECT proof_id,physical_row_id FROM remote.row_origins WHERE proof_id IN (SELECT UNNEST(?)) UNION ALL SELECT proof_id,physical_entity FROM remote.provenance_origins WHERE proof_id IN (SELECT UNNEST(?))",[[pid for pid,row,p in missing.values()]]*2).fetchall()) if missing else {}
+            claims={scope:(kind,physical.get(pid,source if user==local_user or kind in PROVENANCE-{'edit.observed','checkpoint.link'} else foreign_id(user,'file_edits' if kind=='edit.observed' else kind,source)),source,user,p['state']) for scope,(pid,row,p) in missing.items() for kind,source,user in [scope]}
+            found=typed_logical_rows(db,claims.values()) if claims else {}
+            resolved += [scope for scope,claim in claims.items() if matching_logical_row(found[claim],missing[scope][2]['content_hash']) is not None]
             if resolved:
-                temp_rows(db,"resolved_scopes",columns[1:4],resolved)
-                db.execute("DELETE FROM remote.row_conflicts c USING remote.row_proofs p,resolved_scopes r WHERE c.proof_id=p.id AND (p.row_kind,p.source_row_id,p.author_user_id)=(r.kind,r.row_id,r.author)")
+                retired=[]
+                for scope in resolved:
+                    revision=chosen[scope]
+                    while revision in chains[scope]:
+                        retired.append((*scope,revision))
+                        revision=chains[scope][revision][2]["previous_revision"]
+                retire_row_bodies(db,retired)
+            dependency=lambda kind,entity,author:digest([kind,author if kind=='file_edits' else None,entity])
+            waiting=[(dependency(kind,entity,p['author_user_id']),pid) for row,p,pid,native in projected if pid in pending and row['kind']=='edit.observed' for kind,entity in (('file_edits',row['id']),('file.observed',row['data']['file']))]
+            again=project_edit_dependencies(db,waiting,[dependency(row['kind'],row['id'],p['author_user_id']) for row,p,pid,native in projected if pid not in pending and row['kind'] in ('file_edits','file.observed')],[pid for pid,key in work]+[digest(p) for row,p,signer_,lineage in items if row['kind']=='edit.observed'],advanced)
         results=[(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("row_kind","row_id","author_user_id")))==p["revision"] for row,p,signer_,lineage in items]
         accepted=semantic|dict(zip(indexes,results))
-        return [accepted[i] for i in range(len(values))]
+        result=len(work) if retry else [accepted[i] for i in range(len(values))]
     finally:
         if own: db.close()
+    if own and not retry and again: apply_row_replicas(db_path,[],None,[],local_user=local_user,root=root,ready=False,local_device=local_device,retry=True)
+    return result
 def author_user(value,authors): return required((authors or {}).get(value["author"]),ValueError("verified author user required"))
 def foreign_id(author_user,table,old): return digest(f"{author_user}:{table}:{old}")[:16] if old else old
 def sequence(state,workspace,value):

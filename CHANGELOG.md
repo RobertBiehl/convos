@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.11.6b7
+
+- Preserve exact signed archive rows, repository variants, and joined edit facts
+  across native capture, attachment indexing, foreign projection, reparenting,
+  deletion, timestamp repair, and backup recovery.
+  Receiving a replica no longer establishes independent local provenance.
+  Attestation retains a scanned snapshot atomically if source capture changes
+  its typed row before the signature is stored, and retires the direct
+  predecessor body only after its replacement is durable.
+- Keep durable reverse references when a child arrives before its parent; audit
+  and retained publication share core's released logical-row encoders.
+- Resume missing edit dependencies in bounded, durable pages after restart,
+  including shared files observed by another author. Preserve unresolved forks.
+- Keep failed provenance enrichment queued separately from committed ingestion;
+  fix hook handoff races and checkpoint only successfully parsed source files.
+- Keep relay authorization and writes in the same transaction; avoid schema
+  initialization in requests, bound HTTP framing and reads, and refuse redirects
+  that could forward client credentials. Backups require an existing read-only
+  source and publish a verified snapshot atomically.
+- Reject device approvals that alter existing devices and removals that add
+  unapproved replacements, in both the relay and client validators.
+- Remove quadratic ingestion validation and archive-sized team scope/receipt
+  inventories. Bound proof preservation through an indexed source-history lookup.
+- Align all products and dependency minimums so the Remote client receives the
+  core API it requires. Require DuckDB 1.4.3 because the former 1.2 minimum cannot
+  initialize the existing schema. Schema v12 adds recovery metadata after a verified backup;
+  released signed v1 encodings and physical identity recipes stay unchanged.
+
+Existing ambiguous native markers and historical bodies already absent from
+both the archive and relay still require evidence-based reconciliation.
+Automatic live database compaction is deferred until concurrent replacement is
+safe. See [b7 validation](docs/b7-validation.md) for measured scope and limits.
+
 ## 0.11.6b6
 
 - Throttle intermediate hook capture to at most once per minute per transcript;

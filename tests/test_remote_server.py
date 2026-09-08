@@ -1,8 +1,9 @@
-import copy, json, sqlite3, threading
+import copy, json, sqlite3, threading, time, tracemalloc
+from contextlib import closing
 
 import pytest
 import ai_convos_remote_server as server_module
-from ai_convos_remote.control import CONTROL_V, record, sign, state_hash
+from ai_convos_remote.control import CONTROL_V, proposal, record, sign, state_hash, verify_state, vote
 from ai_convos_remote.protocol import certificate, digest, event, identity, logical_row, open_blob, registration_proof, row_proof, seal_blob, seal_event, seal_key, seal_replica, sign_control
 from ai_convos_remote_server import action, bounded, connect, ledger_state
 
@@ -80,6 +81,61 @@ def test_response_byte_bound_stops_before_materializing_rest():
     assert bounded(values(),len,5)==["aaa"] and seen==["aaa","bbb"]
 
 
+@pytest.mark.parametrize('approval',['self_approve','quorum_approve','personal_recover'])
+def test_device_approval_preserves_existing_authorization_records(tmp_path,approval):
+    with closing(connect(tmp_path/'server.db')) as db:
+        alice,bob,carol=account(db,'alice'),account(db,'bob'),account(db,'carol')
+        base=create_ws(db,alice,'w',bytes(32),'personal' if approval=='personal_recover' else 'team')
+        if approval!='personal_recover': base=rotate_ws(db,alice,base,bytes([1])*32,((alice,'admin'),(bob,'member'),(carol,'member')))
+        def advance(actor,action,devices,removed=None,approval=None):
+            return sign(actor['device'],{'v':1,'kind':'workspace.state','workspace':'w','scope':base['scope'],'revision':base['revision']+1,'prev':state_hash(base),'epoch':base['epoch']+1,'boundary':{'epoch':base['epoch']+1,**ledger_state(db,'w')},'key_commitment':digest(bytes([2])*32),'members':base['members'],'devices':devices,'removed':base['removed'] if removed is None else removed,'action':action,'approval':approval,'approved_at':time.time()})
+        def rotate_request(actor,state,history=None):
+            envelopes={key:seal_key(bytes([2])*32,entry['device']['box_public'],f'workspace:w:epoch:{state["epoch"]}') for key,entry in state['devices'].items()}
+            return sign_control(actor['device'],{'op':'rotate','workspace':'w','control':state,'envelopes':envelopes,'history_envelopes':history or {}})
+        if approval=='quorum_approve':
+            removal=advance(alice,'remove',{key:value for key,value in base['devices'].items() if key!=bob['device']['id']},[bob['device']['id']])
+            action(db,rotate_request(alice,removal),alice['token']); base=removal
+        owner=alice if approval=='personal_recover' else bob
+        target=identity('second-device'); registered=register_device(db,owner['user'],owner['root'],target)
+        entry=record(owner['user'],owner['root']['sign_public'],target,certificate(owner['root'],owner['user'],target),False)
+        request=proposal(target,'w',base,entry,time.time()+60)
+        if approval!='personal_recover': action(db,{'op':'propose','proposal':request},registered['token'])
+        author=carol if approval=='quorum_approve' else bob if approval=='self_approve' else {'device':target,'token':registered['token']}
+        votes=[vote(person['device'],person['user'],request) for person in (alice,carol)] if approval=='quorum_approve' else []
+        devices={**base['devices'],target['id']:{**entry,'history':approval!='quorum_approve'}}
+        clean=advance(author,approval,devices,approval={'proposal':request,'votes':votes})
+        history={target['id']:{str(epoch):seal_key(bytes([1])*32,target['box_public'],f'workspace:w:epoch:{epoch}') for epoch in range(base['members'][owner['user']]['history_from'],clean['epoch'])}} if approval=='self_approve' else {}
+        changed=copy.deepcopy(devices); changed[alice['device']['id']]['history']=False
+        corrupted=advance(author,approval,changed,approval={'proposal':request,'votes':votes})
+        with pytest.raises(ValueError,match='preserve existing devices'): verify_state(corrupted,base)
+        with pytest.raises(ValueError,match='preserve existing devices'): action(db,rotate_request(author,corrupted,history),author['token'])
+        assert action(db,{'op':'state'},alice['token'])['workspaces'][0]['controls'][-1]==base
+        assert verify_state(clean,base)==clean
+        action(db,rotate_request(author,clean,history),author['token'])
+        stored=action(db,{'op':'state'},alice['token'])['workspaces'][0]['controls'][-1]
+        assert stored==clean and all(stored['devices'][key]==value for key,value in base['devices'].items())
+
+
+def test_device_removal_cannot_approve_a_replacement(tmp_path):
+    with closing(connect(tmp_path/'server.db')) as db:
+        alice,bob=account(db,'alice'),account(db,'bob')
+        base=create_ws(db,alice,'w',bytes(32),'team'); base=rotate_ws(db,alice,base,bytes([1])*32,((alice,'admin'),(bob,'member')))
+        target=identity('unapproved-bob'); register_device(db,'bob',bob['root'],target)
+        entry=record(bob['user'],bob['root']['sign_public'],target,certificate(bob['root'],bob['user'],target))
+        def removal(devices):
+            return sign(alice['device'],{'v':1,'kind':'workspace.state','workspace':'w','scope':'team','revision':base['revision']+1,'prev':state_hash(base),'epoch':base['epoch']+1,'boundary':{'epoch':base['epoch']+1,**ledger_state(db,'w')},'key_commitment':digest(bytes([2])*32),'members':base['members'],'devices':devices,'removed':[bob['device']['id']],'action':'remove','approval':None,'approved_at':time.time()})
+        def request(state):
+            envelopes={key:seal_key(bytes([2])*32,value['device']['box_public'],f'workspace:w:epoch:{state["epoch"]}') for key,value in state['devices'].items()}
+            return sign_control(alice['device'],{'op':'rotate','workspace':'w','control':state,'envelopes':envelopes})
+        kept={alice['device']['id']:base['devices'][alice['device']['id']]}; corrupted=removal(kept|{target['id']:entry})
+        with pytest.raises(ValueError,match='invalid device removal'): verify_state(corrupted,base)
+        with pytest.raises(ValueError,match='invalid device removal'): action(db,request(corrupted),alice['token'])
+        assert action(db,{'op':'state'},alice['token'])['workspaces'][0]['controls'][-1]==base
+        clean=removal(kept); assert verify_state(clean,base)==clean
+        action(db,request(clean),alice['token'])
+        assert action(db,{'op':'state'},alice['token'])['workspaces'][0]['controls'][-1]==clean
+
+
 def test_blob_replica_is_raw_bounded_repairable_and_history_scoped(tmp_path,monkeypatch):
     db=connect(tmp_path/"server.db"); a,b=account(db,"alice"),account(db,"bob"); ws,k1,k2="team",bytes([1])*32,bytes([2])*32; state=create_ws(db,a,ws,k1,"team"); env=seal_blob(b"body",ws,1,k1,a["device"]["id"]); state=rotate_ws(db,a,state,k2,((a,"admin"),(b,"member"))); ack=action(db,{"op":"blob_upload","envelope":env},a["token"]); assert db.execute("SELECT LENGTH(ciphertext) FROM blob_replicas").fetchone()[0]==20 and action(db,{"op":"blob_pull","workspace":ws},b["token"])["blobs"]==[]
     state=history_ws(a,state,b["user"]); action(db,sign_control(a["device"],{"op":"grant_all","workspace":ws,"user":b["user"],"control":state,"envelopes":{"1":{b["device"]["id"]:seal_key(k1,b["device"]["box_public"],f"workspace:{ws}:epoch:1")},"2":{b["device"]["id"]:seal_key(k2,b["device"]["box_public"],f"workspace:{ws}:epoch:2")}}}),a["token"]); pulled=action(db,{"op":"blob_pull","workspace":ws},b["token"])["blobs"][0]; assert pulled["cursor"]==ack["cursor"] and open_blob(pulled["envelope"],k1)[0]==b"body"
@@ -153,3 +209,113 @@ def test_registration_requires_fresh_device_key_proof_and_consumes_challenge(tmp
     assert action(db,{**request,"proof":proof})["device"]==device["id"]
     db.close(); db=connect(path)
     with pytest.raises(PermissionError,match="already used"): action(db,{**request,"proof":proof})
+
+
+def test_failed_event_batch_rolls_back_before_connection_reuse(tmp_path):
+    with closing(connect(tmp_path/"server.db")) as db:
+        a=account(db,"alice"); ws,key="personal",bytes(32); create_ws(db,a,ws,key,"personal")
+        env=seal_event(event(a["device"],1,"message.record","one",{},[]),ws,1,key)
+        with pytest.raises(PermissionError): action(db,{"op":"upload_many","envelopes":[env,{**env,"author":"wrong"}]},a["token"])
+        assert not db.in_transaction
+        action(db,sign_control(a["device"],{"op":"recovery","bundle":{"ciphertext":"updated"}}),a["token"])
+        assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0]==db.execute("SELECT COUNT(*) FROM ledger_cursors").fetchone()[0]==0
+
+
+def test_event_upload_and_signed_rotation_are_serialized(tmp_path,monkeypatch):
+    path=tmp_path/"server.db"
+    with closing(connect(path)) as db:
+        a=account(db,"alice"); ws,key="personal",bytes(32); state=create_ws(db,a,ws,key,"personal")
+        env=seal_event(event(a["device"],1,"message.record","one",{},[]),ws,1,key)
+        checked,resume=threading.Event(),threading.Event(); outcomes=[]; real=server_module.digest
+        def pause(value):
+            if value is env:
+                checked.set()
+                assert resume.wait(5)
+            return real(value)
+        def upload():
+            with closing(connect(path)) as conn:
+                try: outcomes.append(action(conn,{"op":"upload","envelope":env},a["token"]))
+                except BaseException as error: outcomes.append(error)
+        monkeypatch.setattr(server_module,"digest",pause)
+        worker=threading.Thread(target=upload,name="paused-upload"); worker.start()
+        try:
+            assert checked.wait(5)
+            db.execute("PRAGMA busy_timeout=0")
+            with pytest.raises(sqlite3.OperationalError,match="locked"): rotate_ws(db,a,state,bytes([1])*32,((a,"admin"),))
+            assert not db.in_transaction
+        finally:
+            resume.set(); worker.join(5)
+        assert not worker.is_alive() and len(outcomes)==1 and isinstance(outcomes[0],dict), outcomes
+        rotated=rotate_ws(db,a,state,bytes([1])*32,((a,"admin"),))
+        assert rotated["boundary"]=={"epoch":2,"tail":outcomes[0]["cursor"],"heads":{a["device"]["id"]:{"seq":1,"event":env["event"]}}}
+
+
+def test_state_is_one_snapshot_while_a_rotation_commits(tmp_path,monkeypatch):
+    path=tmp_path/"server.db"
+    with closing(connect(path)) as db,closing(connect(path,False)) as writer:
+        a=account(db,"alice"); ws,key="personal",bytes(32); state=create_ws(db,a,ws,key,"personal"); real=server_module.rows; rotations=[]
+        def rotate_after_membership(conn,sql,args=()):
+            values=real(conn,sql,args)
+            if sql.startswith("SELECT w.id") and not rotations: rotations.append(rotate_ws(writer,a,state,bytes([1])*32,((a,"admin"),)))
+            return values
+        monkeypatch.setattr(server_module,"rows",rotate_after_membership)
+        snapshot=action(db,{"op":"state"},a["token"])["workspaces"][0]
+        assert rotations and snapshot["epoch"]==snapshot["controls"][-1]["epoch"]==max(k["epoch"] for k in snapshot["keys"])==1
+        assert not db.in_transaction and action(db,{"op":"state"},a["token"])["workspaces"][0]["epoch"]==2
+
+
+def test_request_connection_reads_during_writer_and_does_not_create_missing_db(tmp_path):
+    path=tmp_path/"relay #1.db"
+    with closing(connect(path)) as writer:
+        a=account(writer,"alice")
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("UPDATE users SET recovery='{}'")
+        with closing(connect(path,False)) as reader:
+            assert reader.execute("PRAGMA foreign_keys").fetchone()[0]==reader.execute("PRAGMA secure_delete").fetchone()[0]==1
+            assert reader.execute("PRAGMA busy_timeout").fetchone()[0]==30000
+            assert action(reader,{"op":"recovery_fetch","user":a["user"]})=={"bundle":{"ciphertext":"opaque"}}
+        writer.rollback()
+    with pytest.raises(sqlite3.OperationalError): connect(tmp_path/"missing.db",False)
+    assert not (tmp_path/"missing.db").exists()
+
+
+def test_concurrent_event_retries_keep_one_cursor(tmp_path):
+    path=tmp_path/"server.db"
+    with closing(connect(path)) as db:
+        a=account(db,"alice"); ws,key="personal",bytes(32); create_ws(db,a,ws,key,"personal")
+        env=seal_event(event(a["device"],1,"message.record","one",{},[]),ws,1,key)
+        barrier=threading.Barrier(4); outcomes=[]
+        def upload():
+            with closing(connect(path,False)) as conn:
+                barrier.wait(5)
+                try: outcomes.append(action(conn,{"op":"upload","envelope":env},a["token"]))
+                except BaseException as error: outcomes.append(error)
+        workers=[threading.Thread(target=upload) for _ in range(4)]
+        for worker in workers: worker.start()
+        for worker in workers: worker.join(5)
+        assert len(outcomes)==4 and all(isinstance(value,dict) for value in outcomes), outcomes
+        assert sum(value["created"] for value in outcomes)==1 and len({value["cursor"] for value in outcomes})==1
+        assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0]==db.execute("SELECT COUNT(*) FROM ledger_cursors").fetchone()[0]==1
+
+
+def test_ledger_heads_use_each_authors_sequence_and_workspace_tail(tmp_path):
+    with closing(connect(tmp_path/"server.db")) as db:
+        values=[(ws,f"event-{i}",author,seq) for i,(ws,author,seq) in enumerate((("w","a",7),("w","b",2),("w","a",1),("other","a",100),("w","b",3),("w","b",1)))]
+        db.executemany("INSERT INTO events(workspace,event,author,seq) VALUES (?,?,?,?)",values)
+        assert ledger_state(db,"w")=={"tail":6,"heads":{"a":{"seq":7,"event":"event-0"},"b":{"seq":3,"event":"event-4"}}}
+        assert ledger_state(db,"absent")=={"tail":0,"heads":{}}
+
+
+def test_lazy_event_page_does_not_materialize_large_bodies(tmp_path):
+    with closing(connect(tmp_path/"server.db")) as db:
+        a=account(db,"alice"); ws,key="personal",bytes(32); create_ws(db,a,ws,key,"personal")
+        envelopes=[seal_event(event(a["device"],i+1,"future.large",str(i),{"body":"x"*1024**2},[]),ws,1,key) for i in range(8)]
+        action(db,{"op":"upload_many","envelopes":envelopes},a["token"])
+        tracemalloc.start()
+        try:
+            result=action(db,{"op":"pull","workspace":ws},a["token"])
+            peak=tracemalloc.get_traced_memory()[1]
+        finally: tracemalloc.stop()
+        assert len(result["events"])==8 and all(value["lazy"] and "envelope" not in value for value in result["events"])
+        assert peak<2*1024**2
+        assert action(db,{"op":"fetch","workspace":ws,"event":envelopes[-1]["event"]},a["token"])["envelope"]==envelopes[-1]

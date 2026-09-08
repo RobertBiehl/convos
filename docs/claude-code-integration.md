@@ -9,6 +9,10 @@ read_when:
 
 # Claude Code Integration
 
+Native-session sync checkpoints only successfully parsed files. Parser failures
+remain eligible for the next sync even when the transcript mtime has not changed;
+valid empty sessions are accounted for without creating a conversation.
+
 Parses local Claude Code session files from `~/.claude/projects/`.
 Canonical field semantics and subagent relationships are defined in
 [Provider conversation contract](provider-conversation-contract.md).

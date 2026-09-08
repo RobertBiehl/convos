@@ -272,12 +272,40 @@ class TestCodexParser:
         from ai_convos import cli
         root=tmp_path/".codex"; a,b=root/"sessions/a.jsonl",root/"sessions/b.jsonl"; a.parent.mkdir(parents=True); events=[{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"same","cwd":"/repo"}},{"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}},{"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}]; a.write_text("\n".join(map(json.dumps,events[:2]))); b.write_text("\n".join(map(json.dumps,events))); parsed=cli.parse_codex(root); assert len(parsed.convs)==2; db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,parsed); assert db.execute("SELECT (SELECT count(*) FROM conversations),(SELECT count(*) FROM messages),(SELECT count(*) FROM provider_sessions)").fetchone()==(1,2,1)
 
+    def test_native_input_accounting_distinguishes_empty_from_failed(self,tmp_path):
+        from ai_convos import cli
+        root=tmp_path/".codex"; sessions=root/"sessions"; sessions.mkdir(parents=True); (sessions/"empty.jsonl").write_text(""); (sessions/"bad.jsonl").write_bytes(b"\xff")
+        parsed=cli.parse_codex(root)
+        assert not parsed.convs and parsed.failed_inputs==[str(sessions/"bad.jsonl")]
+        combined=cli.ParseResult()+parsed; combined+=cli.ParseResult(failed_inputs=["another.jsonl"])
+        assert combined.failed_inputs==[str(sessions/"bad.jsonl"),"another.jsonl"]
+
     def test_same_batch_divergent_native_session_fails_before_mutation(self,tmp_path):
         import duckdb,pytest
         from ai_convos import cli
         root=tmp_path/".codex"; sessions=root/"sessions"; sessions.mkdir(parents=True); base=lambda text:[{"type":"session_meta","payload":{"id":"same","cwd":"/repo"}},{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}]; (sessions/"a.jsonl").write_text("\n".join(map(json.dumps,base("alpha")))); (sessions/"b.jsonl").write_text("\n".join(map(json.dumps,base("beta")))); db=duckdb.connect(); cli.init_schema(db)
         with pytest.raises(ValueError,match="divergent provider session"): cli.upsert(db,cli.parse_codex(root))
         assert db.execute("SELECT (SELECT count(*) FROM conversations),(SELECT count(*) FROM messages),(SELECT count(*) FROM provider_sessions)").fetchone()==(0,0,0)
+
+    def test_duplicate_identity_validation_is_linear_and_compares_complete_fields(self):
+        from ai_convos import cli
+        accesses=[0]
+        class Row(dict):
+            def __getitem__(self,key): accesses[0]+=1; return super().__getitem__(key)
+        rows=[Row(id=f"m{i}",content="prefix"*100,metadata="{}") for i in range(2000)]
+        assert cli._id_conflict([*rows,*rows],("content","metadata")) is None
+        assert accesses[0]<=len(rows)*8
+        assert cli._id_conflict([*rows,{**rows[-1],"content":"prefix"*100+"different"}],("content","metadata"))=="m1999"
+        assert cli._id_conflict([*rows,{**rows[0],"metadata":"{\"changed\":true}"}],("content","metadata"))=="m0"
+
+    def test_chunked_ingest_rejects_divergent_duplicates_before_opening_archive(self,monkeypatch):
+        import pytest
+        from ai_convos import cli
+        conv=dict(id="c",source="codex",title="long",created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")
+        msgs=[dict(id=f"m{i}",conversation_id="c",role="user",content="evidence",thinking=None,created_at=None,model=None,metadata="{}",parent_id=None) for i in range(501)]
+        monkeypatch.setattr(cli,"_core",lambda **_:pytest.fail("divergent batch opened archive"))
+        with pytest.raises(ValueError,match="divergent provider session in import batch: m0"):
+            cli.commit_result(cli.ParseResult(convs=[conv],msgs=[*msgs,{**msgs[0],"content":"different evidence"}]),purpose="test.ingest")
 
     def test_parse_result_relations_fail_before_any_write(self):
         import duckdb,pytest

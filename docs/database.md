@@ -155,11 +155,24 @@ product is strictly read-only.
 | `file_edit_evidence` | Per-edit classification (`confirmed`, `invalid`, `unknown`, or `unverified`), reason, and exact tool-call link |
 | `git_checkpoints` | Git head plus capture-time working-tree hash, changed paths, and capture source |
 | `checkpoint_edits` | Checkpoint-to-`file_edits.id` evidence |
-| `local_facts` | Content-free marker that this archive independently observed a fact and may sign it locally |
+| `local_facts` | Content-free marker written only by independent source capture, never by receiving a replica; a local fact keeps its native typed body when foreign variants arrive |
+| `pending` | Local conversation/edit identities and their ingestion generations awaiting provenance enrichment |
 
 There are intentionally no copied prompts, message bodies, changesets,
 file-edit bodies, raw remote payloads, workspace IDs, or device IDs in this
 schema.
+
+Native capture preserves signed variants before replacing a foreign-only
+immutable projection, then records local ownership in the same transaction.
+Receiving a fact from the current user's other device does not establish that
+this archive independently observed it.
+
+Historical limitation: b6 could leave `local_facts` pointing at a foreign typed
+variant. Existing markers are preserved; ordinary capture does not replace an
+already marked immutable fact, so upgrading or running a full sync does not
+prove or repair that old ownership. Such a case needs explicit reconciliation
+against retained signed bodies and source evidence before it can be treated as
+a native observation.
 
 Raw `file_edits` remain lossless archive records. Exact provenance,
 changegraph, project summaries, and team contribution use only `confirmed`
@@ -180,12 +193,15 @@ separate provenance and does not change semantic row identity after recovery.
 
 | Relation | Durable facts |
 |----------|---------------|
+| `row_references` | Exact temporary reverse references from verified children awaiting parent origins; removed when the parent mapping is present |
+| `edit_dependencies` | Proof IDs waiting on author-scoped archive edits or shared file identities |
+| `edit_ready` | Durable dependency keys and bounded retry cursors, including legacy bootstrap progress |
 | `row_origins` | Author-scoped physical-to-source identity and currently materialized proof |
 | `provenance_origins` | Imported provenance fact attribution and original proof link |
 | `row_proofs` | Bodyless signed revision, content hash, predecessor, state, author, and authorization epoch |
 | `row_signers` | One normalized root key and device certificate per author device |
 | `workspace_controls` | Signed origin-workspace authorization chain, once per control revision |
-| `row_conflicts` | Canonical logical body for a rare verified incomparable head not selected as the main row |
+| `row_conflicts` | Exact signed body retained when the typed projection cannot reconstruct it, including unresolved heads and captured snapshots |
 | `provider_session_aliases` | Author-scoped root-signed exact provider-session membership leaves and their deterministic canonical source row |
 | `file_edit_evidence_proofs` | Root-signed evidence leaves bound to exact edit and optional tool-call row revisions |
 

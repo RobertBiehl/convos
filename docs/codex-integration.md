@@ -12,6 +12,13 @@ Parses local Codex CLI session files from `~/.codex/sessions/`.
 Canonical field semantics and subagent relationships are defined in
 [Provider conversation contract](provider-conversation-contract.md).
 
+Incremental native-session sync records a file as complete only when its parser
+returns successfully. Failed files remain eligible on the next sync even if their
+mtime is unchanged; valid empty sessions are accounted for without creating a
+conversation. A changed mtime in either direction triggers parsing. Hook failures,
+including unavailable transcript files or parser dependencies, remain queued and
+are reported in hook progress instead of being silently discarded.
+
 ## Session Files
 
 Codex stores sessions organized by date:

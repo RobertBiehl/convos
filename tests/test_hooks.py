@@ -80,6 +80,40 @@ def test_failed_only_drain_does_not_respawn_tight_loop(hooks,monkeypatch):
     sessions,data=hooks; path=sessions/"bad.jsonl"; transcript(path); enqueue(path); launched=[]; monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(args)); monkeypatch.setattr(cli,"hook_result",lambda *_:(_ for _ in ()).throw(ValueError("bad transcript")))
     assert cli.drain_hooks()==0 and not launched and json.loads((data/"hook_progress.json").read_text())["failed"]==1
 
+def test_failed_prefix_does_not_starve_healthy_capture_or_spin(hooks,monkeypatch):
+    sessions,_=hooks; launched=[]; parse=cli.hook_result; monkeypatch.setattr(cli,"HOOK_DRAIN_EVENTS",2)
+    for name in ("bad-0","bad-1","bad-2","good"): transcript(path:=sessions/f"{name}.jsonl",name); enqueue(path)
+    def broken(source,path,bindings):
+        if path.stem.startswith("bad"): raise ValueError("bad transcript")
+        return parse(source,path,bindings)
+    monkeypatch.setattr(cli,"hook_result",broken); monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(kwargs))
+    assert cli.drain_hooks()==0 and len(launched)==1
+    monkeypatch.setenv("CONVOS_HOOK_ATTEMPT",launched[0]["env"]["CONVOS_HOOK_ATTEMPT"])
+    assert cli.drain_hooks()==1 and len(launched)==1
+    with cli.open_db(read_only=True,purpose="fixture.read") as db: assert db.execute("SELECT content FROM messages").fetchall()==[("good",)]
+    assert len(list(cli.HOOK_DIR.glob("*.json")))==3
+    monkeypatch.setattr(cli,"hook_result",parse)
+    monkeypatch.delenv("CONVOS_HOOK_ATTEMPT")
+    assert cli.drain_hooks()==2 and cli.drain_hooks()==1
+
+def test_replaced_failed_capture_is_eligible_in_same_drain_attempt(hooks,monkeypatch):
+    sessions,_=hooks; transcript(path:=sessions/"retry.jsonl"); enqueue(path); parse=cli.hook_result
+    monkeypatch.setattr(cli,"hook_result",lambda *_:(_ for _ in ()).throw(ValueError("partial transcript")))
+    assert cli.drain_hooks()==0
+    monkeypatch.setenv("CONVOS_HOOK_ATTEMPT",json.loads(cli.HOOK_PROGRESS.read_text())["attempt"])
+    monkeypatch.setattr(cli,"hook_result",parse); transcript(path,"completed transcript"); enqueue(path)
+    assert cli.drain_hooks()==1 and not list(cli.HOOK_DIR.glob("*.json"))
+    with cli.open_db(read_only=True,purpose="fixture.read") as db: assert db.execute("SELECT content FROM messages").fetchall()==[("completed transcript",)]
+
+def test_drain_publishes_progress_before_releasing_worker_lease(hooks,monkeypatch):
+    write=cli.atomic_json; observed=[]
+    def publish(path,value):
+        if path==cli.HOOK_PROGRESS:
+            with cli.operation_lock(cli.HOOK_DIR/".drain.lock","fixture.probe",0,mandatory=False) as acquired: observed.append(acquired is None)
+        return write(path,value)
+    monkeypatch.setattr(cli,"atomic_json",publish)
+    assert cli.drain_hooks()==0 and observed==[True]
+
 def test_concurrent_sync_exits_immediately_and_explicitly(hooks,capsys):
     _,data=hooks; data.mkdir(); hold=POPEN([sys.executable,"-c","import sys; from pathlib import Path; from ai_convos.cli import operation_lock\nwith operation_lock(Path(sys.argv[1]),'sync'): print('ready',flush=True); input()",str(data/".sync.lock")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); done=threading.Event(); result=[]
     def attempt():
@@ -144,6 +178,42 @@ def test_failed_parse_returns_claim_to_queue(hooks, monkeypatch):
     assert len(list((data/"hook_inbox").glob("*.json"))) == 1 and not list((data/"hook_inbox").glob("*.work"))
     monkeypatch.setattr(cli, "hook_result", original); assert cli.drain_hooks() == 1
 
+def test_missing_parser_dependency_does_not_discard_hook_input(hooks,monkeypatch):
+    sessions,_=hooks; transcript(path:=sessions/"missing.jsonl"); enqueue(path)
+    monkeypatch.setattr(cli,"hook_result",lambda *_:(_ for _ in ()).throw(FileNotFoundError("parser dependency unavailable")))
+    assert cli.drain_hooks()==0 and json.loads(cli.HOOK_PROGRESS.read_text())["failed"]==1
+    assert len(list(cli.HOOK_DIR.glob("*.json")))==1
+
+def test_hook_retries_provenance_after_ingestion_committed(hooks,tmp_path,monkeypatch):
+    sessions,_=hooks; root=tmp_path/"repo"; root.mkdir(); subprocess.run(["git","-C",str(root),"init","-q"],check=True)
+    transcript(path:=sessions/"git-retry.jsonl"); path.write_text(path.read_text().replace('"/repo"',json.dumps(str(root)))); enqueue(path); run=cli._git_run
+    monkeypatch.setattr(cli,"_git_run",lambda *args:(_ for _ in ()).throw(subprocess.CalledProcessError(1,args,stderr=b"temporary git failure")))
+    assert cli.drain_hooks()==0
+    with cli.open_db(read_only=True,purpose="fixture.read") as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==1
+        assert db.execute("SELECT checkout LIKE 'pending:%' FROM provenance.conversation_scopes").fetchone()[0]
+    monkeypatch.setattr(cli,"_git_run",run); assert cli.drain_hooks()==1
+    with cli.open_db(read_only=True,purpose="fixture.read") as db:
+        assert not db.execute("SELECT checkout LIKE 'pending:%' FROM provenance.conversation_scopes").fetchone()[0]
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==1
+
+def test_local_sync_retries_failed_unchanged_transcript(hooks,monkeypatch):
+    sessions,_=hooks; parse=cli.parse_codex_session
+    for name in ("good","bad"): transcript(sessions/f"{name}.jsonl",name)
+    def broken(path,bindings=None):
+        if path.stem=="bad": raise ValueError("temporary parser failure")
+        return parse(path,bindings)
+    monkeypatch.setattr(cli,"parse_codex_session",broken); cli.sync(False,300,False,True,False,False,True)
+    with cli.open_db(read_only=True,purpose="fixture.read") as db: assert db.execute("SELECT content FROM messages").fetchall()==[("good",)]
+    assert str(sessions/"bad.jsonl") not in cli.load_state()["local"]["codex"]["files"]
+    monkeypatch.setattr(cli,"parse_codex_session",parse); cli.sync(False,300,False,True,False,False,True)
+    with cli.open_db(read_only=True,purpose="fixture.read") as db: assert set(db.execute("SELECT content FROM messages").fetchall())=={("good",),("bad",)}
+
+def test_local_sync_notices_backward_transcript_mtime(hooks):
+    sessions,_=hooks; transcript(path:=sessions/"restored.jsonl","original"); cli.sync(False,300,False,True,False,False,True); previous=path.stat()
+    transcript(path,"restored evidence"); os.utime(path,ns=(previous.st_atime_ns,previous.st_mtime_ns-60_000_000_000)); cli.sync(False,300,False,True,False,False,True)
+    with cli.open_db(read_only=True,purpose="fixture.read") as db: assert set(db.execute("SELECT content FROM messages").fetchall())=={("original",),("restored evidence",)}
+
 def test_stable_metadata_only_session_completes_until_changed(hooks):
     sessions, data = hooks; path = sessions/"empty.jsonl"; path.write_text(json.dumps({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"cwd":"/repo"}})); enqueue(path)
     assert cli.drain_hooks() == 1 and not list((data/"hook_inbox").glob("*.json"))
@@ -154,6 +224,15 @@ def test_orphaned_claim_leaves_authoritative_fts_state_stale(hooks):
     conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); cli.upsert(conn, cli.hook_result("codex", path)); conn.close()
     assert cli.drain_hooks() == 1
     conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT fts_generation IS NULL OR messages_generation<>fts_generation FROM retrieval_state").fetchone()[0]; conn.close()
+
+def test_recovered_completion_preserves_newer_queued_capture_at_time_budget(hooks,monkeypatch):
+    sessions,_=hooks; transcript(path:=sessions/"recovered.jsonl"); enqueue(path); queue=next(cli.HOOK_DIR.glob("*.json")); event=json.loads(queue.read_text()); assert cli.drain_hooks()==1
+    cli.atomic_json(queue.with_suffix(".work"),{**event,"snap":[event["mtime"],event["size"]],"changed":[]})
+    transcript(other:=sessions/"other.jsonl","other"); enqueue(other); transcript(path,"newer recovered evidence"); enqueue(path)
+    monkeypatch.setattr(cli,"HOOK_DRAIN_SECONDS",-1); assert cli.drain_hooks()==2
+    assert [*cli.HOOK_DIR.glob("*.json"),*cli.HOOK_DIR.glob("*.work")], "newer queued capture was erased by recovered completion"
+    monkeypatch.setattr(cli,"HOOK_DRAIN_SECONDS",10); assert cli.drain_hooks()==1
+    with cli.open_db(read_only=True,purpose="fixture.read") as db: assert db.execute("SELECT content FROM messages WHERE content='newer recovered evidence'").fetchone()
 
 def test_hook_defers_fts_and_search_does_not_rebuild(hooks):
     sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); assert cli.drain_hooks() == 1

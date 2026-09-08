@@ -87,6 +87,30 @@ HTTPS endpoint. The server itself has no TLS or public-network configuration.
 The client rejects plaintext HTTP except on loopback;
 `CONVOS_REMOTE_INSECURE=1` is only for a trusted test network.
 
+Schema initialization runs at startup. Each request opens an existing database
+without running migrations or acquiring a writer lock for connection setup.
+Reads use one SQLite snapshot, so a response cannot mix membership, keys, and
+signed controls from different rotations. Mutations authorize and commit within
+one write transaction; a failed batch is rolled back completely, and concurrent
+uploads cannot cross a signed epoch history boundary. WAL readers can continue
+while another request holds the write transaction.
+
+The relay defaults to 32 request workers; set `CONVOS_SERVER_WORKERS` in the
+service environment to adjust the concurrency and memory allowance. Excess
+connections receive HTTP 503 with `Retry-After: 1`. Each body is limited to
+64 MiB, with exactly one nonnegative `Content-Length` and no transfer encoding.
+Idle sockets close after 30 seconds; a 120-second connection deadline also
+closes clients that keep sending slowly. The deadline uses the server's
+existing accept loop and does not allocate a timer thread for each request.
+Unexpected failures are logged on the server and return a generic error.
+
+Large-event pages return manifests without materializing ciphertext bodies in
+Python; clients fetch those bodies individually. Ledger heads are computed
+from the author-sequence index. The bounded synthetic
+[`benchmark_relay.py`](../scripts/benchmark_relay.py) records startup, complete
+HTTP reads and writes, concurrent reads, writer contention, and large-page
+allocations; see [b7 relay measurements](relay-b7-hardening.md).
+
 ## Personal multi-computer setup
 
 On the first computer:
@@ -400,6 +424,14 @@ convos-server backup \
   --db ~/.local/share/convos-server/server.db \
   --output ~/backups/convos-server.db
 ```
+
+The command opens an existing source read-only, verifies the staged snapshot
+with SQLite `quick_check`, and publishes it with private `0600` permissions.
+It fsyncs the file before replacement and the containing directory afterward.
+Missing sources and output paths that refer to the source, including symlinks
+and hardlinks, are rejected. A failed copy or validation leaves an existing
+backup intact. Choose a fresh output path if the old output has SQLite `-wal`,
+`-shm`, or `-journal` files.
 
 Restore by stopping the relay, replacing its database with the snapshot, and
 starting it again. The backup contains ciphertext, ACL metadata, key envelopes,

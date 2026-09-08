@@ -24,3 +24,7 @@ the supplied report have not been independently audited.
 No report-specific repair has been run on personal data. Hook throttling is
 separate completed work and does not resolve these defects. Schema additions
 must be compact and reusable; avoid incident-specific migration chains.
+
+Pending edit facts now use core-owned `remote.edit_dependencies` and `remote.edit_ready` metadata. Archive edit dependencies include the author; shared file dependencies do not. An arriving parent queues its key, and each retry transaction handles at most 500 dependency/proof entries. The retry cursor commits with projection and body cleanup. Incoming relay receipts follow the core commit that durably retains the body and dependency metadata. Sync drains ready work after restart even when no new replicas arrive, and the settled check includes readiness without scanning retained bodies.
+
+The empty dependency key tracks a one-time, paginated bootstrap of legacy retained edit facts; `done` completes that bootstrap. Unready facts remain retained without making every no-op sync scan their bodies. Cleanup removes a safely projected head and only its proven causal ancestors, preserving unresolved forks and scope conflicts.

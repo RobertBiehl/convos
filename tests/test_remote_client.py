@@ -60,6 +60,36 @@ def test_replica_inventory_uses_server_limit_and_legacy_default(tmp_path,monkeyp
     assert len(remote_client.replica_inventory({"server_state":{"capabilities":{"replica_reconcile_limit":2500}}},state,"w",candidates))==5001 and calls==[2500,2500,1]
     calls.clear(); assert len(remote_client.replica_inventory({},state,"w",candidates[:1001]))==1001 and calls==[500,500,1]; state.close()
 
+
+def test_local_receipt_lookup_is_scoped_to_requested_keys_and_epochs(tmp_path):
+    state=connect(tmp_path/"state.db"); state.executemany("INSERT INTO replica_receipts VALUES (?,?,?,?)",[("w",f"{i:064x}",1,i+1) for i in range(20000)]+[("w","epoch",2,20001),("other","elsewhere",1,1)])
+    steps=[]; state.set_progress_handler(lambda:steps.append(1) or 0,1)
+    assert remote_client.local_receipts(state,"replica","w",[(f"{i:064x}",1) for i in (1,19999)]+[("epoch",1),("elsewhere",1)])=={(f"{i:064x}",1) for i in (1,19999)}
+    assert len(steps)<1000, "receipt membership scanned the archive instead of requested keys"
+    state.close()
+
+
+def test_empty_row_pull_does_not_inventory_existing_receipts(tmp_path,monkeypatch):
+    state=connect(tmp_path/"state.db"); state.executemany("INSERT INTO replica_receipts VALUES (?,?,?,?)",[("w",f"{i:064x}",1,i+1) for i in range(20000)]); state.execute("INSERT INTO meta VALUES ('replica_projection:w','stamp')"); state.commit()
+    monkeypatch.setattr(remote_client,"bridge_stamp",lambda root:"stamp"); monkeypatch.setattr(remote_client,"request",lambda *args:{"replicas":[],"floor":0,"tail":0})
+    steps=[]; state.set_progress_handler(lambda:steps.append(1) or 0,1)
+    assert remote_client.pull_row_replicas({"device":{"id":"device"},"user":"user"},state,tmp_path,{"id":"w","controls":[]})==0
+    assert len(steps)<1000, "empty pull read an archive-sized receipt inventory"
+    state.close()
+
+
+def test_row_cursor_rollback_revalidates_receipted_bodies(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr(remote_client,"request",transport(server)); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
+    root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); sid=workspace(cfg,"Personal"); write_archive(root/"data/convos.db","restore me"); sync_once(root)
+    with duckdb.connect(str(root/"data/convos.db")) as core: core.execute("DELETE FROM conversations")
+    cfg=load(root); ws=next(w for w in refresh(cfg,root)["workspaces"] if w["id"]==sid)
+    with connect(root/"remote/state.db") as state:
+        assert state.execute("SELECT COUNT(*) FROM replica_receipts WHERE workspace=?",[sid]).fetchone()[0]>0
+        state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_cursor:{sid}","999999")); state.commit()
+        assert remote_client.pull_row_replicas(cfg,state,root,ws)>0
+    with duckdb.connect(str(root/"data/convos.db"),read_only=True) as core: assert core.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==("restore me",)
+
+
 def test_first_publication_does_not_reconcile_each_preparation_page(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); direct=transport(server); calls=[]
     monkeypatch.setattr("ai_convos_remote.request",lambda cfg,body,auth=True:calls.append(body["op"]) or direct(cfg,body,auth)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","first publication"); orphan=root/"remote/outbox/.replica-batch-orphan.json.1.1"; orphan.write_text("ignored staging data"); calls.clear(); sync_once(root)
@@ -79,7 +109,7 @@ def test_legacy_replica_batch_stream_splits_and_resumes(tmp_path,monkeypatch):
     monkeypatch.setattr(remote_client,"request",lambda cfg,body,auth=True:{"present":{rid:i+100 for i,rid in enumerate(body["replicas"])}} if body["op"]=="replica_reconcile" else {"replicas":[]}); remote_client.upload_replicas({},state,root); assert state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]==len(envs) and not list((root/"remote/outbox").glob("replica-*")); state.close()
 
 def test_remote_timeout_names_operation(monkeypatch):
-    monkeypatch.setattr("urllib.request.urlopen",lambda *args,**kwargs:(_ for _ in ()).throw(urllib.error.URLError(TimeoutError("write timed out"))))
+    monkeypatch.setattr(remote_client._HTTP,"open",lambda *args,**kwargs:(_ for _ in ()).throw(urllib.error.URLError(TimeoutError("write timed out"))))
     with pytest.raises(ConnectionError,match="replica_upload_many.*120s.*write timed out"): remote_client.request({"url":"http://localhost","token":"t"},{"op":"replica_upload_many","envelopes":[]})
 
 
@@ -140,6 +170,75 @@ def test_remote_sync_publishes_captured_snapshot_then_concurrent_change(tmp_path
     assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==1
     sync_once(root,manual=True); rows=[open_replica(json.loads(r[0]),key(load(root),ws,1)) for r in server.execute("SELECT envelope FROM row_replicas ORDER BY cursor").fetchall()]; assert [r["row"]["data"]["title"] for r in rows]==["snapshot","later"] and rows[1]["proof"]["previous_revision"]==rows[0]["proof"]["revision"]
     sync_once(root,manual=True); assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==2
+
+
+def test_sync_process_serializes_attestation_planning_and_retry(tmp_path,monkeypatch):
+    server_path,root=tmp_path/"server.db",tmp_path/"client"
+    server=server_connect(server_path)
+    monkeypatch.setattr(remote_client,"request",transport(server))
+    monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
+    monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(root))
+    cfg,_=setup_client("http://server","alice",root=root)
+    ws,path=workspace(cfg,"Personal"),root/"data/convos.db"
+    write_archive(path,"base")
+    sync_once(root)
+    base=open_replica(json.loads(server.execute("SELECT envelope FROM row_replicas").fetchone()[0]),key(load(root),ws,1))
+    write_archive(path,"planned")
+    child="""
+import sys
+from pathlib import Path
+import ai_convos_remote as remote
+from ai_convos.cli import LockBusy
+from ai_convos_remote_server import action, connect
+server=connect(Path(sys.argv[2]),initialize=False)
+remote.request=lambda cfg,body,auth=True: action(server,body,cfg['token'] if auth else None)
+remote.drain_hooks=lambda:None
+try:
+    remote.sync_once(Path(sys.argv[1]))
+except LockBusy as error:
+    print(str(error))
+    sys.exit(17)
+finally:
+    server.close()
+"""
+    command=[sys.executable,"-c",child,str(root),str(server_path)]
+    sign,attempts=projection_module.row_proof,[]
+    def concurrent(device,user,workspace,epoch,row,previous=None,*args,**kwargs):
+        # The real attester has closed its planning read and selected this head.
+        assert row["data"]["title"]=="planned" and previous==base["proof"]["revision"]
+        write_archive(path,"retry")
+        result=subprocess.run(command,capture_output=True,text=True,timeout=30)
+        assert result.returncode==17 and "remote sync" in result.stdout and "another operation" in result.stdout,(result.stdout,result.stderr)
+        attempts.append(result)
+        return sign(device,user,workspace,epoch,row,previous,*args,**kwargs)
+    monkeypatch.setattr(projection_module,"row_proof",concurrent)
+    sync_once(root)
+    assert len(attempts)==1 and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==2
+    monkeypatch.setattr(projection_module,"row_proof",sign)
+    result=subprocess.run(command,capture_output=True,text=True,timeout=30)
+    assert result.returncode==0,(result.stdout,result.stderr)
+    rows=[open_replica(json.loads(raw),key(load(root),ws,1)) for raw, in server.execute("SELECT envelope FROM row_replicas ORDER BY cursor")]
+    assert [value["row"]["data"]["title"] for value in rows]==["base","planned","retry"]
+    assert [value["proof"]["previous_revision"] for value in rows]==[None,rows[0]["proof"]["revision"],rows[1]["proof"]["revision"]]
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==("retry",)
+        assert db.execute("SELECT p.revision FROM remote.row_proofs p WHERE NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.previous_revision=p.revision)").fetchall()==[(rows[-1]["proof"]["revision"],)]
+    sync_once(root)
+    assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==3
+    server.close()
+
+
+def test_team_delta_preserves_scope_without_rewriting_existing_members(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr(remote_client,"request",transport(server)); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
+    root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); ws=create(cfg,"Team",root=root); replicate_conversation(root,ws); sync_once(root)
+    with connect(root/"remote/state.db") as state:
+        assert [tuple(r) for r in state.execute("SELECT workspace,conversation FROM team_scopes")]==[(ws,"c")]
+        state.executescript("CREATE TRIGGER preserve_team_scope BEFORE DELETE ON team_scopes BEGIN SELECT RAISE(ABORT,'scope rows rewritten'); END; CREATE TRIGGER append_team_scope BEFORE INSERT ON team_scopes WHEN EXISTS (SELECT 1 FROM team_scopes WHERE (workspace,conversation)=(NEW.workspace,NEW.conversation)) BEGIN SELECT RAISE(ABORT,'existing scope reinserted'); END;")
+    write_archive(root/"data/convos.db","updated once"); sync_once(root)
+    with connect(root/"remote/state.db") as state: assert [tuple(r) for r in state.execute("SELECT workspace,conversation FROM team_scopes")]==[(ws,"c")]
+    env=json.loads(server.execute("SELECT envelope FROM row_replicas WHERE workspace=? ORDER BY cursor DESC LIMIT 1",[ws]).fetchone()[0])
+    assert open_replica(env,key(load(root),ws,1))["row"]["data"]["title"]=="updated once"
+
 
 def test_sync_revalidates_sharing_policy_before_publication(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","private until validated"); real=remote_client.sharing_routes; calls=[]

@@ -83,7 +83,7 @@ def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_pat
     observed=next(r for r in records if r["kind"]=="repository.observed"); head=db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]; project(db,{**observed,"payload":{k:v for k,v in observed["payload"].items() if k!="head"},"observed_at":None}); assert db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]==head
     row=query(db,"conversation_changes","c")[0]; assert row["repositories"]==2 and row["files"]==2 and row["prompt"]=="make the cross-repo change" and row["changeset_id"]=="m"
     assert len(query(db,"changeset_files","m"))==2 and query(db,"current_activity",str(a))[0]["repository"]==repository(a)["id"]
-    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","repository_aliases","conversation_scopes","files","file_versions","file_edit_scopes","file_edit_files","file_edit_evidence","git_checkpoints","checkpoint_edits","local_facts"}
+    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","repository_aliases","conversation_scopes","files","file_versions","file_edit_scopes","file_edit_files","file_edit_evidence","git_checkpoints","checkpoint_edits","local_facts","pending"}
     columns={r[0] for r in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance'").fetchall()}; assert not columns&{"prompt","content","payload","workspace","author"}
 
 
@@ -290,7 +290,7 @@ def test_core_upgrade_adds_origin_proof_link_without_losing_attribution(tmp_path
 
 
 def test_core_upgrade_backfills_proof_authorization_workspace(tmp_path):
-    db=graph(tmp_path/"graph.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); proof=row_proof(device,user,"origin",1,logical_row("messages",identity="m",state="deleted")); cert=certificate(root,user,device); project_row_proof(db,proof,root["sign_public"],cert); db.execute("ALTER TABLE remote.row_proofs DROP COLUMN authorization_workspace_id"); init_schema(db); project_row_proof(db,row_proof(device,user,"origin",1,logical_row("messages",identity="n",state="deleted")),root["sign_public"],cert); assert db.execute("SELECT workspace_id,authorization_workspace_id FROM remote.row_proofs ORDER BY source_row_id").fetchall()==[("origin","origin"),("origin","origin")]
+    db=graph(tmp_path/"graph.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); proof=row_proof(device,user,"origin",1,logical_row("messages",identity="m",state="deleted")); cert=certificate(root,user,device); project_row_proof(db,proof,root["sign_public"],cert); db.execute("DROP INDEX remote.row_proofs_source; ALTER TABLE remote.row_proofs DROP COLUMN authorization_workspace_id"); init_schema(db); project_row_proof(db,row_proof(device,user,"origin",1,logical_row("messages",identity="n",state="deleted")),root["sign_public"],cert); assert db.execute("SELECT workspace_id,authorization_workspace_id FROM remote.row_proofs ORDER BY source_row_id").fetchall()==[("origin","origin"),("origin","origin")]
 
 
 def test_core_upgrade_indexes_existing_retained_attachment_body(tmp_path):
@@ -311,9 +311,9 @@ def test_git_checkpoint_is_capture_observation_not_dirty_path_gap(tmp_path):
 
 def test_provenance_failure_rolls_back_only_enrichment(tmp_path,monkeypatch):
     root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); write=core_module.project_provenance; generation=archive_state(db)[1]; db.close()
-    def fail(conn,value,*args):
+    def fail(conn,value,*args,**kwargs):
         if value["kind"]=="file.observed": raise OSError("git evidence failed")
-        return write(conn,value,*args)
+        return write(conn,value,*args,**kwargs)
     monkeypatch.setattr(core_module,"project_provenance",fail)
     with pytest.raises(OSError,match="evidence"): capture(path)
     db=duckdb.connect(str(path))
@@ -391,6 +391,57 @@ def test_ingestion_commits_before_git_failure_and_failed_marker_cannot_reclassif
     with pytest.raises(subprocess.CalledProcessError): capture(path)
     db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="saved" and db.execute("SELECT checkout LIKE 'pending:%' FROM provenance.conversation_scopes").fetchone()[0]; db.close(); monkeypatch.setattr(core_module,"_git_run",real)
     __import__("shutil").rmtree(root/".git"); capture(path); db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT repository,checkout FROM provenance.conversation_scopes").fetchone()==(None,None) and not db.execute("SELECT 1 FROM provenance.repositories").fetchone(); db.close()
+
+def test_pending_provenance_survives_failed_existing_edit_and_noop_sync(tmp_path,monkeypatch):
+    root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); capture(path); monkeypatch.setattr(core_module,"DB_PATH",path)
+    result=core_module.ParseResult(edits=[dict(id="e0",message_id="m",file_path=str(root/"x.py"),edit_type="write",content="two\n",created_at=None,old_content=None)],edit_evidence=[dict(file_edit_id="e0",status="confirmed",reason="test_fixture",tool_call_id=None)])
+    core_module.commit_result(result,purpose="test.ingest"); run=core_module._git_run
+    monkeypatch.setattr(core_module,"_git_run",lambda *args:(_ for _ in ()).throw(subprocess.CalledProcessError(1,args,stderr=b"temporary git failure")))
+    with pytest.raises(subprocess.CalledProcessError): capture(path,edit_ids=set(),conversation_ids=set())
+    with core_module.open_db(path,read_only=True,purpose="fixture.read") as db:
+        assert db.execute("SELECT content FROM file_edits WHERE id='e0'").fetchone()[0]=="two\n"
+        assert db.execute("SELECT new_content_hash FROM provenance.file_edit_files WHERE file_edit_id='e0'").fetchone()[0]==digest(b"one\n")
+        assert db.execute("SELECT kind,entity FROM provenance.pending").fetchall()==[("file_edits","e0")]
+    monkeypatch.setattr(core_module,"_git_run",run); core_module.sync(False,300,False,False,False,False,True)
+    with core_module.open_db(path,read_only=True,purpose="fixture.read") as db:
+        assert db.execute("SELECT new_content_hash FROM provenance.file_edit_files WHERE file_edit_id='e0'").fetchone()[0]==digest(b"two\n")
+        assert not db.execute("SELECT 1 FROM provenance.pending").fetchone()
+        generation=db.execute("SELECT generation FROM archive_state").fetchone()[0]
+    assert capture(path,edit_ids=set(),conversation_ids=set())==[]
+    with core_module.open_db(path,read_only=True,purpose="fixture.read") as db: assert db.execute("SELECT generation FROM archive_state").fetchone()[0]==generation
+
+@pytest.mark.parametrize("related",[True,False])
+def test_provenance_commit_revalidates_only_observed_inputs(tmp_path,monkeypatch,related):
+    root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); monkeypatch.setattr(core_module,"DB_PATH",path); observe=core_module._observe_provenance
+    def raced(*args,**kwargs):
+        result=core_module.ParseResult(edits=[dict(id="e0",message_id="m",file_path=str(root/"x.py"),edit_type="write",content="concurrent\n",created_at=None,old_content=None)],edit_evidence=[dict(file_edit_id="e0",status="confirmed",reason="test_fixture",tool_call_id=None)]) if related else core_module.ParseResult(convs=[dict(id="other",source="codex",title="unrelated",created_at=None,updated_at=None,model=None,cwd=str(root),git_branch=None,project_id=None,metadata="{}")])
+        core_module.commit_result(result,purpose="test.concurrent.ingest")
+        return observe(*args,**kwargs)
+    monkeypatch.setattr(core_module,"_observe_provenance",raced)
+    if related:
+        with pytest.raises(ValueError,match="Provenance inputs changed"): capture(path,edit_ids=["e0"])
+    else: assert any(r["kind"]=="edit.observed" for r in capture(path,edit_ids=["e0"]))
+    with core_module.open_db(path,read_only=True,purpose="fixture.read") as db:
+        assert db.execute("SELECT kind,entity FROM provenance.pending").fetchall()==([("file_edits","e0")] if related else [("conversations","other")])
+        if related: assert not db.execute("SELECT 1 FROM provenance.file_edit_files").fetchone()
+    monkeypatch.setattr(core_module,"_observe_provenance",observe); capture(path,edit_ids=set(),conversation_ids=set())
+    with core_module.open_db(path,read_only=True,purpose="fixture.read") as db:
+        assert not db.execute("SELECT 1 FROM provenance.pending").fetchone()
+        assert db.execute("SELECT new_content_hash FROM provenance.file_edit_files WHERE file_edit_id='e0'").fetchone()[0]==digest(b"concurrent\n" if related else b"one\n")
+
+def test_provenance_retry_batch_is_bounded_and_same_version_schema_is_additive(tmp_path,monkeypatch):
+    path=tmp_path/"core.db"; root=repo(tmp_path/"repo"); db=graph(path); db.execute("DROP TABLE provenance.pending"); before=archive_state(db); init_schema(db); assert archive_state(db)==before; db.close(); monkeypatch.setattr(core_module,"DB_PATH",path)
+    rows=[dict(id=f"c{i}",source="codex",title="pending",created_at=None,updated_at=None,model=None,cwd=str(root),git_branch=None,project_id=None,metadata="{}") for i in range(501)]
+    core_module.commit_result(core_module.ParseResult(convs=rows),purpose="test.ingest")
+    for remaining in (1,0):
+        capture(path,edit_ids=set(),conversation_ids=set())
+        with core_module.open_db(path,read_only=True,purpose="fixture.read") as db: assert db.execute("SELECT COUNT(*) FROM provenance.pending").fetchone()[0]==remaining
+
+def test_provenance_targets_rollback_with_ingestion(tmp_path):
+    path=tmp_path/"core.db"; db=graph(path); row=dict(id="rollback",source="codex",title="pending",created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")
+    with pytest.raises(RuntimeError,match="crash"):
+        with core_module._transaction(db): core_module.upsert(db,core_module.ParseResult(convs=[row])); raise RuntimeError("crash")
+    assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==db.execute("SELECT COUNT(*) FROM provenance.pending").fetchone()[0]==0; db.close()
 
 
 def test_cwd_only_ingestion_persists_moved_checkout_without_changing_identity(tmp_path):

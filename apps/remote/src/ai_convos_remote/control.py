@@ -57,7 +57,7 @@ def verify_state(value,previous=None):
     if action in ("self_approve","quorum_approve","personal_recover"):
         if value["members"]!=previous["members"] or value["removed"]!=previous["removed"] or value["epoch"]!=previous["epoch"]+1: raise ValueError("approval changed workspace policy")
         added=set(value["devices"])-set(previous["devices"])
-        if len(added)!=1 or set(previous["devices"])-set(value["devices"]): raise ValueError("approval must add exactly one device")
+        if len(added)!=1 or any(value["devices"].get(d)!=r for d,r in previous["devices"].items()): raise ValueError("approval must add exactly one device and preserve existing devices")
         target,device=value["approval"]["proposal"]["target"],next(iter(added))
         if device!=target["device"]["id"] or {k:v for k,v in value["devices"][device].items() if k!="history"}!={k:v for k,v in target.items() if k!="history"} or device in previous["removed"]: raise ValueError("approval target mismatch")
         if action=="self_approve" and (author["user"]!=target["user"] or value["devices"][device]["history"]!=author["history"]): raise ValueError("self approval permission mismatch")
@@ -72,7 +72,7 @@ def verify_state(value,previous=None):
         if target["history"] is not True or previous["devices"].get(device,{}).get("history") is not False or value["members"]!=previous["members"] or value["devices"]!=expected or value["removed"]!=previous["removed"] or value["epoch"]!=previous["epoch"] or value["key_commitment"]!=previous["key_commitment"]: raise ValueError("invalid history activation")
         approved(previous,value["approval"]["proposal"],value["approval"]["votes"],value["approved_at"],"history.proposal")
     elif action=="remove":
-        if value["members"]!=previous["members"] or value["epoch"]!=previous["epoch"]+1: raise ValueError("invalid device removal")
+        if value["members"]!=previous["members"] or value["epoch"]!=previous["epoch"]+1 or set(value["devices"])-set(previous["devices"]): raise ValueError("invalid device removal")
         removed=set(previous["devices"])-set(value["devices"])
         if not removed or not removed<=set(value["removed"]) or not set(previous["removed"])<=set(value["removed"]) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if d not in removed): raise ValueError("removed device tombstone missing")
     elif action=="membership":

@@ -30,6 +30,14 @@ or stops reporting progress; a stalled holder is reported after five seconds of 
 inventory every production `flock` call. Contention-only waiter notices also use `flock`, solely so
 a crashed waiter is distinguishable from a live one and its stale notice can be removed safely.
 
+Hook workers retain separate completed claims and newer captures for the same transcript.
+Automatic worker handoffs share one attempt token: each unchanged failed queue entry is
+tried once during that attempt, so failures cannot starve later captures or spin a backlog
+larger than one batch. A new capture or explicit drain starts a new attempt. Replacing a
+failed queue entry makes it immediately eligible, including within the current attempt.
+Progress and failed queue-file identities are published before releasing the worker lease;
+the queue remains the durable input record.
+
 ## DuckDB archive
 
 1. Every live archive connection goes through `get_db`/`open_db`, which resolves the
@@ -42,7 +50,9 @@ a crashed waiter is distinguishable from a live one and its stale notice can be 
 3. Ordinary canonical writes are bounded transactions and revalidate the archive generation
    or exact rows on which unlocked preparation depended. Remote publication may instead persist
    an immutable signed revision already captured at watermark `G`; it records only `G`, so later
-   archive changes remain pending for the next idempotent sync.
+   archive changes remain pending for the next idempotent sync. Attestation stores exact
+   scanned bodies that no longer match the current archive alongside their signatures in
+   the same transaction; a restart before sealing cannot lose them or replace newer input.
 4. Read snapshots are materialized and closed before expensive Python processing. A read
    lock is not harmless: DuckDB cannot admit a writer from another process while it is open.
 5. DuckDB's native cross-process lock is authoritative. After a real native conflict, Convos
@@ -76,6 +86,19 @@ read-only mode to validate it. It is not the live archive and takes no archive l
 | Remote receive | Verify/decrypt before opening DuckDB; bounded projection transaction; semantic proofs, ancestor links, and affected edit evidence are applied set-wise without archive-wide reconciliation |
 | Attachment relocation | Read plan, hash/copy/fsync unlocked, exact-row revalidation and bounded metadata write |
 | Backup and migration | Explicit maintenance exception; consistent checkpoint/backup precedes mutation |
+
+Captures totaling at most 500 rows use one dependency-ordered transaction across
+their related row kinds; larger captures keep the bounded, restart-safe phases.
+Local ingestion records unfinished provenance targets in its own transaction.
+Provenance capture retries at most 500 queued targets in addition to the current
+explicit targets; `sync --full` retains full reconciliation. Capturing an updated
+edit revisits its derived hashes, while an unchanged completed edit stays a no-op.
+The input snapshot also records generations for just the selected conversations
+and edits. Before writing derived facts, capture verifies those generations and
+acknowledges the targets in the same transaction. A changed target or Git failure
+retains the pending work and the already committed conversations; unrelated
+ingestion does not invalidate the snapshot. When scopes already exist, planning
+and input materialization share one read connection before all Git inspection.
 
 ## SQLite databases
 
