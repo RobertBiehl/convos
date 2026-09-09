@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.6b10
 
 - Preserve metadata-only signed attachment history without requiring nonexistent
   files during backup or recovery. Resolve claimed attachment bytes through all
