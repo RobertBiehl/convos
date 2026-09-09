@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.11.6b9
+
+- Repair proven legacy edit-scope placeholders without changing signed history or evidence status; provide backup-first simulation and targeted recovery tools.
+- Preserve origin-referenced historical bodies when signing successors, and reconstruct exact failed-edit bodies from backup without treating failed edits as successful.
+- Coordinate capture with full import, audit, and alias reconciliation; preserve queued input on interruption. Continue only verified recorded edit branches.
+- Report missing physical parent references separately from signed-body availability, including unsigned messages and explicitly marked history.
+- Include exact orphan-reference counts and distinct missing-parent IDs in `convos doctor`, even without Remote installed.
+- Keep offline diagnosis and explicit repair in `scripts/archive_recovery`; use canonical audit results, exact protected-row comparison, and archive-bound donor proofs. Remove the obsolete direct-write orphan-stub script.
+
+- Publish restored history with its original proof and author on the next ordinary sync, without generating native deletion records.
+- Flush verified repair snapshots durably before mutation; stage exact attachment bytes before restoring references, including isolated simulations.
+
+Core stays at schema 12; no new signed encoding, identity recipe, or relay migration.
+Already-migrated archives need explicit evidence-backed repair. See the
+[recovery procedure](docs/archive-recovery.md) and [release report](docs/archive-release-readiness.md).
+
 ## 0.11.6b8
 
 - Store bulk relay ciphertext as binary with accurate storage quotas. Add a

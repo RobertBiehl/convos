@@ -1018,7 +1018,7 @@ def sync_once(root=None,repair=False,manual=False):
             retry_edit_replicas(core_path(root),cfg['user'],cfg['device']['id'],root,_progress)
             ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
             authorized={w["id"] for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
-            aliases={ws:reconcile_provider_aliases(core_path(root),cfg,ws) for ws in ready&authorized if cfg["workspaces"].get(ws,{}).get("kind")=="personal"}
+            aliases={ws:reconcile_provider_aliases(core_path(root),cfg,ws,_progress) for ws in ready&authorized if cfg["workspaces"].get(ws,{}).get("kind")=="personal"}
             for ws,value in aliases.items(): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"provider_aliases:{ws}",json.dumps(value,sort_keys=True)))
             state.commit()
             path,active=core_path(root),authorized
@@ -1040,12 +1040,13 @@ def sync_once(root=None,repair=False,manual=False):
             scans=[(ws,meta,state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()) for ws,meta in cfg["workspaces"].items() if path.is_file() and ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]]
             scans,deltas=[(ws,meta,prior) for ws,meta,prior in scans if prior is None or int(prior[0])!=generation or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()],{}
             if scans:
+                with _core(root,True,purpose="remote.recovery.changes") as db: recovered=db.execute("SELECT COALESCE(MAX(generation),0) FROM archive_changes WHERE kind='retained.body' AND generation<=?",[generation]).fetchone()[0]
                 _progress("scanning archive")
                 routes={ws:sharing_routes(state,ws,cfg["user"],cfg.get("bindings",{}),known) for ws,meta,prior in scans}
                 batches=[]
                 for ws,meta,prior in scans:
                     repos,roots,match=routes[ws]
-                    full=prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()
+                    full=prior is None or int(prior[0])<recovered or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()
                     scope=set()
                     records=scan_archive(path,state,meta["kind"],repos,roots,ws,scope,match,cfg["user"],generation,_progress,since=None if full else int(prior[0]))
                     batches.append((ws,protect_all(records,root,ws) if meta["kind"]=="team" else records,scope,full))
@@ -1387,6 +1388,7 @@ def repull_cmd(from_backup:Path|None=None):
     try: removed,audit=repull_once(from_backup=from_backup)
     except (ConnectionError,ValueError,RuntimeError) as error: cli_error(error)
     typer.echo(f"Remote rows reconciled from relay; existing rows preserved; verified={audit['totals'].get('projection_match',0)}, retained_variants={audit['totals'].get('retained_variants',0)}")
+    if audit["relationships"]: typer.echo("Unresolved physical references remain: "+", ".join(f"{key}={value['rows']}" for key,value in audit["relationships"].items())+". Body preservation is complete; relationship repair is not.",err=True)
 @remote.command("fetch")
 @locked
 def fetch_cmd(event_id:Optional[str]=None):
@@ -1455,7 +1457,8 @@ def audit_cmd(format:str=typer.Option("text","-f","--format")):
         typer.echo(json.dumps(result,sort_keys=True))
         return
     [typer.echo(f"{kind}: checked={value['origins']}, projection={value['projection_match']} valid/{value['projection_mismatch']} mismatch/{value['projection_missing']} missing, retained_variants={value['retained_variants']}, unavailable={value['unavailable']}") for kind,value in sorted(result["tables"].items())]
-    bad=sum(result["totals"].get(key,0) for key in ("projection_mismatch","projection_missing","proof_missing"))
-    if bad: cli_error(f"Signed-row audit: {result['totals'].get('unavailable',0)} unavailable bodies; {result['totals'].get('retained_variants',0)} retained variants. `convos remote repull` retries reconciliation without deleting existing rows.")
+    [typer.echo(f"Missing parent {key}: rows={value['rows']}, parent_ids={value['parent_ids']}, marked_history_rows={value['marked_history_rows']}") for key,value in result["relationships"].items()]
+    bad=sum(result["totals"].get(key,0) for key in ("projection_mismatch","projection_missing","proof_missing"))+sum(value["rows"] for value in result["relationships"].values())
+    if bad: cli_error(f"Signed-row audit: {result['totals'].get('unavailable',0)} unavailable bodies; {result['totals'].get('retained_variants',0)} retained variants. Missing physical references require diagnosis; another repull alone does not prove archive health.")
 for app in _pending: register(app)
 _pending.clear()

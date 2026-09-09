@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
@@ -153,7 +153,11 @@ def control_chain(controls):
 def stored_controls(db_path,origins):
     if not origins or not Path(db_path).is_file(): return []
     with open_db(db_path,True,purpose="remote.controls.read") as db: return [json.loads(r[0]) for r in db.execute(f"SELECT CAST(control AS VARCHAR) FROM remote.workspace_controls WHERE workspace_id IN ({','.join('?'*len(origins))}) ORDER BY workspace_id,revision",list(origins)).fetchall()]
-def audit_rows(db_path,page=5000,progress=None,local_user=None):
+def audit_rows(db_path,page=5000,progress=None,local_user=None,on_unavailable=None):
+    # Capture stays durable in the inbox; page readers still release DuckDB for unrelated work.
+    with operation_lock(Path(db_path).parent/".sync.lock","remote.audit.local",30) as local,operation_lock(Path(db_path).parent/"hook_inbox/.drain.lock","remote.audit.capture",30) as hooks:
+        return _audit_rows(db_path,page,lambda stage:(local(stage),hooks(stage),progress and progress(stage)),local_user,on_unavailable)
+def _audit_rows(db_path,page=5000,progress=None,local_user=None,on_unavailable=None):
     sql="SELECT * FROM (SELECT o.table_name kind,o.physical_row_id physical,o.source_row_id,o.author_user_id,o.proof_id,p.content_hash,p.state FROM remote.row_origins o LEFT JOIN remote.row_proofs p ON p.id=o.proof_id UNION ALL SELECT o.kind,o.physical_entity,o.source_entity,o.author_user_id,o.proof_id,p.content_hash,p.state FROM remote.provenance_origins o LEFT JOIN remote.row_proofs p ON p.id=o.proof_id) WHERE kind>? OR kind=? AND (physical>? OR physical=? AND COALESCE(proof_id,'')>?) ORDER BY kind,physical,COALESCE(proof_id,'') LIMIT ?"
     origins,after,generation=[],("","",""),None
     while True:
@@ -185,10 +189,14 @@ def audit_rows(db_path,page=5000,progress=None,local_user=None):
             stat=tables.setdefault(kind,dict(origins=0,projection_match=0,projection_mismatch=0,projection_missing=0,proof_missing=0,retained_variants=0,unavailable=0))
             stat["retained_variants"]+=int(kept and not projection)
             stat["unavailable"]+=int(not projection and not kept)
+            if not projection and not kept and on_unavailable: on_unavailable(dict(kind=kind,physical=physical,source=source,author=user,proof=pid,expected=expected,state=state))
             for key,value in (("origins",1),("proof_missing",expected is None),("projection_missing",row is None),("projection_match",projection),("projection_mismatch",row is not None and expected is not None and not projection)): stat[key]+=value
             if len(examples)<20 and not projection: examples.append(dict(kind=kind,id=source,projection="missing" if row is None else "mismatch"))
         (progress and progress(f"audit rows {min(at+page,len(origins))}"),archive_yield(db_path))
-    return (lambda keys:dict(totals={key:sum(value[key] for value in tables.values()) for key in keys},tables=tables,examples=examples))(next(iter(tables.values())).keys() if tables else ())
+    with contextlib.closing(open_db(db_path,True,purpose="remote.audit.relationships")) as db:
+        required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote audit; retry"))
+        relationships=archive_relationships(db)
+    return (lambda keys:dict(totals={key:sum(value[key] for value in tables.values()) for key in keys},tables=tables,examples=examples,relationships=relationships,archive_generation=generation))(next(iter(tables.values())).keys() if tables else ())
 def event_support(value):
     if not isinstance(kind:=value["kind"],str) or not isinstance(version:=value["payload_v"],int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
     return "supported" if (kind,version) in CORE_EVENTS else "required"
@@ -383,12 +391,14 @@ def attest_rows(db_path,cfg,workspace,records,origins=()):
         rows=[signed_row(r) if r["kind"] in TABLES else logical_fact(r) for r in selected]
         scopes,ids=(workspace,*origins),[r["id"] for r in rows]
         found=db.execute(f"SELECT DISTINCT p.workspace_id,p.row_kind,p.source_row_id,p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id IN ({','.join('?'*len(scopes))}) AND p.author_user_id=? AND p.source_row_id IN ({TEXT_IDS}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],packed(ids))).fetchall() if rows else []
+        bases={(entity):(revision,body) for entity,revision,expected,raw in db.execute(f"SELECT b.entity,b.revision,p.content_hash,c.body FROM remote.local_row_bases b JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(b.kind,b.entity,b.author,b.revision) JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE b.kind='edit.observed' AND b.author=? AND b.entity IN ({TEXT_IDS})",(cfg["user"],packed(ids))).fetchall() if digest(body:=json.loads(raw))==expected} if rows else {}
     heads={}
     [heads.setdefault((r[1],r[2]),{}).setdefault(r[3],(r[0],r[3],r[4])) for r in sorted(found,key=lambda r:(r[0]!=workspace,r[0]))]
     snapshots,signing_key=[],None
     for row in rows:
         prior,current=list(heads.get((row["kind"],row["id"]),{}).values()),digest(row)
         if any(h[2]==current for h in prior): continue
+        if row["kind"]=="edit.observed" and len(prior)>1 and (base:=bases.get(row["id"])) and base[0] in {h[1] for h in prior} and all(base[1][k]==row[k] for k in ("kind","id")) and all(base[1]["data"][k]==row["data"][k] for k in ("turn","file","repository")): prior=[h for h in prior if h[1]==base[0]]
         if len(prior)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
         snapshots.append((row,row_proof(device,cfg["user"],prior[0][0] if prior else workspace,cfg["workspaces"][workspace]["epoch"],row,prior[0][1] if prior else None,workspace,current,signing_key=(signing_key:=signing_key or row_signing_key(device)))))
     [_store_proofs(db_path,snapshots[i:i+500],signer,controls) for i in range(0,len(snapshots),500)]
@@ -519,6 +529,7 @@ def _alias_members(db,user,source,session,members,canonical):
     [origin_members.setdefault(logical,set()).add(physical) for physical,logical in origin_rows]
     local,member_physical=(local:={r[0] for r in db.execute("SELECT id FROM conversations WHERE id IN (SELECT UNNEST(?))",(members,)).fetchall()}),{member:required(next(iter(found)) if len(found)==1 else None,ValueError(f"provider alias member projection is ambiguous: {member}")) for member in members for found in [{*origin_members.get(member,set()),*({member} if member in local else set())}] if found}
     active=(required(canonical in (active:={member for member in members if member_heads[("conversations",member)]["state"]=="active"}) and active<=set(member_physical),ValueError("provider alias active body unavailable")),active)[-1]
+    required(all(actual==source and isinstance(metadata:=json.loads(raw) if raw else None,dict) and metadata.get("session_id")==session for actual,raw in db.execute("SELECT source,metadata FROM conversations WHERE id IN (SELECT UNNEST(?))",[[member_physical[m] for m in active]]).fetchall()),ValueError("provider alias exact evidence conflicts"))
     member_physical|={member:next(iter(origin_members.get(member,{member}))) for member in set(members)-set(member_physical)}
     return member_heads,member_physical,active,{member:member not in origin_members for member in members},not (binding:=db.execute("SELECT conversation_id FROM provider_sessions WHERE source=? AND session_id=?",(source,session)).fetchone()) or binding[0]!=member_physical[canonical]
 def _alias_page(db,user,member_physical,after,page=500):
@@ -543,13 +554,18 @@ def _alias_pages(db_path,user,member_physical,page=500):
         if not rows: return
         yield generation,rows
         archive_yield(db_path)
-def reconcile_provider_aliases(db_path,cfg,workspace):
+def reconcile_provider_aliases(db_path,cfg,workspace,progress=None):
+    data=Path(db_path).parent
+    with operation_lock(data/".sync.lock","remote.alias.local",30) as local,operation_lock(data/"hook_inbox/.drain.lock","remote.alias.capture",30) as hooks:
+        return _reconcile_provider_aliases(db_path,cfg,workspace,lambda stage:(local(stage),hooks(stage),progress and progress(stage)))
+def _reconcile_provider_aliases(db_path,cfg,workspace,progress):
     groups,user={},cfg["user"]
     with contextlib.closing(open_db(db_path,purpose="remote.alias.schema")) as db: init_schema(db)
     with contextlib.closing(open_db(db_path,True,purpose="remote.alias.plan")) as db: stored=[(oid,source,session,json.loads(members),canonical,json.loads(proof)) for oid,source,session,members,canonical,proof in db.execute("SELECT object_id,source,session_id,CAST(members AS VARCHAR),canonical_source_row_id,CAST(proof AS VARCHAR) FROM remote.provider_session_aliases WHERE author_user_id=? ORDER BY object_id,revision",(user,)).fetchall()]
     [groups.setdefault(row[0],[]).append(row) for row in stored]
     result,controls,signer,backed_up={"changed":0,"settled":0,"blocked":{}},next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace),cfg["controls"][workspace]["devices"][cfg["device"]["id"]],False
-    for object_id,values in groups.items():
+    for at,(object_id,values) in enumerate(groups.items()):
+        progress(f"provider aliases {at}/{len(groups)}")
         ancestors={a for value in values for a in value[5]["ancestors"]}
         leaves=[value for value in values if value[5]["revision"] not in ancestors]
         if len(leaves)!=1:
@@ -592,6 +608,7 @@ def reconcile_provider_aliases(db_path,cfg,workspace):
             result["changed"]+=bool(changed or rows or binding)
         except duckdb.InterruptException: raise
         except Exception as e: result["blocked"][object_id]=str(e)
+    progress(f"provider aliases {len(groups)}/{len(groups)}")
     return result
 def blob_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,retained=True):
     if cfg["workspaces"][workspace]["kind"]!="personal": return []
