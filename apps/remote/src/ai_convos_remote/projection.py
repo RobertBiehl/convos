@@ -153,11 +153,11 @@ def control_chain(controls):
 def stored_controls(db_path,origins):
     if not origins or not Path(db_path).is_file(): return []
     with open_db(db_path,True,purpose="remote.controls.read") as db: return [json.loads(r[0]) for r in db.execute(f"SELECT CAST(control AS VARCHAR) FROM remote.workspace_controls WHERE workspace_id IN ({','.join('?'*len(origins))}) ORDER BY workspace_id,revision",list(origins)).fetchall()]
-def audit_rows(db_path,page=5000,progress=None,local_user=None):
+def audit_rows(db_path,page=5000,progress=None,local_user=None,on_unavailable=None):
     # Capture stays durable in the inbox; page readers still release DuckDB for unrelated work.
     with operation_lock(Path(db_path).parent/".sync.lock","remote.audit.local",30) as local,operation_lock(Path(db_path).parent/"hook_inbox/.drain.lock","remote.audit.capture",30) as hooks:
-        return _audit_rows(db_path,page,lambda stage:(local(stage),hooks(stage),progress and progress(stage)),local_user)
-def _audit_rows(db_path,page=5000,progress=None,local_user=None):
+        return _audit_rows(db_path,page,lambda stage:(local(stage),hooks(stage),progress and progress(stage)),local_user,on_unavailable)
+def _audit_rows(db_path,page=5000,progress=None,local_user=None,on_unavailable=None):
     sql="SELECT * FROM (SELECT o.table_name kind,o.physical_row_id physical,o.source_row_id,o.author_user_id,o.proof_id,p.content_hash,p.state FROM remote.row_origins o LEFT JOIN remote.row_proofs p ON p.id=o.proof_id UNION ALL SELECT o.kind,o.physical_entity,o.source_entity,o.author_user_id,o.proof_id,p.content_hash,p.state FROM remote.provenance_origins o LEFT JOIN remote.row_proofs p ON p.id=o.proof_id) WHERE kind>? OR kind=? AND (physical>? OR physical=? AND COALESCE(proof_id,'')>?) ORDER BY kind,physical,COALESCE(proof_id,'') LIMIT ?"
     origins,after,generation=[],("","",""),None
     while True:
@@ -189,6 +189,7 @@ def _audit_rows(db_path,page=5000,progress=None,local_user=None):
             stat=tables.setdefault(kind,dict(origins=0,projection_match=0,projection_mismatch=0,projection_missing=0,proof_missing=0,retained_variants=0,unavailable=0))
             stat["retained_variants"]+=int(kept and not projection)
             stat["unavailable"]+=int(not projection and not kept)
+            if not projection and not kept and on_unavailable: on_unavailable(dict(kind=kind,physical=physical,source=source,author=user,proof=pid,expected=expected,state=state))
             for key,value in (("origins",1),("proof_missing",expected is None),("projection_missing",row is None),("projection_match",projection),("projection_mismatch",row is not None and expected is not None and not projection)): stat[key]+=value
             if len(examples)<20 and not projection: examples.append(dict(kind=kind,id=source,projection="missing" if row is None else "mismatch"))
         (progress and progress(f"audit rows {min(at+page,len(origins))}"),archive_yield(db_path))

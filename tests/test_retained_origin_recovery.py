@@ -73,18 +73,18 @@ def history_fixture(tmp_path):
 def test_history_recovery_uses_diagnosed_claims_and_exact_backup_without_changing_source(tmp_path, monkeypatch):
     path, backup, user, proof, row = history_fixture(tmp_path)
     output, diagnosis = tmp_path / 'restored', tmp_path / 'diagnosis.json'
-    script = Path(__file__).resolve().parents[1] / 'scripts/archive_recovery/diagnose_b7_rows.py'
+    script = Path(__file__).resolve().parents[1] / 'scripts/archive_recovery/diagnose.py'
     result = subprocess.run([sys.executable, str(script), '--database', str(path), '--user-id', user, '--output', str(diagnosis)], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-    assert json.loads(diagnosis.read_text())['counts']['unavailable'] == 1
+    assert result.returncode == 1, result.stderr
+    assert json.loads(diagnosis.read_text())['audit']['totals']['unavailable'] == 1
     checksum = core._file_sha256(path)
-    monkeypatch.setattr(sys, 'argv', ['repair', '--root', str(path.parent.parent), '--output', str(output), '--database-only', '--restore-history', str(backup), '--restore-claims', str(diagnosis)])
+    monkeypatch.setattr(sys, 'argv', ['repair', '--root', str(path.parent.parent), '--output', str(output), '--database-only', '--donor', str(backup), '--diagnosis', str(diagnosis)])
     repair.main()
     report = json.loads((output / 'report.json').read_text())
     assert report['success'] and report['restored_bodies'] == 1 and report['repaired_scopes'] == 0
-    assert set(report['altered_tables']) == {'"remote"."row_conflicts"', '"main"."archive_state"', '"main"."archive_changes"', '"main"."retrieval_state"'}
+    assert {'main.messages', 'remote.row_proofs'} <= set(report['protected_tables'])
     assert core._file_sha256(path) == checksum
-    assert (output / 'history-preimages.json').stat().st_mode & 0o777 == 0o600
+    assert (output / 'plan.json').stat().st_mode & 0o777 == 0o600
     assert audit_rows(report['target'], local_user=user)['totals']['unavailable'] == 0
     with core.open_db(report['target'], read_only=True, purpose='fixture.verify') as db:
         assert json.loads(db.execute('SELECT body FROM remote.row_conflicts WHERE proof_id=?', [digest(proof)]).fetchone()[0]) == row
@@ -94,7 +94,8 @@ def test_history_recovery_uses_diagnosed_claims_and_exact_backup_without_changin
 @pytest.mark.parametrize('damage', ['body', 'proof', 'existing'])
 def test_history_recovery_refuses_mismatched_or_corrupt_history(tmp_path, damage):
     path, backup, user, proof, row = history_fixture(tmp_path)
-    claims = {'unavailable': [dict(proof=digest(proof), kind='messages', source='m', author=user, expected=proof['content_hash'], state='active')]}
+    with core.open_db(path, read_only=True, purpose='fixture.diagnosis') as db:
+        claims = dict(format='convos-archive-diagnosis-v1', archive_id=repair.identity(db)[0], proof_rows=db.execute('SELECT * FROM remote.row_proofs').fetchall(), unavailable=[dict(proof=digest(proof), kind='messages', source='m', author=user, expected=proof['content_hash'], state='active')])
     target = path if damage == 'existing' else backup
     with core.open_db(target, purpose='fixture.damage') as db:
         if damage == 'proof':
@@ -107,3 +108,36 @@ def test_history_recovery_refuses_mismatched_or_corrupt_history(tmp_path, damage
     with core.open_db(path, read_only=True, purpose='fixture.refuse') as db, pytest.raises(ValueError, match='mismatch|corrupt'):
         repair.history_restore_plan(db, backup, claims)
     assert core._file_sha256(path) == checksum
+
+
+@pytest.mark.parametrize('damage', ['archive', 'diagnostic-proof', 'donor-archive'])
+def test_restore_binds_diagnosis_and_donor_to_the_target_archive(tmp_path, damage):
+    path, backup, user, proof, row = history_fixture(tmp_path)
+    with core.open_db(path, read_only=True, purpose='fixture.claims') as db:
+        claims = dict(format='convos-archive-diagnosis-v1', archive_id=repair.identity(db)[0], proof_rows=[list(r) for r in db.execute('SELECT * FROM remote.row_proofs').fetchall()], unavailable=[dict(proof=digest(proof), kind='messages', source='m', author=user, expected=proof['content_hash'], state='active')])
+    if damage == 'archive': claims['archive_id'] = 'another-archive'
+    elif damage == 'diagnostic-proof': claims['proof_rows'][0][-1] = 'changed-signature'
+    else:
+        with core.open_db(backup, purpose='fixture.other-archive') as db:
+            db.execute("UPDATE archive_state SET archive_id='00000000-0000-0000-0000-000000000099'")
+    checksum = core._file_sha256(path)
+    with core.open_db(path, read_only=True, purpose='fixture.refuse') as db, pytest.raises(ValueError, match='archive|mismatch'):
+        repair.history_restore_plan(db, backup, claims)
+    assert core._file_sha256(path) == checksum
+
+
+def test_diagnosis_uses_canonical_counts_and_remains_private_and_read_only(tmp_path):
+    path, backup, user, proof, row = history_fixture(tmp_path)
+    output = tmp_path / 'diagnosis.json'
+    script = Path(__file__).resolve().parents[1] / 'scripts/archive_recovery/diagnose.py'
+    checksum = core._file_sha256(path)
+    result = subprocess.run([sys.executable, str(script), '--database', str(path), '--user-id', user, '--output', str(output)], capture_output=True, text=True)
+    assert result.returncode == 1, result.stderr
+    report = json.loads(output.read_text())
+    assert report['audit'] == audit_rows(path, local_user=user)
+    assert len(report['unavailable']) == report['audit']['totals']['unavailable'] == 1
+    assert report['unavailable'][0]['proof'] == digest(proof)
+    assert output.stat().st_mode & 0o777 == 0o600 and core._file_sha256(path) == checksum
+    saved = output.read_bytes()
+    again = subprocess.run([sys.executable, str(script), '--database', str(path), '--user-id', user, '--output', str(output)], capture_output=True, text=True)
+    assert again.returncode != 0 and output.read_bytes() == saved
