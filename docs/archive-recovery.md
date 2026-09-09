@@ -29,8 +29,10 @@ Diagnosis exits 1 for unresolved bodies or references, after saving its report.
    The donor may supply retained JSON or an exactly reconstructible historical
    row. Failed-edit reconstruction preserves its invalid evidence status.
    Missing proofs and corrupt existing bodies are refused, not overwritten.
-   Active attachment references require exact content-addressed bytes; repair
+   An active attachment with a non-null `body_hash` requires exact bytes; repair
    stages and verifies them through core before committing the reference.
+   Metadata-only records, including redacted attachments, claim no blob. Their
+   signed rows remain in the database without inventing a file requirement.
 
 These operations leave conversation content, evidence status, and signatures
 unchanged. They do not resolve arbitrary forks or invent missing parent rows.
@@ -74,6 +76,11 @@ backup. If the source still has a WAL, run `convos backup` as its owner first.
 Backup publication flushes the verified database, attachment bundle, and
 containing directories before mutation. Complete simulations also stage existing
 attachment bytes so that their repaired archives can be backed up independently.
+Backup resolves each claimed hash through the attachment store and indexed source
+paths, including paths belonging to another reference to the same bytes. A missing
+or mismatched claimed blob still blocks backup; the error identifies its reference,
+hash, expected size, and candidate paths. Metadata-only signed attachment rows are
+preserved in the database and do not require files in the attachment bundle.
 
 The transaction rejects stale plans and compares every protected table's complete
 row multiset against the backup with SQL `EXCEPT ALL`. This includes proofs,

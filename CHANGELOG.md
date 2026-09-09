@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Preserve metadata-only signed attachment history without requiring nonexistent
+  files during backup or recovery. Resolve claimed attachment bytes through all
+  indexed paths for the same hash; keep missing/corrupt blobs fatal and identify
+  the blocked reference, expected hash/size, and candidate paths in the error.
+
 ## 0.11.6b9
 
 - Repair proven legacy edit-scope placeholders without changing signed history or evidence status; provide backup-first simulation and targeted recovery tools.
