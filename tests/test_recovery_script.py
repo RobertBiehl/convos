@@ -11,7 +11,7 @@ import pytest
 from ai_convos import cli as core
 from tests.test_legacy_scope_recovery import legacy_archive
 
-SPEC = importlib.util.spec_from_file_location("repair_b7_archive", Path(__file__).resolve().parents[1] / "scripts/repair_b7_archive.py")
+SPEC = importlib.util.spec_from_file_location("repair_b7_archive", Path(__file__).resolve().parents[1] / "scripts/archive_recovery/repair_b7_archive.py")
 repair = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(repair)
 
@@ -64,7 +64,7 @@ def test_repair_script_never_allows_live_database_only_backup(tmp_path, monkeypa
 
 
 def test_maintainer_report_excludes_private_data_and_keeps_verifiable_totals():
-    spec = importlib.util.spec_from_file_location("package_b7_recovery", Path(__file__).resolve().parents[1] / "scripts/package_b7_recovery.py")
+    spec = importlib.util.spec_from_file_location("package_b7_recovery", Path(__file__).resolve().parents[1] / "scripts/archive_recovery/package_b7_recovery.py")
     package = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(package)
     secret = "PRIVATE-CONVERSATION-AND-CREDENTIAL-CANARY"
@@ -87,7 +87,7 @@ def test_branch_verifier_refuses_live_archive_before_loading_credentials(tmp_pat
     source.write_bytes(b"untouched archive")
     report = tmp_path / "report.json"
     report.write_text(json.dumps({"mode": "apply", "success": True, "source": str(source), "target": str(source)}))
-    script = Path(__file__).resolve().parents[1] / "scripts/verify_b7_attestation.py"
+    script = Path(__file__).resolve().parents[1] / "scripts/archive_recovery/verify_b7_attestation.py"
     result = subprocess.run([sys.executable, str(script), str(report)], capture_output=True, text=True)
     assert result.returncode != 0 and "only an isolated simulation" in result.stderr
     assert source.read_bytes() == b"untouched archive" and not (tmp_path / "branch-preimages.json").exists()

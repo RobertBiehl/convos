@@ -76,18 +76,21 @@ verified against exact identities and preserved original proofs.
    independently. Document unresolved historical variants instead of deleting them.
 
 See [the repair procedure](b7-archive-recovery.md) for simulation and recovery
-tools. Live archive repair, relay deployment, and publication are separate from
+tools, localized under [`scripts/archive_recovery`](../scripts/archive_recovery/README.md).
+Only validated canonical writers and durable migrations remain in core; operator
+orchestration is not imported by installed products. Live archive repair, relay deployment, and publication are separate from
 the code and synthetic validation in this branch.
 
 ## Local validation
 
 - Unmodified b8 reproduces all three supplied synthetic failures; the patched
   branch passes all three without changing the supplied fixture.
-- Initial hardening (`1adcfbc`): `uv run pytest -m 'not integration' -q`:
-  908 passed, 9 deselected.
-- Doctor statistics follow-up: 124 targeted tests passed, covering doctor,
-  capture, Remote operations, recovery, database access, and line budgets.
+- Runtime commit `0e9792b`: `uv run pytest -m 'not integration' -q`:
+  911 passed, 9 deselected. The subsequent tooling move changes no product code.
+- After tooling localization: 53 recovery, fixture, and budget tests passed.
+  All six tools start; the generated bundle's checksums verify and its patch
+  applies to clean b8. The bundle defaults to the published b8 base.
 - `uv build --all-packages`: all eight distributions build as wheels and sdists.
-- Core: 1,499 token-counted lines. Existing budgets are unchanged.
+- Core: 1,499 token-counted lines; Remote: 2,537. Existing budgets are unchanged.
 - Runtime: Python 3.14.2, DuckDB 1.4.3. No affected production archive was repaired
   or used to infer convergence in this validation.

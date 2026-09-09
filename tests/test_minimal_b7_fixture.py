@@ -7,7 +7,7 @@ import sys
 import duckdb
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts/b7_minimal_fixture.py"
+SCRIPT = ROOT / "scripts/archive_recovery/b7_minimal_fixture.py"
 
 
 def run_fixture(*args):

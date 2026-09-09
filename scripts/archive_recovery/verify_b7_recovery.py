@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import time
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(REPO / "src"), str(REPO / "apps/remote/src")]
 
 from ai_convos import cli as core

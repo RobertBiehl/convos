@@ -51,6 +51,11 @@ bodies, while the existing per-page proof and metadata checks remain in place.
 
 ## Operator tool
 
+All incident-specific tools live in [`scripts/archive_recovery`](../scripts/archive_recovery/README.md).
+They are distributed through the matching tagged repository source, not the
+package wheels or sdists. Core owns the validated archive writes; the scripts
+own backup, simulation, diagnostics, and operator orchestration.
+
 Use the installed Convos Python. The scripts load this checkout's core and Remote
 code explicitly; no installed packages, release tags, or Koder pins are changed.
 A live repair must run as the archive's OS owner. Until upstream ships the fix,
@@ -62,17 +67,17 @@ coordination, without requiring another fork release.
 convos_python="$HOME/.local/pipx/venvs/convos/bin/python"
 
 # Default: simulate in a new isolated copy, including both provenance passes.
-"$convos_python" scripts/repair_b7_archive.py --output "$HOME/convos-b7-simulation" --capture
+"$convos_python" scripts/archive_recovery/repair_b7_archive.py --output "$HOME/convos-b7-simulation" --capture
 # Optional isolated test of recorded-branch attestation, then signed-body audit.
-"$convos_python" scripts/verify_b7_attestation.py "$HOME/convos-b7-simulation/report.json"
-"$convos_python" scripts/verify_b7_recovery.py "$HOME/convos-b7-simulation/report.json"
+"$convos_python" scripts/archive_recovery/verify_b7_attestation.py "$HOME/convos-b7-simulation/report.json"
+"$convos_python" scripts/archive_recovery/verify_b7_recovery.py "$HOME/convos-b7-simulation/report.json"
 
 # Apply only after simulation. Backup/export precedes the transactional repair.
 # Runs actual full local-only sync twice and saves each command's output.
-"$convos_python" scripts/repair_b7_archive.py --output "$HOME/convos-b7-repaired" --apply --sync-full
+"$convos_python" scripts/archive_recovery/repair_b7_archive.py --output "$HOME/convos-b7-repaired" --apply --sync-full
 # Use the same tested client code for the final relay operations.
-"$convos_python" scripts/repair_b7_archive.py convos remote sync
-"$convos_python" scripts/verify_b7_recovery.py "$HOME/convos-b7-repaired/report.json" --repull
+"$convos_python" scripts/archive_recovery/repair_b7_archive.py convos remote sync
+"$convos_python" scripts/archive_recovery/verify_b7_recovery.py "$HOME/convos-b7-repaired/report.json" --repull
 ```
 
 Output directories must be new. `--root` selects another archive for simulation.
@@ -108,10 +113,10 @@ For an archive already affected, diagnose a private snapshot and restore only
 the exact bodies from an earlier backup. Use a new output directory each time:
 
 ```sh
-"$convos_python" scripts/diagnose_b7_rows.py --database /private/snapshot/convos.db --user-id ACCOUNT_ID --output /private/unavailable.json
+"$convos_python" scripts/archive_recovery/diagnose_b7_rows.py --database /private/snapshot/convos.db --user-id ACCOUNT_ID --output /private/unavailable.json
 # Default simulation; live apply also requires the owner's full fresh backup.
-"$convos_python" scripts/repair_b7_archive.py --output "$HOME/convos-b7-history-simulation" --restore-history /private/earlier/convos.db --restore-claims /private/unavailable.json
-"$convos_python" scripts/verify_b7_recovery.py "$HOME/convos-b7-history-simulation/report.json"
+"$convos_python" scripts/archive_recovery/repair_b7_archive.py --output "$HOME/convos-b7-history-simulation" --restore-history /private/earlier/convos.db --restore-claims /private/unavailable.json
+"$convos_python" scripts/archive_recovery/verify_b7_recovery.py "$HOME/convos-b7-history-simulation/report.json"
 ```
 
 Restoration uses the core writer and advances archive generation and affected-row change tracking. Message restoration conservatively invalidates retrieval freshness.

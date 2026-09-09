@@ -73,7 +73,7 @@ def history_fixture(tmp_path):
 def test_history_recovery_uses_diagnosed_claims_and_exact_backup_without_changing_source(tmp_path, monkeypatch):
     path, backup, user, proof, row = history_fixture(tmp_path)
     output, diagnosis = tmp_path / 'restored', tmp_path / 'diagnosis.json'
-    script = Path(__file__).resolve().parents[1] / 'scripts/diagnose_b7_rows.py'
+    script = Path(__file__).resolve().parents[1] / 'scripts/archive_recovery/diagnose_b7_rows.py'
     result = subprocess.run([sys.executable, str(script), '--database', str(path), '--user-id', user, '--output', str(diagnosis)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert json.loads(diagnosis.read_text())['counts']['unavailable'] == 1
