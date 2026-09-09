@@ -11,8 +11,9 @@ Two source-checkout tools, with no package-install side effects:
 
 Use the [recovery procedure](../../docs/archive-recovery.md). Runtime imports,
 Remote synchronization, and signing remain in the normal product commands.
-These tools do not wrap those commands, read signing credentials, or contact a
-relay. They are supplied with repository source, not wheels or sdists.
+These tools do not wrap those commands, create signatures, or contact a relay.
+Live repair reuses Remote's maintenance lease, which reads account metadata for
+lock diagnostics. They are supplied with repository source, not wheels or sdists.
 
 Core owns durable migrations, proof/body validation, archive writes, and change
 tracking. The tools own backup, planning, private reports, and orchestration of

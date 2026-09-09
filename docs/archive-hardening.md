@@ -18,6 +18,8 @@ migration or wire change is required by this patch.
 
 The supplied minimal report reproduces the first three failures on released b8.
 That establishes affected behavior, not when the defects were introduced.
+The placeholder-seeding code itself dates to `cf1d41a` (August 26), before b7;
+the pre-b7 attestation path also already rejected multiple heads.
 It does not establish the origin of the production orphan-message population.
 Missing conversation parents affect conversation joins and retrieval even when
 message bodies remain preserved. Diagnose exact IDs before selecting a repair.
