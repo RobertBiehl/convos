@@ -55,8 +55,9 @@ extrapolating this earlier sample's faster decode result to every workload.
 
 ## Verification and activation
 
-The complete non-integration suite passed across the full suite and focused follow-up: 856 tests, 9 live integrations
-deselected. Compression tests also passed with the declared minimum
+The b8 release requires the complete non-integration suite, package builds, and
+isolated wheel checks; final run counts are recorded in the release PR.
+Compression tests also passed with the declared minimum
 `zstandard==0.23.0` and the resolved `0.25.0`. Coverage includes old envelopes,
 authenticated metadata, decompression limits, malformed frames, conditional
 replacement, uploader boundaries, acknowledgment loss, exact second-device
@@ -71,3 +72,29 @@ staging space and a stopped-relay snapshot/cutover; a snapshot taken while write
 continue must not later replace the active database. Compression is automatic
 once the relay advertises support, so upgrade all receiving clients before the
 relay. No workspace minimum reader version is enforced by the current relay.
+
+
+## GPT-6 Pro release review
+
+The review examined candidate `c5281d48159857022b003cf129f42562a92867ad`
+and identified two reproducible migration defects. Both are corrected in b8:
+
+- Publication now uses an atomic, non-overwriting hard link for migration. A
+  destination created during conversion survives intact; the source is unchanged
+  and staging is cleaned up. The separate backup command retains its overwrite
+  behavior.
+- Quota rebuilding computes byte lengths before union/grouping, so the grouping
+  sorter receives identifiers and integers instead of full ciphertext BLOBs.
+  A regression test lowers SQLite's record-size limit only during accounting;
+  the former query fails and the corrected query returns the exact byte total.
+
+The review found no concrete authorization bypass, unsafe published nonce reuse,
+or historical-payload substitution in compact. Oracle ran 29 selected tests in
+an isolated source harness; it could not run the complete DuckDB/Zstd product
+suite because its environment lacked dependencies and network access. Local and
+Linux CI validation supply that separate evidence. The two reviewed fixes are
+covered by local regression tests, not a second Oracle submission.
+
+Receiver readiness includes restarting long-running processes with the upgraded
+code. Installing the new package on disk alone is insufficient. Do not activate
+compression while an older receiver is expected to reconnect.

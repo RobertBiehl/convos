@@ -121,7 +121,8 @@ conditional fetch/replacement; and recovery after lost acknowledgments.
 ## Rollout
 
 Upgrade all receiving clients before upgrading the relay to advertise compression
-support. The relay cannot decrypt or transcode for an old reader. This readiness
+support, including restarting long-running receiving processes with the new code.
+The relay cannot decrypt or transcode for an old reader. This readiness
 requirement is operational; the current relay does not enforce reader versions.
 No extra configuration is needed after the upgrades. Retained legacy replicas
 remain readable, and normal sync does not implicitly rewrite historical storage.

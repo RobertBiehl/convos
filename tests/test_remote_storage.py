@@ -104,3 +104,17 @@ def test_migration_never_overwrites_output_created_during_conversion(tmp_path,mo
     with pytest.raises(FileExistsError): server.main(["migrate","--db",str(source),"--output",str(target)])
     assert target.read_bytes()==b"concurrently published backup" and source.read_bytes()==original
     assert not list(tmp_path.glob(".binary.db.*"))
+
+
+def test_migration_accounting_does_not_sort_ciphertext(tmp_path):
+    source=tmp_path/"legacy.db"
+    author,envelopes=legacy_relay(source)
+    env={**envelopes["row_replicas"],"ciphertext":server.b64(b"x"*(128*1024))}
+    with closing(sqlite3.connect(source)) as db:
+        db.execute("UPDATE row_replicas SET envelope=?,wire_hash=?",(json.dumps(env),server.digest(env)))
+        db.commit()
+        expected=sum(len(server.split_envelope(e)[0].encode())+len(server.split_envelope(e)[1]) for e in (env,envelopes["semantic_replicas"]))
+        # A diagnostic limit at accounting time rejects payload-sized sorter records.
+        db.set_trace_callback(lambda sql:db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH,64*1024) if sql.startswith("INSERT INTO replica_usage") else None)
+        server.migrate_storage(db)
+        assert db.execute("SELECT bytes FROM replica_usage WHERE uploader=?",(author["device"]["id"],)).fetchone()[0]==expected

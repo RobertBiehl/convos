@@ -82,7 +82,7 @@ def migrate_storage(db):
             after=page[-1][0]
             db.commit()
     db.execute("DELETE FROM replica_usage")
-    db.execute("INSERT INTO replica_usage SELECT workspace,uploader,SUM(LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext)) FROM (SELECT workspace,uploader,envelope,ciphertext FROM row_replicas UNION ALL SELECT workspace,uploader,envelope,ciphertext FROM semantic_replicas) GROUP BY workspace,uploader")
+    db.execute("INSERT INTO replica_usage SELECT workspace,uploader,SUM(bytes) FROM (SELECT workspace,uploader,LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext) bytes FROM row_replicas UNION ALL SELECT workspace,uploader,LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext) bytes FROM semantic_replicas) GROUP BY workspace,uploader")
     db.commit()
 
 def connect(path,initialize=True):
