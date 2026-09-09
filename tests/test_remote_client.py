@@ -13,7 +13,7 @@ from ai_convos_remote import (_upload_batches, add_member, approve_device, appro
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
 from ai_convos_remote.projection import inspect_state, scan, sharing
 from ai_convos_remote.protocol import certificate, event, identity, logical_row, open_blob, open_origin, open_replica, seal_blob, seal_event, seal_key, seal_origin, seal_replica, sign_control, unb64
-from ai_convos_remote_server import action, connect as server_connect
+from ai_convos_remote_server import action, connect as server_connect, stored_envelope
 
 
 def transport(db):
@@ -168,7 +168,7 @@ def test_remote_sync_publishes_captured_snapshot_then_concurrent_change(tmp_path
         return prepare(root,envelopes,semantic)
     monkeypatch.setattr(remote_client,"prepare_replicas",concurrent); sync_once(root,manual=True); state=connect(root/"remote/state.db"); assert int(state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()[0])==generation<changed[0]; state.close()
     assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==1
-    sync_once(root,manual=True); rows=[open_replica(json.loads(r[0]),key(load(root),ws,1)) for r in server.execute("SELECT envelope FROM row_replicas ORDER BY cursor").fetchall()]; assert [r["row"]["data"]["title"] for r in rows]==["snapshot","later"] and rows[1]["proof"]["previous_revision"]==rows[0]["proof"]["revision"]
+    sync_once(root,manual=True); rows=[open_replica(stored_envelope(r),key(load(root),ws,1)) for r in server.execute("SELECT envelope,ciphertext FROM row_replicas ORDER BY cursor").fetchall()]; assert [r["row"]["data"]["title"] for r in rows]==["snapshot","later"] and rows[1]["proof"]["previous_revision"]==rows[0]["proof"]["revision"]
     sync_once(root,manual=True); assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==2
 
 
@@ -182,7 +182,7 @@ def test_sync_process_serializes_attestation_planning_and_retry(tmp_path,monkeyp
     ws,path=workspace(cfg,"Personal"),root/"data/convos.db"
     write_archive(path,"base")
     sync_once(root)
-    base=open_replica(json.loads(server.execute("SELECT envelope FROM row_replicas").fetchone()[0]),key(load(root),ws,1))
+    base=open_replica(stored_envelope(server.execute("SELECT envelope,ciphertext FROM row_replicas").fetchone()),key(load(root),ws,1))
     write_archive(path,"planned")
     child="""
 import sys
@@ -217,7 +217,7 @@ finally:
     monkeypatch.setattr(projection_module,"row_proof",sign)
     result=subprocess.run(command,capture_output=True,text=True,timeout=30)
     assert result.returncode==0,(result.stdout,result.stderr)
-    rows=[open_replica(json.loads(raw),key(load(root),ws,1)) for raw, in server.execute("SELECT envelope FROM row_replicas ORDER BY cursor")]
+    rows=[open_replica(stored_envelope(raw),key(load(root),ws,1)) for raw in server.execute("SELECT envelope,ciphertext FROM row_replicas ORDER BY cursor")]
     assert [value["row"]["data"]["title"] for value in rows]==["base","planned","retry"]
     assert [value["proof"]["previous_revision"] for value in rows]==[None,rows[0]["proof"]["revision"],rows[1]["proof"]["revision"]]
     with duckdb.connect(str(path),read_only=True) as db:
@@ -236,7 +236,7 @@ def test_team_delta_preserves_scope_without_rewriting_existing_members(tmp_path,
         state.executescript("CREATE TRIGGER preserve_team_scope BEFORE DELETE ON team_scopes BEGIN SELECT RAISE(ABORT,'scope rows rewritten'); END; CREATE TRIGGER append_team_scope BEFORE INSERT ON team_scopes WHEN EXISTS (SELECT 1 FROM team_scopes WHERE (workspace,conversation)=(NEW.workspace,NEW.conversation)) BEGIN SELECT RAISE(ABORT,'existing scope reinserted'); END;")
     write_archive(root/"data/convos.db","updated once"); sync_once(root)
     with connect(root/"remote/state.db") as state: assert [tuple(r) for r in state.execute("SELECT workspace,conversation FROM team_scopes")]==[(ws,"c")]
-    env=json.loads(server.execute("SELECT envelope FROM row_replicas WHERE workspace=? ORDER BY cursor DESC LIMIT 1",[ws]).fetchone()[0])
+    env=stored_envelope(server.execute("SELECT envelope,ciphertext FROM row_replicas WHERE workspace=? ORDER BY cursor DESC LIMIT 1",[ws]).fetchone())
     assert open_replica(env,key(load(root),ws,1))["row"]["data"]["title"]=="updated once"
 
 
@@ -452,11 +452,12 @@ def test_interrupted_archive_mode_is_bound_to_exact_core_identity(tmp_path,monke
 
 def test_personal_sync_automatically_bridges_encrypted_memory_between_devices(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b)
-    monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("relay cannot read this","global"); sync_once(a,True); wire="".join(r[0] for r in server.execute("SELECT envelope FROM events").fetchall())
-    wire+="".join(r[0] for r in server.execute("SELECT envelope FROM row_replicas").fetchall()); assert "relay cannot read this" not in wire and str(a) not in wire
+    monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("relay cannot read this","global"); sync_once(a,True); wire="".join(json.dumps(stored_envelope(r)) for r in server.execute("SELECT envelope,ciphertext FROM events").fetchall())
+    wire+="".join(json.dumps(stored_envelope(r)) for r in server.execute("SELECT envelope,ciphertext FROM row_replicas").fetchall()); assert "relay cannot read this" not in wire and str(a) not in wire
     sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[("relay cannot read this",)]; db.close()
     large="second device-safe revision\n"+"x"*70000; memory_module.remember_data(large,"global",created["id"]); sync_once(a,True); sync_once(b,True); count=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; sync_once(a,True); sync_once(b,True)
-    db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[(large,)] and db.execute("SELECT state,COUNT(*) FROM remote_semantics GROUP BY state").fetchall()==[("active",1)]; db.close(); state=connect(b/"remote/state.db"); assert state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==0; state.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count and "second device-safe revision" not in "".join(r[0] for r in server.execute("SELECT envelope FROM row_replicas").fetchall())
+    compressed=[json.loads(r[0]) for r in server.execute("SELECT envelope FROM semantic_replicas")]; assert compressed and all(env["compression"]=="zstd" for env in compressed)
+    db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[(large,)] and db.execute("SELECT state,COUNT(*) FROM remote_semantics GROUP BY state").fetchall()==[("active",1)]; db.close(); state=connect(b/"remote/state.db"); assert state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==0; state.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count and "second device-safe revision" not in "".join(json.dumps(stored_envelope(r)) for r in server.execute("SELECT envelope,ciphertext FROM row_replicas").fetchall())
     memory_module.forget_data(created["id"],"global"); sync_once(a,True); sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT COUNT(*) FROM canonicals").fetchone()[0]==db.execute("SELECT COUNT(*) FROM sources").fetchone()[0]==0 and db.execute("SELECT state,body FROM remote_semantics").fetchone()[0]=="deleted"; db.close(); assert b"second device-safe revision" not in (b/"remote/state.db").read_bytes()
     recreated=memory_module.remember_data(large,"global"); assert recreated["id"]!=created["id"]; sync_once(a,True); sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[(large,)]; db.close()
 
@@ -527,7 +528,7 @@ def test_sync_reports_partial_failure_after_finishing_healthy_workspace(tmp_path
 
 
 def test_later_uploader_copy_heals_poisoned_replica_across_pages(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); memory_module.remember_data("healed delivery copy","global"); sync_once(a,True); cfg=load(b); ws=workspace(cfg,"Personal"); poison_cursor,raw=server.execute("SELECT cursor,envelope FROM semantic_replicas ORDER BY cursor").fetchone(); original=json.loads(raw); body=open_replica(original,key(cfg,ws,original["epoch"])); repaired=seal_replica(body["row"],body["proof"],ws,original["epoch"],key(cfg,ws,original["epoch"]),cfg["device"]["id"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; server.execute("UPDATE semantic_replicas SET envelope=?",(json.dumps(original),)); server.commit()
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); memory_module.remember_data("healed delivery copy","global"); sync_once(a,True); cfg=load(b); ws=workspace(cfg,"Personal"); raw=server.execute("SELECT cursor,envelope,ciphertext FROM semantic_replicas ORDER BY cursor").fetchone(); poison_cursor,original=raw["cursor"],stored_envelope(raw); body=open_replica(original,key(cfg,ws,original["epoch"])); repaired=seal_replica(body["row"],body["proof"],ws,original["epoch"],key(cfg,ws,original["epoch"]),cfg["device"]["id"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; server.execute("UPDATE semantic_replicas SET ciphertext=?",(unb64(original["ciphertext"]),)); server.commit()
     def paged(cfg,request_,auth=True): return direct(cfg,request_|({"limit":1} if request_["op"]=="replica_pull" else {}),auth)
     monkeypatch.setattr("ai_convos_remote.request",paged); state=connect(b/"remote/state.db")
     with pytest.raises(ValueError,match="no valid delivery copy"): pull(cfg,state,b)
@@ -545,7 +546,7 @@ def test_later_uploader_copy_heals_poisoned_blob_across_pages(tmp_path,monkeypat
 
 def test_later_uploader_copy_heals_poisoned_origin_bundle(tmp_path,monkeypatch):
     old=server_connect(tmp_path/"old.db"); monkeypatch.setattr("ai_convos_remote.request",transport(old)); a,b,c=tmp_path/"alice",tmp_path/"bob",tmp_path/"carol"; alice,_=setup_client("http://old","alice",root=a); setup_client("http://old","bob",root=b); origin=create(alice,"Origin","team",a); add_member(alice,origin,"bob",root=a); replicate_conversation(a,origin); pull(load(b),connect(b/"remote/state.db"),b)
-    fresh=server_connect(tmp_path/"fresh.db"); direct=transport(fresh); monkeypatch.setattr("ai_convos_remote.request",direct); bob,_=rehome_client(load(b),"http://fresh",b); setup_client("http://fresh","carol",root=c); replacement=create(bob,"Replacement","team",b); add_member(bob,replacement,"carol",root=b); bob=load(b); state=connect(b/"remote/state.db"); bind_origin(bob,state,replacement,origin,b); state.close(); carol=load(c); server_state=refresh(carol,c); raw=fresh.execute("SELECT envelope FROM origin_bundles").fetchone()[0]; original=json.loads(raw); body=open_origin(original,key(carol,replacement,original["epoch"])); repaired=seal_origin(body["controls"],replacement,original["epoch"],key(carol,replacement,original["epoch"]),carol["device"]["id"],body["rows"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; fresh.execute("UPDATE origin_bundles SET envelope=?",(json.dumps(original),)); fresh.commit(); action(fresh,{"op":"origin_upload","envelope":repaired},carol["token"]); state=connect(c/"remote/state.db"); ws=next(w for w in server_state["workspaces"] if w["id"]==replacement)
+    fresh=server_connect(tmp_path/"fresh.db"); direct=transport(fresh); monkeypatch.setattr("ai_convos_remote.request",direct); bob,_=rehome_client(load(b),"http://fresh",b); setup_client("http://fresh","carol",root=c); replacement=create(bob,"Replacement","team",b); add_member(bob,replacement,"carol",root=b); bob=load(b); state=connect(b/"remote/state.db"); bind_origin(bob,state,replacement,origin,b); state.close(); carol=load(c); server_state=refresh(carol,c); raw=fresh.execute("SELECT envelope,ciphertext FROM origin_bundles").fetchone(); original=stored_envelope(raw); body=open_origin(original,key(carol,replacement,original["epoch"])); repaired=seal_origin(body["controls"],replacement,original["epoch"],key(carol,replacement,original["epoch"]),carol["device"]["id"],body["rows"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; fresh.execute("UPDATE origin_bundles SET ciphertext=?",(unb64(original["ciphertext"]),)); fresh.commit(); action(fresh,{"op":"origin_upload","envelope":repaired},carol["token"]); state=connect(c/"remote/state.db"); ws=next(w for w in server_state["workspaces"] if w["id"]==replacement)
     real_core=remote_client._core
     @__import__("contextlib").contextmanager
     def broken(root,**kwargs):
@@ -716,7 +717,7 @@ def test_large_record_is_fetched_during_convergent_pull(tmp_path,monkeypatch):
 
 
 def test_lazy_fetch_rejects_swapped_envelope(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); sa,sb=connect(a/"remote/state.db"),connect(b/"remote/state.db"); [publish(alice,sa,ws,ledger_event(str(i)*70000,str(i)),a) for i in range(2)]; upload(alice,sa,a); ids=[r[0] for r in server.execute("SELECT event FROM events WHERE LENGTH(envelope)>65536 ORDER BY event").fetchall()]
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); sa,sb=connect(a/"remote/state.db"),connect(b/"remote/state.db"); [publish(alice,sa,ws,ledger_event(str(i)*70000,str(i)),a) for i in range(2)]; upload(alice,sa,a); ids=[r[0] for r in server.execute("SELECT event FROM events WHERE wire_size>65536 ORDER BY event").fetchall()]
     def swapped(cfg,body,auth=True): return direct(cfg,{**body,"event":ids[1]} if body["op"]=="fetch" and body["event"]==ids[0] else body,auth)
     monkeypatch.setattr("ai_convos_remote.request",swapped)
     with pytest.raises(ValueError,match="mismatch"): pull(desktop,sb,b)
@@ -780,7 +781,7 @@ def test_upgrade_seeds_existing_local_publication_before_own_echo(tmp_path,monke
     write_archive(path,"original"); sync_once(root,True)
     with duckdb.connect(str(path)) as db: db.execute("DROP TABLE remote.local_row_bases")
     write_archive(path,"continued after upgrade"); sync_once(root,True)
-    cfg=load(root); values=[open_replica(json.loads(r[0]),key(cfg,workspace(cfg,"Personal"),1))["row"]["data"]["title"] for r in server.execute("SELECT envelope FROM row_replicas")]
+    cfg=load(root); values=[open_replica(stored_envelope(r),key(cfg,workspace(cfg,"Personal"),1))["row"]["data"]["title"] for r in server.execute("SELECT envelope,ciphertext FROM row_replicas")]
     assert "continued after upgrade" in values
 
 
@@ -946,5 +947,5 @@ def test_lost_upload_response_survives_epoch_rotation_without_resealing(tmp_path
         return result
     monkeypatch.setattr("ai_convos_remote.request",drop)
     with pytest.raises(ConnectionError,match="response lost"): upload(alice,state,a)
-    monkeypatch.setattr("ai_convos_remote.request",direct); setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); upload(alice,state,a); stored=json.loads(server.execute("SELECT envelope FROM events WHERE event=?",(eid,)).fetchone()[0])
+    monkeypatch.setattr("ai_convos_remote.request",direct); setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); upload(alice,state,a); stored=stored_envelope(server.execute("SELECT envelope,ciphertext FROM events WHERE event=?",(eid,)).fetchone())
     assert stored==original and state.execute("SELECT epoch FROM receipts WHERE event=?",(eid,)).fetchone()[0]==1 and not state.execute("SELECT 1 FROM outbox WHERE event=?",(eid,)).fetchone()

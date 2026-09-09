@@ -23,6 +23,7 @@ def verify_certificate(cert,root_public):
     if body["v"]!=V: raise ValueError(f"Unsupported certificate version {body['v']}")
     return body
 
+ENCRYPTED_TABLES=("events","row_replicas","semantic_replicas","origin_bundles")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT UNIQUE,root_public TEXT NOT NULL,recovery TEXT,created REAL);
 CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,name TEXT,sign_public TEXT NOT NULL,box_public TEXT NOT NULL,token_hash TEXT UNIQUE NOT NULL,active INT NOT NULL DEFAULT 1,created REAL);
@@ -51,16 +52,54 @@ CREATE TABLE IF NOT EXISTS device_proposals(id TEXT PRIMARY KEY,workspace TEXT,b
 CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_device TEXT,approve INT,vote TEXT,PRIMARY KEY(proposal,voter_user));
 """
 
+def split_envelope(env):
+    raw=unb64(env["ciphertext"])
+    if b64(raw)!=env["ciphertext"]: raise ValueError("ciphertext must use canonical base64url")
+    return canon({k:v for k,v in env.items() if k!="ciphertext"}).decode(),raw,len(canon(env))
+def stored_envelope(row):
+    value=json.loads(row["envelope"])
+    value["ciphertext"]=b64(row["ciphertext"])
+    return value
+def replica_page_size(row): return max(row["wire_size"],json.loads(row["envelope"]).get("plaintext_size",0))
+def binary_schema(db):
+    for table in ENCRYPTED_TABLES:
+        columns={r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+        if "ciphertext" not in columns: db.execute(f"ALTER TABLE {table} ADD COLUMN ciphertext BLOB")
+        if "wire_size" not in columns: db.execute(f"ALTER TABLE {table} ADD COLUMN wire_size INTEGER")
+    db.execute("PRAGMA user_version=2")
+def migrate_storage(db):
+    if db.execute("PRAGMA user_version").fetchone()[0] not in (1,2) or db.execute("SELECT 1 FROM sqlite_master WHERE name='event_purges'").fetchone(): raise ValueError("relay database is incompatible with binary migration")
+    binary_schema(db)
+    for table in ENCRYPTED_TABLES:
+        after=0
+        while page:=bounded(db.execute(f"SELECT cursor,envelope,ciphertext,wire_hash FROM {table} WHERE cursor>? ORDER BY cursor LIMIT 500",(after,)),lambda r:len(r[1])+len(r[2] or b""),4*1024**2):
+            for cursor,raw,encrypted,wire_hash in page:
+                env={**json.loads(raw),"ciphertext":b64(encrypted)} if encrypted is not None else json.loads(raw)
+                if digest(env)!=wire_hash: raise ValueError(f"stored envelope digest mismatch: {table} cursor {cursor}")
+                header,ciphertext,size=split_envelope(env)
+                if stored_envelope({"envelope":header,"ciphertext":ciphertext})!=env: raise ValueError("binary envelope round trip mismatch")
+                db.execute(f"UPDATE {table} SET envelope=?,ciphertext=?,wire_size=? WHERE cursor=?",(header,ciphertext,size,cursor))
+            after=page[-1][0]
+            db.commit()
+    db.execute("DELETE FROM replica_usage")
+    db.execute("INSERT INTO replica_usage SELECT workspace,uploader,SUM(bytes) FROM (SELECT workspace,uploader,LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext) bytes FROM row_replicas UNION ALL SELECT workspace,uploader,LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext) bytes FROM semantic_replicas) GROUP BY workspace,uploader")
+    db.commit()
+
 def connect(path,initialize=True):
     db=sqlite3.connect(path if initialize else Path(path).absolute().as_uri()+"?mode=rw",uri=not initialize,timeout=30)
     db.row_factory=sqlite3.Row
     db.executescript("PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;")
     if not initialize: return db
     old=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
-    if old and (db.execute("PRAGMA user_version").fetchone()[0]!=1 or db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_purges'").fetchone()):
+    version=db.execute("PRAGMA user_version").fetchone()[0]
+    if old and version==1 and not db.execute("SELECT 1 FROM sqlite_master WHERE name='event_purges'").fetchone():
+        db.close()
+        raise ValueError("relay storage migration required: run convos-server migrate --db SOURCE --output NEW_DATABASE before serving the new database")
+    if old and (version!=2 or db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_purges'").fetchone()):
         db.close()
         raise ValueError("relay database is incompatible; create a fresh relay")
-    db.executescript("PRAGMA journal_mode=WAL;"+SCHEMA+"PRAGMA user_version=1;")
+    db.executescript("PRAGMA journal_mode=WAL;"+SCHEMA)
+    binary_schema(db)
     db.execute("INSERT OR IGNORE INTO relay_meta VALUES ('registration_secret',?)",(b64(os.urandom(32)),))
     db.commit()
     return db
@@ -280,29 +319,36 @@ def store_event(db,actor,env):
         return {"cursor":old["cursor"],"created":False}
     if env["epoch"]!=epoch: raise PermissionError("event epoch rejected")
     cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid
-    db.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)",(cursor,ws,env["event"],env["author"],env["epoch"],env["seq"],json.dumps(env),wire,time.time()))
+    header,ciphertext,size=split_envelope(env)
+    db.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?)",(cursor,ws,env["event"],env["author"],env["epoch"],env["seq"],header,wire,time.time(),ciphertext,size))
     return {"cursor":cursor,"created":True}
-def store_replica(db,actor,env,semantic=False):
+def store_replica(db,actor,env,semantic=False,expected=None):
     table="semantic_replicas" if semantic else "row_replicas"
-    fields={"v","kind","workspace","replica","epoch","uploader","nonce","ciphertext"}
+    fields={"v","kind","workspace","replica","epoch","uploader","nonce","ciphertext"}|({"compression","plaintext_size"} if env["v"]==2 else set())
     ws=env["workspace"]
     member=device_member(db,ws,actor)
     current=db.execute("SELECT epoch FROM workspaces WHERE id=?",(ws,)).fetchone()[0]
-    if set(env)!=fields or env["v"]!=1 or env["kind"]!="row.replica" or env["uploader"]!=actor["id"] or not member["history_from"]<=env["epoch"]<=current or not db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(ws,env["epoch"],actor["id"])).fetchone() or not isinstance(env["replica"],str) or len(env["replica"])!=64 or any(c not in "0123456789abcdef" for c in env["replica"]): raise PermissionError("row replica envelope rejected")
+    if set(env)!=fields or type(env["v"]) is not int or env["v"] not in (1,2) or env["kind"]!="row.replica" or env["uploader"]!=actor["id"] or not member["history_from"]<=env["epoch"]<=current or not db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(ws,env["epoch"],actor["id"])).fetchone() or not isinstance(env["replica"],str) or len(env["replica"])!=64 or any(c not in "0123456789abcdef" for c in env["replica"]): raise PermissionError("row replica envelope rejected")
+    if env["v"]==2 and (env["compression"]!="zstd" or type(env["plaintext_size"]) is not int or not 0<env["plaintext_size"]<=48*1024**2): raise ValueError("unsupported replica compression")
     key=(ws,env["replica"],env["epoch"],actor["id"])
     wire=digest(env)
-    old=db.execute(f"SELECT cursor,wire_hash,envelope FROM {table} WHERE workspace=? AND replica=? AND epoch=? AND uploader=?",key).fetchone()
-    now,size=time.time(),len(canon(env))
+    old=db.execute(f"SELECT cursor,wire_hash,LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext) size FROM {table} WHERE workspace=? AND replica=? AND epoch=? AND uploader=?",key).fetchone()
+    header,ciphertext,size=split_envelope(env)
+    now,stored_size=time.time(),len(header.encode())+len(ciphertext)
+    if expected is not None:
+        if not isinstance(expected,str) or len(expected)!=64 or any(c not in "0123456789abcdef" for c in expected): raise ValueError("invalid replica replacement digest")
+        if not old or old["wire_hash"]!=expected: return {"cursor":old["cursor"] if old else None,"created":False,"replaced":False,"conflict":True}
+        if stored_size>=old["size"]: return {"cursor":old["cursor"],"created":False,"replaced":False,"conflict":False}
     used=(db.execute("SELECT bytes FROM replica_usage WHERE workspace=? AND uploader=?",(ws,actor["id"])).fetchone() or [0])[0]
-    total=used-(len(canon(json.loads(old["envelope"]))) if old else 0)+size
+    total=used-(old["size"] if old else 0)+stored_size
     if size>48*1024**2: raise ValueError("row replica exceeds 48 MiB")
     if total>REPLICA_QUOTA: raise ValueError("row replica quota exceeded")
     db.execute("INSERT OR REPLACE INTO replica_usage VALUES (?,?,?)",(ws,actor["id"],total))
     if old:
-        db.execute(f"UPDATE {table} SET envelope=?,wire_hash=?,updated=? WHERE workspace=? AND replica=? AND epoch=? AND uploader=?",(json.dumps(env),wire,now,*key))
+        db.execute(f"UPDATE {table} SET envelope=?,ciphertext=?,wire_size=?,wire_hash=?,updated=? WHERE workspace=? AND replica=? AND epoch=? AND uploader=?",(header,ciphertext,size,wire,now,*key))
         return {"cursor":old["cursor"],"created":False,"replaced":old["wire_hash"]!=wire}
     cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid
-    db.execute(f"INSERT INTO {table} VALUES (?,?,?,?,?,?,?,?,?)",(cursor,*key,json.dumps(env),wire,now,now))
+    db.execute(f"INSERT INTO {table} VALUES (?,?,?,?,?,?,?,?,?,?,?)",(cursor,*key,header,wire,now,now,ciphertext,size))
     return {"cursor":cursor,"created":True,"replaced":False}
 def store_origin(db,actor,env):
     fields={"v","kind","workspace","origin","epoch","uploader","nonce","ciphertext"}
@@ -312,15 +358,16 @@ def store_origin(db,actor,env):
     if set(env)!=fields or env["v"]!=1 or env["kind"]!="origin.bundle" or env["uploader"]!=actor["id"] or env["epoch"]!=current or not isinstance(env["origin"],str) or len(env["origin"])!=64 or any(c not in "0123456789abcdef" for c in env["origin"]): raise PermissionError("origin bundle rejected")
     key=(ws,env["origin"],env["epoch"],actor["id"])
     wire=digest(env)
-    old=db.execute("SELECT cursor,wire_hash,LENGTH(envelope) size FROM origin_bundles WHERE workspace=? AND origin=? AND epoch=? AND uploader=?",key).fetchone()
-    now,size=time.time(),len(canon(env))
-    used=db.execute("SELECT COALESCE(SUM(LENGTH(envelope)),0) FROM origin_bundles WHERE workspace=? AND uploader=?",(ws,actor["id"])).fetchone()[0]
-    if size>4*1024**2 or used-(old["size"] if old else 0)+size>64*1024**2: raise ValueError("origin bundle quota exceeded")
+    old=db.execute("SELECT cursor,wire_hash,LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext) size FROM origin_bundles WHERE workspace=? AND origin=? AND epoch=? AND uploader=?",key).fetchone()
+    header,ciphertext,size=split_envelope(env)
+    now,stored_size=time.time(),len(header.encode())+len(ciphertext)
+    used=db.execute("SELECT COALESCE(SUM(LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext)),0) FROM origin_bundles WHERE workspace=? AND uploader=?",(ws,actor["id"])).fetchone()[0]
+    if size>4*1024**2 or used-(old["size"] if old else 0)+stored_size>64*1024**2: raise ValueError("origin bundle quota exceeded")
     if old:
-        db.execute("UPDATE origin_bundles SET envelope=?,wire_hash=?,updated=? WHERE workspace=? AND origin=? AND epoch=? AND uploader=?",(json.dumps(env),wire,now,*key))
+        db.execute("UPDATE origin_bundles SET envelope=?,ciphertext=?,wire_size=?,wire_hash=?,updated=? WHERE workspace=? AND origin=? AND epoch=? AND uploader=?",(header,ciphertext,size,wire,now,*key))
         return {"cursor":old["cursor"],"created":False,"replaced":old["wire_hash"]!=wire}
     cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid
-    db.execute("INSERT INTO origin_bundles VALUES (?,?,?,?,?,?,?,?,?)",(cursor,*key,json.dumps(env),wire,now,now))
+    db.execute("INSERT INTO origin_bundles VALUES (?,?,?,?,?,?,?,?,?,?,?)",(cursor,*key,header,wire,now,now,ciphertext,size))
     return {"cursor":cursor,"created":True,"replaced":False}
 def store_blob(db,actor,env):
     fields={"v","kind","workspace","blob","epoch","uploader","size","nonce","ciphertext"}
@@ -352,7 +399,7 @@ def bounded(values,size,limit=48*1024**2):
 def action(db, req, token=None):
     if not isinstance(req,dict) or not isinstance(req.get("op"),str): raise ValueError("request requires a string operation")
     with db:
-        db.execute("BEGIN IMMEDIATE" if req["op"] in {"register","certify","create","rotate","propose","reject","vote","upload","upload_many","replica_upload_many","blob_upload","origin_upload","grant_all","history_activate","recovery"} else "BEGIN")
+        db.execute("BEGIN IMMEDIATE" if req["op"] in {"register","certify","create","rotate","propose","reject","vote","upload","upload_many","replica_upload_many","replica_replace_many","blob_upload","origin_upload","grant_all","history_activate","recovery"} else "BEGIN")
         return dispatch(db,req,token)
 def dispatch(db, req, token):
     op = req["op"]
@@ -424,7 +471,28 @@ def dispatch(db, req, token):
             w["device_authorized"]=bool(db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(w["id"],w["epoch"],actor["id"])).fetchone()) and not bool(db.execute("SELECT 1 FROM workspace_device_exclusions WHERE workspace=? AND device=?",(w["id"],actor["id"])).fetchone())
             w["sync"]=sync_tails(db,w["id"],w["history_from"],actor["id"]) if w["device_authorized"] else None
             w["controls"]=[json.loads(r[0]) for r in db.execute("SELECT state FROM workspace_controls WHERE workspace=? ORDER BY revision",(w["id"],)).fetchall()]
-        return {"user":actor["user_id"],"device":actor["id"],"workspaces":memberships,"capabilities":{"replica_reconcile_limit":2500,"replica_pull_limit":2500,"sync_tails":1}}
+        return {"user":actor["user_id"],"device":actor["id"],"workspaces":memberships,"capabilities":{"replica_reconcile_limit":2500,"replica_pull_limit":2500,"sync_tails":1,"replica_compression":["zstd"],"replica_repack":1}}
+    if op=="replica_replace_many":
+        if not isinstance(req["replacements"],list) or not 1<=len(req["replacements"])<=500: raise ValueError("replacement batch limit is 1 to 500")
+        if any(set(v)!={"semantic","expected_wire_hash","envelope"} or type(v["semantic"]) is not bool or v["expected_wire_hash"] is None for v in req["replacements"]): raise ValueError("invalid replica replacement")
+        return {"replicas":[store_replica(db,actor,v["envelope"],v["semantic"],v["expected_wire_hash"]) for v in req["replacements"]]}
+    if op in {"replica_repack_pull","replica_repack_get"}:
+        ws,after=req["workspace"],req.get("after",0)
+        m=device_member(db,ws,actor)
+        if type(after) is not int or after<0: raise ValueError("invalid replica repack cursor")
+        columns="cursor,workspace,uploader,epoch,envelope,wire_size,wire_hash"+(",ciphertext" if op=="replica_repack_get" else "")
+        table=f"(SELECT 0 semantic,{columns} FROM row_replicas UNION ALL SELECT 1 semantic,{columns} FROM semantic_replicas)"
+        access="x.workspace=? AND x.uploader=? AND x.epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?)"
+        args=(ws,actor["id"],m["history_from"],actor["id"])
+        if op=="replica_repack_get":
+            if type(req["cursor"]) is not int or type(req["semantic"]) is not bool: raise ValueError("invalid replica locator")
+            row=db.execute(f"SELECT envelope,ciphertext,wire_hash FROM {table} x WHERE {access} AND cursor=? AND semantic=?",(*args,req["cursor"],req["semantic"])).fetchone()
+            if not row or row["wire_hash"]!=req["wire_hash"]: raise ValueError("replica unavailable or changed during compaction; retry")
+            return {"envelope":stored_envelope(row)}
+        tail=db.execute("SELECT COALESCE(MAX(cursor),0) FROM ledger_cursors").fetchone()[0]
+        if after>tail: raise ValueError("compaction cursor exceeds relay history; use --restart")
+        values=bounded(db.execute(f"SELECT semantic,cursor,envelope,wire_size,wire_hash FROM {table} x WHERE {access} AND cursor>? AND cursor<=? AND json_extract(envelope,'$.compression') IS NOT 'zstd' ORDER BY cursor LIMIT 500",(*args,after,tail)),lambda r:r["wire_size"],4*1024**2)
+        return {"cursor":values[-1]["cursor"] if values else tail,"replicas":[{"semantic":bool(r["semantic"]),"cursor":r["cursor"],"wire_hash":r["wire_hash"],"wire_size":r["wire_size"],"header":json.loads(r["envelope"])} for r in values]}
     if op == "ledger":
         member(db,req["workspace"],actor["user_id"])
         return ledger_state(db,req["workspace"])
@@ -459,8 +527,8 @@ def dispatch(db, req, token):
     if op == "origin_pull":
         ws=req["workspace"]
         m=device_member(db,ws,actor)
-        values=rows(db,"SELECT cursor,envelope FROM origin_bundles WHERE workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=origin_bundles.workspace AND k.epoch=origin_bundles.epoch AND k.device=?) ORDER BY cursor",(ws,m["history_from"],actor["id"]))
-        return {"origins":[{"cursor":r["cursor"],"envelope":json.loads(r["envelope"])} for r in values]}
+        values=rows(db,"SELECT cursor,envelope,ciphertext FROM origin_bundles WHERE workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=origin_bundles.workspace AND k.epoch=origin_bundles.epoch AND k.device=?) ORDER BY cursor",(ws,m["history_from"],actor["id"]))
+        return {"origins":[{"cursor":r["cursor"],"envelope":stored_envelope(r)} for r in values]}
     if op == "replica_reconcile":
         ws=req["workspace"]
         device_member(db,ws,actor)
@@ -482,8 +550,8 @@ def dispatch(db, req, token):
         access="x.workspace=? AND x.epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?)"
         args=(ws,m["history_from"],actor["id"])
         floor,tail=cursor_bounds(db,table+" x",access,args)
-        values=bounded(db.execute(f"SELECT cursor,envelope FROM {table} x WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(after,limit)),lambda r:len(r["envelope"]))
-        return {"floor":floor,"tail":tail,"replicas":[{"cursor":r["cursor"],"envelope":json.loads(r["envelope"])} for r in values]}
+        values=bounded(db.execute(f"SELECT cursor,envelope,ciphertext,wire_size FROM {table} x WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(after,limit)),replica_page_size)
+        return {"floor":floor,"tail":tail,"replicas":[{"cursor":r["cursor"],"envelope":stored_envelope(r)} for r in values]}
     if op == "pull":
         ws=req["workspace"]
         m=device_member(db,ws,actor)
@@ -492,13 +560,13 @@ def dispatch(db, req, token):
         access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?)"
         args=(ws,m["history_from"],actor["id"])
         floor,tail=cursor_bounds(db,"events x",access,args)
-        out=rows(db,f"SELECT cursor,event,CASE WHEN LENGTH(CAST(envelope AS BLOB))<=65536 THEN envelope END envelope,LENGTH(CAST(envelope AS BLOB)) size FROM events x WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(req.get("after",0),limit))
-        return {"floor":floor,"tail":tail,"events":[{"cursor":r["cursor"],**({"lazy":True,"event":r["event"],"size":r["size"]} if r["size"]>65536 else {"envelope":json.loads(r["envelope"])})} for r in out]}
+        out=rows(db,f"SELECT cursor,event,CASE WHEN wire_size<=65536 THEN envelope END envelope,CASE WHEN wire_size<=65536 THEN ciphertext END ciphertext,wire_size size FROM events x WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(req.get("after",0),limit))
+        return {"floor":floor,"tail":tail,"events":[{"cursor":r["cursor"],**({"lazy":True,"event":r["event"],"size":r["size"]} if r["size"]>65536 else {"envelope":stored_envelope(r)})} for r in out]}
     if op == "fetch":
         m=device_member(db,req["workspace"],actor)
-        row=db.execute("SELECT cursor,envelope FROM events WHERE workspace=? AND event=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=events.workspace AND k.epoch=events.epoch AND k.device=?)",(req["workspace"],req["event"],m["history_from"],actor["id"])).fetchone()
+        row=db.execute("SELECT cursor,envelope,ciphertext FROM events WHERE workspace=? AND event=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=events.workspace AND k.epoch=events.epoch AND k.device=?)",(req["workspace"],req["event"],m["history_from"],actor["id"])).fetchone()
         if not row: raise ValueError("event not found")
-        return {"cursor":row["cursor"],"envelope":json.loads(row["envelope"])}
+        return {"cursor":row["cursor"],"envelope":stored_envelope(row)}
     if op == "grant_all":
         if device_member(db,req["workspace"],actor)["role"]!="admin": raise PermissionError("workspace access denied")
         previous=current_control(db,req["workspace"])
@@ -601,15 +669,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send(500,{"error":"relay request failed"})
 
 def main(argv=None):
-    (p:=argparse.ArgumentParser()).add_argument("command",choices=("serve","backup"))
+    (p:=argparse.ArgumentParser()).add_argument("command",choices=("serve","backup","migrate"))
     for name,default in (("db",os.environ.get("CONVOS_SERVER_DB","convos-server.db")),("host","127.0.0.1"),("output",None)): p.add_argument("--"+name,default=default)
     p.add_argument("--port",type=int,default=8787)
     a=p.parse_args(argv)
-    if a.command == "backup":
+    if a.command in ("backup","migrate"):
         if not a.output: p.error("backup requires --output")
         source,output=Path(a.db).resolve(),Path(a.output).absolute()
         if not source.is_file(): p.error("backup requires an existing source database")
         if output.exists() and source.samefile(output): p.error("backup output must be a different file from the source")
+        if a.command=="migrate" and output.exists(): p.error("migration requires a new output path")
         if any(Path(str(output)+suffix).exists() for suffix in ("-wal","-shm","-journal")): p.error("backup output has SQLite sidecars; choose a fresh output path")
         output.parent.mkdir(parents=True,exist_ok=True)
         fd,stage=tempfile.mkstemp(prefix=f".{output.name}.",dir=output.parent)
@@ -617,9 +686,13 @@ def main(argv=None):
             with os.fdopen(fd,"r+b") as handle,closing(sqlite3.connect(source.as_uri()+"?mode=ro",uri=True)) as src,closing(sqlite3.connect(stage)) as dst:
                 src.backup(dst)
                 dst.execute("PRAGMA journal_mode=DELETE").fetchone()
+                if a.command=="migrate":
+                    migrate_storage(dst)
+                    dst.execute("VACUUM")
                 if dst.execute("PRAGMA quick_check").fetchall()!=[("ok",)]: raise sqlite3.DatabaseError("backup integrity check failed")
                 os.fsync(handle.fileno())
-            os.replace(stage,output)
+            if a.command=="migrate": os.link(stage,output)
+            else: os.replace(stage,output)
             directory=os.open(output.parent,os.O_RDONLY)
             try: os.fsync(directory)
             finally: os.close(directory)

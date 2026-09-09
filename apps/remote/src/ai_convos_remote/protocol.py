@@ -1,4 +1,4 @@
-"""Canonical signed/encrypted event protocol. Wire format v1; server sees envelopes only."""
+"""Signed payloads v1, versioned encrypted envelopes; server sees ciphertext only."""
 import base64, datetime, functools, hashlib, hmac, json, os, cryptography.exceptions as crypto_errors, cryptography.hazmat.primitives.hashes as hashes, cryptography.hazmat.primitives.asymmetric.ed25519 as ed25519, cryptography.hazmat.primitives.asymmetric.x25519 as x25519
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -6,6 +6,8 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from ai_convos.cli import PROVENANCE_FIELDS_V1, ROW_FIELDS_V1, ROW_JSON_V1, ROW_TIME_V1, logical_fact, logical_row, required
 
 V = 1
+REPLICA_PLAIN_LIMIT=48*1024**2
+REPLICA_ZSTD_LEVEL=1
 SEMANTIC_FIELDS_V1=ROW_FIELDS_V1|PROVENANCE_FIELDS_V1
 ROW_PROOF_FIELDS={"v","kind","workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"}
 SEMANTIC_PROOF_FIELDS={"v","kind","workspace","object_kind","object_id","encoding_v","content_hash","revision","previous_revision","ancestors","state","author_user_id","author_device_id","authorization_epoch","root_public","signature"}
@@ -103,17 +105,47 @@ def open_event(envelope, key, sign_public):
     if (value["id"], value["author"], value["seq"], value["parents"]) != (header["event"], header["author"], header["seq"], header["parents"]): raise ValueError("Envelope header mismatch")
     return value
 
-def seal_replica(row,proof,workspace,epoch,key,uploader,content_hash=None,lineage=()):
-    if proof["content_hash"]!=(content_hash if content_hash is not None else digest(row)): raise ValueError("row replica proof mismatch")
-    return _seal({"v":1,"kind":"row.replica","workspace":workspace,"replica":fingerprint(key,digest(proof)),"epoch":epoch,"uploader":uploader,"nonce":b64(os.urandom(12))},{"row":row,"proof":proof,"lineage":list(lineage)},key)
-
-def open_replica(value,key):
+def _seal_replica(header,raw,key,compression):
+    if compression not in ("none","zstd"): raise ValueError("unsupported replica compression")
+    if compression=="zstd" and len(raw)<=REPLICA_PLAIN_LIMIT:
+        import zstandard
+        packed=zstandard.ZstdCompressor(level=REPLICA_ZSTD_LEVEL).compress(raw)
+        if len(packed)+100<len(raw): header,raw={**header,"v":2,"compression":"zstd","plaintext_size":len(raw)},packed
+    return _seal(header,raw,key)
+def replica_compression(cfg): return "zstd" if "zstd" in cfg.get("server_state",{}).get("capabilities",{}).get("replica_compression",[]) else "none"
+def replica_plain_size(value):
+    if value["v"]==2:
+        if type(value["plaintext_size"]) is not int or not 0<value["plaintext_size"]<=REPLICA_PLAIN_LIMIT: raise ValueError("invalid replica decompression size")
+        return value["plaintext_size"]
+    if value["v"]!=1: raise ValueError("unsupported replica envelope version; upgrade Convos")
+    return len(value["ciphertext"])
+def _decompress_replica(header,payload):
+    import zstandard
     try:
-        if set(value)!={"v","kind","workspace","replica","epoch","uploader","nonce","ciphertext"} or value["v"]!=1 or value["kind"]!="row.replica": raise ValueError
-        header,body=_open(value,("v","kind","workspace","replica","epoch","uploader","nonce"),key)
+        frame=zstandard.get_frame_parameters(payload)
+        if frame.content_size!=header["plaintext_size"] or frame.window_size>REPLICA_PLAIN_LIMIT or frame.dict_id: raise ValueError("invalid compressed replica frame")
+        return zstandard.ZstdDecompressor().decompress(payload,max_output_size=header["plaintext_size"],allow_extra_data=False)
+    except zstandard.ZstdError as error: raise ValueError("invalid compressed replica frame") from error
+def seal_replica(row,proof,workspace,epoch,key,uploader,content_hash=None,lineage=(),compression="zstd"):
+    if proof["content_hash"]!=(content_hash if content_hash is not None else digest(row)): raise ValueError("row replica proof mismatch")
+    return _seal_replica({"v":1,"kind":"row.replica","workspace":workspace,"replica":fingerprint(key,digest(proof)),"epoch":epoch,"uploader":uploader,"nonce":b64(os.urandom(12))},canon({"row":row,"proof":proof,"lineage":list(lineage)}),key,compression)
+
+def open_replica(value,key,raw=False):
+    try:
+        fields={"v","kind","workspace","replica","epoch","uploader","nonce"}|({"compression","plaintext_size"} if value["v"]==2 else set())
+        if set(value)!=fields|{"ciphertext"} or type(value["v"]) is not int or value["v"] not in (1,2) or value["kind"]!="row.replica": raise ValueError
+        if value["v"]==2 and (value["compression"]!="zstd" or type(value["plaintext_size"]) is not int or not 0<value["plaintext_size"]<=REPLICA_PLAIN_LIMIT): raise ValueError
+        header,payload=_open(value,fields,key,True)
+        if value["v"]==2:
+            payload=_decompress_replica(header,payload)
+            if len(payload)!=header["plaintext_size"]: raise ValueError
+        body=json.loads(payload)
         if set(body)!={"row","proof","lineage"} or not isinstance(body["lineage"],list) or value["replica"]!=fingerprint(key,digest(body["proof"])) or body["proof"]["content_hash"]!=digest(body["row"]): raise ValueError
-        return body
+        return payload if raw else body
     except (crypto_errors.InvalidTag,KeyError,TypeError,ValueError) as e: raise ValueError("invalid row replica") from e
+def repack_replica(value,key,compression="zstd"):
+    raw=open_replica(value,key,True)
+    return _seal_replica({**{k:value[k] for k in ("kind","workspace","replica","epoch","uploader")},"v":1,"nonce":b64(os.urandom(12))},raw,key,compression)
 
 def seal_origin(controls,workspace,epoch,key,uploader,rows=True):
     return _seal({"v":1,"kind":"origin.bundle","workspace":workspace,"origin":fingerprint(key,digest(body:={"controls":controls,"rows":rows})),"epoch":epoch,"uploader":uploader,"nonce":b64(os.urandom(12))},body,key)

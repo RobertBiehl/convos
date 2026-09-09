@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.11.6b8
+
+- Store bulk relay ciphertext as binary with accurate storage quotas. Add a
+  verified, copy-only migration that preserves the source database and checks
+  exact wire reconstruction before publishing the converted copy.
+- Compress retained replicas before encryption with Zstd level 1 by default
+  on supporting relays; keep incompressible payloads in the legacy envelope.
+  Authenticate codec metadata and bound decompression size and framing.
+- Compact owned retained replicas across authorized workspaces by default.
+  Skip compressed bodies at the relay, reuse byte-verified local payloads, and
+  download only missing historical payloads. Preserve signed logical rows,
+  cursors, and concurrent replacements through conditional updates.
+
+Upgrade all receiving clients before enabling compression on the relay. Stop
+the relay before taking the final migration snapshot and switching databases.
+See [compression and measurements](docs/remote-compression.md) and
+[verified storage migration](docs/relay-storage-validation.md).
+
 ## 0.11.6b7
 
 - Preserve exact signed archive rows, repository variants, and joined edit facts

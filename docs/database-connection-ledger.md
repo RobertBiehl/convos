@@ -97,7 +97,10 @@ Each row is one production connection acquisition site. IDs are stable labels, s
 | A86 | `apps/remote/src/ai_convos_remote/__init__.py::recovery_notice` | `remote.status.retained` | Shared | One count of retained exceptional bodies | Briefly delays writers | No body materialization or full integrity audit; immediate close |
 | A89 | `src/ai_convos/cli.py::merge_archive_backup` | `remote.repair.bodies` | Exclusive | Destination reconstruction for at most 500 donor origin/head claims, exceptional body retention, and dependency retry scheduling | Briefly blocks live clients | Donor reconstruction/hash verification precedes acquisition; exact unavailable variants and retry scheduling commit together; close/yield per page |
 
-The AST ledger has 82 archive acquisition sites and 21 SQLite constructor sites. Every acquisition has a distinct label, including separate sites with the same function and purpose. A42 (proof-header repair shortcut), A46 (repull backup), and A47 (destructive reset) are retired. Attestation uses one planning read followed by bounded write pages; hashing and signing run after the planning connection closes.
+| A90 | `apps/remote/src/ai_convos_remote/projection.py::repack_index` | `remote.compact.index` | Shared | At most 5,000 immutable proof records per page, only when uncompressed replicas exist | Each page briefly delays writers | Keyset paging; close/yield before temporary index writes and subsequent pages; no network under the archive lease |
+| A91 | `apps/remote/src/ai_convos_remote/projection.py::local_repack_envelopes` | `remote.compact.bodies` | Shared | Typed bodies, exceptional bodies, and lineage for one inventory page of at most 500 replicas | Each page briefly delays writers | Batch reconstruction; close/yield before encryption or any relay request; exact retained ciphertext digest is checked before replacement |
+
+The AST ledger has 84 archive acquisition sites and 21 SQLite constructor sites. Every acquisition has a distinct label, including separate sites with the same function and purpose. A42 (proof-header repair shortcut), A46 (repull backup), and A47 (destructive reset) are retired. Attestation uses one planning read followed by bounded write pages; hashing and signing run after the planning connection closes.
 
 ## Direct DuckDB constructors
 
