@@ -202,6 +202,25 @@ def test_backup_merge_stages_attachment_before_restoring_its_reference(tmp_path)
     repair.snapshot(path, tmp_path / 'complete-merged')
 
 
+@pytest.mark.parametrize('failure', ['file', 'store', 'parent'])
+def test_core_attachment_restore_requires_durable_content_before_reference(tmp_path, monkeypatch, failure):
+    path, donor, row, proof, diagnosis = attachment_history(tmp_path)
+    data = (donor.with_name(donor.name + '.attachments') / row['data']['body_hash']).read_bytes()
+    blob = core.attachment_body(data, path.parent)
+    failed = {'file': blob, 'store': blob.parent, 'parent': blob.parent.parent}[failure]
+    flush = core._fsync
+    def fail(target):
+        if Path(target) == failed: raise OSError('durability failure')
+        return flush(target)
+    monkeypatch.setattr(core, '_fsync', fail)
+    with core.open_db(path, purpose='fixture.durability') as db, core._transaction(db):
+        generation = repair.identity(db)[1]
+        with pytest.raises(OSError, match='durability failure'):
+            core.restore_signed_bodies(db, [dict(proof_id=proof[0], proof_row=proof, body=row)])
+        assert not db.execute('SELECT 1 FROM remote.row_conflicts').fetchone()
+        assert repair.identity(db)[1] == generation
+
+
 @pytest.mark.parametrize('damage', ['missing', 'hash', 'size', 'symlink'])
 def test_attachment_recovery_fails_closed_without_exact_bytes(tmp_path, damage):
     path, donor, row, proof, diagnosis = attachment_history(tmp_path)

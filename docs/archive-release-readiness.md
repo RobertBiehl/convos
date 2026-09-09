@@ -53,7 +53,7 @@ Physical patch counts relative to b8, excluding documentation:
 | Core and Remote runtime | 71 | 47 |
 | Two recovery tools | 186 | 0 |
 | Obsolete orphan-stub script | 0 | 73 |
-| Regression tests | 913 | 7 |
+| Regression tests | 932 | 7 |
 
 The 186 tool lines are localized under `scripts/archive_recovery`: 149 for
 repair and 37 for diagnosis. Core owns canonical mutation and durable migration;
@@ -114,9 +114,11 @@ package manifests and synthetic signatures. It could not install DuckDB or
 obtain full checkouts; its own probes used database doubles. The executable
 Convos tests described here were run locally, not by Oracle.
 
-The focused final regression pass completed with **284 passed**. All eight
+The focused regression pass completed with **284 passed**; the final attachment
+durability and budget checks passed **37 tests**, including three injected flush
+failures before reference insertion. All eight
 products built as wheels and sdists; package budgets, connection checks, and
-isolated install verification passed. The complete final suite contains 929
+isolated install verification passed. The complete final suite contains 932
 non-integration tests and excludes 9 live integration tests; PR and post-merge
 CI must pass before publication. Validation
 uses Python 3.14.2 and DuckDB 1.4.3 locally; Linux CI independently runs the suite
