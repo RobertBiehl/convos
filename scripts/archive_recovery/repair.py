@@ -109,7 +109,7 @@ def run(root, output, apply=False, database_only=False, donor=None, diagnosis=No
                 for blob, size in json.loads((bundles[0] / 'manifest.json').read_text())['attachments'].items():
                     core.required(core.attachment_index(bundles[0] / blob, size) == (blob, size), ValueError('Snapshot attachment changed'))
                     core.required(core.attachment_body((bundles[0] / blob).read_bytes(), target.parent), ValueError('Snapshot attachment exceeds storage limit'))
-            for body in [r['body'] for r in expected['bodies'] if r['body']['kind'] == 'attachments' and r['body']['state'] == 'active']:
+            for body in [r['body'] for r in expected['bodies'] if r['body']['kind'] == 'attachments' and r['body']['state'] == 'active' and r['body']['data']['body_hash'] is not None]:
                 blob, size = body['data']['body_hash'], body['data']['size']
                 candidates = [target.parent / 'attachments' / (blob or ''), *(directory / (blob or '') for directory in bundles)]
                 found = next((p for p in candidates if core.attachment_index(p, size) == (blob, size)), None)
