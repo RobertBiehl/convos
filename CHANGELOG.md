@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Repair proven legacy edit-scope placeholders without changing signed history or evidence status; provide backup-first simulation and targeted recovery tools.
+- Preserve origin-referenced historical bodies when signing successors, and reconstruct exact failed-edit bodies from backup without treating failed edits as successful.
+- Coordinate capture with full import, audit, and alias reconciliation; preserve queued input on interruption. Continue only verified recorded edit branches.
+- Report missing physical parent references separately from signed-body availability, including unsigned messages and explicitly marked history.
+
 ## 0.11.6b8
 
 - Store bulk relay ciphertext as binary with accurate storage quotas. Add a

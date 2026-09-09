@@ -30,7 +30,7 @@ def test_remote_sync_expected_failure_is_concise(monkeypatch):
     assert result.exit_code==1 and "Personal: row replica proof mismatch" in output and "Traceback" not in output and "RuntimeError" not in output
 
 def test_remote_audit_is_machine_readable_and_fails_concisely(monkeypatch):
-    result={"totals":{"projection_mismatch":1,"projection_missing":0,"proof_missing":0,"retained_variants":0,"unavailable":1},"tables":{"tool_calls":{"origins":2,"projection_match":1,"projection_mismatch":1,"projection_missing":0,"proof_missing":0,"retained_variants":0,"unavailable":1}},"examples":[]}; monkeypatch.setattr(remote_client,"load",lambda:{"user":"test"}); monkeypatch.setattr(remote_client,"audit_rows",lambda *args,**kwargs:result); runner=CliRunner(); failed=runner.invoke(remote_client.remote,["audit"]); machine=runner.invoke(remote_client.remote,["audit","--format","json"])
+    result={"totals":{"projection_mismatch":1,"projection_missing":0,"proof_missing":0,"retained_variants":0,"unavailable":1},"tables":{"tool_calls":{"origins":2,"projection_match":1,"projection_mismatch":1,"projection_missing":0,"proof_missing":0,"retained_variants":0,"unavailable":1}},"examples":[],"relationships":{}}; monkeypatch.setattr(remote_client,"load",lambda:{"user":"test"}); monkeypatch.setattr(remote_client,"audit_rows",lambda *args,**kwargs:result); runner=CliRunner(); failed=runner.invoke(remote_client.remote,["audit"]); machine=runner.invoke(remote_client.remote,["audit","--format","json"])
     assert failed.exit_code==1 and "tool_calls: checked=2" in failed.output and "1 unavailable bodies" in failed.output and "Traceback" not in failed.output and machine.exit_code==0 and json.loads(machine.output)==result
 
 
