@@ -33,6 +33,10 @@ cause of the production orphan messages.
 - Include exact missing physical references in audit, including unsigned rows.
   Report body preservation separately from relationship completeness. Repull
   completion is not a convergence assertion.
+- Show the same relationship counts in `convos doctor`, including healthy zeros,
+  distinct missing-parent IDs, and explicitly marked message history. This uses
+  the existing read-only archive snapshot and works without the Remote product.
+  An incomplete schema is reported as unavailable, never as zero orphan rows.
 
 ## How serious are orphan messages?
 
@@ -79,8 +83,11 @@ the code and synthetic validation in this branch.
 
 - Unmodified b8 reproduces all three supplied synthetic failures; the patched
   branch passes all three without changing the supplied fixture.
-- `uv run pytest -m 'not integration' -q`: 908 passed, 9 deselected.
+- Initial hardening (`1adcfbc`): `uv run pytest -m 'not integration' -q`:
+  908 passed, 9 deselected.
+- Doctor statistics follow-up: 124 targeted tests passed, covering doctor,
+  capture, Remote operations, recovery, database access, and line budgets.
 - `uv build --all-packages`: all eight distributions build as wheels and sdists.
-- Core: 1,499 token-counted lines; Remote: 2,540. Existing budgets are unchanged.
+- Core: 1,499 token-counted lines. Existing budgets are unchanged.
 - Runtime: Python 3.14.2, DuckDB 1.4.3. No affected production archive was repaired
   or used to infer convergence in this validation.

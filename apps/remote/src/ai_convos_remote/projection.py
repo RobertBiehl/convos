@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_yield, captured_edit_paths, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
@@ -196,10 +196,6 @@ def _audit_rows(db_path,page=5000,progress=None,local_user=None):
         required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during Remote audit; retry"))
         relationships=archive_relationships(db)
     return (lambda keys:dict(totals={key:sum(value[key] for value in tables.values()) for key in keys},tables=tables,examples=examples,relationships=relationships,archive_generation=generation))(next(iter(tables.values())).keys() if tables else ())
-def archive_relationships(db):
-    # These are exact missing physical references, including unsigned rows; history markers do not prove disposability.
-    counts={f"{table}.{column}":dict(zip(("rows","parent_ids","marked_history_rows"),db.execute(f"SELECT count(*),count(DISTINCT c.{column}),{"count(*) FILTER (WHERE json_extract_string(c.metadata,'$.history_of') IS NOT NULL)" if table=='messages' else '0'} FROM {table} c LEFT JOIN {parent} p ON p.id=c.{column} WHERE p.id IS NULL"+(f" AND c.{column} IS NOT NULL" if (table,column)==('messages','parent_id') else '')).fetchone())) for table,refs in FKS.items() for column,parent in refs}
-    return {key:value for key,value in counts.items() if value["rows"]}
 def event_support(value):
     if not isinstance(kind:=value["kind"],str) or not isinstance(version:=value["payload_v"],int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
     return "supported" if (kind,version) in CORE_EVENTS else "required"

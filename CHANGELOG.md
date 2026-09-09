@@ -6,6 +6,7 @@
 - Preserve origin-referenced historical bodies when signing successors, and reconstruct exact failed-edit bodies from backup without treating failed edits as successful.
 - Coordinate capture with full import, audit, and alias reconciliation; preserve queued input on interruption. Continue only verified recorded edit branches.
 - Report missing physical parent references separately from signed-body availability, including unsigned messages and explicitly marked history.
+- Include exact orphan-reference counts and distinct missing-parent IDs in `convos doctor`, even without Remote installed.
 
 ## 0.11.6b8
 
