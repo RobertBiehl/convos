@@ -1040,12 +1040,13 @@ def sync_once(root=None,repair=False,manual=False):
             scans=[(ws,meta,state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()) for ws,meta in cfg["workspaces"].items() if path.is_file() and ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]]
             scans,deltas=[(ws,meta,prior) for ws,meta,prior in scans if prior is None or int(prior[0])!=generation or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()],{}
             if scans:
+                with _core(root,True,purpose="remote.recovery.changes") as db: recovered=db.execute("SELECT COALESCE(MAX(generation),0) FROM archive_changes WHERE kind='retained.body' AND generation<=?",[generation]).fetchone()[0]
                 _progress("scanning archive")
                 routes={ws:sharing_routes(state,ws,cfg["user"],cfg.get("bindings",{}),known) for ws,meta,prior in scans}
                 batches=[]
                 for ws,meta,prior in scans:
                     repos,roots,match=routes[ws]
-                    full=prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()
+                    full=prior is None or int(prior[0])<recovered or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()
                     scope=set()
                     records=scan_archive(path,state,meta["kind"],repos,roots,ws,scope,match,cfg["user"],generation,_progress,since=None if full else int(prior[0]))
                     batches.append((ws,protect_all(records,root,ws) if meta["kind"]=="team" else records,scope,full))

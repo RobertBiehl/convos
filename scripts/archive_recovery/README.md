@@ -6,7 +6,8 @@ Two source-checkout tools, with no package-install side effects:
   claims, their proofs, and physical relationship counts. It is read-only and
   offline. Exit 1 means the report contains unresolved integrity issues.
 - `repair.py` repairs only proven legacy scope placeholders and restores selected,
-  exact signed bodies from an earlier backup. Its default target is an isolated
+  exact signed bodies from an earlier backup, including reconstructible
+  historical rows. Referenced attachment bytes must be available and verified. Its default target is an isolated
   copy. Live application requires the archive owner and an attachment backup.
 
 Use the [recovery procedure](../../docs/archive-recovery.md). Runtime imports,

@@ -141,3 +141,82 @@ def test_diagnosis_uses_canonical_counts_and_remains_private_and_read_only(tmp_p
     saved = output.read_bytes()
     again = subprocess.run([sys.executable, str(script), '--database', str(path), '--user-id', user, '--output', str(output)], capture_output=True, text=True)
     assert again.returncode != 0 and output.read_bytes() == saved
+
+
+@pytest.mark.parametrize('kind', ['conversations', 'messages'])
+def test_restoring_foreign_body_does_not_encode_a_native_deletion(tmp_path, kind):
+    from ai_convos_remote.projection import _records, apply_row_replicas
+    _, device, user, control, rows, proofs, bodies, _ = signed_edit_graph()
+    path = tmp_path / 'archive.db'
+    apply_row_replicas(path, bodies, 'w', [control], local_user='receiver')
+    with core.open_db(path, purpose='fixture.restore') as db:
+        proof = db.execute('SELECT * FROM remote.row_proofs WHERE row_kind=?', [kind]).fetchone()
+        pid = proof[0]
+        db.execute('DELETE FROM remote.row_conflicts WHERE proof_id=?', [pid])
+        generation = db.execute('SELECT generation FROM archive_state').fetchone()[0]
+        with core._transaction(db): core.restore_signed_bodies(db, [dict(proof_id=pid, proof_row=proof, body=rows[kind])])
+        _, changes = core.archive_changes(db, generation)
+        assert not _records(db, None, changes=changes)
+        assert changes == [('retained.body', pid)]
+
+
+def attachment_history(tmp_path):
+    _, device, user, control, _, _, _, _ = signed_edit_graph()
+    path, data = tmp_path / 'source/data/convos.db', b'irreplaceable attachment bytes'
+    blob = core.attachment_body(data, path.parent)
+    row = dict(v=1, kind='attachments', id='a', state='active', data=dict(message_id='m', filename='evidence.txt', mime_type='text/plain', size=len(data), body_hash=blob.name, url=None, created_at=None))
+    proof = row_proof(device, user, 'w', 1, row)
+    signer = control['devices'][device['id']]
+    with core.open_db(path, purpose='fixture.attachment') as db:
+        core.init_schema(db)
+        core.project_attested_rows(db, [(row, proof)], signer['root_public'], signer['certificate'])
+        stored = db.execute('SELECT * FROM remote.row_proofs').fetchone()
+    donor, _ = repair.snapshot(path, tmp_path / 'donor')
+    with core.open_db(path, purpose='fixture.missing-attachment') as db:
+        db.execute('DELETE FROM remote.row_conflicts')
+        diagnosis = dict(format='convos-archive-diagnosis-v1', archive_id=repair.identity(db)[0], proof_rows=[stored], unavailable=[dict(proof=digest(proof), kind='attachments', physical='a', source='a', author=user, expected=proof['content_hash'], state='active')])
+    blob.unlink()
+    return path, donor, row, stored, diagnosis
+
+
+@pytest.mark.parametrize('apply', [False, True])
+def test_attachment_recovery_stages_exact_bytes_and_remains_completely_backuppable(tmp_path, apply):
+    path, donor, row, proof, diagnosis = attachment_history(tmp_path)
+    checksum = core._file_sha256(path)
+    result = repair.run(path.parent.parent, tmp_path / 'repair', apply=apply, donor=donor, diagnosis=diagnosis)
+    assert result['restored_bodies'] == 1 and (apply or core._file_sha256(path) == checksum)
+    target = Path(result['target'])
+    assert core.attachment_index(target.parent / 'attachments' / row['data']['body_hash'], row['data']['size']) == (row['data']['body_hash'], row['data']['size'])
+    backup, _ = repair.snapshot(target, tmp_path / 'complete-after')
+    assert (backup.with_name(backup.name + '.attachments') / row['data']['body_hash']).is_file()
+    again = repair.run(target.parent.parent, tmp_path / 'repeat', donor=donor, diagnosis=diagnosis)
+    assert again['restored_bodies'] == 0
+    repair.snapshot(Path(again['target']), tmp_path / 'complete-repeated-simulation')
+
+
+def test_backup_merge_stages_attachment_before_restoring_its_reference(tmp_path):
+    path, donor, row, proof, diagnosis = attachment_history(tmp_path)
+    core.merge_archive_backup(path, donor)
+    with core.open_db(path, read_only=True, purpose='fixture.merged-attachment') as db:
+        assert json.loads(db.execute('SELECT body FROM remote.row_conflicts WHERE proof_id=?', [proof[0]]).fetchone()[0]) == row
+    repair.snapshot(path, tmp_path / 'complete-merged')
+
+
+@pytest.mark.parametrize('damage', ['missing', 'hash', 'size', 'symlink'])
+def test_attachment_recovery_fails_closed_without_exact_bytes(tmp_path, damage):
+    path, donor, row, proof, diagnosis = attachment_history(tmp_path)
+    blob = donor.with_name(donor.name + '.attachments') / row['data']['body_hash']
+    if damage == 'hash': blob.write_bytes(b'x' * row['data']['size'])
+    elif damage == 'size': blob.write_bytes(b'short')
+    elif damage == 'symlink':
+        saved = blob.rename(tmp_path / 'saved-blob')
+        blob.symlink_to(saved)
+    else: blob.unlink()
+    checksum = core._file_sha256(path)
+    with pytest.raises(ValueError, match='Exact attachment bytes'):
+        repair.run(path.parent.parent, tmp_path / 'repair', apply=True, donor=donor, diagnosis=diagnosis)
+    assert core._file_sha256(path) == checksum
+    with core.open_db(path, purpose='fixture.direct-writer') as db, core._transaction(db):
+        with pytest.raises(ValueError, match='attachment body is unavailable'):
+            core.restore_signed_bodies(db, [dict(proof_id=proof[0], proof_row=proof, body=row)])
+        assert not db.execute('SELECT 1 FROM remote.row_conflicts').fetchone()

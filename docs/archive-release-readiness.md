@@ -1,11 +1,12 @@
 # Archive integrity release review
 
-Recommended release: **0.11.6b9**, based on published b8. Do not replace b8's tag
+Release: **0.11.6b9**, based on published b8. Do not replace b8's tag
 or artifacts. This is a client integrity and recovery release; complete recovery
 of the two reported production archives has not been demonstrated.
 
-The runtime and operator tooling reviewed here are committed at `daffb57`.
-Subsequent documentation changes do not change that runtime.
+Oracle reviewed candidate `ca2f8f2` against b8 and returned a no-go.
+The release includes corrections and executable regressions for all four
+findings; the earlier Oracle verdict is not approval of this final source.
 
 ## What is fixed
 
@@ -19,6 +20,11 @@ Subsequent documentation changes do not change that runtime.
   Capture remains queued; unrelated mutations still invalidate paginated audits.
 - Doctor and audit report exact missing-parent counts, distinct parent IDs, and
   explicitly marked message history, including unsigned rows.
+- Restored history is published under its original proof and author on the next
+  ordinary sync. A retained-proof change marker triggers one full authorized
+  scan; it cannot be mistaken for a native deletion.
+- Repair durably publishes its verified snapshot before mutation and stages
+  exact attachment bytes before committing references, including simulations.
 
 The supplied reproducer established three failures on released b8. Independent
 regressions cover their invariants and refusal cases. The placeholder seeding
@@ -38,18 +44,18 @@ Using the repository's token-aware code-line counter:
   archive writer, not another schema migration.
 - Total core: 1,499, unchanged from b8. The strict limit is below 1,500, leaving
   no spare counted line. Compactness does not make the integrity logic trivial.
-- Total Remote: 2,538, up from b8's 2,520, below its existing 2,600 limit.
+- Total Remote: 2,539, up from b8's 2,520, below its existing 2,600 limit.
 
 Physical patch counts relative to b8, excluding documentation:
 
 | Area | Added | Removed |
 | --- | ---: | ---: |
-| Core and Remote runtime | 63 | 40 |
-| Two recovery tools | 171 | 0 |
+| Core and Remote runtime | 71 | 47 |
+| Two recovery tools | 186 | 0 |
 | Obsolete orphan-stub script | 0 | 73 |
-| Regression tests | 699 | 1 |
+| Regression tests | 913 | 7 |
 
-The 171 tool lines are localized under `scripts/archive_recovery`: 134 for
+The 186 tool lines are localized under `scripts/archive_recovery`: 149 for
 repair and 37 for diagnosis. Core owns canonical mutation and durable migration;
 operator backup, planning, and private reports stay outside the product runtime.
 There are no new dependencies in this patch.
@@ -91,36 +97,52 @@ have not been timed on these production archives. Those costs need measurement
 on private copies. An older client can reintroduce the corrected failures even
 though there is no schema bump; update background writers as well as shells.
 
-## Release sequence
+## Oracle findings and validation
 
-Final local validation of `daffb57`: **914 passed, 9 integration tests deselected**
-in 265.43 seconds. The focused integrity/tooling review passed 96 tests, including
-rollback after an unexpected content write, stale-plan refusal, donor/diagnostic
-identity mismatches, source preservation, and idempotent owner-local apply on
-temporary archives. Both tools' command-line entry points were checked.
+All four concerns were confirmed against the candidate. DuckDB regression tests
+reproduced the false native deletion and the missing database fsync. New tests
+exercise exact attachment restoration and subsequent complete backup, failure
+on missing/corrupt/symlinked bytes, and reconstruction of an invalid edit from a
+donor with no retained JSON. Both simulation and owner-local apply use temporary
+archives. A two-user in-process relay test verifies original-author publication,
+no cross-workspace upload, no native tombstone, and a subsequent idle sync.
+A separate relay test preserves and publishes an invalid native edit without
+confirming its evidence status.
 
-All eight products built as wheels and sdists. The built core and Remote source
-was compared byte-for-byte with the reviewed checkout. Validation used Python
-3.14.2 and DuckDB 1.4.3. Linux CI, public-install verification, production-copy
-simulation, and production-scale timing remain release gates. No live archive
-was repaired and no new release was published during this work.
+Oracle inspected exact-ref source through GitHub and verified the supplied
+package manifests and synthetic signatures. It could not install DuckDB or
+obtain full checkouts; its own probes used database doubles. The executable
+Convos tests described here were run locally, not by Oracle.
 
-1. Finish source validation and simulate independently on fresh copies of both
-   affected archives. Inspect exact plans, remaining gaps, and runtime.
-2. Align all eight product versions and internal minimums to b9; update the
-   version-alignment test, lockfile, and changelog. Current build metadata still
-   says b8 and must not be uploaded as a replacement.
-3. Review the final PR; require Linux CI and its isolated wheel smoke. Merge,
-   verify post-merge CI, and create the tag from that exact merge commit.
-4. Publish a GitHub prerelease. The current workflow builds all eight products
-   and publishes four to PyPI: convos, convos-redact, convos-remote, and
-   convos-remote-server. Verify every publication and a fresh installation.
-5. Update both owners' foreground and background clients. Run reviewed local
+The focused final regression pass completed with **284 passed**. All eight
+products built as wheels and sdists; package budgets, connection checks, and
+isolated install verification passed. The complete final suite contains 929
+non-integration tests and excludes 9 live integration tests; PR and post-merge
+CI must pass before publication. Validation
+uses Python 3.14.2 and DuckDB 1.4.3 locally; Linux CI independently runs the suite
+and a binary-only wheel smoke. All eight versions and internal bounds are b9.
+
+A fresh macOS Python 3.14 environment installs all four local public wheels and
+runs their CLI help entry points. A binary-only macOS Python 3.12 install fails
+because PyPI has no usable llama-cpp-python wheel; this reproduces on published
+b8. The existing macOS installation contract permits local compilation, as the
+README states. This release does not claim compiler-free macOS installation.
+
+## Publication and owner rollout
+
+1. Require PR CI, merge, verify post-merge CI, and tag that exact merge commit.
+2. Publish a GitHub prerelease. Trusted publishers release four distributions:
+   convos, convos-redact, convos-remote, and convos-remote-server. Verify every
+   publication, fresh public-index installs, metadata, and CLI entry points.
+3. Before applying production repair, simulate on fresh copies of both affected
+   archives. Inspect exact plans, remaining gaps, and production-scale runtime.
+4. Update both owners' foreground and background clients. Run reviewed local
    repairs and full local imports, then exchange records: first owner, second
    owner, first owner again, with further exchange driven by actual new records.
-6. Audit body availability, physical references, shared logical IDs/content,
+5. Audit body availability, physical references, shared logical IDs/content,
    and authorization scope separately before resuming background operation.
 
 An already b8-compatible relay needs no new deployment for these fixes. If the
 relay is still pre-b8, follow b8's separate stopped-relay storage migration and
-receiver-upgrade procedure before enabling compression.
+receiver-upgrade procedure before enabling compression. No live archive repair
+or production-scale timing is claimed by these release tests.

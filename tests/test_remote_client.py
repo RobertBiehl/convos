@@ -335,6 +335,87 @@ def test_incremental_sync_reads_only_core_marked_rows(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); path=root/"data/convos.db"; write_archive(path,"one"); sync_once(root,True); before=server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]; seen=[]; real=projection_module.scan; monkeypatch.setattr(projection_module,"scan",lambda *args,**kwargs:seen.append(args[5]) or real(*args,**kwargs)); write_archive(path,"two"); sync_once(root)
     assert seen==[{("conversations","c")}] and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==before+1
 
+
+def test_incremental_sync_republishes_restored_foreign_history_without_native_tombstones(tmp_path, monkeypatch):
+    server = server_connect(tmp_path / 'server.db')
+    direct, uploaded = transport(server), []
+    def request(cfg, body, auth=True):
+        if body['op'] == 'replica_upload_many': uploaded.extend(body['envelopes'])
+        return direct(cfg, body, auth)
+    monkeypatch.setattr(remote_client, 'request', request)
+    monkeypatch.setattr(remote_client, 'drain_hooks', lambda: None)
+    a, b = tmp_path / 'alice', tmp_path / 'bob'
+    alice, _ = setup_client('http://server', 'alice', root=a)
+    setup_client('http://server', 'bob', root=b)
+    team = create(alice, 'Team', 'team', a)
+    add_member(alice, team, 'bob', root=a)
+    first = replicate_conversation(a, team, 'original')[0]
+    sync_once(b, True)
+    bob = load(b)
+    original = open_replica(first, key(bob, team, 2))
+    replicate_conversation(a, team, 'successor')
+    sync_once(b)
+    path = b / 'data/convos.db'
+    pid = projection_module.digest(original['proof'])
+    with core_module.open_db(path, purpose='fixture.restore-history') as db, core_module._transaction(db):
+        proof = db.execute('SELECT * FROM remote.row_proofs WHERE id=?', [pid]).fetchone()
+        db.execute('DELETE FROM remote.row_conflicts WHERE proof_id=?', [pid])
+        core_module.restore_signed_bodies(db, [dict(proof_id=pid, proof_row=proof, body=original['row'])])
+    server.execute('DELETE FROM row_replicas WHERE replica=?', [first['replica']])
+    server.commit()
+    with connect(b / 'remote/state.db') as state:
+        state.execute('DELETE FROM replica_receipts WHERE replica=?', [first['replica']])
+        state.commit()
+    uploaded.clear()
+    sync_once(b)
+    recovered = [open_replica(env, key(bob, team, env['epoch'])) for env in uploaded if env['workspace'] == team]
+    assert any(body['proof'] == original['proof'] and body['row'] == original['row'] for body in recovered)
+    assert all(env['workspace'] == team for env in uploaded)
+    with core_module.open_db(path, read_only=True, purpose='fixture.verify-history') as db:
+        assert not db.execute("SELECT 1 FROM remote.row_proofs WHERE author_user_id=? OR state='deleted'", [bob['user']]).fetchone()
+        assert db.execute('SELECT * FROM remote.row_proofs WHERE id=?', [pid]).fetchone() == proof
+        assert db.execute('SELECT title FROM conversations').fetchall() == [('successor',)]
+    uploaded.clear()
+    sync_once(b)
+    assert not uploaded
+
+
+def test_incremental_sync_publishes_restored_invalid_edit_without_confirming_it(tmp_path, monkeypatch):
+    server = server_connect(tmp_path / 'server.db')
+    monkeypatch.setattr(remote_client, 'request', transport(server))
+    monkeypatch.setattr(remote_client, 'drain_hooks', lambda: None)
+    root = tmp_path / 'client'
+    cfg, _ = setup_client('http://server', 'alice', root=root)
+    path = root / 'data/convos.db'
+    write_archive(path, 'failed edit history')
+    (root / 'a.py').write_text('one')
+    with core_module.open_db(path, purpose='fixture.edit') as db, core_module._transaction(db):
+        project_archive_row(db, 'messages', ARCHIVE_COLUMNS['messages'], ['m','c','assistant','done',None,'2026-01-01',None,'{}',None])
+        project_archive_row(db, 'file_edits', ARCHIVE_COLUMNS['file_edits'], ['e','m',str(root / 'a.py'),'write','one','2026-01-01',None])
+        db.execute("INSERT OR REPLACE INTO provenance.file_edit_evidence VALUES ('e','confirmed','first',NULL)")
+    capture_provenance(path)
+    sync_once(root, True)
+    with core_module.open_db(path, purpose='fixture.failed-edit') as db, core_module._transaction(db):
+        proof = db.execute("SELECT * FROM remote.row_proofs WHERE row_kind='edit.observed'").fetchone()
+        claim = ('edit.observed', proof[4], proof[4], cfg['user'], 'active')
+        body = core_module.typed_logical_rows(db, [claim])[claim]
+        db.execute("UPDATE provenance.file_edit_evidence SET status='invalid',reason='provider_failure'")
+        db.execute('DELETE FROM remote.row_conflicts WHERE proof_id=?', [proof[0]])
+        core_module.restore_signed_bodies(db, [dict(proof_id=proof[0], proof_row=proof, body=body)])
+    with connect(root / 'remote/state.db') as state:
+        state.execute('DELETE FROM replica_receipts')
+        state.commit()
+    server.execute('DELETE FROM row_replicas')
+    server.commit()
+    sync_once(root)
+    cfg = load(root)
+    restored = [open_replica(stored_envelope(row), key(cfg, row['workspace'], row['epoch'])) for row in server.execute("SELECT * FROM row_replicas").fetchall()]
+    assert any(item['proof']['content_hash'] == proof[6] and item['row'] == body for item in restored)
+    with core_module.open_db(path, read_only=True, purpose='fixture.verify-invalid') as db:
+        assert not core_module.provenance_records(db, {('edit.observed', proof[4])})
+        assert db.execute('SELECT status,reason FROM provenance.file_edit_evidence').fetchone() == ('invalid', 'provider_failure')
+        assert db.execute('SELECT * FROM remote.row_proofs WHERE id=?', [proof[0]]).fetchone() == proof
+
 def test_incremental_semantic_failure_keeps_generation_for_retry(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); ws=workspace(cfg,"Personal"); path=root/"data/convos.db"; path.parent.mkdir(parents=True); db=duckdb.connect(str(path)); init_schema(db); db.execute("BEGIN"); project_archive_row(db,"conversations",ARCHIVE_COLUMNS["conversations"],["c","codex","title","2026-01-01","2026-01-01",None,None,None,None,"{}"]); project_archive_row(db,"messages",ARCHIVE_COLUMNS["messages"],["m","c","assistant","done",None,"2026-01-01",None,"{}",None]); project_archive_row(db,"file_edits",ARCHIVE_COLUMNS["file_edits"],["e","m","a.py","write","one","2026-01-01",None]); db.execute("INSERT OR REPLACE INTO provenance.file_edit_evidence VALUES ('e','confirmed','first',NULL)"); db.execute("COMMIT"); db.close(); sync_once(root,True); before=server.execute("SELECT COUNT(*) FROM semantic_replicas").fetchone()[0]; state=connect(root/"remote/state.db"); prior=int(state.execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()[0]); state.close(); db=duckdb.connect(str(path)); db.execute("BEGIN; UPDATE provenance.file_edit_evidence SET reason='second' WHERE file_edit_id='e'"); current=core_module._archive_touch(db,[("file_edits","e")]); db.execute("COMMIT"); db.close(); real=remote_client.reconcile_replicas
     def fail(cfg,state,root,ws,envelopes,semantic=False):

@@ -101,7 +101,9 @@ Each row is one production connection acquisition site. IDs are stable labels, s
 | A90 | `apps/remote/src/ai_convos_remote/projection.py::repack_index` | `remote.compact.index` | Shared | At most 5,000 immutable proof records per page, only when uncompressed replicas exist | Each page briefly delays writers | Keyset paging; close/yield before temporary index writes and subsequent pages; no network under the archive lease |
 | A91 | `apps/remote/src/ai_convos_remote/projection.py::local_repack_envelopes` | `remote.compact.bodies` | Shared | Typed bodies, exceptional bodies, and lineage for one inventory page of at most 500 replicas | Each page briefly delays writers | Batch reconstruction; close/yield before encryption or any relay request; exact retained ciphertext digest is checked before replacement |
 
-The AST ledger has 84 archive acquisition sites and 21 SQLite constructor sites. Every acquisition has a distinct label, including separate sites with the same function and purpose. A42 (proof-header repair shortcut), A46 (repull backup), and A47 (destructive reset) are retired. Attestation uses one planning read followed by bounded write pages; hashing and signing run after the planning connection closes.
+| A92 | `apps/remote/src/ai_convos_remote/__init__.py::sync_once` | `remote.recovery.changes` | Shared | Latest retained-body restoration generation through the captured generation | Briefly delays writers | Closes before scanning, encryption, or relay requests |
+
+The AST ledger has 85 archive acquisition sites and 21 SQLite constructor sites. Every acquisition has a distinct label, including separate sites with the same function and purpose. A42 (proof-header repair shortcut), A46 (repull backup), and A47 (destructive reset) are retired. Attestation uses one planning read followed by bounded write pages; hashing and signing run after the planning connection closes.
 
 ## Direct DuckDB constructors
 

@@ -12,6 +12,7 @@ def write_json(path, value):
         stream.write(json.dumps(value, indent=2, default=str) + '\n')
         stream.flush()
         os.fsync(stream.fileno())
+    core._fsync(path.parent)
 
 
 def snapshot(source, directory, attachments=True):
@@ -20,11 +21,9 @@ def snapshot(source, directory, attachments=True):
     with core._core(source, read_only=True, purpose='repair.snapshot') as db:
         if Path(str(source) + '.wal').exists(): raise ValueError('Archive has a WAL; run convos backup as its owner before repair')
         checksum = core._file_sha256(source)
-        core._backup_copy(source, backup)
-        backup.chmod(0o600)
-        core.required(core._file_sha256(backup) == checksum, ValueError('Backup checksum mismatch'))
-        core._check_archive(backup)
         if attachments: core._backup_attachments(db, source, backup, checksum)
+        core.atomic_publish(backup, lambda temp: (core._backup_copy(source, temp), core.required(core._file_sha256(temp) == checksum, ValueError('Backup checksum mismatch')), core._check_archive(temp)))
+        core._fsync(directory.parent)
     return backup, checksum
 
 
@@ -43,6 +42,10 @@ def history_restore_plan(db, donor, diagnosis):
         core.required(identity(source)[0] == identity(db)[0], ValueError('Donor is not a backup of this archive'))
         proofs = {r[0]: r for r in source.execute('SELECT * FROM remote.row_proofs WHERE id IN (SELECT UNNEST(?))', [ids]).fetchall()}
         bodies = dict(source.execute('SELECT proof_id,body FROM remote.row_conflicts WHERE proof_id IN (SELECT UNNEST(?))', [ids]).fetchall())
+        missing = [c for pid, c in claims.items() if pid not in bodies and pid not in existing]
+        found = core.typed_logical_rows(source, [tuple(c[k] for k in ('kind', 'physical', 'source', 'author', 'state')) for c in missing], historical=True)
+        paths = core.captured_edit_paths(source, [c['physical'] for c in missing if c['kind'] == 'file_edits'])
+        bodies.update({c['proof']: json.dumps(row) for c in missing if (row := core.matching_logical_row(found[tuple(c[k] for k in ('kind', 'physical', 'source', 'author', 'state'))], c['expected'], [paths[c['physical']]] if c['physical'] in paths else ())) is not None})
     for pid, claim in claims.items():
         core.required(pid in current and current[pid] == proofs.get(pid) == recorded.get(pid), ValueError(f'Donor/current/diagnostic proof mismatch: {pid}'))
         proof = current[pid]
@@ -82,6 +85,7 @@ def run(root, output, apply=False, database_only=False, donor=None, diagnosis=No
     core.required(not apply or source.stat().st_uid == os.getuid(), ValueError('Live repair requires the archive owner'))
     core.required(not (apply and database_only), ValueError('Live repair requires a verified attachment backup'))
     output.mkdir(mode=0o700)
+    core._fsync(output.parent)
     report = dict(format='convos-archive-repair-v1', mode='apply' if apply else 'simulation', source=str(source), success=False, committed=False)
     try:
         with contextlib.ExitStack() as leases:
@@ -100,6 +104,17 @@ def run(root, output, apply=False, database_only=False, donor=None, diagnosis=No
                 core._backup_copy(backup, target)
                 target.chmod(0o600)
             report['target'] = str(target)
+            bundles = [backup.with_name(backup.name + '.attachments'), *( [donor.with_name(donor.name + '.attachments'), donor.parent / 'attachments'] if donor else [])]
+            if not apply and not database_only:
+                for blob, size in json.loads((bundles[0] / 'manifest.json').read_text())['attachments'].items():
+                    core.required(core.attachment_index(bundles[0] / blob, size) == (blob, size), ValueError('Snapshot attachment changed'))
+                    core.required(core.attachment_body((bundles[0] / blob).read_bytes(), target.parent), ValueError('Snapshot attachment exceeds storage limit'))
+            for body in [r['body'] for r in expected['bodies'] if r['body']['kind'] == 'attachments' and r['body']['state'] == 'active']:
+                blob, size = body['data']['body_hash'], body['data']['size']
+                candidates = [target.parent / 'attachments' / (blob or ''), *(directory / (blob or '') for directory in bundles)]
+                found = next((p for p in candidates if core.attachment_index(p, size) == (blob, size)), None)
+                core.required(found, ValueError('Exact attachment bytes are unavailable'))
+                core.required((stored := core.attachment_body(found.read_bytes(), target.parent)) and stored.name == blob, ValueError('Attachment changed during recovery'))
             with core._core(target, purpose='repair.apply') as db, core._transaction(db):
                 core.required(plan(db, donor, diagnosis) == expected, ValueError('Archive or donor changed since planning'))
                 repaired = core.repair_legacy_edit_scopes(db, apply=True)

@@ -62,6 +62,33 @@ def test_donor_recovers_legacy_filtered_body_without_confirming_failed_edit(tmp_
         assert db.execute("SELECT status,reason FROM provenance.file_edit_evidence").fetchone() == ('invalid', 'provider_failure')
 
 
+@pytest.mark.parametrize('apply', [False, True])
+def test_narrow_repair_reconstructs_failed_edit_without_retained_donor_json(tmp_path, apply):
+    from tests.test_recovery_script import repair
+    path, cfg, proof = signed_native_edit(tmp_path)
+    root = tmp_path / 'source'
+    (root / 'data').mkdir(parents=True)
+    path = path.rename(root / 'data/convos.db')
+    with core.open_db(path, purpose='fixture.failed-edit') as db:
+        db.execute("UPDATE provenance.file_edit_evidence SET status='invalid',reason='provider_failure'")
+        db.execute('DELETE FROM remote.row_conflicts WHERE proof_id=?', [proof[0]])
+    unavailable = []
+    projection.audit_rows(path, local_user=cfg['user'], on_unavailable=unavailable.append)
+    with core.open_db(path, read_only=True, purpose='fixture.diagnosis') as db:
+        diagnosis = dict(format='convos-archive-diagnosis-v1', archive_id=repair.identity(db)[0], unavailable=unavailable, proof_rows=db.execute('SELECT * FROM remote.row_proofs').fetchall())
+    donor, _ = repair.snapshot(path, tmp_path / 'donor')
+    checksum = core._file_sha256(path)
+    result = repair.run(root, tmp_path / 'repair', apply=apply, donor=donor, diagnosis=diagnosis)
+    assert result['restored_bodies'] == 1
+    assert apply or core._file_sha256(path) == checksum
+    assert projection.audit_rows(result['target'], local_user=cfg['user'])['totals']['unavailable'] == 0
+    with core.open_db(result['target'], read_only=True, purpose='fixture.repaired') as db:
+        assert db.execute('SELECT * FROM remote.row_proofs WHERE id=?', [proof[0]]).fetchone() == proof
+        assert db.execute('SELECT status,reason FROM provenance.file_edit_evidence').fetchone() == ('invalid', 'provider_failure')
+        assert not core.provenance_records(db, {('edit.observed', proof[4])})
+        assert repair.history_restore_plan(db, donor, diagnosis) == []
+
+
 def test_audit_reports_unsigned_orphans_and_history_without_changing_archive(tmp_path, monkeypatch):
     path = tmp_path / 'archive.db'
     with core.open_db(path, purpose="fixture.orphans") as db:

@@ -1,7 +1,7 @@
 # Archive integrity changes after b8
 
 Release `0.11.6b8` is already published at
-`d7ad83446cb1fe80d8d6a93bcf9757bc2b2ecd54`. The proposed next prerelease is b9.
+`d7ad83446cb1fe80d8d6a93bcf9757bc2b2ecd54`. The integrity release is 0.11.6b9.
 Its client fixes retain b8's storage and compression behavior; no new relay
 migration or wire change is required by this patch.
 
@@ -37,11 +37,11 @@ There is no reporter-specific package generator, credential-backed signing
 experiment, bundled fixture generator, or command-forwarding layer. The old
 orphan-stub script is removed. Runtime products never import recovery tooling.
 
-## Release gates
+## Validation and rollout
 
 1. Validate the final source with all non-integration tests, budget checks,
    all-package builds, Linux CI, and isolated wheel installation.
-2. Simulate on fresh copies of both affected owner archives. Check plans,
+2. Before production repair, simulate on fresh copies of both affected owner archives. Check plans,
    retained-body availability, reference gaps, idempotence, and production-scale
    runtime. No production recovery or large-archive timing is established yet.
 3. Align all eight product versions and internal dependencies for b9, update the

@@ -26,7 +26,11 @@ Diagnosis exits 1 for unresolved bodies or references, after saving its report.
 2. Restore missing retained bodies from an earlier backup of the same archive.
    The diagnosis, current archive, and donor must have identical proof records;
    each body must match the recorded version, identity, state, and content hash.
+   The donor may supply retained JSON or an exactly reconstructible historical
+   row. Failed-edit reconstruction preserves its invalid evidence status.
    Missing proofs and corrupt existing bodies are refused, not overwritten.
+   Active attachment references require exact content-addressed bytes; repair
+   stages and verifies them through core before committing the reference.
 
 These operations leave conversation content, evidence status, and signatures
 unchanged. They do not resolve arbitrary forks or invent missing parent rows.
@@ -67,6 +71,10 @@ owner. `--database-only` is available solely for simulations whose attachments
 are inaccessible; live application always requires the complete attachment
 backup. If the source still has a WAL, run `convos backup` as its owner first.
 
+Backup publication flushes the verified database, attachment bundle, and
+containing directories before mutation. Complete simulations also stage existing
+attachment bytes so that their repaired archives can be backed up independently.
+
 The transaction rejects stale plans and compares every protected table's complete
 row multiset against the backup with SQL `EXCEPT ALL`. This includes proofs,
 conversation content, and evidence. Any difference aborts the transaction.
@@ -85,6 +93,11 @@ convos remote sync
 convos remote audit
 convos doctor
 ```
+
+Restored bodies produce an internal retained-proof change marker. The next
+ordinary Remote sync makes one full authorized publication pass, preserving
+original proofs and authors; it does not encode these logical IDs as native
+row changes. Subsequent settled syncs resume the incremental path.
 
 Publish from the first owner, sync the second owner, then sync the first again.
 Audit both, and continue only as needed for newly exchanged records. Account

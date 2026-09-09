@@ -451,7 +451,7 @@ def restore_signed_bodies(db,records):
     proofs={r[0]:r for r in db.execute("SELECT * FROM remote.row_proofs WHERE id IN (SELECT UNNEST(?))",[[r["proof_id"] for r in records]]).fetchall()}
     existing=dict(db.execute("SELECT proof_id,body FROM remote.row_conflicts WHERE proof_id IN (SELECT UNNEST(?))",[[r["proof_id"] for r in records]]).fetchall())
     fresh=[r for r in records if required((p:=proofs.get(r["proof_id"])) is not None and tuple(r["proof_row"])==p and (r["body"]["kind"],r["body"]["id"],r["body"]["v"],r["body"]["state"],provenance_digest(r["body"]))==(p[3],p[4],p[5],p[9],p[6]) and (p[0] not in existing or provenance_digest(json.loads(existing[p[0]]))==p[6]),ValueError("Retained recovery body/proof mismatch")) and r["proof_id"] not in existing]
-    return (_insert_pages(db,"remote.row_conflicts",[(r["proof_id"],json.dumps(r["body"],sort_keys=True,separators=(",",":"))) for r in fresh],mode=" OR IGNORE"),_archive_touch(db,[(r["proof_row"][3],r["proof_row"][4]) for r in fresh]),len(fresh))[-1] if fresh else 0
+    return (required(all(r["body"]["kind"]!="attachments" or r["body"]["state"]!="active" or attachment_index(Path(next((v[2] for v in db.execute("PRAGMA database_list").fetchall() if v[2]),"" )).parent/"attachments"/(r["body"]["data"]["body_hash"] or ""),r["body"]["data"]["size"])==(r["body"]["data"]["body_hash"],r["body"]["data"]["size"]) for r in fresh),ValueError("Restored attachment body is unavailable")),_insert_pages(db,"remote.row_conflicts",[(r["proof_id"],json.dumps(r["body"],sort_keys=True,separators=(",",":"))) for r in fresh],mode=" OR IGNORE"),_archive_touch(db,[("retained.body",r["proof_id"]) for r in fresh]),len(fresh))[-1] if fresh else 0
 def retire_row_bodies(db,revisions): return db.execute("DELETE FROM remote.row_conflicts c USING remote.row_proofs p,(SELECT x.* FROM UNNEST(from_json(?,?)) t(x)) r WHERE c.proof_id=p.id AND (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(r.kind,r.source,r.author,r.revision) AND (NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) OR NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.proof_id=p.id) AND NOT EXISTS (SELECT 1 FROM remote.provenance_origins o WHERE o.proof_id=p.id))",(json.dumps([dict(kind=kind,source=source,author=author,revision=revision) for kind,source,author,revision in revisions],separators=(",",":")),'[{"kind":"VARCHAR","source":"VARCHAR","author":"VARCHAR","revision":"VARCHAR"}]'))
 def project_edit_dependencies(db,waiting=(),arrived=(),processed=(),advanced=()):
     clean={key for key,pid in waiting}|{key for key,pid in advanced}|{r[0] for r in db.execute("SELECT dependency_key FROM remote.edit_dependencies WHERE proof_id IN (SELECT UNNEST(?))",[list(processed)]).fetchall()} if waiting or processed or advanced else set()
@@ -586,6 +586,12 @@ def merge_archive_backup(path,backup,page=500):
             required(db.execute("SELECT archive_id::VARCHAR FROM archive_state WHERE singleton").fetchone()[0]==identity,ValueError("Repair backup belongs to a different archive"))
             targets={f"{schema}.{table}":[r[0] for r in db.execute(f"DESCRIBE {schema}.{table}").fetchall()] for schema,table in db.execute("SELECT table_schema,table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND (table_schema IN ('provenance','remote') OR table_name IN (SELECT UNNEST(?)))",[list(ARCHIVE_COLUMNS)+["attachment_bodies","provider_sessions"]]).fetchall()}
         available={f"{schema}.{table}" for schema,table in donor.execute("SELECT table_schema,table_name FROM information_schema.tables WHERE table_type='BASE TABLE'").fetchall()}
+        bundle=backup.with_name(backup.name+".attachments")
+        for ref,body_hash,size,original in _backup_rows(donor):
+            candidates=([bundle/body_hash,backup.parent/"attachments"/body_hash] if body_hash else [])+([Path(original)] if original else [])
+            if found:=next((p for p in candidates if p.is_file() and not p.is_symlink() and (size is None or p.stat().st_size==size) and (not body_hash or _file_sha256(p)==body_hash)),None):
+                data=found.read_bytes()
+                project_attachment_body(path,data,body_hash or _file_sha256(found))
         restored=0
         for table,columns in sorted(targets.items(),key=lambda item:(item[0] in ("provenance.local_facts","remote.row_conflicts"),item[0])):
             if table not in available: continue
@@ -623,12 +629,6 @@ def merge_archive_backup(path,backup,page=500):
                             current,paths=typed_logical_rows(db,[claim for pid,expected,claim,row in exact],"remote.row_references" in targets),captured_edit_paths(db,[claim[1] for pid,expected,claim,row in exact if claim[0]=="file_edits"])
                             restore(db,"remote.row_conflicts",[(pid,json.dumps(row,sort_keys=True,separators=(",",":"))) for pid,expected,claim,row in exact if matching_logical_row(current[claim],expected,[paths[claim[1]]] if paths.get(claim[1]) else ()) is None])
                     archive_yield(path)
-        bundle=backup.with_name(backup.name+".attachments")
-        for ref,body_hash,size,original in _backup_rows(donor):
-            candidates=([bundle/body_hash,backup.parent/"attachments"/body_hash] if body_hash else [])+([Path(original)] if original else [])
-            if found:=next((p for p in candidates if p.is_file() and not p.is_symlink() and (size is None or p.stat().st_size==size) and (not body_hash or _file_sha256(p)==body_hash)),None):
-                data=found.read_bytes()
-                project_attachment_body(path,data,body_hash or _file_sha256(found))
     return restored
 def _repository_alias_migration(conn):
     _refresh_repository()

@@ -119,3 +119,24 @@ def test_repair_rejects_archive_changed_after_snapshot(tmp_path, monkeypatch):
     with core.open_db(root / "data/convos.db", read_only=True, purpose="fixture.preserved") as db:
         assert db.execute("SELECT content FROM messages").fetchone()[0] == 'new capture'
         assert len(core.repair_legacy_edit_scopes(db)) == 1
+
+
+@pytest.mark.parametrize('failure', ['database', 'directory'])
+def test_repair_requires_durable_backup_before_mutation(tmp_path, monkeypatch, failure):
+    path, _ = legacy_archive(tmp_path)
+    root, output = tmp_path / 'source', tmp_path / 'repair'
+    (root / 'data').mkdir(parents=True)
+    path.rename(root / 'data/convos.db')
+    source = root / 'data/convos.db'
+    checksum = core._file_sha256(source)
+    real = core._fsync
+    def fail_sync(path):
+        path = Path(path)
+        if (failure == 'database' and path.is_file() and path.parent.name == 'before' and not path.name.endswith('.json')) or (failure == 'directory' and path == output / 'before'):
+            raise OSError('injected backup durability failure')
+        return real(path)
+    monkeypatch.setattr(core, '_fsync', fail_sync)
+    with pytest.raises(OSError, match='durability failure'):
+        repair.run(root, output, apply=True)
+    assert core._file_sha256(source) == checksum
+    assert not json.loads((output / 'report.json').read_text())['committed']
