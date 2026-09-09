@@ -91,3 +91,16 @@ def test_migration_never_overwrites_existing_output_and_old_server_state_is_expl
     target.write_bytes(b"existing backup")
     with pytest.raises(SystemExit): server.main(["migrate","--db",str(source),"--output",str(target)])
     assert target.read_bytes()==b"existing backup" and source.read_bytes()==original
+
+
+def test_migration_never_overwrites_output_created_during_conversion(tmp_path,monkeypatch):
+    source,target=tmp_path/"old.db",tmp_path/"binary.db"
+    legacy_relay(source)
+    original,migrate=source.read_bytes(),server.migrate_storage
+    def concurrent_output(db):
+        migrate(db)
+        target.write_bytes(b"concurrently published backup")
+    monkeypatch.setattr(server,"migrate_storage",concurrent_output)
+    with pytest.raises(FileExistsError): server.main(["migrate","--db",str(source),"--output",str(target)])
+    assert target.read_bytes()==b"concurrently published backup" and source.read_bytes()==original
+    assert not list(tmp_path.glob(".binary.db.*"))
