@@ -68,8 +68,40 @@ Unique legacy edits, attachments, and unsupported identity recipes remain
 preserved. This repair does not infer their content or upgrade their evidence
 quality. Without source-derived lineage from an authorized author, older signed
 rows remain ingestible and their unresolved relationships remain visible.
-The separately reported unexplained thread-parent gaps are still under
-investigation.
+Thread-parent reconciliation has additional requirements described below.
+
+## Thread-parent follow-up
+
+The September 14 v2 maintainer report attributes 1,860 Claude Code thread gaps
+to thinking-only parent turns omitted by the historical parser. It reports exact
+child ID, text/thinking hash, timestamp, and parent ID checks against available
+source events. Original production transcripts are excluded from that package;
+the population attribution is supplied evidence, not a locally repeated census.
+
+The invented three-event transcript independently reproduces the mechanism:
+the historical parser emits the user and answer, omits the thinking-only parent,
+and leaves the answer pointing at its absent ID. Both b10 and this branch still
+omit that parent, but clear the answer's reference. Changing the provider-session
+binding emits different child IDs, leaving the old representation unreconciled.
+No relay or provider file-format change is required to reproduce these results.
+
+The tool lineage implemented above does not reconcile these legacy message and
+conversation identities. Completing this scope requires retaining thinking-only
+turns and source-backed reconciliation across old and current session bindings,
+while preserving signed message bodies and proofs. Nulling legacy parent fields
+or deleting old children does not satisfy the invariant.
+
+The report leaves 8,675 other Claude Code and 739 ChatGPT thread gaps unclassified.
+The historical ChatGPT code-node omission is also reproducible, and b10 already
+retains that synthetic parent, but the affected production mappings are absent.
+All 11,274 reported gaps already exist in the September 5 backup according to the
+supplied comparison. Neither that timing nor a synthetic mechanism attributes the
+unclassified rows to a particular parser defect.
+
+Validation used the v2 package's five thread evidence tests against exact b10
+and repeated its parser reproduction against commit `942c831`. All five tests
+passed; the current branch retains the limitations stated here. Validation used
+temporary outputs and left the supplied archives and live installation unchanged.
 
 ## Validation
 
