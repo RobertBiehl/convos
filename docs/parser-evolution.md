@@ -86,6 +86,8 @@ not a second searchable conversation copy. `parser_tool_history` and
 `parser_message_history` expose unambiguous matches while their current carriers
 and replacements remain present.
 
+The incremental sync scan does not turn physical retirement into a permanent
+logical deletion. Other devices verify replacement and dependencies independently.
 A replay of the exact retired body is removed again, including after a later
 replacement revision or a backup merge. A changed body under the old identity is
 preserved. If a unique late child needs an old parent, core restores the exact

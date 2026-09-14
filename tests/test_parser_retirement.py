@@ -243,3 +243,24 @@ def test_long_chain_retires_in_batches_and_keeps_unique_ancestors(tmp_path,uniqu
         assert kept==(set(old_ids[:401]) if unique else set())
         assert db.execute("SELECT count(*) FROM parser_retired_rows WHERE kind='messages'").fetchone()==(100 if unique else 501,)
         assert not core.archive_relationships(db)
+
+
+def test_retirement_does_not_publish_permanent_logical_deletion(tmp_path):
+    path,transcript,old,bodies,device,user,control=archive(tmp_path)
+    with core._core(path,purpose='test.scan') as db,projection.connect(tmp_path/'state.db') as state:
+        core.init_schema(db)
+        current=import_current(db,transcript)
+        changes=set(db.execute('SELECT kind,entity FROM archive_changes').fetchall())
+        rows=[projection.signed_row(r) for r in projection.scan(db,state,changes=changes,user=user) if r['kind'] in projection.TABLES]
+        retired={old['conv']['id'],*[m['id'] for m in old['msgs']]}
+        assert not any(r['id'] in retired for r in rows)
+        assert {m['id'] for m in current['msgs']}<={r['id'] for r in rows}
+        assert all(r['state']=='active' for r in rows)
+        # A real deletion still produces its tombstone; changed content at an old ID still publishes.
+        with core._transaction(db):
+            db.execute('DELETE FROM messages WHERE id=?',[current['msgs'][-1]['id']])
+            kind,physical,raw,body=db.execute("SELECT kind,physical,projection,body FROM parser_retired_rows WHERE kind='messages' LIMIT 1").fetchone()
+            core._insert_pages(db,kind,[core.retired_projection(kind,physical,json.loads(body),json.loads(raw))],core.ARCHIVE_COLUMNS[kind])
+            db.execute("UPDATE messages SET content='A new observation' WHERE id=?",[physical])
+        rows=[projection.signed_row(r) for r in projection.scan(db,state,changes={('messages',physical),('messages',current['msgs'][-1]['id'])},user=user) if r['kind'] in projection.TABLES]
+        assert {(r['id'],r['state']) for r in rows}=={(physical,'active'),(current['msgs'][-1]['id'],'deleted')}
