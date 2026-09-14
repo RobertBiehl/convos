@@ -262,7 +262,7 @@ def _records(core,state,blobs=True,changes=None):
     for kind,table in TABLES.items():
         wanted=[entity for changed,entity in changes or () if changed==table]
         if changes is not None and not wanted: continue
-        target,imported=(target:="a.id" if table=="attachments" else "x.id"),{r[0] for r in core.execute(f"SELECT physical_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id IN ({TEXT_IDS})",(table,packed(wanted))).fetchall()} if changes is not None else set()
+        target,imported=(target:="a.id" if table=="attachments" else "x.id"),{r[0] for r in core.execute(f"SELECT physical_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id IN ({TEXT_IDS}) UNION SELECT physical FROM parser_retired_rows WHERE kind=? AND physical IN ({TEXT_IDS})",(table,packed(wanted),table,packed(wanted))).fetchall()} if changes is not None else set()
         where=" WHERE "+(f"{target} IN ({TEXT_IDS}) AND " if changes is not None else "")+f"NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='{table}' AND o.physical_row_id={target})"
         cur=core.execute(("SELECT x.* EXCLUDE (embedding) FROM messages x" if table=="messages" else "SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id" if table=="attachments" else f"SELECT x.* FROM {table} x")+where,[packed(wanted)] if changes is not None else [])
         cols=[d[0] for d in cur.description]

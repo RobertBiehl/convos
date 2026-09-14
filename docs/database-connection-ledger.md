@@ -103,7 +103,9 @@ Each row is one production connection acquisition site. IDs are stable labels, s
 
 | A92 | `apps/remote/src/ai_convos_remote/__init__.py::sync_once` | `remote.recovery.changes` | Shared | Latest retained-body restoration generation through the captured generation | Briefly delays writers | Closes before scanning, encryption, or relay requests |
 
-The AST ledger has 85 archive acquisition sites and 21 SQLite constructor sites. Every acquisition has a distinct label, including separate sites with the same function and purpose. A42 (proof-header repair shortcut), A46 (repull backup), and A47 (destructive reset) are retired. Attestation uses one planning read followed by bounded write pages; hashing and signing run after the planning connection closes.
+| A93 | `src/ai_convos/cli.py::merge_archive_backup` | `remote.repair.parser-lineage` | Exclusive | Final transactional rebuild of parser claims and retirement after donor merge | Archive-sized reconciliation can delay clients | Once per donor; bounded body batches, exact hash checks, rollback on failure, no network under the lease |
+
+The AST ledger has 86 archive acquisition sites and 21 SQLite constructor sites. Every acquisition has a distinct label, including separate sites with the same function and purpose. A42 (proof-header repair shortcut), A46 (repull backup), and A47 (destructive reset) are retired. Attestation uses one planning read followed by bounded write pages; hashing and signing run after the planning connection closes.
 
 ## Direct DuckDB constructors
 

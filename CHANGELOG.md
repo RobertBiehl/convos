@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.11.6b11
+
+- Preserve author-scoped native parent bindings during signed replay, and repair
+  proven mixed-archive parent gaps through a backed-up core migration.
+- Retain thinking-only Claude Code parent turns. Reconstruct supported historical
+  Claude Code/Codex message and tool identities from source events, including
+  changed session bindings, and replicate exact replacement evidence in signed
+  metadata.
+- Delete verified obsolete active copies when their complete replacements exist
+  and no unique dependent needs them. Retain required historical bodies
+  separately, prevent resurrection through replay or backup merge, and restore
+  exact parents for late unique children. Physical retirement does not publish
+  a permanent logical deletion.
+- Make parser evolution and archive cleanliness explicit product invariants.
+  Unknown historical gaps remain visible; a missing parent alone never justifies
+  deletion.
+
+All eight products are aligned to b11. Core schema 14 and parser epoch 6 use the
+existing validated migration backup process; released signed encodings and the
+relay protocol stay unchanged. See [parser evolution](docs/parser-evolution.md).
+
 ## 0.11.6b10
 
 - Preserve metadata-only signed attachment history without requiring nonexistent

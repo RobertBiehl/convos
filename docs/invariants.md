@@ -2,6 +2,7 @@
 summary: "Normative product invariants for archive ownership, recovery, replication, and provenance."
 read_when:
   - Changing core ingestion or the DuckDB schema
+  - Changing parser identities, filtering, normalization, or parent attribution
   - Changing Remote state, relay recovery, or replication
   - Changing file-edit or provenance capture
   - Reviewing an architectural tradeoff
@@ -78,8 +79,10 @@ they do not depend on relay or `state.db` history.
 > A peer that accepts a signed logical row stores its proof and projects it into
 > typed archive tables in one transaction. That projection is origin-owned:
 > ordinary ingestion, enrichment, and maintenance cannot update or delete it.
-> Only a verified newer revision from the same author and source row may
-> supersede it. A receiver never re-attests another author's row.
+> A verified newer revision from the same author and source row may supersede
+> it; verified parser lineage from that author may retire an obsolete physical
+> representation under the parser-evolution rules below. A receiver never
+> re-attests another author's row.
 
 > Randomized re-encryption creates a delivery replica, not new semantic
 > content. The relay attributes replicas to their authenticated uploader and
@@ -166,6 +169,50 @@ they do not depend on relay or `state.db` history.
 > proof; an incomparable revision remains conflicted instead of creating a
 > duplicate row or winning by arrival order.
 
+## Parser evolution
+
+> A parser change is an archive-evolution change whenever it changes row
+> identity, emitted records, parent attribution, call/result grouping, or
+> evidence meaning. Correct output on a fresh import is insufficient: the
+> release must account for rows produced by earlier parsers, locally and in
+> currently retained relay replicas.
+
+> Parser version and exact input identity make required reprocessing
+> discoverable even when source files are unchanged. Reprocessing converges
+> idempotently; when the original input is unavailable, existing evidence is
+> retained and the unresolved limitation remains visible.
+
+> Changed identities or relationships require explicit, verifiable migration
+> evidence and a core-owned, backed-up, transactional, resumable reconciliation
+> of affected rows and their dependents: messages, tools, attachments, edits,
+> artifacts, and provenance. Re-importing under a new ID must not silently leave
+> obsolete records as additional current facts or strand their children.
+
+> A parser upgrade never rewrites or reinterprets retained signed logical
+> bodies, identities, or proofs. A physical relink preserves their signed
+> meaning; a semantic correction requires an authorized successor or an
+> explicitly versioned representation with verifiable lineage. A receiver
+> without source transcripts must still ingest retained older encodings and
+> preserve their evidence without needing the original author's private key.
+
+> Legacy call/result associations and parent repairs require exact identity or
+> dependency evidence. Content similarity or matching timestamps alone cannot
+> authorize a rewrite or deletion. Unique orphan edits and other unresolved
+> records remain retained and explicitly diagnosed; missing parents are never
+> fabricated to make an audit pass.
+
+> Verified obsolete representations are physically removed from the active
+> archive once their complete replacement is available and no unique dependent
+> evidence requires them. Keeping the database clean is part of reconciliation,
+> not an optional manual purge. Original signed bodies and the compact evidence
+> needed to interpret retained replicas remain available separately for their
+> required lifetime; preservation does not require duplicate active rows.
+
+> Cleanup is idempotent across re-import, replay, delivery order, and backup
+> merge. A stale replica must not resurrect an already verified obsolete copy.
+> A late unique dependent restores its exact retained parent when necessary;
+> a changed body or ambiguous replacement is not silently discarded.
+
 ## Retained semantic state
 
 > Recovery preserves the newest valid causal revision of mutable semantic
@@ -182,6 +229,14 @@ they do not depend on relay or `state.db` history.
 > parents, while tools, edits, attachments, and other children reference their
 > owning row. A known missing reference may be shown as unavailable; unrelated
 > rows are never hidden while repair proceeds.
+
+> Physical parent resolution is independent of whether the child uses a native
+> or received identity. Receive, successor replay, repull, and migration preserve
+> valid same-author parent bindings in mixed archives, across batch boundaries
+> and repeated delivery. A source ID match alone never binds another author's
+> received child to a native row. Signed-body availability, projection fidelity,
+> and physical relationship health are separate audit results; passing the first
+> two does not establish the third.
 
 > Repair inventories the relay before encrypting or uploading received rows. A
 > received projection is re-published only when it still hashes to its author
@@ -269,6 +324,14 @@ they do not depend on relay or `state.db` history.
 
 > Correctness and recovery claims require destructive tests and measured limits,
 > not architectural intent.
+
+> Parser-change acceptance covers old-parser import followed by upgrade and
+> re-import, fresh onboarding from retained old signed rows without transcripts,
+> mixed native/received parents and children, out-of-order and paged delivery,
+> repeated receive and repull, authorized successors, cross-author collisions,
+> and interrupted reconciliation followed by resume. Tests prove preservation
+> of retained evidence and explain remaining gaps; row counts or zero unavailable
+> signed bodies alone are insufficient.
 
 ## File edits
 
