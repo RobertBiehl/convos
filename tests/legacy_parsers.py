@@ -119,3 +119,61 @@ def parse_codex_session(jsonl: Path) -> dict | None:
                     model=meta.get("model_provider", "openai"), cwd=meta.get("cwd"), git_branch=None, project_id=None,
                     metadata=json.dumps({"cli_version": meta.get("cli_version"), "session_id": jsonl.stem})),
         "msgs": msgs, "tools": tools, "edits": edits}
+
+
+# Frozen thread parser from 95f7bea33195ddc963a29b784bbfc1b7d73a93f2.
+def extract_thread_content(content) -> dict:
+    if isinstance(content, str): return {"text": content, "thinking": None, "tools": [], "attachments": []}
+    if not isinstance(content, list): return {"text": "", "thinking": None, "tools": [], "attachments": []}
+    blocks = [b for b in content if isinstance(b, dict)]
+    return {
+        "text": "\n".join(b.get("text", "") or b.get("thinking", "") if b.get("type") in ("text", None) else "" for b in blocks).strip() or
+                "\n".join(str(b) for b in content if isinstance(b, str)).strip(),
+        "thinking": "\n".join(b["thinking"] for b in blocks if b.get("type") == "thinking" and b.get("thinking")).strip() or None,
+        "tools": [{"name": b["name"], "input": b.get("input", {}), "id": b.get("id")} for b in blocks if b.get("type") == "tool_use"] +
+                 [{"id": b.get("tool_use_id"), "output": b.get("content", "")} for b in blocks if b.get("type") == "tool_result"],
+        "attachments": [{"filename": b.get("name", b.get("file_name")), "mime_type": b.get("content_type", b.get("file_type")),
+                        "size": b.get("size", b.get("file_size")), "url": b.get("asset_pointer", b.get("url"))}
+                       for b in blocks if b.get("type") in ("image_asset_pointer", "file") or b.get("content_type") in ("image_asset_pointer", "file")]
+    }
+
+def parse_claude_thread_session(jsonl: Path) -> dict:
+    events = load_jsonl(jsonl)
+    if not events: return None
+    cid, src = gen_id("claude-code", str(jsonl)), "claude-code"
+    timestamps = [ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e]
+    system = next((e for e in events if e.get("type") == "system"), {})
+    msg_events = [(i, e) for i, e in enumerate(events) if "message" in e]
+    uuid2id = {e["uuid"]: gen_id(src, f"{cid}:{idx}") for idx, (i, e) in enumerate(msg_events) if "uuid" in e}
+
+    def make_msg(idx, i, e):
+        c = extract_thread_content(e["message"].get("content", e["message"].get("text", "")))
+        return dict(id=gen_id(src, f"{cid}:{idx}"), conversation_id=cid, role=e["type"],
+                   content=c["text"], thinking=c["thinking"], created_at=ts_from_iso(e.get("timestamp")),
+                   model="claude" if e["type"] == "assistant" else None, metadata="{}", parent_id=uuid2id.get(e.get("parentUuid")))
+
+    def make_tools(idx, i, e):
+        c, ts = extract_thread_content(e["message"].get("content", [])), ts_from_iso(e.get("timestamp"))
+        mid = gen_id(src, f"{cid}:{idx}")
+        return [dict(id=gen_id(src, f"tool:{cid}:{idx}:{j}"), message_id=mid, tool_name=t.get("name", t.get("id")),
+                    input=json.dumps(t.get("input", {})), output=json.dumps(t.get("output", "")) if "output" in t else "{}",
+                    status="complete" if "output" in t else "pending", duration_ms=None, created_at=ts) for j, t in enumerate(c["tools"])]
+
+    def make_edits(idx, i, e):
+        c, ts = extract_thread_content(e["message"].get("content", [])), ts_from_iso(e.get("timestamp"))
+        mid = gen_id(src, f"{cid}:{idx}")
+        return [dict(id=gen_id(src, f"edit:{cid}:{idx}:{j}"), message_id=mid, file_path=t["input"]["file_path"],
+                    edit_type=t["name"].lower(), content=t["input"].get("content") or t["input"].get("new_string", ""), created_at=ts,
+                    old_content=t["input"].get("old_string"))
+               for j, t in enumerate(c["tools"]) if t.get("name") in ("Write", "Edit", "MultiEdit") and t.get("input", {}).get("file_path")]
+
+    msgs = [make_msg(idx, i, e) for idx, (i, e) in enumerate(msg_events) if (c := extract_thread_content(e["message"].get("content", "")))["text"] or c["tools"]]  # keep tool-only turns: tools/edits reference them
+    if not msgs: return None
+    return {
+        "conv": dict(id=cid, source=src, title=f"{jsonl.parent.name.replace('-Users-', '~/').replace('-', '/')} ({jsonl.stem[:8]})",
+                    created_at=timestamps[0] if timestamps else None, updated_at=timestamps[-1] if timestamps else None,
+                    model="claude", cwd=system.get("cwd"), git_branch=system.get("gitBranch"), project_id=None,
+                    metadata=json.dumps({"session_id": jsonl.stem})),
+        "msgs": msgs,
+        "tools": [t for idx, (i, e) in enumerate(msg_events) for t in make_tools(idx, i, e)],
+        "edits": [ed for idx, (i, e) in enumerate(msg_events) for ed in make_edits(idx, i, e)]}

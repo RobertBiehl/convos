@@ -64,11 +64,11 @@ class TestClaudeCodeParser:
         assert by_content["Branch A"]["parent_id"] == by_content["Hi"]["id"]
         assert by_content["Branch B (regenerated)"]["parent_id"] == by_content["Hi"]["id"]
 
-    def test_filtered_parent_does_not_leave_dangling_message_reference(self,tmp_path):
+    def test_empty_source_parent_is_retained_for_thread_topology(self,tmp_path):
         import duckdb
         from ai_convos import cli
         root=tmp_path/".claude/projects/-test"; root.mkdir(parents=True); (root/"s.jsonl").write_text("\n".join(map(json.dumps,[{"type":"human","uuid":"empty","message":{"content":""}},{"type":"assistant","uuid":"kept","parentUuid":"empty","message":{"content":"done"}}]))); result=cli.parse_claude_code(tmp_path/".claude/projects"); db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,result)
-        assert len(result.msgs)==1 and result.msgs[0]["parent_id"] is None and db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==1
+        assert len(result.msgs)==2 and result.msgs[1]["parent_id"]==result.msgs[0]["id"] and db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==2
 
     def test_parse_thinking_blocks(self, tmp_path):
         """Parse session with thinking blocks."""

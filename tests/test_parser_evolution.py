@@ -85,7 +85,9 @@ def test_upgrade_reimport_retains_legacy_rows_and_unique_edit(tmp_path,source,si
         assert {t:db.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall() for t in snapshot}==snapshot
         gaps=core.archive_relationships(db)
         if source=='codex':
-            assert gaps['tool_calls.message_id']['marked_history_rows']==2
+            assert 'tool_calls.message_id' not in gaps
+            assert db.execute('SELECT count(*) FROM tool_calls').fetchone()==(1,)
+            assert db.execute("SELECT count(*) FROM parser_retired_rows WHERE kind='tool_calls'").fetchone()==(2,)
             assert gaps['file_edits.message_id']['rows']==1
     assert path.with_name(path.name+'.pre-v13.bak').is_file()
     assert projection.audit_rows(path,local_user=user)['totals']['unavailable']==0
@@ -120,6 +122,7 @@ def test_lineage_cannot_classify_changed_or_foreign_tools(tmp_path,alter):
         reimport(db,parser,transcript)
         message=db.execute("SELECT metadata FROM messages WHERE id=?",[session['msgs'][0]['id']]).fetchone()[0]
         assert len(json.loads(message)['convos_tool_lineage']['records'])==2
+        if alter=='old_content': core._insert_pages(db,'tool_calls',[core.retired_projection('tool_calls',old[0]['id'],*map(json.loads,db.execute("SELECT body,projection FROM parser_retired_rows WHERE physical=?",[old[0]['id']]).fetchone()))],core.ARCHIVE_COLUMNS['tool_calls'])
         if alter=='old_content': db.execute("UPDATE tool_calls SET output='\"changed\"' WHERE id=?",[old[0]['id']])
         if alter=='current_content': db.execute("UPDATE tool_calls SET output='\"changed\"' WHERE id=?",[session['tools'][0]['id']])
         if alter=='different_author': db.execute("INSERT INTO remote.row_origins(table_name,physical_row_id,source_row_id,author_user_id) VALUES ('tool_calls',?,?,'someone-else')",[old[0]['id'],old[0]['id']])
@@ -143,6 +146,7 @@ def test_multiple_authors_with_identical_source_ids_remain_independent(tmp_path)
         core.init_schema(db)
         reimport(db,parser,transcript)
         rows=[core.logical_row(table,core.ARCHIVE_COLUMNS[table],r) for table in ('conversations','messages','tool_calls') for r in db.execute(f"SELECT {','.join(core.ARCHIVE_COLUMNS[table])} FROM {table}").fetchall()]
+        rows += [json.loads(body) for body, in db.execute('SELECT body FROM parser_retired_rows').fetchall()]
     _,device2,user2,control2,_,_,_,_=signed_edit_graph()
     combined={**control,'devices':control['devices']|control2['devices']}
     bodies=[dict(row=r,proof=row_proof(dev,author,'w',1,r)) for dev,author in ((device,user),(device2,user2)) for r in rows]
@@ -164,7 +168,7 @@ def test_current_invocation_with_different_json_whitespace_is_not_duplicated(tmp
         with core._transaction(db): core.project_archive_row(db,'tool_calls',core.ARCHIVE_COLUMNS['tool_calls'],list(session['tools'][0].values()))
         assert db.execute('SELECT count(*) FROM tool_calls').fetchone()==(3,)
         reimport(db,parser,transcript)
-        assert db.execute('SELECT count(*) FROM tool_calls').fetchone()==(3,)
+        assert db.execute('SELECT count(*) FROM tool_calls').fetchone()==(1,)
         assert db.execute('SELECT count(*) FROM tool_calls WHERE id NOT IN (SELECT old_id FROM parser_tool_history)').fetchone()==(1,)
 
 

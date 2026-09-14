@@ -62,7 +62,7 @@ def test_migration_repairs_only_physical_links_and_is_idempotent(tmp_path,kind):
         claim=(kind,core.remote_id(user,kind,body["row"]["id"]),body["row"]["id"],user,"active")
         logical=core.typed_logical_rows(db,[claim])
         core.init_schema(db)
-        assert db.execute("SELECT version FROM core_schema").fetchone()==(13,)
+        assert db.execute("SELECT version FROM core_schema").fetchone()==(core.CORE_VERSION,)
         assert not core.archive_relationships(db)
         assert core.typed_logical_rows(db,[claim])==logical
         assert {t:db.execute(f"SELECT * FROM {t}").fetchall() for t in tables}==before
