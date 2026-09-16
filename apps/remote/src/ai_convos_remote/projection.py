@@ -10,7 +10,7 @@ from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
-STATE_VERSION,ALIAS_VERSION="4",10
+STATE_VERSION,ALIAS_VERSION="4",11
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -752,6 +752,9 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
                 row,head,native,parent_map,path=next(item for item in current if item[0]['kind']=='conversations' and item[0]['id']==canonical)
                 metadata=row['data']['metadata']
                 prior=metadata.get('convos_message_lineage',{}).get('records',[])
+                replacements={value['old_id']:value['current_id'] for value in lineage}
+                # Supersede reverse directions only within freshly proven equivalent groups; signed ancestors remain retained.
+                prior=[value for value in prior if value['current_id'] not in replacements or replacements.get(value['old_id'],value['old_id'])!=replacements[value['current_id']]]
                 records=sorted({canon(value):value for value in [*prior,*lineage]}.values(),key=lambda v:(v['old_id'],v['old_hash'],v['current_id'],v['current_hash']))
                 carrier={**row,'data':{**row['data'],'metadata':{**metadata,'convos_message_lineage':{'v':1,'records':records}}}}
                 with contextlib.closing(open_db(db_path,True,purpose='remote.alias.message-plan')) as db:

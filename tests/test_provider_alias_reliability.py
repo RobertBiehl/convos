@@ -218,6 +218,39 @@ def test_cyclic_retirement_cannot_remove_every_current_message(tmp_path):
         assert core.archive_relationships(db)=={}
 
 
+@pytest.mark.parametrize('historical_reverse',[False,True])
+def test_alias_canonical_direction_supersedes_reverse_parser_history(tmp_path,historical_reverse):
+    root,path,identity,device,user,cfg,_=archive(tmp_path,False)
+    ids=sorted(core.gen_id('codex',str(i)) for i in range(2))
+    with duckdb.connect(str(path)) as db:
+        db.execute('DELETE FROM messages')
+        db.execute("DELETE FROM remote.row_proofs WHERE row_kind='messages'")
+        db.executemany("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES (?,'a','user','same',?)",[(mid,json.dumps(dict(provider_index=1))) for mid in ids])
+        claims=[('messages',mid,mid,user,'active') for mid in ids]
+        bodies=core.typed_logical_rows(db,claims)
+        records=[dict(old_id=ids[i],old_hash=core.provenance_digest(bodies[claims[i]]),current_id=ids[1-i],current_hash=core.provenance_digest(bodies[claims[1-i]])) for i in range(2)]
+        metadata=json.loads(db.execute("SELECT metadata FROM conversations WHERE id='a'").fetchone()[0])
+        db.execute("UPDATE conversations SET metadata=? WHERE id='a'",[json.dumps({**metadata,'convos_message_lineage':dict(v=1,records=records)})])
+        if historical_reverse:
+            core._insert_pages(db,'parser_retired_rows',[('messages',ids[0],ids[0],user,records[0]['old_hash'],bodies[claims[0]],dict(conversation_id='a',parent_id=None),ids[1])])
+    attest(tmp_path,path,cfg)
+    with duckdb.connect(str(path),read_only=True) as db:
+        carrier=core.typed_logical_rows(db,[('conversations','a','a',user,'active')])[('conversations','a','a',user,'active')]
+        proof=projection._heads(db,user,{'conversations':{'a'}})[('conversations','a')]
+    accept(root,identity,device,user,SESSION,['a','b'])
+    assert projection.reconcile_provider_aliases(path,cfg,'personal')=={'changed':1,'settled':0,'blocked':{}}
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT 1 FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.revision=?',[proof['revision']]).fetchone()==(1,)
+    for _ in range(2):
+        projection.apply_row_replicas(path,[dict(row=carrier,proof=proof)],'personal',cfg['server_state']['workspaces'][0]['controls'],local_user=user)
+        assert projection.reconcile_provider_aliases(path,cfg,'personal')=={'changed':0,'settled':1,'blocked':{}}
+        with duckdb.connect(str(path),read_only=True) as db:
+            assert db.execute('SELECT id FROM messages').fetchall()==[(ids[0],)]
+            assert db.execute('SELECT 1 FROM remote.row_proofs WHERE revision=?',[proof['revision']]).fetchone()==(1,)
+            assert core.archive_relationships(db)=={}
+    assert projection.audit_rows(path,local_user=user)['totals']['unavailable']==0
+
+
 def test_semantic_proof_arrival_invalidates_settled_sync_without_row_mutation(tmp_path):
     from ai_convos_remote import _archive_marker
     root,path,identity,device,user,cfg,_=archive(tmp_path)

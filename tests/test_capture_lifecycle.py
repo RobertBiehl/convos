@@ -120,3 +120,16 @@ def test_worktree_disappearing_during_lookup_cannot_inherit_parent(tmp_path,monk
         return root
     monkeypatch.setattr(cli,'_git_root',disappears)
     assert cli.repository(path,refresh=False) is None
+
+
+def test_failed_repository_filling_retry_page_does_not_starve_later_work(hooks,tmp_path,monkeypatch):
+    bad,good=repository(tmp_path/'bad'),repository(tmp_path/'good')
+    with cli.open_db(purpose='test.retry.backlog') as db:
+        cli.init_schema(db)
+        db.executemany("INSERT INTO conversations(id,source,cwd,metadata) VALUES (?,'codex',?,'{}')",[(f'bad-{i:04}',str(bad)) for i in range(500)]+[('good',str(good))])
+        db.execute("INSERT INTO provenance.pending SELECT 'conversations',id,1 FROM conversations")
+    ownership_failure(monkeypatch,bad)
+    cli.capture_provenance(edit_ids=set(),conversation_ids=set(),strict=False)
+    with cli.open_db(read_only=True,purpose='test.retry.progress') as db:
+        assert db.execute("SELECT repository IS NOT NULL FROM provenance.conversation_scopes WHERE conversation='good'").fetchone()==(True,)
+        assert db.execute('SELECT count(*) FROM provenance.pending').fetchone()==(500,)

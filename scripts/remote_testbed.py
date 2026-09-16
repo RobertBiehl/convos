@@ -65,7 +65,7 @@ def as_user(client,*command,input=None,check=True):
 def cli(client,*args,input=None,check=True): return as_user(client,client.convos,*args,input=input,check=check)
 def sha256(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 def package_version(client): return as_user(client,client.python,"-c","import importlib.metadata\nprint(importlib.metadata.version('convos'))").stdout.strip()
-def wait_health(url,process,timeout=15):
+def wait_health(url,process,timeout=15,diagnostics=None):
     started,opener,last=time.monotonic(),urllib.request.build_opener(urllib.request.ProxyHandler({})),None
     while time.monotonic()-started<timeout:
         if process.poll() is not None: raise RuntimeError(f"relay exited ({process.returncode}): {process.stderr.read() if process.stderr else 'see relay.log'}")
@@ -73,6 +73,7 @@ def wait_health(url,process,timeout=15):
         except Exception as error:
             last=error
             time.sleep(.1)
+    if diagnostics and sys.platform=='darwin': subprocess.run(('/usr/bin/sample',str(process.pid),'1','-file',str(diagnostics)),capture_output=True,timeout=10)
     raise TimeoutError(f"relay did not become healthy: {last}")
 
 
@@ -440,7 +441,7 @@ def _desktop_lane(root,venv,commit,baseline_venv=None):
     server=subprocess.Popen((Path(venv)/'bin/convos-server','serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
     started=time.monotonic()
     try:
-        wait_health(url,server)
+        wait_health(url,server,diagnostics=evidence/'relay-stack.log')
         a,b,c=clients
         if not (a['root']/'archive/remote/config.json').exists():
             output=desktop_cli(a,'remote','setup',url,'canary-alice','--device','laptop').stdout
@@ -502,7 +503,7 @@ def _desktop_lane(root,venv,commit,baseline_venv=None):
         (evidence/'offline.log').write_text(offline.stdout+offline.stderr)
         if offline.returncode==0: raise AssertionError('offline relay reported a successful sync')
         server=subprocess.Popen((Path(venv)/'bin/convos-server','serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
-        wait_health(url,server)
+        wait_health(url,server,diagnostics=evidence/'relay-restart-stack.log')
         for _ in range(3):
             for client in clients: desktop_cli(client,'remote','sync')
         current=[desktop_inventory(client) for client in clients]

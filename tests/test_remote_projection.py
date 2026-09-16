@@ -205,7 +205,8 @@ def test_legacy_delivery_diagnostics_cannot_supersede_author_evidence(tmp_path,r
 
 @pytest.mark.parametrize('native',[False,True])
 @pytest.mark.parametrize('changed',[False,True])
-def test_late_evidence_restores_only_its_exact_retired_tool(tmp_path,native,changed):
+@pytest.mark.parametrize('trigger',['semantic','retirement'])
+def test_late_evidence_restores_only_its_exact_retired_tool(tmp_path,native,changed,trigger):
     root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph()
     rows['tool_calls']['data']['output']='file written'
     proofs['tool_calls']=row_proof(device,user,'w',1,rows['tool_calls'])
@@ -213,14 +214,18 @@ def test_late_evidence_restores_only_its_exact_retired_tool(tmp_path,native,chan
     archive=tmp_path/'archive'; path=archive/'data/convos.db'; physical='t' if native else foreign_id(user,'tool_calls','t')
     apply=lambda values:apply_row_replicas(path,values,'w',[control],local_user=user if native else 'receiver',root=archive)
     apply(bodies)
+    row=evidence(proofs['file_edits']['revision'],proofs['tool_calls']['revision'])
+    signed=dict(row=row,proof=semantic_proof(root,user,device['id'],'w',1,row))
+    if trigger=='retirement': apply([signed])
     with duckdb.connect(str(path)) as db:
         body=next(value['row'] for value in bodies if value['row']['kind']=='tool_calls')
         if changed: body={**body,'data':{**body['data'],'output':'different result'}}
         projection=dict(id=physical,message_id=db.execute('SELECT message_id FROM tool_calls').fetchone()[0])
         db.execute('INSERT INTO parser_retired_rows VALUES (?,?,?,?,?,?,?,?)',['tool_calls',physical,'t','' if native else user,digest(body),json.dumps(body),json.dumps(projection,default=str),'replacement'])
         db.execute('DELETE FROM tool_calls')
-    row=evidence(proofs['file_edits']['revision'],proofs['tool_calls']['revision'])
-    apply([dict(row=row,proof=semantic_proof(root,user,device['id'],'w',1,row))])
+        db.execute("UPDATE provenance.file_edit_evidence SET status='unverified',reason='signed_replica_missing_evidence',tool_call_id=NULL")
+        if trigger=='retirement': core_module.retire_parser_rows(db)
+    if trigger=='semantic': apply([signed])
     with duckdb.connect(str(path),read_only=True) as db:
         assert db.execute('SELECT count(*) FROM tool_calls').fetchone()==(0 if changed else 1,)
         assert db.execute('SELECT status FROM provenance.file_edit_evidence').fetchone()==('unverified' if changed else 'confirmed',)
