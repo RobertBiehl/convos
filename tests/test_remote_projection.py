@@ -206,7 +206,7 @@ def test_legacy_delivery_diagnostics_cannot_supersede_author_evidence(tmp_path,r
 @pytest.mark.parametrize('native',[False,True])
 @pytest.mark.parametrize('changed',[False,True])
 @pytest.mark.parametrize('trigger',['semantic','retirement'])
-def test_late_evidence_restores_only_its_exact_retired_tool(tmp_path,native,changed,trigger):
+def test_late_evidence_restores_only_its_exact_retired_tool(tmp_path,monkeypatch,native,changed,trigger):
     root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph()
     rows['tool_calls']['data']['output']='file written'
     proofs['tool_calls']=row_proof(device,user,'w',1,rows['tool_calls'])
@@ -229,6 +229,9 @@ def test_late_evidence_restores_only_its_exact_retired_tool(tmp_path,native,chan
     with duckdb.connect(str(path),read_only=True) as db:
         assert db.execute('SELECT count(*) FROM tool_calls').fetchone()==(0 if changed else 1,)
         assert db.execute('SELECT status FROM provenance.file_edit_evidence').fetchone()==('unverified' if changed else 'confirmed',)
+    if not changed:
+        monkeypatch.setattr(core_module,'_apply_signed_edit_evidence',lambda *args,**kwargs:pytest.fail('settled evidence was recomputed'))
+        with duckdb.connect(str(path)) as db: core_module.retire_parser_rows(db)
 
 
 @pytest.mark.parametrize('damage',[None,'missing_base','changed_edit','changed_tool','other_author'])
