@@ -183,8 +183,74 @@ def test_signed_edit_evidence_tracks_exact_row_heads_reorder_tombstones_and_fork
     merged=evidence(e4["revision"],t2["revision"]); merge=semantic_proof(root,user,device["id"],"w",1,merged,[proof for row,proof in branches]); assert apply([{"row":merged,"proof":merge}])==[True] and state()==("confirmed","provider_success",True); assert apply([{"row":merged,"proof":merge}])==[True] and state()==("confirmed","provider_success",True)
     db=duckdb.connect(str(path),read_only=True); leaves=db.execute("SELECT count(*) FROM remote.file_edit_evidence_proofs p WHERE NOT EXISTS (SELECT 1 FROM remote.semantic_ancestors a WHERE a.object_kind='file-edit.evidence' AND a.ancestor_revision=p.revision)").fetchone()[0]; assert leaves==1 and db.execute("SELECT count(*) FROM remote.semantic_ancestors WHERE child_revision=?",(merge["revision"],)).fetchone()[0]>=len(branches); db.close()
 
-def test_signed_evidence_never_binds_to_native_rows_by_source_id(tmp_path):
-    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); archive=tmp_path/"native"; path=archive/"data/convos.db"; apply_row_replicas(path,bodies,"w",[control],recover="native",local_user=user,root=archive); row=evidence(proofs["file_edits"]["revision"],proofs["tool_calls"]["revision"]); proof=semantic_proof(root,user,device["id"],"w",1,row); apply_row_replicas(path,[{"row":row,"proof":proof}],"w",[control],recover="native",local_user=user,root=archive); db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT status,reason,tool_call_id FROM provenance.file_edit_evidence").fetchone()==("unverified","signed_replica_missing_evidence",None) and not db.execute("SELECT 1 FROM remote.row_origins WHERE table_name='file_edits'").fetchone(); db.close()
+@pytest.mark.parametrize('reason',['signed_replica_missing_evidence','signed_evidence_conflict'])
+def test_legacy_delivery_diagnostics_cannot_supersede_author_evidence(tmp_path,reason):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph()
+    archive=tmp_path/'archive'; path=archive/'data/convos.db'
+    apply=lambda values:apply_row_replicas(path,values,'w',[control],local_user='receiver',root=archive)
+    apply(bodies)
+    row=evidence(proofs['file_edits']['revision'],proofs['tool_calls']['revision'])
+    signed=semantic_proof(root,user,device['id'],'w',1,row)
+    diagnostic={**row,'data':{**row['data'],'status':'unverified','reason':reason,'tool_call':None,'tool_revision':None}}
+    diagnostic_proof=semantic_proof(root,user,device['id'],'w',1,diagnostic,signed)
+    apply([dict(row=diagnostic,proof=diagnostic_proof),dict(row=row,proof=signed)])
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT status,reason,tool_call_id IS NOT NULL FROM provenance.file_edit_evidence').fetchone()==('confirmed','provider_success',True)
+        assert db.execute('SELECT count(*) FROM remote.file_edit_evidence_proofs').fetchone()==(2,)
+    invalid={**row,'data':{**row['data'],'status':'invalid','reason':'provider_error'}}
+    apply([dict(row=invalid,proof=semantic_proof(root,user,device['id'],'w',1,invalid,diagnostic_proof))])
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT status,reason FROM provenance.file_edit_evidence').fetchone()==('invalid','provider_error')
+
+
+@pytest.mark.parametrize('native',[False,True])
+@pytest.mark.parametrize('changed',[False,True])
+@pytest.mark.parametrize('trigger',['semantic','retirement'])
+def test_late_evidence_restores_only_its_exact_retired_tool(tmp_path,monkeypatch,native,changed,trigger):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph()
+    rows['tool_calls']['data']['output']='file written'
+    proofs['tool_calls']=row_proof(device,user,'w',1,rows['tool_calls'])
+    bodies=[dict(row=rows[kind],proof=proofs[kind]) for kind in rows]
+    archive=tmp_path/'archive'; path=archive/'data/convos.db'; physical='t' if native else foreign_id(user,'tool_calls','t')
+    apply=lambda values:apply_row_replicas(path,values,'w',[control],local_user=user if native else 'receiver',root=archive)
+    apply(bodies)
+    row=evidence(proofs['file_edits']['revision'],proofs['tool_calls']['revision'])
+    signed=dict(row=row,proof=semantic_proof(root,user,device['id'],'w',1,row))
+    if trigger=='retirement': apply([signed])
+    with duckdb.connect(str(path)) as db:
+        body=next(value['row'] for value in bodies if value['row']['kind']=='tool_calls')
+        if changed: body={**body,'data':{**body['data'],'output':'different result'}}
+        projection=dict(id=physical,message_id=db.execute('SELECT message_id FROM tool_calls').fetchone()[0])
+        db.execute('INSERT INTO parser_retired_rows VALUES (?,?,?,?,?,?,?,?)',['tool_calls',physical,'t','' if native else user,digest(body),json.dumps(body),json.dumps(projection,default=str),'replacement'])
+        db.execute('DELETE FROM tool_calls')
+        db.execute("UPDATE provenance.file_edit_evidence SET status='unverified',reason='signed_replica_missing_evidence',tool_call_id=NULL")
+        if trigger=='retirement': core_module.retire_parser_rows(db)
+    if trigger=='semantic': apply([signed])
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT count(*) FROM tool_calls').fetchone()==(0 if changed else 1,)
+        assert db.execute('SELECT status FROM provenance.file_edit_evidence').fetchone()==('unverified' if changed else 'confirmed',)
+    if not changed:
+        monkeypatch.setattr(core_module,'_apply_signed_edit_evidence',lambda *args,**kwargs:pytest.fail('settled evidence was recomputed'))
+        with duckdb.connect(str(path)) as db: core_module.retire_parser_rows(db)
+
+
+@pytest.mark.parametrize('damage',[None,'missing_base','changed_edit','changed_tool','other_author'])
+def test_signed_evidence_binds_native_rows_only_with_matching_author_base_and_body(tmp_path,damage):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph()
+    archive=tmp_path/'native'
+    path=archive/'data/convos.db'
+    apply_row_replicas(path,bodies,'w',[control],recover='native',local_user=user,root=archive)
+    with duckdb.connect(str(path)) as db:
+        if damage=='missing_base': db.execute('DELETE FROM remote.local_row_bases')
+        if damage=='changed_edit': db.execute("UPDATE file_edits SET content='locally changed'")
+        if damage=='changed_tool': db.execute("UPDATE tool_calls SET output='\"locally changed\"'")
+        if damage=='other_author': db.execute("UPDATE remote.local_row_bases SET author='someone-else'")
+    row=evidence(proofs['file_edits']['revision'],proofs['tool_calls']['revision'])
+    proof=semantic_proof(root,user,device['id'],'w',1,row)
+    apply_row_replicas(path,[dict(row=row,proof=proof)],'w',[control],recover='native',local_user=user,root=archive)
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT status,reason,tool_call_id FROM provenance.file_edit_evidence').fetchone()==(('confirmed','provider_success','t') if damage is None else ('unverified','signed_replica_missing_evidence',None))
+        assert not db.execute("SELECT 1 FROM remote.row_origins WHERE table_name='file_edits'").fetchone()
 
 def test_retained_foreign_semantic_proof_is_reuploadable_after_author_departure(tmp_path,monkeypatch):
     root_a,device_a,user_a,control1,rows,proofs,bodies,evidence=signed_edit_graph(); holder=tmp_path/"holder"; path=holder/"data/convos.db"; apply_row_replicas(path,bodies,"w",[control1],local_user="holder",root=holder); row=evidence(proofs["file_edits"]["revision"],proofs["tool_calls"]["revision"]); proof=semantic_proof(root_a,user_a,device_a["id"],"w",1,row); apply_row_replicas(path,[{"row":row,"proof":proof}],"w",[control1],local_user="holder",root=holder)
@@ -318,6 +384,23 @@ def test_native_tombstone_and_author_heads_are_repairable_from_duckdb(tmp_path):
 def test_conflicting_attachment_bodies_remain_repairable(tmp_path):
     root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":certificate(root,user,device),"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","message_id","filename","mime_type","size","path","url","created_at","body_hash"]; data=[b"one",b"two"]; hash_=lambda value:__import__("hashlib").sha256(value).hexdigest(); hashes=[hash_(value) for value in data]; row=lambda name,body:logical_row("attachments",fields,["a","m",name,None,len(body),None,None,"2026-01-01T00:00:00",hash_(body)]); base=row("base",b"old"); parent=row_proof(device,user,"w",1,base); children=[row_proof(device,user,"w",1,row(str(i),body),parent["revision"]) for i,body in enumerate(data)]; path=tmp_path/"data/convos.db"; apply_row_replicas(path,[{"row":base,"proof":parent}],"w",[control]); apply_row_replicas(path,[{"row":row(str(i),body),"proof":proof} for i,(body,proof) in enumerate(zip(data,children))],"w",[control]); [project_attachment_body(path,body,body_hash) for body,body_hash in zip(data,hashes)]; cfg={"user":user,"device":device,"workspaces":{"w":{"kind":"personal"}}}; blobs=blob_replicas(path,cfg,"w",[],{1:bytes(32)}); recovered={open_blob(env,bytes(32))[0] for env in blobs}
     assert recovered==set(data) and duckdb.connect(str(path),read_only=True).execute("SELECT COUNT(*) FROM remote.row_conflicts").fetchone()[0]==2
+
+
+@pytest.mark.parametrize('body_first',[False,True])
+@pytest.mark.parametrize('native',[False,True])
+def test_attachment_rows_and_shared_bytes_can_arrive_in_either_order(tmp_path,body_first,native):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph()
+    path=tmp_path/'data/convos.db'; data=b'one shared attachment'; hash_=core_module.provenance_digest(data)
+    apply=lambda values:apply_row_replicas(path,values,'w',[control],local_user=user if native else 'receiver')
+    apply(bodies)
+    if body_first: project_attachment_body(path,data,hash_)
+    for name in ('a','b'):
+        row=logical_row('attachments',[*ARCHIVE_COLUMNS['attachments'],'body_hash'],[name,'m','image.png','image/png',len(data),None,None,None,hash_])
+        apply([dict(row=row,proof=row_proof(device,user,'w',1,row))])
+    if not body_first: project_attachment_body(path,data,hash_)
+    with duckdb.connect(str(path),read_only=True) as db:
+        paths=db.execute('SELECT path FROM attachments').fetchall()
+        assert len(paths)==2 and all(value and Path(value).read_bytes()==data for value, in paths)
 
 
 def test_row_replica_page_is_atomic(tmp_path):

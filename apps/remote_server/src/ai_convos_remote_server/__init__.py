@@ -3,6 +3,7 @@ import argparse, base64, hashlib, hmac, json, logging, os, secrets, socket, sqli
 from contextlib import closing, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -610,6 +611,10 @@ class Server(ThreadingHTTPServer):
         self.slots=threading.BoundedSemaphore(max(1,int(os.environ.get("CONVOS_SERVER_WORKERS","32"))))
         self.deadlines={}
         super().__init__(*args,**kwargs)
+    def server_bind(self):
+        # HTTPServer's reverse-DNS lookup must not delay a bound relay's startup.
+        TCPServer.server_bind(self)
+        self.server_name,self.server_port=self.server_address
     def process_request(self,request,client_address):
         if not self.slots.acquire(False):
             with suppress(OSError):

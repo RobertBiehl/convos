@@ -9,7 +9,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  qualify:
+    uses: ./.github/workflows/tests.yml
+    permissions:
+      contents: read
+
   build:
+    needs: qualify
     runs-on: ubuntu-latest
     permissions:
       contents: read

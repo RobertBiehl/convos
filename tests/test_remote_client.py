@@ -90,6 +90,24 @@ def test_row_cursor_rollback_revalidates_receipted_bodies(tmp_path,monkeypatch):
     with duckdb.connect(str(root/"data/convos.db"),read_only=True) as core: assert core.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==("restore me",)
 
 
+def test_schema_upgrade_replays_retained_bodies_without_resetting_receipts(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/'server.db'); monkeypatch.setattr(remote_client,'request',transport(server)); monkeypatch.setattr(remote_client,'drain_hooks',lambda:None)
+    root=tmp_path/'client'; cfg,_=setup_client('http://server','alice',root=root); sid=workspace(cfg,'Personal'); path=root/'data/convos.db'
+    write_archive(path,'signed base'); sync_once(root)
+    with duckdb.connect(str(path)) as db:
+        db.execute("UPDATE conversations SET title='local edit' WHERE id='c'")
+        db.execute('DELETE FROM remote.row_conflicts')
+    cfg=load(root); ws=next(w for w in refresh(cfg,root)['workspaces'] if w['id']==sid)
+    with connect(root/'remote/state.db') as state:
+        assert state.execute('SELECT count(*) FROM replica_receipts').fetchone()[0]>0
+        state.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',(f'replica_projection:{sid}','previous-schema')); state.commit()
+        assert remote_client.pull_row_replicas(cfg,state,root,ws)>0
+        assert remote_client.pull_row_replicas(cfg,state,root,ws)==0
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==('local edit',)
+        assert db.execute("SELECT json_extract_string(c.body,'$.data.title') FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id JOIN remote.local_row_bases b ON (b.kind,b.entity,b.author,b.revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)").fetchone()==('signed base',)
+
+
 def test_first_publication_does_not_reconcile_each_preparation_page(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); direct=transport(server); calls=[]
     monkeypatch.setattr("ai_convos_remote.request",lambda cfg,body,auth=True:calls.append(body["op"]) or direct(cfg,body,auth)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","first publication"); orphan=root/"remote/outbox/.replica-batch-orphan.json.1.1"; orphan.write_text("ignored staging data"); calls.clear(); sync_once(root)
@@ -297,7 +315,7 @@ def test_remote_scan_is_read_only_and_does_not_self_trigger(tmp_path,monkeypatch
     sync_once(root); db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT observed_at FROM provenance.repositories").fetchone()[0]==observed; db.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count
 
 def test_manual_noop_sync_does_not_force_repair_or_scan_archive_bridges(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct,calls=transport(server),[]; monkeypatch.setattr("ai_convos_remote.request",lambda cfg,body,auth=True:calls.append(body["op"]) or direct(cfg,body,auth)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","settled"); sync_once(root,True); calls.clear()
+    server=server_connect(tmp_path/"server.db"); direct,calls=transport(server),[]; monkeypatch.setattr("ai_convos_remote.request",lambda cfg,body,auth=True:calls.append(body["op"]) or direct(cfg,body,auth)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","settled"); sync_once(root,True); sync_once(root); calls.clear()
     monkeypatch.setattr(remote_client,"scan_archive",lambda *args,**kwargs:(_ for _ in ()).throw(AssertionError("no-op archive scan"))); monkeypatch.setattr(remote_client,"edit_evidence_records",lambda *args,**kwargs:(_ for _ in ()).throw(AssertionError("no-op evidence scan")))
     sync_once(root,manual=True); state=connect(root/"remote/state.db"); assert calls==["state"] and not state.execute("SELECT 1 FROM meta WHERE key LIKE 'replica_repair:%'").fetchone(); state.close()
 

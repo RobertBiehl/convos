@@ -192,7 +192,7 @@ class TestChatGPTAPI:
             if "offset=1" in url: return {"items":[{"id":"same","update_time":100},{"id":"older","update_time":100},{"id":"missing-time","update_time":None},{"id":"null-stored","update_time":100},{"id":"new","update_time":None}], "total":6}
             if "/conversations?" in url: return {"items":[], "total":6}
             details.append(url.rsplit("/", 1)[-1]); return {"mapping":{}}
-        monkeypatch.setattr(cli, "fetch_json", fake); known = {cli.gen_id("chatgpt", x):(cli.ts_any(t).timestamp() if t else None) for x, t in (("same",100),("older",150),("changed",150),("missing-time",150),("null-stored",None))}
+        monkeypatch.setattr(cli, "fetch_json", fake); known = {cli.gen_id("chatgpt", x):(t if t else None) for x, t in (("same",100),("older",150),("changed",150),("missing-time",150),("null-stored",None))}
         assert len(cli.fetch_chatgpt("safari", known=known).convs) == 4 and set(details) == {"changed", "missing-time", "null-stored", "new"}
         details.clear(); assert len(cli.fetch_chatgpt("safari", known={}).convs) == 6 and set(details) == {"same", "older", "changed", "missing-time", "null-stored", "new"}
 
@@ -226,7 +226,7 @@ class TestChatGPTAPI:
                 if offset == 1: return {"items":[{"id":"changed","update_time":350},{"id":"tie","update_time":300},{"id":"old","update_time":299}], "total":4}
                 raise AssertionError(f"fetched past frontier: {offset}")
             details.append(url.rsplit("/",1)[-1]); return {"mapping":{}}
-        known = {cli.gen_id("chatgpt",x):cli.ts_any(t).timestamp() for x,t in (("changed",300),("old",299))}; monkeypatch.setattr(cli, "fetch_json", fake)
+        known = {cli.gen_id("chatgpt",x):t for x,t in (("changed",300),("old",299))}; monkeypatch.setattr(cli, "fetch_json", fake)
         r = cli.fetch_chatgpt("safari", known=known, frontiers={"default":{"account":"acct","updated":300}})
         assert lists == [0,1] and set(details) == {"new","changed","tie"} and len(r.convs) == 3
 
@@ -239,7 +239,7 @@ class TestChatGPTAPI:
                 if offset==0: return {"items":[{"id":"new","update_time":400},{"id":"old","update_time":299},{"id":"missing","update_time":None}]+([{"id":"misplaced","update_time":350}] if mode["inverted"] else []),"total":4 if mode["inverted"] else 3}
                 return {"items":[],"total":offset}
             calls.append(("detail",url.rsplit("/",1)[-1])); return {"mapping":{}}
-        monkeypatch.setattr(cli,"fetch_json",fake); frontier = {"default":{"account":"acct","updated":300}}; known = {cli.gen_id("chatgpt","old"):cli.ts_any(299).timestamp()}
+        monkeypatch.setattr(cli,"fetch_json",fake); frontier = {"default":{"account":"acct","updated":300}}; known = {cli.gen_id("chatgpt","old"):299}
         cli.fetch_chatgpt("safari",known=known,frontiers=frontier); assert calls==[("list",0),("detail","new"),("detail","missing")]
         calls.clear(); mode["inverted"] = True; cli.fetch_chatgpt("safari",known=known,frontiers=frontier)
         assert calls==[("list",0),("detail","new"),("detail","missing"),("detail","misplaced")]

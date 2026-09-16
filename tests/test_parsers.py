@@ -33,7 +33,7 @@ class TestClaudeCodeParser:
         assert result.msgs[0]["role"] == "user"
         assert result.msgs[1]["role"] == "assistant" and result.msgs[1]["model"] == "claude-opus-4-8"
         assert result.convs[0]["model"] == "claude-opus-4-8"
-        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"session-123","session_kind":"main","session_kind_evidence":"inferred","originator":"cli","client_version":"2.1.9","capture_mode":"transcript"}
+        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"session-123","session_kind":"main","session_kind_evidence":"inferred","originator":"cli","client_version":"2.1.9","capture_mode":"transcript","timestamp_basis":"utc"}
 
     def test_subagent_session_metadata_is_normalized(self,tmp_path):
         from ai_convos.cli import parse_claude_code
@@ -42,7 +42,7 @@ class TestClaudeCodeParser:
             {"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"content":"inspect"}},
             {"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"done"}]}}]))
         conv=parse_claude_code(tmp_path/".claude/projects").convs[0]; meta=json.loads(conv["metadata"])
-        assert (conv["cwd"],conv["git_branch"],conv["model"]) == ("/repo","main","claude-opus-4-8") and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","session_kind_evidence":"exact","agent_id":"child","client_version":"2.1.9","capture_mode":"transcript"}
+        assert (conv["cwd"],conv["git_branch"],conv["model"]) == ("/repo","main","claude-opus-4-8") and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","session_kind_evidence":"exact","agent_id":"child","client_version":"2.1.9","capture_mode":"transcript","timestamp_basis":"utc"}
 
     def test_parent_thread_tree(self, tmp_path):
         """parentUuid chains become parent_id links; roots and unknown parents stay NULL."""
@@ -219,7 +219,7 @@ class TestCodexParser:
         assert result.convs[0]["cwd"] == "/test"
         assert (result.convs[0]["model"],result.convs[0]["git_branch"]) == ("gpt-5.6-sol","main")
         assert {m["model"] for m in result.msgs} == {"gpt-5.6-sol"}
-        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"provider-123","session_kind":"main","session_kind_evidence":"inferred","originator":"codex-tui","client_version":"0.116.0","capture_mode":"transcript","git_repository":"https://example.com/repo.git","git_commit":"abc"}
+        assert json.loads(result.convs[0]["metadata"]) == {"session_id":"provider-123","session_kind":"main","session_kind_evidence":"inferred","originator":"codex-tui","client_version":"0.116.0","capture_mode":"transcript","timestamp_basis":"utc","git_repository":"https://example.com/repo.git","git_commit":"abc"}
 
     def test_subagent_session_metadata_is_normalized(self,tmp_path):
         from ai_convos.cli import parse_codex
@@ -230,7 +230,7 @@ class TestCodexParser:
             {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"}]}},
             {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}]))
         conv=parse_codex(tmp_path/".codex").convs[0]; meta=json.loads(conv["metadata"])
-        assert conv["model"] == "gpt-5.6-luna" and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","session_kind_evidence":"exact","agent_name":"Ada","agent_role":"explorer","agent_depth":1,"client_version":"0.116.0","capture_mode":"transcript"}
+        assert conv["model"] == "gpt-5.6-luna" and meta == {"session_id":"child","parent_session_id":"root","session_kind":"subagent","session_kind_evidence":"exact","agent_name":"Ada","agent_role":"explorer","agent_depth":1,"client_version":"0.116.0","capture_mode":"transcript","timestamp_basis":"utc"}
 
     def test_review_subagent_string_is_normalized(self,tmp_path):
         from ai_convos import cli
@@ -804,6 +804,18 @@ def test_latest_mtime_includes_export_formats(tmp_path):
 
 class TestTimestampParsing:
     """Tests for timestamp parsing utilities."""
+
+    @pytest.mark.parametrize('zone',['UTC','Europe/Berlin','America/Los_Angeles','Asia/Kathmandu'])
+    def test_absolute_provider_times_are_identical_across_device_timezones(self,monkeypatch,zone):
+        import time
+        from ai_convos.cli import ts_from_epoch,ts_from_iso
+        try:
+            with monkeypatch.context() as patch:
+                patch.setenv('TZ',zone)
+                time.tzset()
+                assert ts_from_epoch(1704110400)==ts_from_iso('2024-01-01T12:00:00Z')==ts_from_iso('2024-01-01T17:45:00+05:45')==datetime(2024,1,1,12)
+                assert ts_from_iso('2024-01-01T12:00:00')==datetime(2024,1,1,12)
+        finally: time.tzset()
 
     def test_epoch_to_datetime(self):
         """Parse Unix epoch timestamp."""
