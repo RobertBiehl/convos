@@ -66,12 +66,14 @@ def cli(client,*args,input=None,check=True): return as_user(client,client.convos
 def sha256(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 def package_version(client): return as_user(client,client.python,"-c","import importlib.metadata\nprint(importlib.metadata.version('convos'))").stdout.strip()
 def wait_health(url,process,timeout=15):
-    started=time.monotonic()
+    started,opener,last=time.monotonic(),urllib.request.build_opener(urllib.request.ProxyHandler({})),None
     while time.monotonic()-started<timeout:
         if process.poll() is not None: raise RuntimeError(f"relay exited ({process.returncode}): {process.stderr.read() if process.stderr else 'see relay.log'}")
-        try: return json.loads(urllib.request.urlopen(url+"/v1/health",timeout=.2).read())
-        except Exception: time.sleep(.1)
-    raise TimeoutError("relay did not become healthy")
+        try: return json.loads(opener.open(url+"/v1/health",timeout=1).read())
+        except Exception as error:
+            last=error
+            time.sleep(.1)
+    raise TimeoutError(f"relay did not become healthy: {last}")
 
 
 class Relay:
@@ -370,7 +372,7 @@ def canary_lane(released_venv,current_venv,released_commit,current_commit):
 
 def desktop_client(root,venv):
     root=Path(root).resolve()
-    return dict(root=root,venv=Path(venv).resolve(),env={**os.environ,'CONVOS_PROJECT_ROOT':str(root/'archive'),'CODEX_HOME':str(root/'codex'),'CLAUDE_CONFIG_DIR':str(root/'claude'),'CONVOS_SEMANTIC':'off'})
+    return dict(root=root,venv=Path(venv).resolve(),env={**os.environ,'CONVOS_PROJECT_ROOT':str(root/'archive'),'CODEX_HOME':str(root/'codex'),'CLAUDE_CONFIG_DIR':str(root/'claude'),'CONVOS_SEMANTIC':'off','NO_PROXY':'127.0.0.1,localhost,::1','no_proxy':'127.0.0.1,localhost,::1'})
 
 
 def desktop_cli(client,*args,input=None,check=True):
