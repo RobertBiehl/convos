@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.11.6b12
+
+- Reconcile exact provider identities and signed parser history across devices,
+  including source-backed repair of older timestamps. Store provider timestamps
+  in UTC so machines in different timezones converge on the same rows.
+- Preserve signed bodies, native edits, tool evidence, and parent relationships
+  during replay. Publish retained signed corrections when parser rows retire.
+  Reject ambiguous replacement chains and retain unresolved
+  history. Avoid creating edit history when only a portable file path changes.
+- Keep conversation capture working after worktree deletion or Git ownership
+  failures; retry provenance separately without starving other repositories.
+- Reuse alias dependency inventories and skip settled groups. Avoid blocking
+  relay startup on reverse DNS and return a failing exit status for SQL errors.
+- Gate publication on installed-package lifecycle tests on Linux and macOS:
+  same-account sync across timezones, account isolation, deleted worktrees,
+  offline recovery, repeated imports, and retained-archive upgrades from b11.
+  Extend the existing testbed with private, local-only transcript snapshots.
+
+All eight products are aligned to b12. Core schema 15 uses a validated backup
+before migration; parser epoch 8 reprocesses local sources. Released signed
+encodings remain readable. Historical gaps still require original source or
+signed evidence, and large archive replay can take time.
+
 ## 0.11.6b11
 
 - Preserve author-scoped native parent bindings during signed replay, and repair

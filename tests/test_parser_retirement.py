@@ -264,3 +264,22 @@ def test_retirement_does_not_publish_permanent_logical_deletion(tmp_path):
             db.execute("UPDATE messages SET content='A new observation' WHERE id=?",[physical])
         rows=[projection.signed_row(r) for r in projection.scan(db,state,changes={('messages',physical),('messages',current['msgs'][-1]['id'])},user=user) if r['kind'] in projection.TABLES]
         assert {(r['id'],r['state']) for r in rows}=={(physical,'active'),(current['msgs'][-1]['id'],'deleted')}
+
+
+@pytest.mark.parametrize('size',[1,500])
+def test_retired_native_proofs_enter_retained_publication_before_next_sync(tmp_path,size):
+    path,transcript,old,bodies,device,user,control=archive(tmp_path)
+    with core._core(path,purpose='test.retired_publication') as db:
+        core.init_schema(db)
+        before=db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]
+        import_current(db,transcript,size)
+        retired={row[0] for row in db.execute('SELECT source FROM parser_retired_rows').fetchall()}
+        expected={core.provenance_digest(b['proof']):b['row'] for b in bodies if b['row']['id'] in retired}
+        found={pid:json.loads(raw) for pid,raw in db.execute('SELECT proof_id,body FROM remote.row_conflicts').fetchall()}
+        assert expected and all(found.get(pid)==body for pid,body in expected.items())
+        # The normal incremental sync must revisit retained bodies even when their active rows are gone.
+        assert db.execute("SELECT max(generation) FROM archive_changes WHERE kind='retained.body'").fetchone()[0]>before
+        stable=db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]
+        core.restore_retired_proofs(db)
+        assert db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]==stable
+    assert set(expected)<=set().union(*projection.retained_proof_pages(path,'w',author=user,page=1))
