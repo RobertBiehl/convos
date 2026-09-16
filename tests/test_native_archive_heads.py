@@ -38,6 +38,17 @@ def retained(path,cfg):
     return [open_replica(env,bytes(32)) for env in row_replicas(path,cfg,'w',[],{1:bytes(32)})]
 
 
+def test_change_inventory_handles_repeated_capture_and_evidence_rows_across_pages(tmp_path):
+    with core.open_db(tmp_path/'archive.db',purpose='test.repeated.changes') as db:
+        core.init_schema(db)
+        rows=[(kind,str(i)) for i in range(600) for kind in ('messages','file_edits')]
+        for _ in range(3):
+            before=db.execute('SELECT messages_generation FROM retrieval_state').fetchone()[0]
+            with core._transaction(db): generation=core._archive_touch(db,rows+list(reversed(rows))+rows)
+            assert db.execute('SELECT count(*),min(generation),max(generation) FROM archive_changes').fetchone()==(1200,generation,generation)
+            assert db.execute('SELECT messages_generation FROM retrieval_state').fetchone()[0]==before+1
+
+
 @pytest.mark.parametrize('table,attribute,column,value',[
     ('conversations','convs','title','replacement'),('messages','msgs','content','replacement'),
     ('tool_calls','tools','output','"replacement"'),('attachments','attachs','filename','replacement'),

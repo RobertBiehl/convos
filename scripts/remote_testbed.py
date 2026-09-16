@@ -526,7 +526,7 @@ def _desktop_lane(root,venv,commit,baseline_venv=None):
             (evidence/f'edits-{index}.json').write_text(json.dumps(edits,indent=2)+'\n')
             expected_edits=native_edits[0]|native_edits[1] if index<2 else native_edits[2]
             if any(row['content']!='captured file contents' for row in edits) or not expected_edits<={row['id'] for row in edits if row['status']=='confirmed'}: raise AssertionError(f'client {index}: successful source edit lost its provider evidence')
-        untrusted={**a,'env':{**a['env'],'GIT_TEST_ASSUME_DIFFERENT_OWNER':'1'}}
+        untrusted={**a,'env':{**a['env'],'GIT_TEST_ASSUME_DIFFERENT_OWNER':'1','GIT_CONFIG_COUNT':'1','GIT_CONFIG_KEY_0':'safe.directory','GIT_CONFIG_VALUE_0':''}}
         repo=a['root']/'checkout'
         denied=run(('git','-C',repo,'status','--porcelain'),check=False,env=untrusted['env'])
         (evidence/'git-ownership.log').write_text(denied.stderr)

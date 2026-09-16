@@ -185,7 +185,7 @@ def provenance_digest(v): return hashlib.sha256(v if isinstance(v,bytes) else js
 def remote_id(author,table,source): return provenance_digest(f"{author}:{table}:{source}")[:16] if source is not None else None
 def _archive_touch(db,rows=()):
     generation=(db.execute("UPDATE archive_state SET generation=generation+1 WHERE singleton RETURNING generation").fetchone() or [0])[0]
-    (((rows) and (_insert_pages(db,"archive_changes",[(kind,entity,generation) for kind,entity in rows],mode=" OR REPLACE"))),((any(kind=="messages" for kind,_ in rows)) and (db.execute("UPDATE retrieval_state SET messages_generation=messages_generation+1 WHERE singleton"))))
+    (((rows) and (_insert_pages(db,"archive_changes",[(kind,entity,generation) for kind,entity in sorted(set(rows))],mode=" OR REPLACE"))),((any(kind=="messages" for kind,_ in rows)) and (db.execute("UPDATE retrieval_state SET messages_generation=messages_generation+1 WHERE singleton"))))
     return generation
 def archive_changes(db,since): return db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],db.execute("SELECT kind,entity FROM archive_changes WHERE generation>?",(since,)).fetchall()
 def archive_state(db): return (lambda state,local:(*state,local))(db.execute("SELECT archive_id::VARCHAR,generation FROM archive_state WHERE singleton").fetchone(),sum(db.execute(f"SELECT COUNT(*) FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name=? AND o.physical_row_id=x.id)",(table,)).fetchone()[0] for table in ARCHIVE_COLUMNS))
