@@ -6,7 +6,8 @@
   including source-backed repair of older timestamps. Store provider timestamps
   in UTC so machines in different timezones converge on the same rows.
 - Preserve signed bodies, native edits, tool evidence, and parent relationships
-  during replay. Reject ambiguous replacement chains and retain unresolved
+  during replay. Publish retained signed corrections when parser rows retire.
+  Reject ambiguous replacement chains and retain unresolved
   history. Avoid creating edit history when only a portable file path changes.
 - Keep conversation capture working after worktree deletion or Git ownership
   failures; retry provenance separately without starving other repositories.
