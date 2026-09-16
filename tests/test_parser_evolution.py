@@ -184,3 +184,90 @@ def test_tool_json_comparison_preserves_boolean_and_numeric_distinctions(tmp_pat
             actual=db.execute('SELECT input FROM tool_calls WHERE id=?',[current['id']]).fetchone()[0]
             assert json.dumps(json.loads(actual))==current['input']
         assert db.execute('SELECT count(*) FROM tool_calls').fetchone()==(4,)
+
+
+@pytest.mark.parametrize('blank_lines',[False,True])
+@pytest.mark.parametrize('changed',[False,True])
+def test_codex_legacy_messages_require_exact_transcript_backed_evidence(tmp_path,blank_lines,changed):
+    transcript=tmp_path/'rollout-2026-01-01T00-00-00-019a2f3d-9455-7820-b4f6-0beeb2bf1f6f.jsonl'
+    rows=[dict(type='session_meta',payload=dict(id='019a2f3d-9455-7820-b4f6-0beeb2bf1f6f')),
+          *[dict(type='response_item',timestamp=f'2026-01-01T00:00:0{i}Z',payload=dict(type='message',role='user',content=[dict(type='input_text',text=f'turn {i}')])) for i in range(1,4)]]
+    transcript.write_text(('\n\n' if blank_lines else '\n').join(map(json.dumps,rows)))
+    old=legacy_parsers.parse_codex_session(transcript)
+    cid=core.gen_id('codex','canonical')
+    current=core.parse_codex_session(transcript,{('codex',rows[0]['payload']['id']):cid})
+    with core._core(tmp_path/'db',purpose='test.codex_message_upgrade') as db:
+        core.init_schema(db)
+        core.upsert(db,core.ParseResult(convs=[old['conv']],msgs=[{**m,'parent_id':None} for m in old['msgs']]))
+        if changed: db.execute("UPDATE messages SET content='unique local evidence' WHERE id=?",[old['msgs'][0]['id']])
+        result=core.ParseResult(convs=[current['conv']],msgs=current['msgs'],message_lineage=current['message_lineage'])
+        core.upsert(db,result)
+        assert db.execute("SELECT count(*) FROM parser_retired_rows WHERE kind='messages'").fetchone()==(2 if changed else 3,)
+        assert db.execute('SELECT count(*) FROM messages').fetchone()==(4 if changed else 3,)
+        if changed: assert db.execute('SELECT content FROM messages WHERE id=?',[old['msgs'][0]['id']]).fetchone()==('unique local evidence',)
+        assert not core.archive_relationships(db)
+
+
+@pytest.mark.parametrize('reverse',[False,True])
+def test_codex_source_backed_retirement_replays_without_transcript(tmp_path,reverse):
+    transcript,parser,_,_,_=fixture(tmp_path,'codex')
+    transcript=transcript.rename(transcript.with_name('rollout-legacy.jsonl'))
+    old=legacy_parsers.parse_codex_session(transcript)
+    current=parser(transcript,{('codex','session'):core.gen_id('codex','canonical')})
+    path=tmp_path/'sender.db'
+    with core._core(path,purpose='test.codex_lineage') as db:
+        core.init_schema(db)
+        core.upsert(db,core.ParseResult(convs=[old['conv']],msgs=[{**m,'parent_id':None} for m in old['msgs']]))
+        core.upsert(db,core.ParseResult(convs=[current['conv']],msgs=current['msgs'],message_lineage=current['message_lineage']))
+        retained=[json.loads(v[0]) for v in db.execute('SELECT body FROM parser_retired_rows').fetchall()]
+        rows=retained+[core.logical_row(kind,core.ARCHIVE_COLUMNS[kind],v) for kind in ('conversations','messages') for v in db.execute(f"SELECT {','.join(core.ARCHIVE_COLUMNS[kind])} FROM {kind}").fetchall()]
+        assert db.execute('SELECT count(*) FROM messages').fetchone()==(1,)
+    _,device,user,control,*_=signed_edit_graph()
+    bodies=[dict(row=row,proof=row_proof(device,user,'w',1,row)) for row in rows]
+    transcript.unlink()
+    target=tmp_path/'receiver.db'
+    for body in reversed(bodies) if reverse else bodies: projection.apply_row_replicas(target,[body],'w',[control],local_user='reader')
+    with core._core(target,True,purpose='test.codex_replay') as db:
+        assert db.execute('SELECT count(*) FROM messages').fetchone()==(1,)
+        assert db.execute("SELECT count(*) FROM parser_retired_rows WHERE kind='messages'").fetchone()==(1,)
+        assert not core.archive_relationships(db)
+    assert projection.audit_rows(target,local_user='reader')['totals']['unavailable']==0
+
+
+def test_changed_edit_preserves_its_original_provider_result(tmp_path):
+    import duckdb
+    db=duckdb.connect()
+    core.init_schema(db)
+    conv=dict(id='c',source='claude-code',title='edit',created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata='{}')
+    message=dict(id='m',conversation_id='c',role='assistant',content='',thinking=None,created_at=None,model=None,metadata='{}',parent_id=None)
+    tool=dict(id='t',message_id='m',tool_name='Write',input='{}',output='"first result"',status='complete',duration_ms=None,created_at=None)
+    edit=dict(id='e',message_id='m',file_path='a.txt',edit_type='write',content='first contents',created_at=None,old_content=None)
+    evidence=dict(file_edit_id='e',status='confirmed',reason='provider_success',tool_call_id='t')
+    core.upsert(db,core.ParseResult(convs=[conv],msgs=[message],tools=[tool],edits=[edit],edit_evidence=[evidence]))
+    core.upsert(db,core.ParseResult(tools=[{**tool,'output':'"second result"'}],edits=[{**edit,'content':'second contents'}],edit_evidence=[evidence]))
+    assert db.execute('SELECT e.content,v.status,t.output FROM file_edits e JOIN provenance.file_edit_evidence v ON v.file_edit_id=e.id JOIN tool_calls t ON t.id=v.tool_call_id ORDER BY e.content').fetchall()==[('first contents','confirmed','"first result"'),('second contents','confirmed','"second result"')]
+    assert not core.archive_relationships(db)
+
+
+def test_upgrade_recovers_each_exact_signed_retired_variant_and_keeps_it(tmp_path):
+    _,device,user,control,rows,proofs,bodies,_=signed_edit_graph()
+    first=rows['tool_calls']
+    second={**first,'data':{**first['data'],'output':'later result'}}
+    p1=proofs['tool_calls']
+    p2=row_proof(device,user,'w',1,second,p1['revision'])
+    path=tmp_path/'retired.db'
+    signer=control['devices'][device['id']]
+    with core._core(path,purpose='test.retired_encodings') as db:
+        core.init_schema(db)
+        for body,proof in ((first,p1),(second,p2)):
+            core.project_row_proof(db,proof,signer['root_public'],signer['certificate'])
+            variant={**body,'data':{**body['data'],'created_at':str(body['data']['created_at'])+'.000000'}}
+            core._insert_pages(db,'parser_retired_rows',[('tool_calls','t','t',user,core.provenance_digest(variant),variant,{'id':'t','message_id':'m'},'current-tool')])
+        db.execute('UPDATE core_schema SET version=14')
+        core.init_schema(db)
+        restored=dict(db.execute('SELECT proof_id,body FROM remote.row_conflicts').fetchall())
+        assert {pid:json.loads(body) for pid,body in restored.items()}=={core.provenance_digest(p1):first,core.provenance_digest(p2):second}
+        core.retire_row_bodies(db,[('tool_calls','t',user,p['revision']) for p in (p1,p2)])
+        core.init_schema(db)
+        assert dict(db.execute('SELECT proof_id,body FROM remote.row_conflicts').fetchall())==restored
+    assert path.with_name(path.name+'.pre-v15.bak').is_file()

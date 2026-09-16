@@ -268,7 +268,7 @@ def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
 def test_sync_targets_provenance_but_full_reconciles_all(hooks, monkeypatch):
     _,data=hooks; monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); calls=[]; monkeypatch.setattr(cli,"capture_provenance",lambda *a,**k:calls.append((a,k)) or [])
     cli.sync(False,300,False,False,False,False,True); cli.sync(False,300,False,False,True,False,True)
-    assert calls==[((),{"edit_ids":set(),"conversation_ids":set()}),((),{})]
+    assert calls==[((),{"edit_ids":set(),"conversation_ids":set(),"strict":False}),((),{"strict":False})]
 
 def test_local_only_sync_imports_configured_agent_roots_without_web(hooks, tmp_path, monkeypatch):
     sessions, data = hooks; transcript(sessions/"local.jsonl", "offline codex history"); (sessions/"gone.jsonl").symlink_to(tmp_path/"missing-codex.jsonl"); claude=tmp_path/"claude"; project=claude/"projects"/"-repo"; project.mkdir(parents=True); (project/"local.jsonl").write_text("\n".join([json.dumps({"type":"system","timestamp":"2026-01-01T00:00:00Z","cwd":"/repo"}),json.dumps({"type":"human","timestamp":"2026-01-01T00:00:01Z","message":{"content":"offline claude history"}})])); (project/"gone.jsonl").symlink_to(tmp_path/"missing-claude.jsonl"); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); blocked = lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("local-only sync touched web"))

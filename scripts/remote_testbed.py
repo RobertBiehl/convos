@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run isolated multi-user Convos qualification lanes inside the Titan container."""
+"""Run persistent customer lifecycle checks locally or in the Titan test container."""
 import argparse
 import hashlib
 import json
@@ -16,10 +16,11 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
-from ai_convos.cli import archive_state, capture_provenance, init_schema
+from ai_convos.cli import archive_state, capture_provenance, init_schema, operation_lock
 
 USERS={"fresh":("convos-fresh-a","convos-fresh-b"),"canary":("convos-canary-a","convos-canary-b")}
 STATE=Path("/var/lib/convos-testbed")
@@ -55,7 +56,9 @@ def run(command,*,input=None,check=True,env=None):
     command=tuple(map(str,command))
     try: return subprocess.run(command,input=input,text=True,capture_output=True,check=check,env=env)
     except subprocess.CalledProcessError as error:
-        raise RuntimeError(f"command failed ({error.returncode}): {' '.join(command)}\n{error.stdout}{error.stderr}") from error
+        shown=['<redacted>' if i and command[i-1] in ('--recovery','--token','--password') else value for i,value in enumerate(command)]
+        output=re.sub(r'(Recovery key \(store offline\): )\S+',r'\1<redacted>',(error.stdout or '')+(error.stderr or ''))
+        raise RuntimeError(f"command failed ({error.returncode}): {' '.join(shown)}\n{output}") from None
 def as_user(client,*command,input=None,check=True):
     env=("env",f"HOME={client.home}",f"PATH={client.venv/'bin'}:/usr/bin:/bin",f"CONVOS_PROJECT_ROOT={client.root}")
     return run(("runuser","-u",client.user,"--",*env,*command),input=input,check=check)
@@ -65,7 +68,7 @@ def package_version(client): return as_user(client,client.python,"-c","import im
 def wait_health(url,process,timeout=15):
     started=time.monotonic()
     while time.monotonic()-started<timeout:
-        if process.poll() is not None: raise RuntimeError(f"relay exited: {process.stderr.read()}")
+        if process.poll() is not None: raise RuntimeError(f"relay exited ({process.returncode}): {process.stderr.read() if process.stderr else 'see relay.log'}")
         try: return json.loads(urllib.request.urlopen(url+"/v1/health",timeout=.2).read())
         except Exception: time.sleep(.1)
     raise TimeoutError("relay did not become healthy")
@@ -365,6 +368,194 @@ def canary_lane(released_venv,current_venv,released_commit,current_commit):
     print(json.dumps({"evidence":str(evidence_path),"lane":lane,"passed":True,**entry},sort_keys=True))
 
 
+def desktop_client(root,venv):
+    root=Path(root).resolve()
+    return dict(root=root,venv=Path(venv).resolve(),env={**os.environ,'CONVOS_PROJECT_ROOT':str(root/'archive'),'CODEX_HOME':str(root/'codex'),'CLAUDE_CONFIG_DIR':str(root/'claude'),'CONVOS_SEMANTIC':'off'})
+
+
+def desktop_cli(client,*args,input=None,check=True):
+    return run((client['venv']/'bin/convos',*args),input=input,check=check,env=client['env'])
+
+
+def desktop_transcript(client,session,worktree,turns=2):
+    path=client['root']/'codex/sessions'/f'rollout-2026-01-01T00-00-00-{session}.jsonl'
+    path.parent.mkdir(parents=True,exist_ok=True)
+    rows=[dict(type='session_meta',timestamp='2026-01-01T00:00:00Z',payload=dict(id=session,cwd=str(worktree),cli_version='qualification'))]
+    rows += [dict(type='response_item',timestamp=(datetime(2026,1,1)+timedelta(seconds=i+1)).isoformat()+'Z',payload=dict(type='message',role='user' if i%2==0 else 'assistant',content=[dict(type='input_text' if i%2==0 else 'output_text',text=f'canary {session} turn {i}')])) for i in range(turns)]
+    rows[1]['payload']['content'].append(dict(type='input_image',image_url='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg=='))
+    path.write_text('\n'.join(json.dumps(row) for row in rows)+'\n')
+    return path
+
+
+def desktop_claude_transcript(client,session,worktree):
+    path=client['root']/'claude/projects/checkout'/f'{session}.jsonl'
+    path.parent.mkdir(parents=True,exist_ok=True)
+    rows=[dict(type='system',sessionId=session,cwd=str(worktree)),
+          dict(type='user',uuid='prompt',timestamp='2026-01-01T00:00:01Z',message=dict(content='inspect created.txt')),
+          dict(type='assistant',uuid='answer',parentUuid='prompt',timestamp='2026-01-01T00:00:02Z',message=dict(content=[dict(type='thinking',thinking='inspect the captured file'),dict(type='tool_use',id='read-1',name='Read',input=dict(file_path='created.txt'))])),
+          dict(type='user',uuid='result',parentUuid='answer',timestamp='2026-01-01T00:00:03Z',message=dict(content=[dict(type='tool_result',tool_use_id='read-1',content='captured file contents')])),
+          dict(type='assistant',uuid='write',parentUuid='result',timestamp='2026-01-01T00:00:04Z',message=dict(content=[dict(type='tool_use',id='write-1',name='Write',input=dict(file_path='created.txt',content='captured file contents'))])),
+          dict(type='user',uuid='written',parentUuid='write',timestamp='2026-01-01T00:00:05Z',message=dict(content=[dict(type='tool_result',tool_use_id='write-1',content='file written')]))]
+    path.write_text('\n'.join(json.dumps(row) for row in rows)+'\n')
+    return path
+
+
+def desktop_inventory(client):
+    query="SELECT c.source,json_extract_string(c.metadata,'$.session_id') provider_session,m.role,m.content,m.thinking,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) provider_index,CAST(m.created_at AS VARCHAR) created FROM conversations c JOIN messages m ON m.conversation_id=c.id ORDER BY provider_session,created,m.role,m.content"
+    return json.loads(desktop_cli(client,'sql',query,'--format','json').stdout)
+
+
+def desktop_lane(root,venv,commit,baseline_venv=None):
+    root=Path(root).resolve()
+    with operation_lock(root.parent/f'.{root.name}.lock','customer lifecycle testbed',0): return _desktop_lane(root,venv,commit,baseline_venv)
+
+
+def _desktop_lane(root,venv,commit,baseline_venv=None):
+    import socket,uuid
+    root=Path(root).resolve()
+    marker=root/'testbed.json'
+    if root.exists() and any(root.iterdir()) and not marker.is_file(): raise ValueError(f'refusing non-testbed directory: {root}')
+    root.mkdir(parents=True,exist_ok=True)
+    os.chmod(root,0o700)
+    if marker.exists():
+        manifest=json.loads(marker.read_text())
+        if manifest.get('kind')!='convos-desktop-testbed-v1': raise ValueError('unknown testbed marker')
+    else:
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1',0))
+            port=sock.getsockname()[1]
+        manifest=dict(kind='convos-desktop-testbed-v1',port=port,session=str(uuid.uuid4()),runs=[])
+        marker.write_text(json.dumps(manifest,indent=2)+'\n')
+    with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+        sock.bind(('127.0.0.1',manifest['port']))
+    clients=[desktop_client(root/name,venv) for name in ('laptop','desktop','other-user')]
+    if baseline_venv: clients[1]=desktop_client(root/'desktop',baseline_venv)
+    url=f"http://127.0.0.1:{manifest['port']}"
+    evidence=root/f"run-{len(manifest['runs'])+1}-{int(time.time())}"
+    evidence.mkdir()
+    log=(evidence/'relay.log').open('w')
+    server=subprocess.Popen((Path(venv)/'bin/convos-server','serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
+    started=time.monotonic()
+    try:
+        wait_health(url,server)
+        a,b,c=clients
+        if not (a['root']/'archive/remote/config.json').exists():
+            output=desktop_cli(a,'remote','setup',url,'canary-alice','--device','laptop').stdout
+            recovery=re.search(r'Recovery key \(store offline\): (\S+)',output)
+            if not recovery: raise AssertionError('setup did not return a recovery key')
+            desktop_cli(b,'remote','recover',url,'canary-alice','--device','desktop','--recovery',recovery[1])
+            desktop_cli(c,'remote','setup',url,'canary-bob','--device','independent-author')
+        session,turns=manifest['session'],manifest.get('turns',2)
+        native_edits=[]
+        for client in clients:
+            repo=client['root']/'checkout'
+            if not repo.exists():
+                repo.mkdir(parents=True)
+                run(('git','-C',repo,'init','-q'))
+                run(('git','-C',repo,'-c','user.name=Convos Testbed','-c','user.email=convos-testbed@example.invalid','commit','--allow-empty','-qm','initial'))
+            worktree=repo/'.koder/worktrees/task'
+            if not worktree.exists():
+                worktree.parent.mkdir(parents=True,exist_ok=True)
+                run(('git','-C',repo,'worktree','add','--detach',worktree,'HEAD'))
+            path=desktop_transcript(client,session,worktree,2 if client is c else turns)
+            desktop_cli(client,'capture','codex',input=json.dumps(dict(transcript_path=str(path),hook_event_name='Stop')))
+            desktop_cli(client,'drain-hooks','--block')
+            path=desktop_claude_transcript(client,session+'-claude',worktree)
+            desktop_cli(client,'capture','claude-code',input=json.dumps(dict(transcript_path=str(path),hook_event_name='Stop')))
+            desktop_cli(client,'drain-hooks','--block')
+            native_edits.append({row['id'] for row in json.loads(desktop_cli(client,'sql',"SELECT e.id FROM file_edits e JOIN provenance.file_edit_evidence v ON v.file_edit_id=e.id WHERE e.content='captured file contents' AND v.status='confirmed'",'--format','json').stdout)})
+            if not native_edits[-1]: raise AssertionError('provider-confirmed source edit was not captured')
+        for iteration in range(3):
+            for index,client in enumerate(clients):
+                output=desktop_cli(client,'remote','sync')
+                (evidence/f'sync-{iteration}-{index}.log').write_text(output.stdout+output.stderr)
+        if baseline_venv:
+            for index,client in enumerate(clients):
+                (evidence/f'before-upgrade-{index}.json').write_text(json.dumps(desktop_inventory(client),indent=2)+'\n')
+            clients[1]=desktop_client(root/'desktop',venv)
+            for client in clients: desktop_cli(client,'sync','--local-only')
+            for iteration in range(3):
+                for index,client in enumerate(clients):
+                    output=desktop_cli(client,'remote','sync')
+                    (evidence/f'upgrade-{iteration}-{index}.log').write_text(output.stdout+output.stderr)
+        inventories=[desktop_inventory(client) for client in clients]
+        for index,values in enumerate(inventories):
+            (evidence/f'archive-{index}.json').write_text(json.dumps(values,indent=2)+'\n')
+            selected=[v for v in values if v['provider_session']==session]
+            expected=2 if index==2 else turns
+            if sorted(v['content'] for v in selected)!=sorted(f'canary {session} turn {i}' for i in range(expected)): raise AssertionError(f'client {index}: expected {expected} exact Codex turns, got {len(selected)}')
+            selected=[v for v in values if v['provider_session']==session+'-claude']
+            if len(selected)!=5: raise AssertionError(f'client {index}: expected five linked Claude turns, got {len(selected)}')
+            if [v['provider_index'] for v in selected]!=[1,2,3,4,5] or selected[1]['thinking']!='inspect the captured file': raise AssertionError(f'client {index}: Claude turn identity or thinking changed')
+        if inventories[0]!=inventories[1]: raise AssertionError('same-user clients disagree on current session content')
+        if len(inventories[2])!=7: raise AssertionError('independent user received private content')
+        server.terminate()
+        server.wait(timeout=10)
+        manifest['turns']=turns+2
+        path=desktop_transcript(a,session,a['root']/'checkout/.koder/worktrees/task',manifest['turns'])
+        desktop_cli(a,'capture','codex',input=json.dumps(dict(transcript_path=str(path),hook_event_name='Stop')))
+        desktop_cli(a,'drain-hooks','--block')
+        offline=desktop_cli(a,'remote','sync',check=False)
+        (evidence/'offline.log').write_text(offline.stdout+offline.stderr)
+        if offline.returncode==0: raise AssertionError('offline relay reported a successful sync')
+        server=subprocess.Popen((Path(venv)/'bin/convos-server','serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
+        wait_health(url,server)
+        for _ in range(3):
+            for client in clients: desktop_cli(client,'remote','sync')
+        current=[desktop_inventory(client) for client in clients]
+        if current[0]!=current[1] or current[2]!=inventories[2]: raise AssertionError('offline continuation did not converge privately')
+        for index in (0,1):
+            if sorted(v['content'] for v in current[index] if v['provider_session']==session)!=sorted(f'canary {session} turn {i}' for i in range(manifest['turns'])): raise AssertionError('offline continuation lost or duplicated a turn')
+        inventories=current
+        for client in clients:
+            repo=client['root']/'checkout'
+            run(('git','-C',repo,'worktree','remove',repo/'.koder/worktrees/task'))
+            desktop_cli(client,'sync','--full','--local-only')
+            desktop_cli(client,'remote','sync')
+        for _ in range(2):
+            for client in clients: desktop_cli(client,'remote','sync')
+        for index,client in enumerate(clients):
+            audit=json.loads(desktop_cli(client,'remote','audit','--format','json').stdout)
+            (evidence/f'audit-{index}.json').write_text(json.dumps(audit,indent=2)+'\n')
+            if audit['totals']['unavailable'] or any(v['rows'] for v in audit['relationships'].values()): raise AssertionError(f'client {index}: unresolved archive evidence')
+            if desktop_inventory(client)!=inventories[index]: raise AssertionError(f'client {index}: deleted worktree reimport changed content')
+            attachments=json.loads(desktop_cli(client,'sql','SELECT a.path,b.content_hash FROM attachments a JOIN attachment_bodies b ON b.attachment_id=a.id','--format','json').stdout)
+            if not attachments or any(not row['path'] or sha256(Path(row['path']))!=row['content_hash'] for row in attachments): raise AssertionError(f'client {index}: attachment body missing or changed')
+            edits=json.loads(desktop_cli(client,'sql',"SELECT e.id,e.content,v.status FROM file_edits e LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=e.id",'--format','json').stdout)
+            (evidence/f'edits-{index}.json').write_text(json.dumps(edits,indent=2)+'\n')
+            expected_edits=native_edits[0]|native_edits[1] if index<2 else native_edits[2]
+            if any(row['content']!='captured file contents' for row in edits) or not expected_edits<={row['id'] for row in edits if row['status']=='confirmed'}: raise AssertionError(f'client {index}: successful source edit lost its provider evidence')
+        untrusted={**a,'env':{**a['env'],'GIT_TEST_ASSUME_DIFFERENT_OWNER':'1'}}
+        repo=a['root']/'checkout'
+        denied=run(('git','-C',repo,'status','--porcelain'),check=False,env=untrusted['env'])
+        (evidence/'git-ownership.log').write_text(denied.stderr)
+        if denied.returncode==0 or 'dubious ownership' not in denied.stderr: raise AssertionError('Git ownership fault was not exercised')
+        ownership_session=session+f'-ownership-{len(manifest["runs"])+1}'
+        path=desktop_transcript(a,ownership_session,repo)
+        desktop_cli(untrusted,'capture','codex',input=json.dumps(dict(transcript_path=str(path),hook_event_name='Stop')))
+        desktop_cli(untrusted,'drain-hooks','--block')
+        if len([v for v in desktop_inventory(a) if v['provider_session']==ownership_session])!=2: raise AssertionError('Git ownership failure lost captured turns')
+        pending=json.loads(desktop_cli(a,'sql','SELECT count(*) pending FROM provenance.pending','--format','json').stdout)[0]['pending']
+        if not pending: raise AssertionError('failed Git enrichment was not retained for retry')
+        desktop_cli(a,'sync','--local-only')
+        for _ in range(3):
+            for client in clients: desktop_cli(client,'remote','sync')
+        after=[desktop_inventory(client) for client in clients]
+        if after[0]!=after[1] or after[2]!=inventories[2] or len([v for v in after[1] if v['provider_session']==ownership_session])!=2: raise AssertionError('ownership-failure capture did not converge privately')
+        outcome=dict(commit=commit,seconds=time.monotonic()-started,success=True,evidence=str(evidence))
+    except BaseException as error:
+        outcome=dict(commit=commit,seconds=time.monotonic()-started,success=False,error=f'{type(error).__name__}: {error}',evidence=str(evidence))
+        raise
+    finally:
+        manifest['runs'].append(outcome)
+        marker.write_text(json.dumps(manifest,indent=2)+'\n')
+        server.terminate()
+        server.wait(timeout=10)
+        log.close()
+    print(json.dumps(outcome,indent=2))
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest="command",required=True)
@@ -377,6 +568,11 @@ def main():
     canary.add_argument("--current-venv",type=Path,required=True)
     canary.add_argument("--released-commit",required=True)
     canary.add_argument("--current-commit",required=True)
+    desktop=sub.add_parser("desktop")
+    desktop.add_argument("--root",type=Path,required=True)
+    desktop.add_argument("--venv",type=Path,required=True)
+    desktop.add_argument("--commit",required=True)
+    desktop.add_argument("--baseline-venv",type=Path)
     seed_parser=sub.add_parser("seed")
     seed_parser.add_argument("root",type=Path)
     seed_parser.add_argument("cid")
@@ -389,5 +585,6 @@ def main():
     args=parser.parse_args()
     if args.command=="fresh": fresh_lane(args.venv,args.commit,args.released_venv)
     elif args.command=="canary": canary_lane(args.released_venv,args.current_venv,args.released_commit,args.current_commit)
+    elif args.command=="desktop": desktop_lane(args.root,args.venv,args.commit,args.baseline_venv)
     else: seed_archive(isolated_root(args.root),args.cid,args.title,args.prompt,args.cwd,args.edit,args.content,args.old_content)
 if __name__=="__main__": main()
