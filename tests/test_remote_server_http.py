@@ -26,6 +26,18 @@ def running_relay(tmp_path,monkeypatch):
     return run
 
 
+def test_relay_health_does_not_depend_on_reverse_dns(running_relay,monkeypatch):
+    def unavailable(*args): raise TimeoutError('reverse DNS unavailable')
+    monkeypatch.setattr(socket,'getfqdn',unavailable)
+    with running_relay() as (address,_):
+        conn=http.client.HTTPConnection(*address,timeout=2)
+        try:
+            conn.request('GET','/v1/health')
+            result=conn.getresponse()
+            assert result.status==200 and json.loads(result.read())==dict(ok=True,version=1)
+        finally: conn.close()
+
+
 def response(address,headers,body=b"",eof=False,path="/v1"):
     with socket.create_connection(address,timeout=2) as conn:
         conn.sendall(f"POST {path} HTTP/1.1\r\nHost: relay\r\n{headers}\r\n".encode()+body)

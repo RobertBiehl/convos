@@ -408,12 +408,12 @@ def desktop_inventory(client):
     return json.loads(desktop_cli(client,'sql',query,'--format','json').stdout)
 
 
-def desktop_lane(root,venv,commit,baseline_venv=None):
+def desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
     root=Path(root).resolve()
-    with operation_lock(root.parent/f'.{root.name}.lock','customer lifecycle testbed',0): return _desktop_lane(root,venv,commit,baseline_venv)
+    with operation_lock(root.parent/f'.{root.name}.lock','customer lifecycle testbed',0): return _desktop_lane(root,venv,commit,baseline_venv,relay_venv)
 
 
-def _desktop_lane(root,venv,commit,baseline_venv=None):
+def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
     import socket,uuid
     root=Path(root).resolve()
     marker=root/'testbed.json'
@@ -438,7 +438,8 @@ def _desktop_lane(root,venv,commit,baseline_venv=None):
     evidence=root/f"run-{len(manifest['runs'])+1}-{int(time.time())}"
     evidence.mkdir()
     log=(evidence/'relay.log').open('w')
-    server=subprocess.Popen((Path(venv)/'bin/convos-server','serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
+    relay=Path(relay_venv or venv)/'bin/convos-server'
+    server=subprocess.Popen((relay,'serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
     started=time.monotonic()
     try:
         wait_health(url,server,diagnostics=evidence/'relay-stack.log')
@@ -502,7 +503,7 @@ def _desktop_lane(root,venv,commit,baseline_venv=None):
         offline=desktop_cli(a,'remote','sync',check=False)
         (evidence/'offline.log').write_text(offline.stdout+offline.stderr)
         if offline.returncode==0: raise AssertionError('offline relay reported a successful sync')
-        server=subprocess.Popen((Path(venv)/'bin/convos-server','serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
+        server=subprocess.Popen((relay,'serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
         wait_health(url,server,diagnostics=evidence/'relay-restart-stack.log')
         for _ in range(3):
             for client in clients: desktop_cli(client,'remote','sync')
@@ -551,6 +552,7 @@ def _desktop_lane(root,venv,commit,baseline_venv=None):
         outcome=dict(commit=commit,seconds=time.monotonic()-started,success=False,error=f'{type(error).__name__}: {error}',evidence=str(evidence))
         raise
     finally:
+        outcome['relay']=str(relay)
         manifest['runs'].append(outcome)
         marker.write_text(json.dumps(manifest,indent=2)+'\n')
         server.terminate()
@@ -576,6 +578,7 @@ def main():
     desktop.add_argument("--venv",type=Path,required=True)
     desktop.add_argument("--commit",required=True)
     desktop.add_argument("--baseline-venv",type=Path)
+    desktop.add_argument("--relay-venv",type=Path)
     seed_parser=sub.add_parser("seed")
     seed_parser.add_argument("root",type=Path)
     seed_parser.add_argument("cid")
@@ -588,6 +591,6 @@ def main():
     args=parser.parse_args()
     if args.command=="fresh": fresh_lane(args.venv,args.commit,args.released_venv)
     elif args.command=="canary": canary_lane(args.released_venv,args.current_venv,args.released_commit,args.current_commit)
-    elif args.command=="desktop": desktop_lane(args.root,args.venv,args.commit,args.baseline_venv)
+    elif args.command=="desktop": desktop_lane(args.root,args.venv,args.commit,args.baseline_venv,args.relay_venv)
     else: seed_archive(isolated_root(args.root),args.cid,args.title,args.prompt,args.cwd,args.edit,args.content,args.old_content)
 if __name__=="__main__": main()
