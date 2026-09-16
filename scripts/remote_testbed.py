@@ -404,7 +404,7 @@ def desktop_claude_transcript(client,session,worktree):
 
 
 def desktop_inventory(client):
-    query="SELECT c.source,json_extract_string(c.metadata,'$.session_id') provider_session,m.role,m.content,m.thinking,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) provider_index,CAST(m.created_at AS VARCHAR) created FROM conversations c JOIN messages m ON m.conversation_id=c.id ORDER BY provider_session,created,m.role,m.content"
+    query="SELECT c.source,json_extract_string(c.metadata,'$.session_id') provider_session,coalesce(co.source_row_id,c.id) conversation_id,coalesce(mo.source_row_id,m.id) message_id,coalesce(po.source_row_id,m.parent_id) parent_id,m.role,m.content,m.thinking,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) provider_index,CAST(m.created_at AS VARCHAR) created FROM conversations c JOIN messages m ON m.conversation_id=c.id LEFT JOIN remote.row_origins co ON co.table_name='conversations' AND co.physical_row_id=c.id LEFT JOIN remote.row_origins mo ON mo.table_name='messages' AND mo.physical_row_id=m.id LEFT JOIN remote.row_origins po ON po.table_name='messages' AND po.physical_row_id=m.parent_id ORDER BY provider_session,created,m.role,m.content"
     return json.loads(desktop_cli(client,'sql',query,'--format','json').stdout)
 
 

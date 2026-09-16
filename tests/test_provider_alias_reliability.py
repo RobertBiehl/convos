@@ -218,6 +218,21 @@ def test_cyclic_retirement_cannot_remove_every_current_message(tmp_path):
         assert core.archive_relationships(db)=={}
 
 
+@pytest.mark.parametrize('replacement',['missing','orphan','present'])
+def test_historical_retirement_waits_for_a_present_replacement(tmp_path,replacement):
+    with duckdb.connect(str(tmp_path/'history.db')) as db:
+        core.init_schema(db)
+        db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('c','codex','{}')")
+        db.execute("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('old','c','user','retained message','{}')")
+        body=core.typed_logical_rows(db,[('messages','old','old','','active')])[('messages','old','old','','active')]
+        core._insert_pages(db,'parser_retired_rows',[('messages','old','old','',core.provenance_digest(body),body,dict(conversation_id='c',parent_id=None),'new')])
+        if replacement!='missing': db.execute("INSERT INTO messages SELECT 'new',* EXCLUDE(id) FROM messages WHERE id='old'")
+        if replacement=='orphan': db.execute("UPDATE messages SET parent_id='missing' WHERE id='new'")
+        core.retire_parser_rows(db)
+        assert set(db.execute('SELECT id,content FROM messages').fetchall())=={(mid,'retained message') for mid in (['old'] if replacement=='missing' else ['old','new'] if replacement=='orphan' else ['new'])}
+        assert db.execute('SELECT count(*) FROM parser_retired_rows').fetchone()==(1,)
+
+
 @pytest.mark.parametrize('historical_reverse',[False,True])
 def test_alias_canonical_direction_supersedes_reverse_parser_history(tmp_path,historical_reverse):
     root,path,identity,device,user,cfg,_=archive(tmp_path,False)
