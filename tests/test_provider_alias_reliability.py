@@ -275,6 +275,35 @@ def test_semantic_proof_arrival_invalidates_settled_sync_without_row_mutation(tm
     assert before[:4]==after[:4] and before[4]<after[4]
 
 
+@pytest.mark.parametrize('evidence',['valid','wrong_hash','cycle','fork'])
+@pytest.mark.parametrize('settled',[False,True])
+def test_alias_normalizes_only_exact_unambiguous_source_lineage(tmp_path,evidence,settled):
+    root,path,identity,device,user,cfg,_=archive(tmp_path,False)
+    ids=sorted(core.gen_id('codex',str(i)) for i in range(3))
+    if settled:
+        accept(root,identity,device,user,SESSION,['a','b'])
+        assert projection.reconcile_provider_aliases(path,cfg,'personal')['changed']==1
+    with duckdb.connect(str(path)) as db:
+        db.execute('DELETE FROM messages')
+        db.execute("DELETE FROM remote.row_proofs WHERE row_kind='messages'")
+        selected=ids if evidence=='fork' else ids[:2]
+        db.executemany("INSERT INTO messages(id,conversation_id,role,content,created_at,metadata) VALUES (?,'a','user','same event',?,?)",[(mid,f'2026-01-01T{hour}:00:00',json.dumps(dict(provider_index=1))) for mid,hour in zip(selected,('16','00','01'))])
+        claims=[('messages',mid,mid,user,'active') for mid in selected]
+        hashes={claim[1]:core.provenance_digest(body) for claim,body in core.typed_logical_rows(db,claims).items()}
+        links=[(ids[0],ids[1])]+([(ids[1],ids[0])] if evidence=='cycle' else [(ids[0],ids[2])] if evidence=='fork' else [])
+        records=[dict(old_id=old,old_hash='0'*64 if evidence=='wrong_hash' else hashes[old],current_id=new,current_hash=hashes[new]) for old,new in links]
+        metadata=json.loads(db.execute("SELECT metadata FROM conversations WHERE id='a'").fetchone()[0])
+        db.execute("UPDATE conversations SET metadata=? WHERE id='a'",[json.dumps({**metadata,'convos_message_lineage':dict(v=1,records=records)})])
+    attest(tmp_path,path,cfg)
+    accept(root,identity,device,user,SESSION,['a','b'])
+    assert projection.reconcile_provider_aliases(path,cfg,'personal')['changed']==(1 if not settled or evidence=='valid' else 0)
+    with duckdb.connect(str(path),read_only=True) as db:
+        found=db.execute("SELECT id,created_at::VARCHAR FROM messages ORDER BY id").fetchall()
+        assert found==[(ids[0],'2026-01-01 00:00:00')] if evidence=='valid' else len(found)==len(selected)
+        assert not core.archive_relationships(db)
+    assert projection.audit_rows(path,local_user=user)['totals']['unavailable']==0
+
+
 def test_missing_received_evidence_is_not_published_as_an_author_verdict():
     from ai_convos_remote import _edit_record
     for reason in ('signed_replica_missing_evidence','signed_evidence_conflict'):
@@ -303,3 +332,25 @@ def test_alias_reconciles_independent_native_changes_but_preserves_content_confl
         if not conflict: assert json.loads(db.execute("SELECT metadata FROM conversations WHERE id='a'").fetchone()[0])['parser']=='new'
         else: assert db.execute('SELECT count(*) FROM conversations').fetchone()==(2,)
     assert projection.audit_rows(path,local_user=user)['totals']['unavailable']==0
+
+
+@pytest.mark.parametrize('parent_evidence',['valid','wrong_hash','fork','cycle'])
+def test_timestamp_repair_requires_exact_retired_parent_lineage(parent_evidence):
+    def message(key,parent,stamp,index):
+        return core.logical_row('messages',list(data:=dict(id=key,conversation_id='a',role='user',content='event',thinking=None,created_at=stamp,model=None,metadata=dict(provider_index=index),parent_id=parent)),list(data.values()))
+    old_parent,new_parent,old,new,alternate=[core.gen_id('codex',label) for label in ('old-parent','new-parent','old','new','alternate')]
+    parent=message(new_parent,None,'2026-01-01T00:00:01',0)
+    retired=message(old_parent,None,'2026-01-01T00:00:01',0)
+    former=message(old,old_parent,'2025-12-31T16:00:02',1)
+    current=message(new,new_parent,'2026-01-01T00:00:02',1)
+    rows=[parent,{**former,'data':{**former['data'],'parent_id':new_parent}},current]
+    records=[dict(old_id=old_parent,old_hash=projection.digest(retired),current_id=new_parent,current_hash=projection.digest(parent)),dict(old_id=old,old_hash=projection.digest(former),current_id=new,current_hash=projection.digest(current))]
+    if parent_evidence=='wrong_hash': records[0]['old_hash']='0'*64
+    if parent_evidence=='fork': records.append({**records[0],'current_id':alternate})
+    if parent_evidence=='cycle': records.append(dict(old_id=new_parent,old_hash=projection.digest(parent),current_id=old_parent,current_hash=projection.digest(retired)))
+    carrier=core.logical_row('conversations',list(data:={**dict.fromkeys(core.ROW_FIELDS_V1['conversations']), 'id':'a','source':'codex','metadata':dict(convos_message_lineage=dict(v=1,records=records))}),list(data.values()))
+    revisions,lineage=projection._alias_message_plan([(row,{},True,{},None) for row in [carrier,*rows]],'codex',['a'],[retired])
+    assert bool(lineage)==(parent_evidence=='valid')
+    if parent_evidence=='valid':
+        assert {(row['data']['created_at'],row['data']['parent_id']) for row,*_ in revisions if row['kind']=='messages'}=={('2026-01-01T00:00:02',new_parent)}
+    else: assert revisions==[]

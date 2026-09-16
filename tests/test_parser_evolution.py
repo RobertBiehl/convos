@@ -271,3 +271,26 @@ def test_upgrade_recovers_each_exact_signed_retired_variant_and_keeps_it(tmp_pat
         core.init_schema(db)
         assert dict(db.execute('SELECT proof_id,body FROM remote.row_conflicts').fetchall())==restored
     assert path.with_name(path.name+'.pre-v15.bak').is_file()
+
+
+def test_source_replay_repairs_all_event_timestamps_without_content_history(tmp_path):
+    import duckdb
+    stamp=core.ts_from_iso('2026-01-01T00:00:00Z')
+    conv=dict(id='c',source='claude-code',title='source',created_at=stamp,updated_at=stamp,model=None,cwd=None,git_branch=None,project_id=None,metadata=json.dumps(dict(capture_mode='transcript',timestamp_basis='utc')))
+    msg=dict(id='m',conversation_id='c',role='assistant',content='',thinking=None,created_at=stamp,model=None,metadata='{}',parent_id=None)
+    tool=dict(id='t',message_id='m',tool_name='Write',input='{}',output='"written"',status='complete',duration_ms=None,created_at=stamp)
+    edit=dict(id='e',message_id='m',file_path='x.txt',edit_type='write',content='source text',created_at=stamp,old_content=None)
+    evidence=dict(file_edit_id='e',status='confirmed',reason='provider_success',tool_call_id='t')
+    result=core.ParseResult([conv],[msg],tools=[tool],edits=[edit],edit_evidence=[evidence])
+    with duckdb.connect(str(tmp_path/'archive.db')) as db:
+        core.init_schema(db)
+        core.upsert(db,copy.deepcopy(result))
+        for table in ('conversations','messages','tool_calls','file_edits'): db.execute(f"UPDATE {table} SET created_at=created_at-INTERVAL '8 hours'")
+        db.execute("UPDATE conversations SET updated_at=updated_at+INTERVAL '8 hours',metadata=CAST(? AS JSON)",[json.dumps(dict(capture_mode='transcript'))])
+        core.upsert(db,copy.deepcopy(result))
+        for table in ('conversations','messages','tool_calls','file_edits'): assert db.execute(f'SELECT created_at FROM {table}').fetchall()==[(stamp,)]
+        assert db.execute('SELECT updated_at FROM conversations').fetchall()==[(stamp,)]
+        assert db.execute('SELECT * FROM provenance.file_edit_evidence').fetchall()==[('e','confirmed','provider_success','t')]
+        before=core.archive_state(db)
+        core.upsert(db,copy.deepcopy(result))
+        assert core.archive_state(db)==before

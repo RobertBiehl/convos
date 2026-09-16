@@ -1,5 +1,5 @@
 """Portable record/event projection. The immutable relay ledger can rebuild every local view."""
-import contextlib, duckdb, hashlib, json, os, re, shutil, sqlite3, time
+import contextlib, duckdb, hashlib, itertools, json, os, re, shutil, sqlite3, time
 from datetime import date, datetime
 from functools import lru_cache
 from importlib.metadata import entry_points
@@ -10,7 +10,7 @@ from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
-STATE_VERSION,ALIAS_VERSION="4",11
+STATE_VERSION,ALIAS_VERSION="4",12
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -605,11 +605,37 @@ def _alias_pages(db_path,user,member_physical,page=500):
         if not rows: return
         yield generation,rows
         archive_yield(db_path)
-def _alias_message_plan(rows,source,members):
+def _alias_terminal(links,key):
+    seen=set()
+    while key in links and key not in seen:
+        seen.add(key)
+        key=links[key]
+    return key if key is not None and key not in seen else None
+
+def _alias_message_plan(rows,source,members,history=()):
     # Authenticated provider event indices and complete payloads prove equivalence.
     messages={row['id']:row for row,*_ in rows if row['kind']=='messages'}
+    records=[record for row,*_ in rows if row['kind']=='conversations' for meta in [row['data']['metadata']] if isinstance(meta,dict) for lineage in [meta.get('convos_message_lineage')] if isinstance(lineage,dict) and type(lineage.get('v')) is int and lineage['v']==1 and isinstance(lineage.get('records'),list) for record in lineage['records'] if isinstance(record,dict) and set(record)=={'old_id','old_hash','current_id','current_hash'} and all(isinstance(record[k],str) and re.fullmatch('[0-9a-f]{'+str(64 if k.endswith('hash') else 16)+'}',record[k]) for k in record)]
+    declared={key:next(iter(targets)) if len(targets:={r['current_id'] for r in group})==1 else None for key,group in itertools.groupby(sorted(records,key=lambda r:r['old_id']),key=lambda r:r['old_id'])}
+    records=[r for r in records if _alias_terminal(declared,r['old_id']) is not None]
+    bodies={key:[row] for key,row in messages.items()}
+    for row in history:
+        if row['id'] not in messages: bodies.setdefault(row['id'],[]).append(row)
+    equivalent,pairs={},set()
+    while True:
+        fresh={(r['old_id'],r['current_id']) for r in records if r['old_id']!=r['current_id'] and all(any(matching_logical_row({**row,'data':{**row['data'],'parent_id':parent}},expected) is not None for row in bodies.get(key,[]) for parent in {row['data']['parent_id'],*equivalent.get(row['data']['parent_id'],())}) for key,expected in ((r['old_id'],r['old_hash']),(r['current_id'],r['current_hash'])))}-pairs
+        if not fresh: break
+        pairs|=fresh
+        for old,new in fresh:
+            merged={old,new,*equivalent.get(old,()),*equivalent.get(new,())}
+            for key in merged: equivalent[key]=merged
+    pairs=sorted(pairs)
+    links={key:next(iter(targets)) for key,group in itertools.groupby(pairs,key=lambda pair:pair[0]) if len(targets:={target for _,target in group})==1}
+    normalized={key:target for key in links if key in messages and (target:=_alias_terminal(links,key)) in messages}
+    # Only exact, source-backed lineage can replace an older parser's payload or local timestamp.
+    messages={key:{**row,'data':messages[normalized[key]]['data']} if key in normalized else row for key,row in messages.items()}
     indices={key:meta['provider_index'] for key,row in messages.items() for meta in [row['data']['metadata']] if isinstance(meta,dict) and type(meta.get('provider_index')) is int and meta['provider_index']>=0}
-    lineages={key:value['records'] for key,row in messages.items() for value in [(row['data']['metadata'] or {}).get('convos_tool_lineage')] if isinstance(value,dict) and set(value)=={'v','records'} and type(value['v']) is int and value['v']==1 and isinstance(value['records'],list) and all(isinstance(r,dict) and set(r)=={'old_id','old_hash','current_id','current_hash'} and all(isinstance(r[k],str) and re.fullmatch('[0-9a-f]{'+str(64 if k.endswith('hash') else 16)+'}',r[k]) for k in r) for r in value['records'])}
+    lineages={key:value['records'] for row,*_ in rows if row['kind']=='messages' for key in [row['id']] for value in [(row['data']['metadata'] or {}).get('convos_tool_lineage')] if isinstance(value,dict) and set(value)=={'v','records'} and type(value['v']) is int and value['v']==1 and isinstance(value['records'],list) and all(isinstance(r,dict) and set(r)=={'old_id','old_hash','current_id','current_hash'} and all(isinstance(r[k],str) and re.fullmatch('[0-9a-f]{'+str(64 if k.endswith('hash') else 16)+'}',r[k]) for k in r) for r in value['records'])}
     signatures,groups={},{}
     for key in indices:
         chain,visiting=[],set()
@@ -623,11 +649,11 @@ def _alias_message_plan(rows,source,members):
         for member in reversed(chain):
             if member not in signatures:
                 data=messages[member]['data']
-                metadata={k:v for k,v in data['metadata'].items() if k!='convos_tool_lineage' or member not in lineages}
+                metadata={k:v for k,v in data['metadata'].items() if k!='convos_tool_lineage' or member not in lineages and normalized.get(member) not in lineages}
                 signatures[member]=digest({**data,'created_at':datetime.fromisoformat(data['created_at']).isoformat(timespec='microseconds') if data['created_at'] else None,'metadata':metadata,'parent_id':signatures.get(data['parent_id'],data['parent_id'])})
         groups.setdefault((indices[key],signatures[key]),[]).append(key)
     replacements={old:min(keys) for keys in groups.values() for old in keys if old!=min(keys)}
-    revised=[({**row,'data':{**row['data'],**{column:replacements[row['data'][column]] for column,parent in FKS.get(row['kind'],()) if parent=='messages' and row['data'][column] in replacements}}},head,native,parents,path) for row,head,native,parents,path in rows]
+    revised=[({**row,'data':{**row['data'],**{column:replacements[row['data'][column]] for column,parent in FKS.get(row['kind'],()) if parent=='messages' and row['data'][column] in replacements}}},head,native,parents,path) for original,head,native,parents,path in rows for row in [messages[original['id']] if original['kind']=='messages' else original]]
     carriers={min(keys):sorted({canon(record):record for key in keys for record in lineages.get(key,[])}.values(),key=canon) for keys in groups.values() if len(keys)>1}
     revised=[({**row,'data':{**row['data'],'metadata':{**row['data']['metadata'],'convos_tool_lineage':{'v':1,'records':carriers[row['id']]}}}} if row['kind']=='messages' and carriers.get(row['id']) else row,head,native,parents,path) for row,head,native,parents,path in revised]
     current={row['id']:row for row,*_ in revised if row['kind']=='messages'}
@@ -659,7 +685,7 @@ def _alias_fingerprints(db,user,groups):
     # One shared dependency scan replaces thousands of repeated conversation-tree scans.
     query="""WITH members AS (SELECT x.* FROM UNNEST(from_json(?,'[{"alias":"VARCHAR","member":"VARCHAR"}]')) t(x)), roots AS (
       SELECT alias,member physical FROM members UNION SELECT m.alias,o.physical_row_id FROM members m JOIN remote.row_origins o ON o.table_name='conversations' AND o.author_user_id=? AND o.source_row_id=m.member), selected AS (
-      SELECT alias,'conversations' kind,physical FROM roots UNION SELECT r.alias,'messages',m.id FROM roots r JOIN messages m ON m.conversation_id=r.physical
+      SELECT alias,'conversations' kind,physical FROM roots UNION SELECT r.alias,'messages',p.physical FROM roots r JOIN parser_retired_rows p ON p.kind='messages' AND json_extract_string(p.body,'$.data.conversation_id')=r.physical UNION SELECT r.alias,'messages',m.id FROM roots r JOIN messages m ON m.conversation_id=r.physical
       UNION SELECT r.alias,'artifacts',a.id FROM roots r JOIN artifacts a ON a.conversation_id=r.physical
       UNION SELECT r.alias,'tool_calls',x.id FROM roots r JOIN messages m ON m.conversation_id=r.physical JOIN tool_calls x ON x.message_id=m.id
       UNION SELECT r.alias,'attachments',x.id FROM roots r JOIN messages m ON m.conversation_id=r.physical JOIN attachments x ON x.message_id=m.id
@@ -714,7 +740,9 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
         canonical=members[0]
         try:
             with contextlib.closing(open_db(db_path,True,purpose="remote.alias.members")) as db: member_heads,member_physical,active,member_native,binding=_alias_members(db,user,source,session,members,canonical)
-            with contextlib.closing(open_db(db_path,True,purpose='remote.alias.present')) as db: present={m for m,p in member_physical.items() if db.execute('SELECT 1 FROM conversations WHERE id=?',[p]).fetchone()}
+            with contextlib.closing(open_db(db_path,True,purpose='remote.alias.present')) as db:
+                present={m for m,p in member_physical.items() if db.execute('SELECT 1 FROM conversations WHERE id=?',[p]).fetchone()}
+                history=[body for raw,expected in db.execute("SELECT body,content_hash FROM parser_retired_rows WHERE kind='messages' AND (author=? OR author='') AND json_extract_string(body,'$.data.conversation_id') IN (SELECT UNNEST(?))",[user,members]).fetchall() if digest(body:=json.loads(raw))==expected]
             losers,moving,message_rows,attachment_paths=set(members)-{canonical},False,[],[]
             for generation,rows in _alias_pages(db_path,user,member_physical):
                 for row,head,native,parent_map,path in rows:
@@ -725,11 +753,11 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
                         required(body.is_file() and not body.is_symlink() and file_hash(body)==row['data']['body_hash'],ValueError(f"provider alias attachment body unavailable: {row['id']}"))
                         if not path: attachment_paths.append((parent_map.get(('attachments',row['id']),row['id'] if native else foreign_id(user,'attachments',row['id'])),body))
                     moving|=row["kind"] in ("messages","artifacts") and row["data"]["conversation_id"] in losers or digest(row)!=head["content_hash"]
-                    if row['kind']=='messages': message_rows.append((row,head,native,parent_map,path))
+                    if row['kind'] in ('conversations','messages'): message_rows.append((row,head,native,parent_map,path))
         except ValueError as e:
             result["blocked"][object_id]=str(e)
             continue
-        if not moving and present=={canonical} and not binding and not attachment_paths and not _alias_message_plan(message_rows,source,members)[1]:
+        if not moving and present=={canonical} and not binding and not attachment_paths and not _alias_message_plan(message_rows,source,members,history)[1]:
             result["settled"]+=1
             continue
         if not backed_up:
@@ -747,7 +775,7 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
                     (required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during provider alias reconciliation; retry")),project_workspace_controls(db,controls),project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native,parent_map),proof,pid in zip(rows,proofs,project_row_proofs(db,proofs,signer["root_public"],signer["certificate"]))]))
                 changed=True
             current=[item for generation,values in _alias_pages(db_path,user,member_physical) for item in values]
-            revisions,lineage=_alias_message_plan(current,source,members)
+            revisions,lineage=_alias_message_plan(current,source,members,history)
             if lineage:
                 row,head,native,parent_map,path=next(item for item in current if item[0]['kind']=='conversations' and item[0]['id']==canonical)
                 metadata=row['data']['metadata']

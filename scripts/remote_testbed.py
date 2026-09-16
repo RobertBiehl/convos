@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
-from ai_convos.cli import archive_state, capture_provenance, init_schema, operation_lock
+from ai_convos.cli import archive_state, atomic_json, capture_provenance, init_schema, operation_lock
 
 USERS={"fresh":("convos-fresh-a","convos-fresh-b"),"canary":("convos-canary-a","convos-canary-b")}
 STATE=Path("/var/lib/convos-testbed")
@@ -373,7 +373,7 @@ def canary_lane(released_venv,current_venv,released_commit,current_commit):
 
 def desktop_client(root,venv):
     root=Path(root).resolve()
-    return dict(root=root,venv=Path(venv).resolve(),env={**os.environ,'CONVOS_PROJECT_ROOT':str(root/'archive'),'CODEX_HOME':str(root/'codex'),'CLAUDE_CONFIG_DIR':str(root/'claude'),'CONVOS_SEMANTIC':'off','NO_PROXY':'127.0.0.1,localhost,::1','no_proxy':'127.0.0.1,localhost,::1'})
+    return dict(root=root,venv=Path(venv).resolve(),env={**os.environ,'CONVOS_PROJECT_ROOT':str(root/'archive'),'CODEX_HOME':str(root/'codex'),'CLAUDE_CONFIG_DIR':str(root/'claude'),'TZ':{'laptop':'America/Los_Angeles','desktop':'UTC','other-user':'Asia/Kathmandu'}[root.name],'CONVOS_SEMANTIC':'off','NO_PROXY':'127.0.0.1,localhost,::1','no_proxy':'127.0.0.1,localhost,::1'})
 
 
 def desktop_cli(client,*args,input=None,check=True):
@@ -404,7 +404,7 @@ def desktop_claude_transcript(client,session,worktree):
 
 
 def desktop_inventory(client):
-    query="SELECT c.source,json_extract_string(c.metadata,'$.session_id') provider_session,coalesce(co.source_row_id,c.id) conversation_id,coalesce(mo.source_row_id,m.id) message_id,coalesce(po.source_row_id,m.parent_id) parent_id,m.role,m.content,m.thinking,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) provider_index,CAST(m.created_at AS VARCHAR) created FROM conversations c JOIN messages m ON m.conversation_id=c.id LEFT JOIN remote.row_origins co ON co.table_name='conversations' AND co.physical_row_id=c.id LEFT JOIN remote.row_origins mo ON mo.table_name='messages' AND mo.physical_row_id=m.id LEFT JOIN remote.row_origins po ON po.table_name='messages' AND po.physical_row_id=m.parent_id ORDER BY provider_session,created,m.role,m.content"
+    query="SELECT c.source,json_extract_string(c.metadata,'$.session_id') provider_session,coalesce(co.source_row_id,c.id) conversation_id,coalesce(mo.source_row_id,m.id) message_id,coalesce(po.source_row_id,m.parent_id) parent_id,m.role,m.content,m.thinking,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) provider_index,CAST(m.created_at AS VARCHAR) created FROM conversations c JOIN messages m ON m.conversation_id=c.id LEFT JOIN remote.row_origins co ON co.table_name='conversations' AND co.physical_row_id=c.id LEFT JOIN remote.row_origins mo ON mo.table_name='messages' AND mo.physical_row_id=m.id LEFT JOIN remote.row_origins po ON po.table_name='messages' AND po.physical_row_id=m.parent_id ORDER BY 1,2,3,10,9,4"
     return json.loads(desktop_cli(client,'sql',query,'--format','json').stdout)
 
 
@@ -428,7 +428,7 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
             sock.bind(('127.0.0.1',0))
             port=sock.getsockname()[1]
         manifest=dict(kind='convos-desktop-testbed-v1',port=port,session=str(uuid.uuid4()),runs=[])
-        marker.write_text(json.dumps(manifest,indent=2)+'\n')
+        atomic_json(marker,manifest)
     with socket.socket() as sock:
         sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
         sock.bind(('127.0.0.1',manifest['port']))
@@ -522,7 +522,7 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
         for index,client in enumerate(clients):
             audit=json.loads(desktop_cli(client,'remote','audit','--format','json').stdout)
             (evidence/f'audit-{index}.json').write_text(json.dumps(audit,indent=2)+'\n')
-            if audit['totals']['unavailable'] or any(v['rows'] for v in audit['relationships'].values()): raise AssertionError(f'client {index}: unresolved archive evidence')
+            if audit['totals'].get('unavailable',0) or any(v['rows'] for v in audit['relationships'].values()): raise AssertionError(f'client {index}: unresolved archive evidence')
             actual=desktop_inventory(client)
             (evidence/f'reimport-{index}.json').write_text(json.dumps(dict(expected=inventories[index],actual=actual),indent=2)+'\n')
             if actual!=inventories[index]: raise AssertionError(f'client {index}: deleted worktree reimport changed content')
@@ -561,11 +561,135 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
     finally:
         outcome['relay']=str(relay)
         manifest['runs'].append(outcome)
-        marker.write_text(json.dumps(manifest,indent=2)+'\n')
+        atomic_json(marker,manifest)
         server.terminate()
         server.wait(timeout=10)
         log.close()
     print(json.dumps(outcome,indent=2))
+
+
+def customer_projection(client):
+    code="""import json
+from pathlib import Path
+from ai_convos import cli as core
+from ai_convos_remote import load
+root=core.PROJECT_ROOT
+cfg=load(root)
+with core.open_db(root/'data/convos.db',True,purpose='testbed.private.projection') as db:
+ claims=[(kind,pid,source,author,'active') for kind in core.ARCHIVE_COLUMNS for pid,source,author in db.execute(f"SELECT t.id,coalesce(o.source_row_id,t.id),coalesce(o.author_user_id,?) FROM {kind} t LEFT JOIN remote.row_origins o ON o.table_name=? AND o.physical_row_id=t.id",[cfg['user'],kind]).fetchall()]
+ paths=core.captured_edit_paths(db,[c[1] for c in claims if c[0]=='file_edits'])
+ rows={(c[0],c[2]):{**row,'data':{**row['data'],'file_path':paths[c[1]]}} if c[0]=='file_edits' and c[1] in paths else row for c,row in core.typed_logical_rows(db,claims).items()}
+ print(json.dumps({kind:dict(rows=len(selected),sha256=core.provenance_digest(selected)) for kind in core.ARCHIVE_COLUMNS for selected in [[rows[key] for key in sorted(rows) if key[0]==kind]]}))
+"""
+    return json.loads(run((client['venv']/'bin/python','-c',code),env=client['env']).stdout)
+
+
+def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
+    import socket
+    root,venv=Path(root).resolve(),Path(venv).resolve()
+    if os.environ.get('CI'): raise ValueError('real conversation qualification is local-only; CI uses the synthetic desktop lane')
+    marker=root/'customer.json'
+    if root.exists() and any(root.iterdir()) and not marker.is_file(): raise ValueError('refusing a non-customer-testbed directory')
+    root.mkdir(parents=True,exist_ok=True,mode=0o700)
+    os.chmod(root,0o700)
+    os.umask(0o077)
+    with operation_lock(root/'.qualification.lock','private customer qualification',0):
+        if marker.exists():
+            manifest=json.loads(marker.read_text())
+            if manifest['kind']!='convos-private-customer-v1': raise ValueError('unknown customer testbed marker')
+        else:
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1',0))
+                port=sock.getsockname()[1]
+            manifest=dict(kind='convos-private-customer-v1',port=port,corpus=[],runs=[])
+            sources={'codex/sessions':Path(codex).resolve()/'sessions','claude/projects':Path(claude).resolve()/'projects'}
+            for target,source in sources.items():
+                files=sorted(p for p in source.rglob('*.jsonl') if p.is_file() and not p.is_symlink() and inside(p,source) and p.stat().st_mtime<time.time()-60)
+                if target.startswith('codex'):
+                    files=[p for p in files if p.stat().st_size<=16*1024**2]
+                    files=[files[i] for i in sorted({round(j*(len(files)-1)/max(1,min(sessions,len(files))-1)) for j in range(min(sessions,len(files)))})]
+                if not files: raise ValueError(f'no stable transcript inputs in {source}')
+                for path in files:
+                    with path.open('rb') as stream:
+                        before=os.fstat(stream.fileno())
+                        body=stream.read(before.st_size)
+                        after=os.fstat(stream.fileno())
+                    if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns): raise ValueError('a selected transcript changed during its snapshot; retry')
+                    if not body.endswith(b'\n'): body=body[:body.rfind(b'\n')+1]
+                    if not body: raise ValueError('empty transcript snapshot')
+                    relative=Path(target)/path.relative_to(source)
+                    destination=root/'corpus'/relative
+                    destination.parent.mkdir(parents=True,exist_ok=True)
+                    destination.write_bytes(body)
+                    manifest['corpus'].append(dict(source=str(path),path=str(relative),bytes=len(body),sha256=hashlib.sha256(body).hexdigest()))
+            atomic_json(marker,manifest)
+        clients=[desktop_client(root/name,venv) for name in ('laptop','desktop','other-user')]
+        for client in clients:
+            home=client['root']/'home'
+            home.mkdir(parents=True,exist_ok=True)
+            client['env']={key:value for key,value in client['env'].items() if key in ('CONVOS_PROJECT_ROOT','CODEX_HOME','CLAUDE_CONFIG_DIR','CONVOS_SEMANTIC','TZ','NO_PROXY','no_proxy')}
+            client['env'].update(HOME=str(home),PATH=f'{venv}/bin:/usr/bin:/bin:/usr/sbin:/sbin',XDG_CONFIG_HOME=str(home/'config'),XDG_CACHE_HOME=str(home/'cache'),XDG_DATA_HOME=str(home/'data'),LANG='en_US.UTF-8')
+        for entry in manifest['corpus']:
+            source=root/'corpus'/entry['path']
+            if Path(entry['path']).is_absolute() or not inside(source,root/'corpus'): raise ValueError('invalid corpus snapshot path')
+            if source.is_symlink() or sha256(source)!=entry['sha256']: raise ValueError('private corpus snapshot changed')
+            for client in clients[:2]:
+                destination=client['root']/entry['path']
+                destination.parent.mkdir(parents=True,exist_ok=True)
+                if not destination.exists(): shutil.copyfile(source,destination)
+                if sha256(destination)!=entry['sha256']: raise ValueError('client transcript copy changed')
+        url=f"http://127.0.0.1:{manifest['port']}"
+        evidence=root/f"check-{len(manifest['runs'])+1}-{int(time.time())}"
+        evidence.mkdir(mode=0o700)
+        started=time.monotonic()
+        with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+            sock.bind(('127.0.0.1',manifest['port']))
+        with (evidence/'relay.log').open('w') as log:
+            server=subprocess.Popen((venv/'bin/convos-server','serve','--db',root/'relay.db','--host','127.0.0.1','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT,env=clients[2]['env'])
+            try:
+                wait_health(url,server)
+                a,b,c=clients
+                if not (a['root']/'archive/remote/config.json').exists(): desktop_cli(a,'remote','setup',url,'customer-alice','--device','laptop')
+                if not (b['root']/'archive/remote/config.json').exists():
+                    recovery=json.loads((a['root']/'archive/remote/config.json').read_text())['recovery']
+                    desktop_cli(b,'remote','recover',url,'customer-alice','--device','desktop',input=recovery+'\n')
+                if not (c['root']/'archive/remote/config.json').exists(): desktop_cli(c,'remote','setup',url,'customer-bob','--device','independent-user')
+                for index,client in enumerate(clients):
+                    output=desktop_cli(client,'sync','--local-only',*(['--full'] if full else []))
+                    (evidence/f'import-{index}.log').write_text(output.stdout+output.stderr)
+                before=[desktop_inventory(client) for client in clients[:2]]
+                content=lambda rows:sorted((json.dumps({k:v for k,v in row.items() if k not in ('conversation_id','message_id','parent_id')},sort_keys=True) for row in rows))
+                content_hash=lambda rows:hashlib.sha256(json.dumps(content(rows)).encode()).hexdigest()
+                if 'source_projection' not in manifest:
+                    if content(before[0])!=content(before[1]): raise AssertionError('same source snapshots parsed differently across device timezones')
+                    manifest['source_projection']=content_hash(before[0])
+                    atomic_json(marker,manifest)
+                for iteration in range(3):
+                    for index,client in enumerate(clients):
+                        output=desktop_cli(client,'remote','sync')
+                        (evidence/f'sync-{iteration}-{index}.log').write_text(output.stdout+output.stderr)
+                inventories=[desktop_inventory(client) for client in clients]
+                if inventories[0]!=inventories[1]: raise AssertionError('real conversation IDs, parents, or content diverged between same-user devices')
+                if content_hash(inventories[0])!=manifest['source_projection']: raise AssertionError('real conversation sync lost or duplicated source turns')
+                if inventories[2]: raise AssertionError('independent user received private conversation content')
+                projections=[customer_projection(client) for client in clients]
+                if projections[0]!=projections[1] or any(v['rows'] for v in projections[2].values()): raise AssertionError('real conversation child rows diverged or crossed users')
+                for index,client in enumerate(clients):
+                    audit=json.loads(desktop_cli(client,'remote','audit','--format','json').stdout)
+                    (evidence/f'audit-{index}.json').write_text(json.dumps(audit,indent=2)+'\n')
+                    if audit['totals'].get('unavailable',0) or any(v['rows'] for v in audit['relationships'].values()): raise AssertionError(f'client {index}: unresolved real archive evidence')
+                    (evidence/f'doctor-{index}.log').write_text(desktop_cli(client,'doctor').stdout)
+                outcome=dict(commit=commit,success=True,seconds=time.monotonic()-started,projections=projections,messages=[len(rows) for rows in inventories],projection_sha256=[hashlib.sha256(json.dumps(rows,sort_keys=True).encode()).hexdigest() for rows in inventories],evidence=str(evidence))
+            except BaseException as error:
+                outcome=dict(commit=commit,success=False,seconds=time.monotonic()-started,error=f'{type(error).__name__}: {error}',evidence=str(evidence))
+                raise
+            finally:
+                server.terminate()
+                server.wait(timeout=10)
+                manifest['runs'].append(outcome)
+                atomic_json(marker,manifest)
+        print(json.dumps(outcome,indent=2))
 
 
 def main():
@@ -586,6 +710,11 @@ def main():
     desktop.add_argument("--commit",required=True)
     desktop.add_argument("--baseline-venv",type=Path)
     desktop.add_argument("--relay-venv",type=Path)
+    customer=sub.add_parser("customer")
+    for name in ('root','venv','codex','claude'): customer.add_argument('--'+name,type=Path,required=True)
+    customer.add_argument('--commit',required=True)
+    customer.add_argument('--sessions',type=int,default=12)
+    customer.add_argument('--full',action='store_true')
     seed_parser=sub.add_parser("seed")
     seed_parser.add_argument("root",type=Path)
     seed_parser.add_argument("cid")
@@ -599,5 +728,6 @@ def main():
     if args.command=="fresh": fresh_lane(args.venv,args.commit,args.released_venv)
     elif args.command=="canary": canary_lane(args.released_venv,args.current_venv,args.released_commit,args.current_commit)
     elif args.command=="desktop": desktop_lane(args.root,args.venv,args.commit,args.baseline_venv,args.relay_venv)
+    elif args.command=="customer": customer_lane(args.root,args.venv,args.commit,args.codex,args.claude,args.sessions,args.full)
     else: seed_archive(isolated_root(args.root),args.cid,args.title,args.prompt,args.cwd,args.edit,args.content,args.old_content)
 if __name__=="__main__": main()

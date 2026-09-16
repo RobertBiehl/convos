@@ -41,3 +41,14 @@ def test_relay_isolation_requires_only_test_users_and_exact_memberships(tmp_path
         path=tmp_path/f"{name}.db"
         relay(path,**options)
         with pytest.raises(AssertionError,match=match): module.assert_relay_isolation(path,{"alice","bob"},"team")
+
+
+def test_private_customer_lane_refuses_ci_and_nonempty_foreign_storage(tmp_path,monkeypatch):
+    module=load_testbed()
+    marker=tmp_path/'personal-data'
+    marker.write_text('preserve')
+    monkeypatch.setenv('CI','true')
+    with pytest.raises(ValueError,match='local-only'): module.customer_lane(tmp_path,tmp_path,'test',tmp_path,tmp_path)
+    monkeypatch.delenv('CI')
+    with pytest.raises(ValueError,match='non-customer-testbed'): module.customer_lane(tmp_path,tmp_path,'test',tmp_path,tmp_path)
+    assert marker.read_text()=='preserve'
