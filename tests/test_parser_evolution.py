@@ -294,3 +294,36 @@ def test_source_replay_repairs_all_event_timestamps_without_content_history(tmp_
         before=core.archive_state(db)
         core.upsert(db,copy.deepcopy(result))
         assert core.archive_state(db)==before
+
+
+@pytest.mark.parametrize('relative',[False,True])
+@pytest.mark.parametrize('change',['none','content','file'])
+def test_portable_edit_path_reimport_does_not_manufacture_history(tmp_path,relative,change):
+    import duckdb
+    stamp=core.ts_from_iso('2026-01-01T00:00:00Z')
+    conv=dict(id='c',source='claude-code',title='source',created_at=stamp,updated_at=stamp,model=None,cwd=str(tmp_path),git_branch=None,project_id=None,metadata='{}')
+    msg=dict(id='m',conversation_id='c',role='assistant',content='',thinking=None,created_at=stamp,model=None,metadata='{}',parent_id=None)
+    tool=dict(id='t',message_id='m',tool_name='Write',input='{}',output='"written"',status='complete',duration_ms=None,created_at=stamp)
+    edit=dict(id='e',message_id='m',file_path='x.txt' if relative else str(tmp_path/'x.txt'),edit_type='write',content='original content',created_at=stamp,old_content=None)
+    evidence=dict(file_edit_id='e',status='confirmed',reason='provider_success',tool_call_id='t')
+    result=core.ParseResult([conv],[msg],tools=[tool],edits=[edit],edit_evidence=[evidence])
+    path=tmp_path/'archive.db'
+    with duckdb.connect(str(path)) as db:
+        core.init_schema(db)
+        core.upsert(db,copy.deepcopy(result))
+    core.capture_provenance(path)
+    with duckdb.connect(str(path)) as db:
+        portable=core.captured_edit_paths(db,['e'])['e']
+        assert portable!=edit['file_path']
+        db.execute('UPDATE file_edits SET file_path=?',[portable])
+        before=core.archive_state(db)
+        if change=='content': result.edits[0]['content']='updated content'
+        if change=='file': result.edits[0]['file_path']=str(tmp_path/'different.txt')
+        core.upsert(db,copy.deepcopy(result))
+        assert db.execute('SELECT count(*) FROM file_edits').fetchone()==(1 if change=='none' else 2,)
+        if change=='content': assert {r[0] for r in db.execute('SELECT content FROM file_edits').fetchall()}=={'original content','updated content'}
+        elif change=='file': assert {r[0] for r in db.execute('SELECT file_path FROM file_edits').fetchall()}=={portable,str(tmp_path/'different.txt')}
+        else:
+            assert core.archive_state(db)==before
+            assert db.execute('SELECT file_path FROM file_edits').fetchone()==(portable,)
+        assert not core.archive_relationships(db)
