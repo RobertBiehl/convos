@@ -2,6 +2,8 @@
 
 ## 0.11.6b12
 
+- Require DuckDB 1.4.5 or newer to avoid a known column-update assertion in
+  earlier 1.4 releases; validate the locked minimum in CI.
 - Reconcile exact provider identities and signed parser history across devices,
   including source-backed repair of older timestamps. Store provider timestamps
   in UTC so machines in different timezones converge on the same rows.
