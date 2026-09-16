@@ -523,7 +523,9 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
             audit=json.loads(desktop_cli(client,'remote','audit','--format','json').stdout)
             (evidence/f'audit-{index}.json').write_text(json.dumps(audit,indent=2)+'\n')
             if audit['totals']['unavailable'] or any(v['rows'] for v in audit['relationships'].values()): raise AssertionError(f'client {index}: unresolved archive evidence')
-            if desktop_inventory(client)!=inventories[index]: raise AssertionError(f'client {index}: deleted worktree reimport changed content')
+            actual=desktop_inventory(client)
+            (evidence/f'reimport-{index}.json').write_text(json.dumps(dict(expected=inventories[index],actual=actual),indent=2)+'\n')
+            if actual!=inventories[index]: raise AssertionError(f'client {index}: deleted worktree reimport changed content')
             attachments=json.loads(desktop_cli(client,'sql','SELECT a.path,b.content_hash FROM attachments a JOIN attachment_bodies b ON b.attachment_id=a.id','--format','json').stdout)
             if not attachments or any(not row['path'] or sha256(Path(row['path']))!=row['content_hash'] for row in attachments): raise AssertionError(f'client {index}: attachment body missing or changed')
             edits=json.loads(desktop_cli(client,'sql',"SELECT e.id,e.content,v.status FROM file_edits e LEFT JOIN provenance.file_edit_evidence v ON v.file_edit_id=e.id",'--format','json').stdout)
@@ -550,6 +552,11 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
         outcome=dict(commit=commit,seconds=time.monotonic()-started,success=True,evidence=str(evidence))
     except BaseException as error:
         outcome=dict(commit=commit,seconds=time.monotonic()-started,success=False,error=f'{type(error).__name__}: {error}',evidence=str(evidence))
+        for index,client in enumerate(clients):
+            try:
+                snapshot={table:json.loads(desktop_cli(client,'sql',f'SELECT * FROM {table}','--format','json').stdout) for table in ('conversations','messages','tool_calls','file_edits','parser_message_lineage','parser_tool_lineage','parser_retired_rows','remote.row_proofs','remote.local_row_bases','remote.row_origins','remote.row_conflicts','provenance.file_edit_evidence')}
+                (evidence/f'failure-archive-{index}.json').write_text(json.dumps(snapshot,indent=2)+'\n')
+            except Exception as diagnostic: (evidence/f'failure-archive-{index}.log').write_text(f'{type(diagnostic).__name__}: {diagnostic}\n')
         raise
     finally:
         outcome['relay']=str(relay)
