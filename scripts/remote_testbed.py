@@ -675,12 +675,14 @@ def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
                 if inventories[2]: raise AssertionError('independent user received private conversation content')
                 projections=[customer_projection(client) for client in clients]
                 if projections[0]!=projections[1] or any(v['rows'] for v in projections[2].values()): raise AssertionError('real conversation child rows diverged or crossed users')
+                prior=next((run for run in reversed(manifest['runs']) if run['success'] and run['commit']==commit and run.get('full_reimport')),None)
+                if full and prior and projections!=prior['projections']: raise AssertionError('unchanged corpus and package produced different rows after another full import')
                 for index,client in enumerate(clients):
                     audit=json.loads(desktop_cli(client,'remote','audit','--format','json').stdout)
                     (evidence/f'audit-{index}.json').write_text(json.dumps(audit,indent=2)+'\n')
                     if audit['totals'].get('unavailable',0) or any(v['rows'] for v in audit['relationships'].values()): raise AssertionError(f'client {index}: unresolved real archive evidence')
                     (evidence/f'doctor-{index}.log').write_text(desktop_cli(client,'doctor').stdout)
-                outcome=dict(commit=commit,success=True,seconds=time.monotonic()-started,projections=projections,messages=[len(rows) for rows in inventories],projection_sha256=[hashlib.sha256(json.dumps(rows,sort_keys=True).encode()).hexdigest() for rows in inventories],evidence=str(evidence))
+                outcome=dict(commit=commit,success=True,full_reimport=full,seconds=time.monotonic()-started,projections=projections,messages=[len(rows) for rows in inventories],projection_sha256=[hashlib.sha256(json.dumps(rows,sort_keys=True).encode()).hexdigest() for rows in inventories],evidence=str(evidence))
             except BaseException as error:
                 outcome=dict(commit=commit,success=False,seconds=time.monotonic()-started,error=f'{type(error).__name__}: {error}',evidence=str(evidence))
                 raise

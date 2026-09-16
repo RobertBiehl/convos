@@ -11,8 +11,12 @@ permissions:
 
 jobs:
   test:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -21,6 +25,7 @@ jobs:
       - run: uv sync --extra dev --locked
       - run: uv run pytest -m "not integration" -v -o faulthandler_timeout=180 --durations=20
         env:
+          CONVOS_TEST_SHARD: ${{ matrix.shard }}/4
           CONVOS_PROJECT_ROOT: ${{ runner.temp }}/external-convos
           CODEX_HOME: ${{ runner.temp }}/external-codex
           CLAUDE_CONFIG_DIR: ${{ runner.temp }}/external-claude
