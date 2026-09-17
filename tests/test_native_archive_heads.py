@@ -219,3 +219,55 @@ def test_generic_native_replica_projection_cannot_establish_source_base(tmp_path
         core.project_logical_row(db,changed,proof,digest(proof),native=True)
         assert db.execute('SELECT count(*) FROM remote.local_row_bases').fetchone()[0]==0
     assert before in [v['row'] for v in retained(path,cfg)]
+
+
+@pytest.mark.parametrize('same_predecessor',[False,True])
+def test_matching_native_heads_do_not_reproject_or_write_bases_per_row(tmp_path,monkeypatch,same_predecessor):
+    path,body,cfg,state,result,records=native_archive(tmp_path,monkeypatch)
+    messages=[{**result.msgs[0],'id':f'unchanged-{i}'} for i in range(20)]
+    core.commit_result(core.ParseResult(msgs=messages),'test.native.many')
+    rows=[core.logical_row('messages',list(message),list(message.values())) for message in messages]
+    prior=[row_proof(cfg['device'],cfg['user'],'w',1,row if same_predecessor else {**row,'data':{**row['data'],'content':'former'}}) for row in rows]
+    heads=[row_proof(cfg['device'],cfg['user'],'w',1,row,previous['revision']) for row,previous in zip(rows,prior)]
+    signer=cfg['controls']['w']['devices'][cfg['device']['id']]
+    calls=[]
+    write=core.record_local_row_bases
+    def bases(db,proofs,*args,**kwargs):
+        if proofs: calls.append(len(proofs))
+        return write(db,proofs,*args,**kwargs)
+    with core.open_db(path,purpose='test.native.noop') as db,core._transaction(db):
+        core.project_row_proofs(db,prior+heads,signer['root_public'],signer['certificate'])
+        write(db,prior)
+        generation=db.execute('SELECT generation FROM archive_state').fetchone()[0]
+        monkeypatch.setattr(core,'record_local_row_bases',bases)
+        pending=set()
+        assert core.project_logical_rows(db,[(row,head,digest(head),True) for row,head in zip(rows,heads)],defer=pending.add,advance_native='receiving-device')==[]
+        assert not pending and calls==[len(rows)]
+        assert db.execute('SELECT generation FROM archive_state').fetchone()[0]==generation
+        assert set(db.execute("SELECT entity,revision FROM remote.local_row_bases WHERE starts_with(entity,'unchanged-')").fetchall())=={(p['row_id'],p['revision']) for p in heads}
+
+
+def test_native_successor_checks_are_batched_without_overwriting_unpublished_rows(tmp_path,monkeypatch):
+    path,body,cfg,state,result,records=native_archive(tmp_path,monkeypatch)
+    messages=[{**result.msgs[0],'id':f'next-{i}'} for i in range(20)]
+    core.commit_result(core.ParseResult(msgs=messages),'test.native.many')
+    rows=[core.logical_row('messages',list(message),list(message.values())) for message in messages]
+    prior=[row_proof(cfg['device'],cfg['user'],'w',1,row) for row in rows]
+    changed=[{**row,'data':{**row['data'],'content':'remote successor'}} for row in rows]
+    heads=[row_proof(cfg['device'],cfg['user'],'w',1,row,previous['revision']) for row,previous in zip(changed,prior)]
+    signer=cfg['controls']['w']['devices'][cfg['device']['id']]
+    statements=[]
+    with core.open_db(path,purpose='test.native.successors') as db,core._transaction(db):
+        core.project_row_proofs(db,prior+heads,signer['root_public'],signer['certificate'])
+        core.record_local_row_bases(db,prior)
+        db.execute("UPDATE messages SET content='unpublished' WHERE id IN (SELECT UNNEST(?))",[[m['id'] for m in messages[10:]]])
+        class Counted:
+            def execute(self,sql,*args):
+                statements.append(sql)
+                return db.execute(sql,*args)
+        pending=set()
+        selected=core._protect_native_replicas(Counted(),[(row,head,digest(head),True) for row,head in zip(changed,heads)],pending.add,'receiving-device')
+        assert {row['id'] for row,*_ in selected}=={r['id'] for r in rows[:10]}
+        assert pending=={digest(p) for p in heads[10:]}
+        assert len(statements)<len(rows), 'Successor validation must batch its proof lookups'
+        assert db.execute("SELECT count(*) FROM messages WHERE content='remote successor'").fetchone()==(0,)

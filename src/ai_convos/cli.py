@@ -504,7 +504,9 @@ def _protect_native_replicas(db,items,defer,advance_native=None):
     refs,wanted,existing=(refs:={"conversation_id":"conversations","message_id":"messages","parent_id":"messages","turn":"messages","edit":"file_edits"}),(wanted:={(row["kind"],row["id"]) for row,p,pid,native,*maps in items if native}|{(refs[key],value) for row,p,pid,native,*maps in items if native for key,value in (row["data"] or {}).items() if key in refs and value}),{table:{row[0]:row for row in db.execute(f"SELECT {','.join(ARCHIVE_COLUMNS[table])} FROM {table} WHERE id IN (SELECT json_extract_string(value,'$') FROM json_each(?))",[json.dumps(ids,separators=(",",":"))]).fetchall()} if (ids:=[value for kind,value in wanted if kind==table]) else {} for table in ARCHIVE_COLUMNS}
     received,occupied,bindings=(received:=db.execute("SELECT author_user_id,table_name,source_row_id,physical_row_id FROM remote.row_origins WHERE source_row_id IN (SELECT UNNEST(?)) OR physical_row_id IN (SELECT UNNEST(?))",[[value for kind,value in wanted]]*2).fetchall()),(occupied:={(kind,physical) for author,kind,source,physical in received}),{author:({(kind,source):physical for user,kind,source,physical in received if user==author and source not in existing[kind]}|{(kind,source):source for kind,rows in existing.items() for source in rows if (kind,source) not in occupied}) for author in {p["author_user_id"] for row,p,pid,native,*maps in items if native}}
     [bindings[p["author_user_id"]].setdefault((row["kind"],row["id"]),row["id"]) for row,p,pid,native,*maps in items if native and (row["kind"],row["id"]) not in occupied]
-    paths,selected=(paths:=captured_edit_paths(db,list(existing["file_edits"]))),[]
+    paths,selected,unchanged=captured_edit_paths(db,list(existing["file_edits"])),[],[]
+    previous,bases=[dict(kind=row['kind'],entity=row['id'],author=p['author_user_id'],revision=p['previous_revision']) for row,p,pid,native,*maps in items if native and advance_native and p['author_device_id']!=advance_native and row['state']=='active' and p['previous_revision'] and row['kind'] in existing and row['id'] in existing[row['kind']]],{}
+    for kind,entity,author,head,expected in db.execute("WITH RECURSIVE heads AS (SELECT x.* FROM UNNEST(from_json(?,'[{\"kind\":\"VARCHAR\",\"entity\":\"VARCHAR\",\"author\":\"VARCHAR\",\"revision\":\"VARCHAR\"}]')) t(x)), ancestors(kind,entity,author,head,revision) AS (SELECT kind,entity,author,revision,revision FROM heads UNION SELECT a.kind,a.entity,a.author,a.head,p.previous_revision FROM ancestors a JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(a.kind,a.entity,a.author,a.revision) WHERE p.previous_revision IS NOT NULL) SELECT DISTINCT a.kind,a.entity,a.author,a.head,p.content_hash FROM ancestors a JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(a.kind,a.entity,a.author,a.revision) LEFT JOIN remote.local_row_bases b ON (b.kind,b.entity,b.author)=(a.kind,a.entity,a.author) WHERE p.state='active' AND (b.revision IS NULL OR b.revision=p.revision)",[json.dumps(previous,separators=(',',':'))]).fetchall() if previous else []: bases.setdefault((kind,entity,author,head),[]).append(expected)
     for item in items:
         row,p,pid,native,*maps=item
         bound=bindings[p["author_user_id"]] if native else {}
@@ -516,13 +518,14 @@ def _protect_native_replicas(db,items,defer,advance_native=None):
         data={key:norm(key,raw.get(key)) for key in (row["data"] or {})}
         if row["kind"]=="file_edits" and row["id"] in paths and row["data"] and row["data"]["file_path"]==paths[row["id"]]: data["file_path"]=paths[row["id"]]
         if row["kind"]=="attachments": data["body_hash"]=(db.execute("SELECT content_hash FROM attachment_bodies WHERE attachment_id=?",[row["id"]]).fetchone() or [None])[0]
-        bases=db.execute("WITH RECURSIVE ancestors(revision) AS (SELECT CAST(? AS VARCHAR) UNION SELECT p.previous_revision FROM remote.row_proofs p JOIN ancestors a ON p.revision=a.revision WHERE p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND p.previous_revision IS NOT NULL) SELECT p.content_hash FROM remote.row_proofs p JOIN ancestors a ON a.revision=p.revision LEFT JOIN remote.local_row_bases b ON (b.kind,b.entity,b.author)=(p.row_kind,p.source_row_id,p.author_user_id) WHERE (p.row_kind,p.source_row_id,p.author_user_id)=(?,?,?) AND p.state='active' AND (b.revision IS NULL OR b.revision=p.revision)",[p['previous_revision'],row['kind'],row['id'],p['author_user_id'],row['kind'],row['id'],p['author_user_id']]).fetchall() if advance_native and p['author_device_id']!=advance_native and row['state']=='active' and p['previous_revision'] else []
-        if any(matching_logical_row({**row,'data':data},expected) is not None for expected, in bases):
+        if row["state"]=="active" and matching_logical_row({**row,"data":data},p["content_hash"]) is not None:
+            unchanged.append(p)
+            continue
+        if any(matching_logical_row({**row,'data':data},expected) is not None for expected in bases.get((row['kind'],row['id'],p['author_user_id'],p['previous_revision']),())):
             selected.append(item)
             continue
-        if row["state"]=="deleted" or matching_logical_row({**row,"data":data},p["content_hash"]) is None: defer(pid)
-        else: record_local_row_bases(db,[p])
-    return selected
+        defer(pid)
+    return (record_local_row_bases(db,unchanged),selected)[-1]
 def project_logical_rows(db,items,defer=False,advance_native=None):
     evidence=items
     if defer: authors,parents,items={p["author_user_id"] for row,p,pid,native,*maps in items if native},{(row["kind"],row["id"]) for row,p,pid,native,*maps in items}|{(parent,value) for row,p,pid,native,*maps in items for column,parent in ARCHIVE_FKS.get(row["kind"],()) if (value:=(row["data"] or {}).get(column))},_protect_native_replicas(db,items,defer,advance_native)
