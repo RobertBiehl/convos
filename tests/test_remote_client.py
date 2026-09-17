@@ -1071,3 +1071,31 @@ def test_blocked_reconciliation_finishes_transfer_but_cannot_report_settled(tmp_
     sync_once(root,True)
     with connect(root/'remote/state.db') as state:
         assert state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone()
+
+
+def test_sync_merges_dirty_conversation_bookkeeping_before_attestation(tmp_path,monkeypatch):
+    from tests.test_conversation_forks import lineage
+    server=server_connect(tmp_path/'server.db')
+    monkeypatch.setattr(remote_client,'request',transport(server))
+    monkeypatch.setattr(remote_client,'drain_hooks',lambda:None)
+    root=tmp_path/'client'; setup_client('http://server','alice',root=root)
+    path=root/'data/convos.db'; write_archive(path,'source conversation')
+    with core_module.open_db(path,purpose='test.fork.source') as db:
+        db.execute("UPDATE conversations SET metadata=? WHERE id='c'",[json.dumps(dict(session_id='same-source',timestamp_basis='utc'))])
+    sync_once(root,True); cfg=load(root); ws=workspace(cfg,'Personal'); user=cfg['user']
+    with core_module.open_db(path,purpose='test.fork.branches') as db,core_module._transaction(db),core_module.preserve_fact_heads(db,[('conversations','c')]):
+        claim=('conversations','c','c',user,'active'); original=core_module.typed_logical_rows(db,[claim])[claim]
+        head=projection_module._heads(db,user,{'conversations':{'c'}})[('conversations','c')]
+        rows=[{**original,'data':{**original['data'],'updated_at':f'2026-01-01T00:00:{turn}.000000','metadata':{**original['data']['metadata'],'convos_message_lineage':dict(v=1,records=[lineage(str(turn))])}}} for turn in (10,12)]
+        proofs=[projection_module.row_proof(cfg['device'],user,ws,1,row,head['revision']) for row in rows]
+        signer=cfg['controls'][ws]['devices'][cfg['device']['id']]
+        core_module.project_attested_rows(db,list(zip(rows,proofs)),signer['root_public'],signer['certificate'])
+        db.execute("UPDATE conversations SET updated_at='2026-01-01T00:00:14',metadata=? WHERE id='c'",[json.dumps({**original['data']['metadata'],'convos_message_lineage':dict(v=1,records=[lineage('14')])})])
+        core_module._archive_touch(db,[('conversations','c')])
+    sync_once(root,True)
+    with core_module.open_db(path,True,purpose='test.fork.final') as db:
+        value=core_module.typed_logical_rows(db,[claim])[claim]
+        assert value['data']['updated_at']=='2026-01-01T00:00:14.000000'
+        assert len(value['data']['metadata']['convos_message_lineage']['records'])==3
+        assert len({p['content_hash'] for p in projection_module._heads(db,user,{'conversations':{'c'}},True)[('conversations','c')]})==1
+    assert projection_module.audit_rows(path,local_user=user)['totals']['unavailable']==0

@@ -230,14 +230,17 @@ def test_sync_checkpoints_import_before_provenance_failure(hooks,monkeypatch):
     monkeypatch.setattr(cli,'parse_codex',lambda *args:pytest.fail('completed import was repeated'))
     cli.sync(False,300,False,True,False,False,True)
 
-def test_parser_upgrade_checkpoints_batches_and_resumes_unfinished_inputs(hooks,monkeypatch):
+@pytest.mark.parametrize('upgrade',['parser','input_bindings'])
+def test_parser_upgrade_checkpoints_batches_and_resumes_unfinished_inputs(hooks,monkeypatch,upgrade):
     sessions,data=hooks
     for i in range(25): transcript(sessions/f'{i:02}.jsonl',f'turn {i}')
     monkeypatch.setattr(cli,'STATE_PATH',data/'sync_state.json')
     cli.sync(False,300,False,True,False,False,True)
     old=cli.load_state()
-    old['local']['codex'].pop('epochs')
-    old['local']['codex']['parser']=cli.PARSER_EPOCH-1
+    if upgrade=='parser':
+        old['local']['codex'].pop('epochs')
+        old['local']['codex']['parser']=cli.PARSER_EPOCH-1
+    else: old['local']['codex'].pop('bindings')
     cli.atomic_json(cli.STATE_PATH,old)
     real=cli.parse_codex
     parsed=[]
@@ -248,7 +251,7 @@ def test_parser_upgrade_checkpoints_batches_and_resumes_unfinished_inputs(hooks,
     monkeypatch.setattr(cli,'parse_codex',interrupted)
     with pytest.raises(cli.click.ClickException,match='Sync incomplete'): cli.sync(False,300,False,True,False,False,True)
     state=cli.load_state()['local']['codex']
-    assert sum(v==cli.PARSER_EPOCH for v in state['epochs'].values())==20
+    assert (sum(v==cli.PARSER_EPOCH for v in state['epochs'].values()) if upgrade=='parser' else len(state['bindings']))==20
     resumed=[]
     monkeypatch.setattr(cli,'parse_codex',lambda path,files,bindings:resumed.extend(map(str,files)) or real(path,files,bindings))
     cli.sync(False,300,False,True,False,False,True)
@@ -614,3 +617,25 @@ def test_dispatch_releases_worker_lease_before_child_can_start(hooks,monkeypatch
     monkeypatch.setattr(cli.subprocess,'Popen',start)
     cli.wake_hooks(root=data.parent)
     assert launched==[str(data.parent)]
+
+
+def test_unchanged_source_reparses_only_after_its_provider_binding_changes(hooks,monkeypatch):
+    sessions,data=hooks
+    for name in ('affected','unrelated'):
+        path=sessions/(name+'.jsonl'); transcript(path)
+        events=list(map(json.loads,path.read_text().splitlines())); events[0]['payload']['id']=name
+        path.write_text('\n'.join(map(json.dumps,events)))
+    monkeypatch.setattr(cli,'STATE_PATH',data/'sync_state.json')
+    cli.sync(False,300,False,True,False,False,True)
+    with cli._core(purpose='test.source.alias') as db,cli._transaction(db):
+        cid=cli.gen_id('codex',str(sessions/'affected.jsonl'))
+        session=json.loads(db.execute('SELECT metadata FROM conversations WHERE id=?',[cid]).fetchone()[0])['session_id']
+        db.execute("INSERT INTO conversations SELECT 'new-canonical',* EXCLUDE(id) FROM conversations WHERE id=?",[cid])
+        cli.project_provider_bindings(db,'codex',session,'new-canonical',[cid])
+    real,parsed=cli.parse_codex,[]
+    monkeypatch.setattr(cli,'parse_codex',lambda path,files,bindings:parsed.extend(map(str,files)) or real(path,files,bindings))
+    cli.sync(False,300,False,True,False,False,True)
+    assert parsed==[str(sessions/'affected.jsonl')]
+    parsed.clear()
+    cli.sync(False,300,False,True,False,False,True)
+    assert parsed==[]

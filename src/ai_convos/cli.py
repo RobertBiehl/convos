@@ -868,9 +868,10 @@ class ParseResult:
     provenance_conversations: set = field(default_factory=set)
     attachment_indexes: dict = field(default_factory=dict)
     failed_inputs: list = field(default_factory=list)
+    input_sessions: dict = field(default_factory=dict)
 
-    def __iadd__(self,other): return ([getattr(self,name).extend(getattr(other,name)) for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence","tool_lineage","message_lineage","failed_inputs")],self)[-1]
-    def __add__(self,other): return ParseResult(**{name:[*getattr(self,name),*getattr(other,name)] for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence","tool_lineage","message_lineage","failed_inputs")})
+    def __iadd__(self,other): return ([getattr(self,name).extend(getattr(other,name)) for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence","tool_lineage","message_lineage","failed_inputs")],self.input_sessions.update(other.input_sessions),self)[-1]
+    def __add__(self,other): return ParseResult(**{name:[*getattr(self,name),*getattr(other,name)] for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence","tool_lineage","message_lineage","failed_inputs")},input_sessions=self.input_sessions|other.input_sessions)
 
 def log_parse_error(context: str, err: Exception): typer.echo(f"  parse error ({context}): {type(err).__name__}: {err}", err=True)
 def _quarantine_stubs(r): return setattr(r,"convs",[{**c,"metadata":json.dumps({**json.loads(c["metadata"] or "{}"),"capture_mode":"startup-stub-candidate"})} if c["id"] in quarantined else c for c in r.convs]) if (quarantined:={c["id"] for c in r.convs if c["source"]=="codex" and (meta:=json.loads(c["metadata"] or "{}")).get("session_kind")=="main" and not meta.get("parent_session_id") and any(m["conversation_id"]==c["id"] and m["role"]=="user" for m in r.msgs) and not any(m["conversation_id"]==c["id"] and m["role"]=="user" and not re.fullmatch(_INJECTED_RE,m["content"]) for m in r.msgs) and not any(m["conversation_id"]==c["id"] and m["role"]=="assistant" for m in r.msgs) and not any(x.get("conversation_id")==c["id"] or x.get("message_id") in {m["id"] for m in r.msgs if m["conversation_id"]==c["id"]} for x in [*r.tools,*r.attachs,*r.artifacts,*r.edits])}) else None
@@ -1018,7 +1019,7 @@ def _parse_sessions(paths,parser,bindings):
         s=parser(path,bound)
         return [(bound.setdefault((s["conv"]["source"],m["session_id"]),s["conv"]["id"]),s)[1] if s and (m:=json.loads(s["conv"]["metadata"] or "{}")).get("session_id") else s]
     attempts,sessions=(attempts:=[(str(path),safe_parse(f"{parser.__name__.removeprefix('parse_').replace('_session','').replace('_','-')} session {path}",one,path,bound)) for bound in [{} if bindings is None else bindings] for path in sorted(paths)]),[s for _,result in attempts if result is not None for s in result if s]
-    return ParseResult(convs=[s["conv"] for s in sessions],msgs=[m for s in sessions for m in s["msgs"]],tools=[t for s in sessions for t in s["tools"]],attachs=[a for s in sessions for a in s["attachs"]],edits=[e for s in sessions for e in s["edits"]],edit_evidence=[v for s in sessions for v in s["edit_evidence"]],tool_lineage=[v for s in sessions for v in s["tool_lineage"]],message_lineage=[v for s in sessions for v in s["message_lineage"]],failed_inputs=[path for path,result in attempts if result is None])
+    return ParseResult(convs=[s["conv"] for s in sessions],msgs=[m for s in sessions for m in s["msgs"]],tools=[t for s in sessions for t in s["tools"]],attachs=[a for s in sessions for a in s["attachs"]],edits=[e for s in sessions for e in s["edits"]],edit_evidence=[v for s in sessions for v in s["edit_evidence"]],tool_lineage=[v for s in sessions for v in s["tool_lineage"]],message_lineage=[v for s in sessions for v in s["message_lineage"]],failed_inputs=[path for path,result in attempts if result is None],input_sessions={path:next((json.loads(s["conv"]["metadata"]).get("session_id") for s in result if s),None) for path,result in attempts if result is not None})
 def parse_claude_code(projects_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult: return _parse_sessions(files or projects_dir.rglob("*.jsonl"),parse_claude_code_session,bindings)
 
 def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
@@ -1518,6 +1519,8 @@ def backup():
     with _core(purpose="maintenance.backup") as conn: path=_migration_backup(conn,datetime.now(timezone.utc).strftime("manual-%Y%m%dT%H%M%SZ"))
     typer.echo(f"Archive backed up to {path} with attachments at {path}.attachments")
 
+def _input_binding(bindings,source,session): return [bindings.get((source,session)),sorted(bindings.get((source,session,'legacy'),()))]
+def _binding_covers(old,current): return old[0]==current[0] and set(current[1])<=set(old[1])
 def _sync_leader(fn,full=False):
     with operation_lock(DATA_DIR/".sync.lock","sync",wait=0) as pulse,operation_lock(HOOK_DIR/".drain.lock","sync.full.capture",wait=30) if full else contextlib.nullcontext(): return fn(lambda stage:(pulse(stage),sys.stderr.isatty() and (now:=time.monotonic())-getattr(pulse,"shown",0)>=1 and (setattr(pulse,"shown",now),typer.echo(f"  Local sync: {stage}",err=True)))[0])
 
@@ -1529,11 +1532,11 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
     def plan_local(name, path, parser, bindings, sink, progress):
         if name in ("codex", "claude-code"):
             previous,prev,mt=(previous:=local.get(name,{})),previous.get("files",{}),{str(p):m for p in path.rglob("*.jsonl") if (m:=stat_mtime(p)) is not None}
-            epochs,missing={p:previous.get("epochs",{}).get(p,previous.get("parser")) for p in prev},sorted(set(prev)-mt.keys())
+            epochs,missing,dependencies={p:previous.get("epochs",{}).get(p,previous.get("parser")) for p in prev},sorted(set(prev)-mt.keys()),previous.get("bindings",{})
             if missing!=previous.get("missing",[]): set_state("local",name,{**previous,"missing":missing})
             if missing: typer.echo(f"{name}: {len(missing)} previously imported transcript(s) missing locally; archived conversations retained.",err=True)
-            if not (chg:=[Path(p) for p,m in mt.items() if full or p not in prev or m!=prev[p] or epochs.get(p)!=PARSER_EPOCH or p in previous.get("failed",[])]): return None
-            saved,checkpoint,rejected=[],dict(parser=PARSER_EPOCH,files=dict(prev),epochs=epochs,missing=missing,failed=previous.get("failed",[])),[]
+            if not (chg:=[Path(p) for p,m in mt.items() if full or p not in prev or m!=prev[p] or epochs.get(p)!=PARSER_EPOCH or p in previous.get("failed",[]) or p not in dependencies or not _binding_covers(dependencies[p][1],_input_binding(bindings,name,dependencies[p][0]))]): return None
+            saved,checkpoint,rejected=[],dict(parser=PARSER_EPOCH,files=dict(prev),epochs=epochs,missing=missing,failed=previous.get("failed",[]),bindings=dict(dependencies)),[]
             typer.echo(f"{name}: importing {len(chg)} transcript(s); progress is saved after each batch.",err=True)
             def run():
                 for i in range(0,len(chg),20):
@@ -1544,6 +1547,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     with checkpoint_lock:
                         checkpoint["files"].update(finished)
                         checkpoint["epochs"].update({p:PARSER_EPOCH for p in finished})
+                        checkpoint["bindings"].update({p:[session,_input_binding(bindings,name,session)] for p in finished for session in [parsed.input_sessions.get(p)]})
                         checkpoint["failed"]=sorted((set(checkpoint["failed"])-finished.keys())|failed|{str(p) for p in chg[i:i+20] if str(p) not in finished})
                         set_state("local",name,checkpoint)
                     progress(f"parsing {name} {min(i+20,len(chg))}/{len(chg)}")

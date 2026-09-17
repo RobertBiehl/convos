@@ -415,3 +415,15 @@ def test_message_reconciliation_commits_bounded_pages_and_resumes_with_history(t
         assert db.execute("SELECT count(*) FROM file_edits WHERE content='retained edit'").fetchone()==(12,)
         assert db.execute("SELECT count(*) FROM parser_retired_rows WHERE kind='messages'").fetchone()==(6,)
     assert projection.audit_rows(path,local_user=user)['totals']['unavailable']==0
+
+
+def test_alias_reconciles_committed_native_source_update_before_attestation(tmp_path):
+    root,path,identity,device,user,cfg,_=_provider_alias_archive(tmp_path)
+    with core.open_db(path,purpose='test.alias.source') as db,core._transaction(db),core.preserve_fact_heads(db,[('messages','message-b')]):
+        db.execute("UPDATE messages SET content='new committed source content' WHERE id='message-b'")
+        core._archive_touch(db,[('messages','message-b')])
+    result=projection.reconcile_provider_aliases(path,cfg,'personal')
+    assert not result['blocked']
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT conversation_id,content FROM messages').fetchall()==[('a','new committed source content')]
+    assert projection.audit_rows(path,local_user=user)['totals']['unavailable']==0

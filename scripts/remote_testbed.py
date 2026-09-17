@@ -584,6 +584,32 @@ with core.open_db(root/'data/convos.db',True,purpose='testbed.private.projection
     return json.loads(run((client['venv']/'bin/python','-c',code),env=client['env']).stdout)
 
 
+def customer_source_counts(client,corpus=None):
+    code="""import collections,json,sys
+from pathlib import Path
+from ai_convos import cli as core
+out=collections.defaultdict(lambda:dict.fromkeys(core.ARCHIVE_COLUMNS,0))
+key=lambda source,session:json.dumps([source,session],separators=(',',':'))
+if len(sys.argv)>1:
+ for source,parser,path in [('codex',core.parse_codex,Path(sys.argv[1])/'codex'),('claude-code',core.parse_claude_code,Path(sys.argv[1])/'claude/projects')]:
+  parsed=parser(path)
+  conversations={c['id']:key(source,json.loads(c['metadata']).get('session_id')) for c in parsed.convs}
+  messages={m['id']:conversations[m['conversation_id']] for m in parsed.msgs}
+  for kind,rows in [('conversations',parsed.convs),('messages',parsed.msgs),('tool_calls',parsed.tools),('attachments',parsed.attachs),('artifacts',parsed.artifacts),('file_edits',parsed.edits)]:
+   owners={r['id']:conversations[r['id']] if kind=='conversations' else conversations[r['conversation_id']] if kind in ('messages','artifacts') else messages[r['message_id']] for r in rows}
+   for owner,count in collections.Counter(owners.values()).items(): out[owner][kind]+=count
+else:
+ with core.open_db(core.DB_PATH,True,purpose='testbed.private.source-counts') as db:
+  for kind in core.ARCHIVE_COLUMNS:
+   joined='conversations c' if kind=='conversations' else 'artifacts t JOIN conversations c ON c.id=t.conversation_id' if kind=='artifacts' else ('messages m' if kind=='messages' else kind+' t JOIN messages m ON m.id=t.message_id')+' JOIN conversations c ON c.id=m.conversation_id'
+   current='' if kind in ('conversations','artifacts') else " AND json_extract_string(m.metadata,'$.history_of') IS NULL"
+   if kind=='tool_calls': current+=' AND NOT EXISTS(SELECT 1 FROM parser_tool_history h WHERE h.old_id=t.id)'
+   for source,session,count in db.execute("SELECT c.source,json_extract_string(c.metadata,'$.session_id'),count(*) FROM "+joined+" WHERE c.source IN ('codex','claude-code')"+current+' GROUP BY 1,2').fetchall(): out[key(source,session)][kind]=count
+print(json.dumps(out,sort_keys=True))
+"""
+    return json.loads(run((client['venv']/'bin/python','-c',code,*([str(corpus)] if corpus else [])),env=client['env'],timeout=600).stdout)
+
+
 def customer_resume(client,session,evidence,measure):
     paths=[desktop_transcript(client,f'{session}-resume-{i}',client['root']/'absent-worktree') for i in range(25)]
     ledger=client['root']/'archive/data/sync_state.json'
@@ -736,9 +762,17 @@ def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
                     if content(before[0])!=content(before[1]): raise AssertionError('same source snapshots parsed differently across device timezones')
                     manifest['source_projection']=content_hash(before[0])
                     atomic_json(marker,manifest)
+                if 'source_counts' not in manifest:
+                    manifest['source_counts']=customer_source_counts(a,root/'corpus')
+                    atomic_json(marker,manifest)
                 for iteration in range(3):
                     for index,client in enumerate(clients):
                         measure(f'sync-{iteration}-{index}',client,'remote','sync',budget=600)
+                    if iteration<2:
+                        for index,client in enumerate(clients[:2]): measure(f'source-bindings-{iteration}-{index}',client,'sync','--local-only',budget=600)
+                source_counts=[{key:value for key,value in customer_source_counts(client).items() if not (json.loads(key)[1] or '').startswith(activity)} for client in clients]
+                (evidence/'source-counts.json').write_text(json.dumps(dict(expected=manifest['source_counts'],clients=source_counts),indent=2)+'\n')
+                if source_counts[:2]!=[manifest['source_counts']]*2 or source_counts[2]: raise AssertionError('synced current rows do not match frozen source multiplicity')
                 inventories=[desktop_inventory(client) for client in clients]
                 if inventories[0]!=inventories[1]: raise AssertionError('real conversation IDs, parents, or content diverged between same-user devices')
                 if content_hash(inventories[0])!=manifest['source_projection']: raise AssertionError('real conversation sync lost or duplicated source turns')
