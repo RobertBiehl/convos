@@ -10,7 +10,7 @@ from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
-STATE_VERSION,ALIAS_VERSION,ALIAS_WRITE_PAGE="4",12,250
+STATE_VERSION,ALIAS_VERSION,ALIAS_WRITE_PAGE="4",13,250
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -397,11 +397,17 @@ def attest_rows(db_path,cfg,workspace,records,origins=()):
     snapshots,signing_key=[],None
     for row in rows:
         prior,current=list(heads.get((row["kind"],row["id"]),{}).values()),digest(row)
-        if any(h[2]==current for h in prior): continue
+        if prior and all(h[2]==current for h in prior): continue
         if row["kind"]=="edit.observed" and len(prior)>1 and (base:=bases.get(row["id"])) and base[0] in {h[1] for h in prior} and all(base[1][k]==row[k] for k in ("kind","id")) and all(base[1]["data"][k]==row["data"][k] for k in ("turn","file","repository")): prior=[h for h in prior if h[1]==base[0]]
-        if len(prior)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
-        snapshots.append((row,row_proof(device,cfg["user"],prior[0][0] if prior else workspace,cfg["workspaces"][workspace]["epoch"],row,prior[0][1] if prior else None,workspace,current,signing_key=(signing_key:=signing_key or row_signing_key(device)))))
-    [_store_proofs(db_path,snapshots[i:i+500],signer,controls) for i in range(0,len(snapshots),500)]
+        if len({h[2] for h in prior})>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
+        required(len(prior)<=500,ValueError('row revision fanout exceeds atomic attestation limit'))
+        snapshots.extend((row,row_proof(device,cfg["user"],ws,cfg["workspaces"][workspace]["epoch"],row,revision,workspace,current,signing_key=(signing_key:=signing_key or row_signing_key(device)))) for ws,revision,_ in prior or [(workspace,None,None)])
+    pages=[[]]
+    for key,group in itertools.groupby(snapshots,key=lambda item:(item[0]['kind'],item[0]['id'])):
+        group=list(group)
+        if len(pages[-1])+len(group)>500: pages.append([])
+        pages[-1].extend(group)
+    [_store_proofs(db_path,page,signer,controls) for page in pages if page]
     return len(snapshots)
 def retained_proof_pages(db_path,workspace,origins=(),author=None,page=5000):
     scopes,after,marks=(scopes:=(workspace,*origins)),"",','.join('?'*len(scopes))
@@ -426,8 +432,8 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
         [local.setdefault((r[2],r[3],r[5]),{}).setdefault(r[6],proof(r)) for r in sorted(db.execute(f"SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs p WHERE workspace_id IN ({marks}) AND author_user_id=? AND source_row_id IN ({TEXT_IDS}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],packed(row["id"] for row in prepared))).fetchall() if prepared else [],key=lambda r:(r[0]!=workspace,r[0],r[10],r[12]))]
         for row in prepared:
             values=list(local.get((row["kind"],row["id"],digest(row)),{}).values())
-            if len(values)!=1: raise ValueError(f"current row proof unavailable: {row['kind']}:{row['id']}")
-            keep(row,values[0],values[0]["content_hash"])
+            if not values: raise ValueError(f"current row proof unavailable: {row['kind']}:{row['id']}")
+            [keep(row,p,p["content_hash"]) for p in values]
         for values in (db.execute(f"SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs p WHERE workspace_id IN ({marks}) AND author_user_id=? AND state='deleted' AND row_kind IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision){only_sql}",(*scopes,cfg["user"],list(TABLES.values()),*([packed(only)] if only else []))).fetchall() if retained else []):
             p=proof(values)
             keep(logical_row(p["row_kind"],identity=p["row_id"],state="deleted"),p)
@@ -512,7 +518,7 @@ def local_repack_envelopes(db_path,state,cfg,page,keys):
         archive_yield(db_path)
     # The old nonce is used only for local equality checks; replacements use a fresh nonce.
     return {item["cursor"]:_seal(item["header"],bodies[item["cursor"]],keys[item["header"]["epoch"]]) for item in page if item["cursor"] in bodies}
-def _heads(db,user,ids):
+def _heads(db,user,ids,all_heads=False):
     out={}
     for table,sources in ids.items():
         if not sources: continue
@@ -520,9 +526,16 @@ def _heads(db,user,ids):
         for values in rows:
             out.setdefault((table,values[3]),{})[values[6]]=_proof(values)
     missing=[(table,source) for table,sources in ids.items() for source in sources if (table,source) not in out]
-    forks=[key for key,values in out.items() if len(values)!=1]
+    forks=[key for key,values in out.items() if len({p["content_hash"] for p in values.values()})!=1]
     if missing or forks: raise ValueError(f"provider alias row proof unavailable or forked: {(missing or forks)[0]}")
-    return {key:next(iter(values.values())) for key,values in out.items()}
+    return {key:list(values.values()) if all_heads else values[min(values)] for key,values in out.items()}
+# Preserve the single-parent wire format by advancing every equal-valued branch.
+def _alias_proofs(db,cfg,workspace,records):
+    heads=_heads(db,cfg['user'],{kind:{r['id'] for r,p in records if r['kind']==kind} for kind in {r['kind'] for r,p in records}},True)
+    required(all(p['previous_revision'] in {h['revision'] for h in heads[(r['kind'],r['id'])]} for r,p in records),RuntimeError('Row heads changed during provider alias reconciliation; retry'))
+    extras=[row_proof(cfg['device'],cfg['user'],h['workspace'],cfg['workspaces'][workspace]['epoch'],r,h['revision'],workspace) for r,p in records for h in heads[(r['kind'],r['id'])] if h['revision']!=p['previous_revision']]
+    signer=cfg['controls'][workspace]['devices'][cfg['device']['id']]
+    return project_row_proofs(db,[p for r,p in records]+extras,signer['root_public'],signer['certificate'])[:len(records)]
 def _alias_members(db,user,source,session,members,canonical):
     member_heads,origin_rows=_heads(db,user,{"conversations":set(members)}),db.execute("SELECT physical_row_id,source_row_id FROM remote.row_origins WHERE table_name='conversations' AND author_user_id=? AND source_row_id IN (SELECT UNNEST(?))",(user,members)).fetchall()
     origin_members={}
@@ -533,6 +546,9 @@ def _alias_members(db,user,source,session,members,canonical):
     required(all(actual==source and isinstance(metadata:=json.loads(raw) if raw else None,dict) and provider_session_key(source,metadata.get("session_id"))==provider_session_key(source,session) for actual,raw in db.execute("SELECT source,metadata FROM conversations WHERE id IN (SELECT UNNEST(?))",[[member_physical[m] for m in active]]).fetchall()),ValueError("provider alias exact evidence conflicts"))
     member_physical|={member:foreign_id(user,'conversations',member) if member in origin_members else member for member in set(members)-set(member_physical)}
     return member_heads,member_physical,active,{member:member_physical[member]==member and member in local or member not in origin_members and member not in present for member in members},not (binding:=db.execute("SELECT conversation_id FROM provider_sessions WHERE source=? AND session_id=?",(source,provider_session_key(source,session))).fetchone()) or binding[0]!=member_physical[canonical]
+def _lineage_union(values):
+    required(all(isinstance(v,dict) and set(v)=={'v','records'} and type(v['v']) is int and v['v']==1 and isinstance(v['records'],list) and all(isinstance(r,dict) and set(r)=={'old_id','old_hash','current_id','current_hash'} and all(isinstance(r[k],str) and re.fullmatch('[0-9a-f]{'+str(64 if k.endswith('hash') else 16)+'}',r[k]) for k in r) for r in v['records']) for v in values),ValueError('provider alias lineage merge is invalid'))
+    return dict(v=1,records=sorted({canon(r):r for v in values for r in v['records']}.values(),key=canon))
 def _alias_merge_native(db,row,head):
     if row is None: return None
     records=db.execute("WITH RECURSIVE ancestors(revision) AS (SELECT CAST(? AS VARCHAR) UNION SELECT p.previous_revision FROM remote.row_proofs p JOIN ancestors a ON p.revision=a.revision WHERE (p.row_kind,p.source_row_id,p.author_user_id)=(?,?,?) AND p.previous_revision IS NOT NULL) SELECT 0 slot,p.content_hash,c.body FROM remote.local_row_bases b JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(b.kind,b.entity,b.author,b.revision) JOIN ancestors a ON a.revision=b.revision JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE (b.kind,b.entity,b.author)=(?,?,?) UNION ALL SELECT 1 slot,p.content_hash,c.body FROM remote.row_proofs p JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE p.id=? ORDER BY slot",[head['previous_revision'],row['kind'],row['id'],head['author_user_id'],row['kind'],row['id'],head['author_user_id'],digest(head)]).fetchall()
@@ -548,8 +564,7 @@ def _alias_merge_native(db,row,head):
         if equal(new,old) or equal(local,new): return local
         if key in ('convos_message_lineage','convos_tool_lineage'):
             values=[v for v in (old,local,new) if v is not absent]
-            required(all(isinstance(v,dict) and set(v)=={'v','records'} and type(v['v']) is int and v['v']==1 and isinstance(v['records'],list) and all(isinstance(r,dict) and set(r)=={'old_id','old_hash','current_id','current_hash'} and all(isinstance(r[k],str) and re.fullmatch('[0-9a-f]{'+str(64 if k.endswith('hash') else 16)+'}',r[k]) for k in r) for r in v['records']) for v in values),ValueError('provider alias lineage merge is invalid'))
-            return dict(v=1,records=sorted({canon(r):r for v in values for r in v['records']}.values(),key=canon))
+            return _lineage_union(values)
         if key in ('','metadata') and all(isinstance(v,dict) for v in (old,local,new)):
             values={k:merge(old.get(k,absent),local.get(k,absent),new.get(k,absent),k) for k in old.keys()|local.keys()|new.keys()}
             return {k:v for k,v in values.items() if v is not absent}
@@ -704,6 +719,41 @@ def _alias_fingerprints(db,user,groups):
     for source,session,physical in bindings: bound.setdefault((source,provider_session_key(source,session)),[]).append((session,physical))
     archive=db.execute('SELECT archive_id::VARCHAR,(SELECT version FROM core_schema WHERE singleton) FROM archive_state WHERE singleton').fetchone()
     return {'provider-session:'+digest([source,session]):digest([ALIAS_VERSION,archive,aliases,bound.get((source,session),[]),inputs.get('provider-session:'+digest([source,session]))]) for (source,session),aliases in groups.items()}
+def _conversation_join(rows):
+    required(all(r['kind']=='conversations' and r['state']=='active' and r['id']==rows[0]['id'] and r['data']['source'] in ('codex','claude-code') and isinstance(r['data']['metadata'],dict) and r['data']['metadata'].get('session_id') and r['data']['metadata'].get('timestamp_basis')=='utc' for r in rows),ValueError('conversation fork lacks exact current provider metadata'))
+    lineage={'convos_message_lineage','convos_tool_lineage'}
+    ordinary=[{**r,'data':{k:({name:value for name,value in v.items() if name not in lineage} if k=='metadata' else datetime.fromisoformat(v).isoformat(timespec='microseconds') if k=='created_at' and v else v) for k,v in r['data'].items() if k!='updated_at'}} for r in rows]
+    required(len({digest(r) for r in ordinary})==1,ValueError('conversation content conflict requires resolution'))
+    stamps=[datetime.fromisoformat(r['data']['updated_at']) for r in rows if r['data']['updated_at'] is not None]
+    required(all(t.tzinfo is None for t in stamps),ValueError('conversation fork timestamp representation is not canonical UTC'))
+    metadata={**ordinary[0]['data']['metadata'],**{key:_lineage_union([r['data']['metadata'][key] for r in rows if key in r['data']['metadata']]) for key in sorted(lineage) if any(key in r['data']['metadata'] for r in rows)}}
+    return {**ordinary[0],'data':{**ordinary[0]['data'],'updated_at':max(stamps).isoformat(timespec='microseconds') if stamps else None,'metadata':metadata}}
+def _reconcile_conversation_heads(db_path,cfg,workspace,progress):
+    user,after,blocked,changed=cfg['user'],'',{},0
+    while True:
+        with contextlib.closing(open_db(db_path,True,purpose='remote.conversations.forks')) as db:
+            ids=[r[0] for r in db.execute("SELECT p.source_row_id FROM remote.row_proofs p JOIN conversations c ON c.id=p.source_row_id WHERE p.author_user_id=? AND p.workspace_id=? AND p.row_kind='conversations' AND p.source_row_id>? AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) GROUP BY p.source_row_id HAVING count(DISTINCT p.content_hash)>1 ORDER BY p.source_row_id LIMIT 100",[user,workspace,after]).fetchall()]
+        if not ids: return changed,blocked
+        for entity in ids:
+            try:
+                with contextlib.closing(open_db(db_path,purpose='remote.conversations.merge')) as db,_transaction(db),preserve_fact_heads(db,[('conversations',entity)]):
+                    values=db.execute("SELECT "+','.join('p.'+name for name in ('workspace_id','authorization_workspace_id','row_kind','source_row_id','encoding_v','content_hash','revision','previous_revision','state','author_user_id','author_device_id','authorization_epoch','signature'))+",c.body FROM remote.row_proofs p LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE p.row_kind='conversations' AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) ORDER BY p.revision LIMIT 65",[entity,user]).fetchall()
+                    required(len(values)<=64,ValueError('conversation fork exceeds automatic reconciliation limit'))
+                    claim=('conversations',entity,entity,user,'active')
+                    native=typed_logical_rows(db,[claim])[claim]
+                    rows=[required(row if row is not None and digest(row)==v[5] else None,ValueError('conversation fork body unavailable')) for v in values for row in [json.loads(v[-1]) if v[-1] else matching_logical_row(native,v[5])]]
+                    merged=_conversation_join([native,*rows])
+                    proofs=[row_proof(cfg['device'],user,v[0],cfg['workspaces'][workspace]['epoch'],merged,v[6],workspace) for v in values]
+                    signer=cfg['controls'][workspace]['devices'][cfg['device']['id']]
+                    project_workspace_controls(db,next(w['controls'] for w in cfg['server_state']['workspaces'] if w['id']==workspace))
+                    project_attested_rows(db,[(merged,p) for p in proofs],signer['root_public'],signer['certificate'])
+                    proof=min(proofs,key=lambda p:p['revision'])
+                    project_logical_rows(db,[(merged,proof,digest(proof),True)])
+                changed+=1
+            except ValueError as e: blocked['conversation:'+entity]=str(e)
+            progress('reconciling conversation metadata '+entity)
+            archive_yield(db_path)
+        after=ids[-1]
 def reconcile_provider_aliases(db_path,cfg,workspace,progress=None,state=None):
     data=Path(db_path).parent
     try:
@@ -722,6 +772,7 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
         key=(values[0][1],provider_session_key(values[0][1],values[0][2]))
         groups.setdefault(key,[]).append((object_id,leaves))
     result,controls,signer,backed_up={"changed":0,"settled":0,"blocked":{}},next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace),cfg["controls"][workspace]["devices"][cfg["device"]["id"]],False
+    result["changed"],result["blocked"]=_reconcile_conversation_heads(db_path,cfg,workspace,progress)
     cache_key=f'provider_alias_cache:{workspace}:{user}'
     cached=json.loads(row[0]) if state is not None and (row:=state.execute('SELECT value FROM meta WHERE key=?',[cache_key]).fetchone()) else {}
     with contextlib.closing(open_db(db_path,True,purpose='remote.alias.dependencies')) as db: fingerprints=_alias_fingerprints(db,user,groups) if state is not None else {}
@@ -775,7 +826,7 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
                 if not rows: continue
                 proofs=[row_proof(cfg["device"],user,head["workspace"],cfg["workspaces"][workspace]["epoch"],row,head["revision"],workspace) for row,head,native,parent_map in rows]
                 with contextlib.closing(open_db(db_path,purpose="remote.alias.write-page")) as db,_transaction(db),preserve_fact_heads(db,[(row["kind"],row["id"]) for row,head,native,parent_map in rows if native]):
-                    (required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during provider alias reconciliation; retry")),project_workspace_controls(db,controls),project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native,parent_map),proof,pid in zip(rows,proofs,project_row_proofs(db,proofs,signer["root_public"],signer["certificate"]))]))
+                    (required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during provider alias reconciliation; retry")),project_workspace_controls(db,controls),project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native,parent_map),proof,pid in zip(rows,proofs,_alias_proofs(db,cfg,workspace,[(row,proof) for (row,*_),proof in zip(rows,proofs)]))]))
                 changed=True
             current=[item for generation,values in _alias_pages(db_path,user,member_physical,progress=progress) for item in values]
             revisions,lineage=_alias_message_plan(current,source,members,history)
@@ -804,7 +855,7 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
                     progress(f"provider message repair {index}/{len(pages)}")
                     with contextlib.closing(open_db(db_path,purpose='remote.alias.message-lineage')) as db,_transaction(db),preserve_fact_heads(db,[(row['kind'],parents.get(('file_edits' if row['kind']=='edit.observed' else row['kind'],row['id']),row['id'])) for (row,head,native,parents,path),proof in page]):
                         required(db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]==generation,RuntimeError('Archive changed during provider message reconciliation; retry'))
-                        pids=project_row_proofs(db,[proof for row,proof in page],signer['root_public'],signer['certificate'])
+                        pids=_alias_proofs(db,cfg,workspace,[(row[0],proof) for row,proof in page])
                         if page: project_logical_rows(db,[(row,proof,pid,native,parents) for ((row,head,native,parents,path),proof),pid in zip(page,pids)])
                         if evidence: project_file_edit_evidence_many(db,evidence)
                         generation=db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]
@@ -815,7 +866,7 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
                 required(not db.execute("SELECT 1 FROM (SELECT conversation_id FROM messages UNION ALL SELECT conversation_id FROM artifacts) WHERE conversation_id IN (SELECT UNNEST(?)) LIMIT 1",([member_physical[m] for m in set(members)-{canonical}],)).fetchone(),RuntimeError("Provider alias rows remain; retry"))
             rows,proofs=(rows:=[(logical_row("conversations",identity=member,state="deleted"),member_heads[("conversations",member)],member_native[member],{("conversations",source_id):physical for source_id,physical in member_physical.items()}) for member in present-{canonical}]),[row_proof(cfg["device"],user,head["workspace"],cfg["workspaces"][workspace]["epoch"],row,head["revision"],workspace) for row,head,native,parent_map in rows]
             with contextlib.closing(open_db(db_path,purpose="remote.alias.finish")) as db,_transaction(db),preserve_fact_heads(db,[(row["kind"],row["id"]) for row,head,native,parent_map in rows if native]):
-                (required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during provider alias reconciliation; retry")),project_workspace_controls(db,controls),project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native,parent_map),proof,pid in zip(rows,proofs,project_row_proofs(db,proofs,signer["root_public"],signer["certificate"]))]),project_provider_bindings(db,source,session,member_physical[canonical],list(member_physical.values())))
+                (required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during provider alias reconciliation; retry")),project_workspace_controls(db,controls),project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native,parent_map),proof,pid in zip(rows,proofs,_alias_proofs(db,cfg,workspace,[(row,proof) for (row,*_),proof in zip(rows,proofs)]))]),project_provider_bindings(db,source,session,member_physical[canonical],list(member_physical.values())))
             result["changed"]+=bool(changed or rows or binding)
         except duckdb.InterruptException: raise
         except Exception as e: result["blocked"][object_id]=str(e)
@@ -933,10 +984,18 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
             fields="p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature"
             chains={}
             for r in db.execute(f"SELECT p.id,CAST(c.body AS VARCHAR),{fields} FROM remote.row_proofs p JOIN (SELECT DISTINCT kind,row_id,author FROM incoming) i ON (p.row_kind,p.source_row_id,p.author_user_id)=(i.kind,i.row_id,i.author) LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id").fetchall(): chains.setdefault((r[4],r[5],r[11]),{})[r[8]]=(r[0],json.loads(r[1]) if r[1] else None,proof(r[2:]))
+            bases={(kind,entity,author):revision for kind,entity,author,revision in db.execute("SELECT b.* FROM remote.local_row_bases b JOIN (SELECT DISTINCT kind,row_id,author FROM incoming) i ON (b.kind,b.entity,b.author)=(i.kind,i.row_id,i.author)").fetchall()}
             for scope,nodes in chains.items():
                 leaves=set(nodes)-{v[2]["previous_revision"] for v in nodes.values() if v[2]["previous_revision"]}
-                if len(leaves)==1:
-                    revision=leaves.pop()
+                if leaves and len({nodes[r][2]['content_hash'] for r in leaves})==1:
+                    def follows(revision):
+                        seen=set()
+                        while revision in nodes and revision not in seen:
+                            if revision==bases.get(scope): return True
+                            seen.add(revision)
+                            revision=nodes[revision][2]['previous_revision']
+                        return False
+                    revision=min(leaves,key=lambda r:(not follows(r),nodes[r][1] is None,r))
                     pid,row,p=nodes[revision]
                     chosen[scope]=revision
                     if row is not None: projected.append((row,p,pid,p["author_user_id"]==local_user))

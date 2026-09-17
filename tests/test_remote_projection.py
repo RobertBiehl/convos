@@ -626,7 +626,7 @@ def test_provider_alias_reconciliation_blocks_on_row_fork(tmp_path):
     before=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]
     db.close()
     result=reconcile_provider_aliases(path,cfg,"personal")
-    assert result["changed"]==0 and "forked" in next(iter(result["blocked"].values()))
+    assert result["changed"]==0 and any("forked" in error for error in result["blocked"].values())
     db=duckdb.connect(str(path),read_only=True)
     assert db.execute("SELECT id FROM conversations ORDER BY id").fetchall()==[("a",),("b",)]
     assert db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==before
