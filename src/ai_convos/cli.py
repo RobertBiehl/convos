@@ -1550,7 +1550,7 @@ def backup():
 def _input_binding(bindings,source,session): return [bindings.get((source,session)),sorted(bindings.get((source,session,'legacy'),()))]
 def _binding_covers(old,current): return old[0]==current[0] and set(current[1])<=set(old[1])
 def _sync_leader(fn,full=False):
-    with operation_lock(DATA_DIR/".sync.lock","sync",wait=0) as pulse,operation_lock(HOOK_DIR/".drain.lock","sync.full.capture",wait=30) if full else contextlib.nullcontext(): return fn(lambda stage:(pulse(stage),sys.stderr.isatty() and (now:=time.monotonic())-getattr(pulse,"shown",0)>=1 and (setattr(pulse,"shown",now),typer.echo(f"  Local sync: {stage}",err=True)))[0])
+    with operation_lock(DATA_DIR/".sync.lock","sync",wait=0) as pulse,(operation_lock(HOOK_DIR/".drain.lock","sync.full.capture",wait=30) if full else contextlib.nullcontext()) as capture: return fn(lambda stage:(pulse(stage),capture and capture(stage),sys.stderr.isatty() and (now:=time.monotonic())-getattr(pulse,"shown",0)>=1 and (setattr(pulse,"shown",now),typer.echo(f"  Local sync: {stage}",err=True)))[0])
 
 def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch all sources and reconcile all provenance"), verbose: bool = typer.Option(False, "-v", "--verbose"), local_only: bool = typer.Option(False, "--local-only", help="Import local agent sessions and configured exports without contacting web sources.")):
     if sys.argv[1:2] == ["sync"]: signal.signal(signal.SIGINT, signal.SIG_DFL)
