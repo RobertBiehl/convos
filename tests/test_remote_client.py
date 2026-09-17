@@ -1048,3 +1048,26 @@ def test_lost_upload_response_survives_epoch_rotation_without_resealing(tmp_path
     with pytest.raises(ConnectionError,match="response lost"): upload(alice,state,a)
     monkeypatch.setattr("ai_convos_remote.request",direct); setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); upload(alice,state,a); stored=stored_envelope(server.execute("SELECT envelope,ciphertext FROM events WHERE event=?",(eid,)).fetchone())
     assert stored==original and state.execute("SELECT epoch FROM receipts WHERE event=?",(eid,)).fetchone()[0]==1 and not state.execute("SELECT 1 FROM outbox WHERE event=?",(eid,)).fetchone()
+
+
+def test_blocked_reconciliation_finishes_transfer_but_cannot_report_settled(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/'server.db')
+    monkeypatch.setattr(remote_client,'request',transport(server))
+    monkeypatch.setattr(remote_client,'drain_hooks',lambda:None)
+    root=tmp_path/'client'
+    setup_client('http://server','alice',root=root)
+    write_archive(root/'data/convos.db','retained source content')
+    reconcile=remote_client.reconcile_provider_aliases
+    def unresolved(*args,**kwargs):
+        result=reconcile(*args,**kwargs)
+        return result|{'blocked':{'conversation:c':'conversation content conflict requires resolution'}}
+    monkeypatch.setattr(remote_client,'reconcile_provider_aliases',unresolved)
+    with pytest.raises(RuntimeError,match='Archive reconciliation incomplete'): sync_once(root,True)
+    assert server.execute('SELECT count(*) FROM row_replicas').fetchone()[0]==1
+    with connect(root/'remote/state.db') as state:
+        assert not state.execute("SELECT value FROM meta WHERE key='sync_settled'").fetchone()
+        assert not state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone()
+    monkeypatch.setattr(remote_client,'reconcile_provider_aliases',reconcile)
+    sync_once(root,True)
+    with connect(root/'remote/state.db') as state:
+        assert state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone()

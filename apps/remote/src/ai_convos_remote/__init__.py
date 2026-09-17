@@ -1096,6 +1096,7 @@ def sync_once(root=None,repair=False,manual=False):
             server=refresh(cfg,root,True)
             upload(cfg,state,root,ready,True,server)
             failures.update({ws:value["error"] for ws,value in pull(cfg,state,root,True,True,ready=False,server=server).items() if "error" in value})
+            failures.update({ws:RuntimeError("Archive reconciliation incomplete: "+"; ".join(dict.fromkeys(value['blocked'].values()))) for ws,value in aliases.items() if value['blocked']})
             if failures: raise next(iter(failures.values())) if len(authorized)==1 else (ConnectionError if all(isinstance(error,ConnectionError) for error in failures.values()) else RuntimeError)(f"Remote sync completed partially: {len(failures)} workspace error(s); workspaces were isolated and failed data was not accepted or acknowledged. "+"; ".join(f"{cfg['workspaces'].get(ws,{}).get('name',ws[:8])}: {error}" for ws,error in failures.items()))
             remember_archive(cfg,state,root)
             marker=_sync_marker(cfg,root,archive) if (archive:=_archive_marker(root)) and archive==reconciled else None

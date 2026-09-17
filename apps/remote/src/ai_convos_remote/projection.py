@@ -397,7 +397,7 @@ def attest_rows(db_path,cfg,workspace,records,origins=()):
     snapshots,signing_key=[],None
     for row in rows:
         prior,current=list(heads.get((row["kind"],row["id"]),{}).values()),digest(row)
-        if prior and all(h[2]==current for h in prior): continue
+        if any(h[2]==current for h in prior): continue
         if row["kind"]=="edit.observed" and len(prior)>1 and (base:=bases.get(row["id"])) and base[0] in {h[1] for h in prior} and all(base[1][k]==row[k] for k in ("kind","id")) and all(base[1]["data"][k]==row["data"][k] for k in ("turn","file","repository")): prior=[h for h in prior if h[1]==base[0]]
         if len({h[2] for h in prior})>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
         required(len(prior)<=500,ValueError('row revision fanout exceeds atomic attestation limit'))
