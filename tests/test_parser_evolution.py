@@ -9,6 +9,34 @@ from tests.test_remote_projection import signed_edit_graph
 from tests import legacy_parsers
 
 
+def test_lineage_resolution_batches_writes_and_skips_unchanged(tmp_path):
+    count=501
+    with core._core(tmp_path/'data/convos.db',purpose='test.lineage-batch') as db:
+        core.init_schema(db)
+        db.execute("INSERT INTO conversations(id,source) VALUES ('c','codex')")
+        db.execute("INSERT INTO messages(id,conversation_id,role,metadata) VALUES ('m','c','user','{}')")
+        pairs=[tuple(dict(id=core.gen_id(side,str(i)),message_id='m',tool_name=str(i),input='{}',output='{}',status='complete',duration_ms=None,created_at=None) for side in ('old','new')) for i in range(count)]
+        core._insert_pages(db,'tool_calls',[list(row.values()) for pair in pairs for row in pair])
+        records=[dict(old_id=old['id'],old_hash=core.provenance_digest(core.parser_logical_row('tool_calls',old)),current_id=new['id'],current_hash=core.provenance_digest(core.parser_logical_row('tool_calls',new))) for old,new in pairs]
+        core.record_tool_lineage(db,[('m','',True)],metadata={'m':{'convos_tool_lineage':dict(v=1,records=records)}})
+        class CountWrites:
+            writes=0
+            def __getattr__(self,key): return getattr(db,key)
+            def execute(self,sql,*args):
+                if sql.startswith('UPDATE parser_tool_lineage'): self.writes+=1
+                return db.execute(sql,*args)
+            def executemany(self,sql,values):
+                if sql.startswith('UPDATE parser_tool_lineage'): self.writes+=len(values)
+                return db.executemany(sql,values)
+        counted=CountWrites()
+        core.reconcile_tool_lineage(counted,['m'])
+        assert db.execute('SELECT count(*) FROM parser_tool_history').fetchone()==(count,)
+        assert counted.writes<=2
+        counted.writes=0
+        core.reconcile_tool_lineage(counted,['m'])
+        assert counted.writes==0
+
+
 @pytest.mark.parametrize('custom',[False,True])
 def test_alias_reparse_recognizes_each_tool_call_without_collapsing_equal_calls(tmp_path,custom):
     transcript=tmp_path/'session.jsonl'
