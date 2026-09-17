@@ -108,6 +108,73 @@ def test_schema_upgrade_replays_retained_bodies_without_resetting_receipts(tmp_p
         assert db.execute("SELECT json_extract_string(c.body,'$.data.title') FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id JOIN remote.local_row_bases b ON (b.kind,b.entity,b.author,b.revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)").fetchone()==('signed base',)
 
 
+@pytest.mark.parametrize('legacy_marker',[False,True])
+def test_interrupted_projection_repair_resumes_and_revalidates_old_receipts(tmp_path,monkeypatch,legacy_marker):
+    server=server_connect(tmp_path/'server.db')
+    direct=transport(server)
+    monkeypatch.setattr(remote_client,'request',direct)
+    monkeypatch.setattr(remote_client,'drain_hooks',lambda:None)
+    root=tmp_path/'client'
+    cfg,_=setup_client('http://server','alice',root=root)
+    sid=workspace(cfg,'Personal')
+    path=root/'data/convos.db'
+    write_archive(path,'first')
+    sync_once(root)
+    replicate_conversation(root,sid,'second','second')
+    sync_once(root)
+    with duckdb.connect(str(path)) as db: db.execute('DELETE FROM conversations')
+    cfg=load(root)
+    ws=next(w for w in refresh(cfg,root)['workspaces'] if w['id']==sid)
+    cfg['server_state']['capabilities']['replica_pull_limit']=1
+    requests=[]
+    def interrupted(cfg,body,auth=True):
+        requests.append(body['after'])
+        if len(requests)==2: raise ConnectionError('interrupted between pages')
+        return direct(cfg,body,auth)
+    monkeypatch.setattr(remote_client,'request',interrupted)
+    with connect(root/'remote/state.db') as state:
+        state.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',(f'replica_projection:{sid}','old-projection'))
+        if legacy_marker: state.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',(f'replica_repair:{sid}','1'))
+        state.commit()
+        with pytest.raises(ConnectionError,match='interrupted between pages'): remote_client.pull_row_replicas(cfg,state,root,ws)
+        checkpoint=int(state.execute('SELECT value FROM meta WHERE key=?',(f'replica_cursor:{sid}',)).fetchone()[0])
+    with duckdb.connect(str(path),read_only=True) as db: assert db.execute('SELECT count(*) FROM conversations').fetchone()==(1,)
+    requests.clear()
+    monkeypatch.setattr(remote_client,'request',lambda cfg,body,auth=True:requests.append(body['after']) or direct(cfg,body,auth))
+    with connect(root/'remote/state.db') as state: remote_client.pull_row_replicas(cfg,state,root,ws)
+    assert requests[0]==checkpoint>0
+    with duckdb.connect(str(path),read_only=True) as db: assert db.execute('SELECT title FROM conversations ORDER BY title').fetchall()==[('first',),('second',)]
+
+
+def test_additive_schema_upgrade_keeps_validated_replica_cursor(tmp_path,monkeypatch):
+    old=projection_module.digest({'core':15,'bridges':{kind:(bridge['v'],bridge['schema']) for bridge in projection_module.bridges() for kind in bridge['objects']}})
+    state=connect(tmp_path/'state.db')
+    state.execute("INSERT INTO meta VALUES ('replica_cursor:w','941'),('replica_projection:w',?)",(old,))
+    state.commit()
+    requests=[]
+    monkeypatch.setattr(remote_client,'request',lambda cfg,body:requests.append(body['after']) or {'replicas':[],'floor':0,'tail':941})
+    assert remote_client.pull_row_replicas({'user':'user'},state,tmp_path,{'id':'w','controls':[]})==0
+    assert requests==[941]
+    assert state.execute("SELECT value FROM meta WHERE key='replica_projection:w'").fetchone()[0]==projection_module.bridge_stamp(tmp_path)
+    assert not state.execute("SELECT 1 FROM meta WHERE key='replica_repair:w'").fetchone()
+    state.close()
+
+
+@pytest.mark.parametrize('change',['projection','bridge','fresh'])
+def test_projection_or_bridge_change_still_replays_validated_receipts(tmp_path,monkeypatch,change):
+    state=connect(tmp_path/'state.db')
+    stamp=projection_module.bridge_stamp(tmp_path)
+    state.execute("INSERT INTO meta VALUES ('replica_cursor:w','941'),('replica_projection:w',?)",(stamp,))
+    state.commit()
+    if change=='projection': monkeypatch.setattr(projection_module,'REPLICA_VERSIONS',(17,))
+    if change=='bridge': monkeypatch.setattr(projection_module,'bridges',lambda:[{'v':123,'schema':123,'objects':['changed']}])
+    requests=[]
+    monkeypatch.setattr(remote_client,'request',lambda cfg,body:requests.append(body['after']) or {'replicas':[],'floor':0,'tail':0})
+    assert remote_client.pull_row_replicas({'user':'user'},state,tmp_path,{'id':'w','controls':[]},fresh=change=='fresh')==0
+    assert requests==[0]
+    state.close()
+
+
 def test_first_publication_does_not_reconcile_each_preparation_page(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); direct=transport(server); calls=[]
     monkeypatch.setattr("ai_convos_remote.request",lambda cfg,body,auth=True:calls.append(body["op"]) or direct(cfg,body,auth)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); write_archive(root/"data/convos.db","first publication"); orphan=root/"remote/outbox/.replica-batch-orphan.json.1.1"; orphan.write_text("ignored staging data"); calls.clear(); sync_once(root)

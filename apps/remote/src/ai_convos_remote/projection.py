@@ -5,12 +5,13 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import CORE_VERSION, ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_yield, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_file_edit_evidence_many, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_yield, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_file_edit_evidence_many, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
 STATE_VERSION,ALIAS_VERSION,ALIAS_WRITE_PAGE="4",13,250
+REPLICA_VERSIONS=(16,15)  # Schema 16 only rebuilds derived edit lineage locally; projection changes must invalidate these epochs.
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -201,7 +202,8 @@ def event_support(value):
     if not isinstance(kind:=value["kind"],str) or not isinstance(version:=value["payload_v"],int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
     return "supported" if (kind,version) in CORE_EVENTS else "required"
 def bridge_records(root,cfg,workspace,kind,archive=True,changes=None): return [record for bridge in bridges() if archive or bridge.get("source")!="archive" for record in (bridge["delta"](root,cfg["user"],workspace,kind,changes) if changes is not None and "delta" in bridge else bridge["records"](root,cfg["user"],workspace,kind))]
-def bridge_stamp(root): return digest({"core":CORE_VERSION,"bridges":{kind:(bridge["v"],bridge["schema"]) for bridge in bridges() for kind in bridge["objects"]}})
+def bridge_stamps(root): return tuple(digest({"core":version,"bridges":{kind:(bridge["v"],bridge["schema"]) for bridge in bridges() for kind in bridge["objects"]}}) for version in REPLICA_VERSIONS)
+def bridge_stamp(root): return bridge_stamps(root)[0]
 def bridge_state(root,cfg,workspace,kind,generation): return digest((generation,bridge_stamp(root),bridge_records(root,cfg,workspace,kind,False)))
 def bridge_accept_many(root,values,project=True):
     groups=[(bridge,selected) for bridge in bridges() if (selected:=[(i,value) for i,value in enumerate(values) if value[0]["kind"] in bridge["objects"]])]

@@ -57,7 +57,8 @@ def test_alias_reimport_marks_only_exact_edit_copies_and_retains_every_body(tmp_
 @pytest.mark.parametrize('source',['codex','claude-code'])
 @pytest.mark.parametrize('native',[False,True])
 @pytest.mark.parametrize('reverse',[False,True])
-def test_edit_lineage_replays_without_source_files_and_keeps_original_rows(tmp_path,source,native,reverse):
+@pytest.mark.parametrize('upgrade',[False,True])
+def test_edit_lineage_replays_without_source_files_and_keeps_original_rows(tmp_path,source,native,reverse,upgrade):
     path,parser,old,bound,canonical=fixture(tmp_path,source)
     sender=tmp_path/'sender.db'
     with core._core(sender,purpose='test.edit-source') as db:
@@ -75,6 +76,18 @@ def test_edit_lineage_replays_without_source_files_and_keeps_original_rows(tmp_p
     receiver=tmp_path/'receiver.db'
     local=user if native else 'recipient'
     for body in reversed(bodies) if reverse else bodies: projection.apply_row_replicas(receiver,[body],'w',[control],local_user=local)
+    if upgrade:
+        with core._core(receiver,purpose='test.edit-migration') as db:
+            snapshot=lambda:{kind:db.execute('SELECT * FROM '+kind+' ORDER BY id').fetchall() for kind in (*core.ARCHIVE_COLUMNS,'remote.row_proofs')}
+            before=snapshot()
+            db.execute('DROP VIEW current_file_edits')
+            db.execute('DROP VIEW parser_edit_history')
+            db.execute('DROP TABLE parser_edit_lineage')
+            db.execute('UPDATE core_schema SET version=15')
+            core.init_schema(db)
+            assert snapshot()==before
+            assert db.execute('SELECT count(*) FROM current_file_edits').fetchone()==(2,)
+        assert receiver.with_suffix('.db.pre-v16.bak').is_file()
     for _ in range(2):
         projection.apply_row_replicas(receiver,bodies,'w',[control],local_user=local)
         with core._core(receiver,True,purpose='test.edit-received') as db:

@@ -11,7 +11,7 @@ _pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases"
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_file_edit_evidence_many, project_provider_alias, provider_session_key, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import _reconcile_conversation_heads, ALIAS_VERSION, PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, local_repack_envelopes, repack_index, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, retry_edit_replicas, retry_own_replicas, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
+from .projection import _reconcile_conversation_heads, ALIAS_VERSION, PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_stamps, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, local_repack_envelopes, repack_index, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, retry_edit_replicas, retry_own_replicas, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
                        recovery_bundle, registration_proof, repack_replica, replica_compression, replica_plain_size, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
@@ -759,8 +759,14 @@ def replica_page(items,count=2500): return required(isinstance(items,list) and l
 def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
     sid,stamp=ws["id"],bridge_stamp(root)
     saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]
-    repair=fresh or saved!=stamp or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{sid}",)).fetchone())
-    after=0 if repair else int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0])
+    marker=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_repair:{sid}",)).fetchone() or [None])[0]
+    repair=fresh or saved!=stamp and saved not in bridge_stamps(root) or bool(marker)
+    after=int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0]) if not repair or not fresh and marker in (stamp,"projection:"+stamp) else 0
+    # Receive-only repair ends at the tail; explicit repair also verifies outbound retention.
+    if repair:
+        marker=stamp if marker and not marker.startswith("projection:") else "projection:"+stamp
+        state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"replica_repair:{sid}",marker,f"replica_cursor:{sid}",str(after)))
+        state.commit()
     dependencies={r[0] for r in state.execute("SELECT origin FROM control_dependencies WHERE workspace=?",(sid,)).fetchall()}
     controls=ws["controls"]+stored_controls(core_path(root),set(origins)|dependencies)
     cursor,total,known,valid,invalid=after,0,set(),set(),{}
@@ -773,7 +779,8 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
             cursor=after=0
             known,valid,invalid,repair=set(),set(),{},True
             state.execute("DELETE FROM meta WHERE key=?",(f"replica_cursor:{sid}",))
-            state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_repair:{sid}","1"))
+            marker=stamp
+            state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_repair:{sid}",marker))
             state.commit()
             continue
         found=local_receipts(state,"replica",sid,[(item["envelope"]["replica"],item["envelope"]["epoch"]) for item in result["replicas"]]) if not repair else set()
@@ -804,6 +811,7 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=(),fresh=False):
         (state.commit(),_progress(f"receiving rows {total}"))
         if cursor>=tail:
             if invalid: raise ValueError(f"invalid row replica: no valid delivery copy for {len(invalid)} object(s)")
+            if marker and marker.startswith("projection:"): (state.execute("DELETE FROM meta WHERE key=?",(f"replica_repair:{sid}",)),state.commit())
             return total
         if not result["replicas"]: raise ValueError("relay replica tail cannot be reached")
 def pull_blobs(cfg,state,root,ws,recover=None):

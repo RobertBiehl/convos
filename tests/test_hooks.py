@@ -22,6 +22,34 @@ def test_ingest_chunk_identity_work_is_bounded_and_lineage_stays_with_message():
     assert [lineage for part in parts for lineage in part.message_lineage]==messages
     assert all(len(part.msgs)<=100 and {v[0] for v in part.tool_lineage+part.message_lineage}<={m['id'] for m in part.msgs} for part in parts)
 
+def test_unchanged_ingest_reports_committed_progress_without_dirtying_archive():
+    conv=dict(id='c',source='codex',title='source',created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata='{}')
+    msgs=[dict(id=str(i),conversation_id='c',role='user',content=str(i),thinking=None,created_at=None,model=None,metadata='{}',parent_id=None) for i in range(501)]
+    with cli._core(purpose='test.noop.init') as db: cli.init_schema(db)
+    cli.commit_result(cli.ParseResult(convs=[conv],msgs=msgs),purpose='test.noop.seed')
+    with cli._core(read_only=True,purpose='test.noop.before') as db: before=cli.archive_state(db)
+    progress=[]
+    def pulse(stage):
+        with cli._core(read_only=True,purpose='test.noop.progress') as db: assert db.execute('SELECT count(*) FROM messages').fetchone()==(501,)
+        progress.append(stage)
+    result=cli.commit_result(cli.ParseResult(convs=[conv],msgs=msgs),purpose='test.noop.ingest',progress=pulse)
+    with cli._core(read_only=True,purpose='test.noop.after') as db: assert cli.archive_state(db)==before
+    assert result[:7]==(0,0,0,0,0,0,0)
+    assert len(progress)==3 and len(set(progress))==3
+
+def test_doctor_reports_native_conversations_without_recorded_local_sources(tmp_path,capsys):
+    present,missing=tmp_path/'present.jsonl',tmp_path/'missing.jsonl'
+    present.write_text('{}\n')
+    session='019a2f3d-9455-7820-b4f6-0beeb2bf1f6f'
+    with cli._core(purpose='test.coverage.init') as db:
+        cli.init_schema(db)
+        db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex',?)",[(cid,json.dumps(dict(session_id=sid))) for cid,sid in [('present','available'),('missing','rollout-2025-10-29T10-12-36-'+session),('unknown','untracked'),('foreign','untracked')]])
+        db.execute("INSERT INTO remote.row_origins(table_name,physical_row_id,source_row_id,author_user_id) VALUES ('conversations','foreign','foreign','another-user')")
+    cli.atomic_json(cli.STATE_PATH,dict(local=dict(codex=dict(parser=cli.PARSER_EPOCH,files={str(present):0,str(missing):0},bindings={str(present):['available',['present',[]]],str(missing):[session,['missing',[]]],str(tmp_path/'also-missing.jsonl'):['available',['present',[]]]}))))
+    cli.doctor(False)
+    output=capsys.readouterr().out
+    assert 'local sources codex: present=1, missing=1, untracked=1 (native conversations)' in output
+
 @pytest.fixture
 def hooks(tmp_path, monkeypatch):
     data, codex = tmp_path/"data", tmp_path/".codex"; sessions = codex/"sessions"; sessions.mkdir(parents=True)
