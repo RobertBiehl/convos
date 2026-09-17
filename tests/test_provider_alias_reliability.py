@@ -354,3 +354,64 @@ def test_timestamp_repair_requires_exact_retired_parent_lineage(parent_evidence)
     if parent_evidence=='valid':
         assert {(row['data']['created_at'],row['data']['parent_id']) for row,*_ in revisions if row['kind']=='messages'}=={('2026-01-01T00:00:02',new_parent)}
     else: assert revisions==[]
+def test_alias_reconciliation_wakes_hooks_after_releasing_capture_lease(tmp_path,monkeypatch):
+    from ai_convos import cli as core
+    from ai_convos_remote import projection
+    data=tmp_path/'data'
+    queued=data/'hook_inbox/event.json'
+    seen=[]
+    def reconcile(*args):
+        core.atomic_json(queued,dict(source='codex',path='/unused-test-transcript'))
+        return {'changed':0}
+    def wake(*args,**kwargs):
+        with core.operation_lock(data/'hook_inbox/.drain.lock','test.released',0): seen.append(kwargs)
+    monkeypatch.setattr(projection,'_reconcile_provider_aliases',reconcile)
+    monkeypatch.setattr(projection,'wake_hooks',wake)
+    assert projection.reconcile_provider_aliases(data/'convos.db',{},'test')=={'changed':0}
+    assert seen==[{'root':tmp_path}]
+
+
+@pytest.mark.parametrize('interrupt',[False,True,'retirement'])
+def test_message_reconciliation_commits_bounded_pages_and_resumes_with_history(tmp_path,monkeypatch,interrupt):
+    root,path,identity,device,user,cfg,_=archive(tmp_path,False)
+    with duckdb.connect(str(path)) as db:
+        db.execute('DELETE FROM messages')
+        db.execute("DELETE FROM remote.row_proofs WHERE row_kind='messages'")
+        for cid in ('a','b'):
+            for i in range(1,7):
+                mid,tid,eid=(core.gen_id('codex',f'{kind}:{cid}:{i}') for kind in ('message','tool','edit'))
+                parent=core.gen_id('codex',f'message:{cid}:{i-1}') if i>1 else None
+                db.execute("INSERT INTO messages(id,conversation_id,role,content,metadata,parent_id) VALUES (?,?,'assistant',?,?,?)",[mid,cid,f'turn {i}',json.dumps(dict(provider_index=i)),parent])
+                db.execute("INSERT INTO tool_calls VALUES (?,?,'shell','{}','\"retained payload\"','complete',NULL,NULL)",[tid,mid])
+                db.execute("INSERT INTO file_edits VALUES (?,?,'shared.py','write','retained edit',NULL,NULL)",[eid,mid])
+                db.execute("INSERT INTO provenance.file_edit_evidence VALUES (?,'confirmed','test',?)",[eid,tid])
+    core.capture_provenance(path)
+    attest(tmp_path,path,cfg)
+    accept(root,identity,device,user,SESSION,['a','b'])
+    calls=[]
+    write=projection.project_logical_rows
+    monkeypatch.setattr(projection,'ALIAS_WRITE_PAGE',2,raising=False)
+    def recording(db,items,*args,**kwargs):
+        if db.audit[0]=='remote.alias.message-lineage':
+            calls.append(len(items))
+            if interrupt is True and len(calls)==2 or interrupt=='retirement' and any(row['kind']=='conversations' for row,*_ in items): raise RuntimeError('interrupted after committed repair page')
+        return write(db,items,*args,**kwargs)
+    monkeypatch.setattr(projection,'project_logical_rows',recording)
+    result=projection.reconcile_provider_aliases(path,cfg,'personal')
+    if interrupt:
+        assert result['blocked'] and len(calls)>=2
+        with duckdb.connect(str(path),read_only=True) as db:
+            assert core.archive_relationships(db)=={}
+            assert db.execute('SELECT count(*) FROM messages').fetchone()==(12,)
+        assert projection.audit_rows(path,local_user=user)['totals']['unavailable']==0
+        monkeypatch.setattr(projection,'project_logical_rows',write)
+        result=projection.reconcile_provider_aliases(path,cfg,'personal')
+    assert not result['blocked']
+    assert max(calls)<=4
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert core.archive_relationships(db)=={}
+        assert db.execute('SELECT count(*) FROM messages').fetchone()==(6,)
+        assert db.execute("SELECT count(*) FROM tool_calls WHERE output='\"retained payload\"'").fetchone()==(12,)
+        assert db.execute("SELECT count(*) FROM file_edits WHERE content='retained edit'").fetchone()==(12,)
+        assert db.execute("SELECT count(*) FROM parser_retired_rows WHERE kind='messages'").fetchone()==(6,)
+    assert projection.audit_rows(path,local_user=user)['totals']['unavailable']==0

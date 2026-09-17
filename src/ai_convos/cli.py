@@ -9,6 +9,8 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remote_data, migrate_remote_ids, migration_memory, remote_id_migration_scope
 
+# Newer Typer vendors Click; command errors must use the active runtime.
+click=getattr(typer,"_click",click)
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT,DATA_DIR,DB_PATH,STATE_PATH=(root:=find_root()),(data:=root/"data"),data/"convos.db",data/"sync_state.json"
@@ -18,6 +20,7 @@ _INJECTED_RE,MESSAGE_ORDER,MESSAGE_ORDER_DESC=r"(?s)(?:# AGENTS\.md instructions
 
 def _open_db(path,read_only=False): return (path.parent.mkdir(parents=True,exist_ok=True),None if read_only and not path.exists() else duckdb.connect(str(path),read_only=read_only))[-1]
 class LockBusy(click.ClickException,RuntimeError): pass
+class ProvenanceChanged(ValueError): pass
 def lock_owner(purpose,identity=None): return dict(identity or {},v=1,purpose=purpose,pid=os.getpid(),process=Path(sys.argv[0]).name,host=os.uname().nodename,os_user=getpass.getuser(),started_at=(now:=time.time()),heartbeat_at=now,stage="started")
 def _lock_read(lock):
     try: return json.loads((lock.seek(0),lock.read())[-1] if hasattr(lock,"read") else Path(lock).read_text())
@@ -230,7 +233,7 @@ def _checkpoint(repo,source): return (lambda paths,state:dict(id=provenance_dige
 def _provenance_record(kind,entity,payload,observed_at): return dict(kind=kind,entity=entity,payload=payload,observed_at=observed_at)
 def _repository_record(repo,observed): return _provenance_record("repository.observed",repo["id"],{k:repo[k] for k in ("id","lineage","roots","remotes","head")},observed)
 def _checkpoint_records(repo,versions,source,observed): return [_provenance_record("git.checkpoint",cp["id"],cp,observed),*[_provenance_record("file.version",vid,{"id":vid,"file":fid,"content_hash":full},observed) for (rid,fid),(edit,after,full,path) in versions.items() if rid==repo["id"] for vid in [provenance_digest({"file":fid,"content":full})]],*[_provenance_record("checkpoint.link",provenance_digest({"checkpoint":cp["id"],"edit":edit}),{"checkpoint":cp["id"],"edit":edit,"evidence":"full_content_match"},observed) for (rid,fid),(edit,after,full,path) in versions.items() if rid==repo["id"] and path not in cp["paths"] and after==full]] if (cp:=_checkpoint(repo,source)) else []
-def _provenance_edits(core,edit_ids=None): return [dict(zip(("id","path","type","content","old","ts","turn","conversation","cwd","scope_path","repository","root","checkout","route","scope_at"),r)) for r in core.execute("""SELECT fe.id,fe.file_path,fe.edit_type,fe.content,fe.old_content,CAST(fe.created_at AS VARCHAR),m.id,m.conversation_id,c.cwd,COALESCE(f.path,s.path),CASE WHEN f.id IS NOT NULL THEN f.repository ELSE s.repository END,s.root,CASE WHEN f.id IS NOT NULL AND s.checkout LIKE 'pending:%' THEN NULL ELSE s.checkout END,s.route,CAST(s.observed_at AS VARCHAR) FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id LEFT JOIN provenance.file_edit_scopes s ON s.file_edit_id=fe.id LEFT JOIN provenance.file_edit_files captured ON captured.file_edit_id=fe.id LEFT JOIN provenance.files f ON f.id=captured.file_id AND s.observed_at IS NOT NULL AND s.route IS NOT NULL AND captured.evidence IS DISTINCT FROM 'legacy_scope_conflict' AND f.id=sha256(json_object('path',f.path,'repository',f.repository)) WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='file_edits' AND o.physical_row_id=fe.id)"""+" AND (NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_edit_id=fe.id) OR EXISTS (SELECT 1 FROM provenance.pending p WHERE p.kind='file_edits' AND p.entity=fe.id))"+(f" AND fe.id IN ({','.join('?'*len(ids))})" if ids else " AND FALSE" if ids==[] else "")+" ORDER BY fe.created_at,fe.id",ids or ()).fetchall()] if (ids:=sorted(set(edit_ids or ())) if edit_ids is not None else None) is not False else []
+def _provenance_edits(core,edit_ids=None): return [dict(zip(("id","path","type","content","old","ts","turn","conversation","cwd","scope_path","repository","root","checkout","route","scope_at"),r)) for r in core.execute("""SELECT fe.id,fe.file_path,fe.edit_type,fe.content,fe.old_content,CAST(fe.created_at AS VARCHAR),m.id,m.conversation_id,c.cwd,COALESCE(f.path,s.path),CASE WHEN f.id IS NOT NULL THEN f.repository ELSE s.repository END,s.root,CASE WHEN f.id IS NOT NULL AND s.checkout LIKE 'pending:%' THEN NULL ELSE s.checkout END,s.route,CAST(s.observed_at AS VARCHAR) FROM file_edits fe JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id LEFT JOIN provenance.file_edit_scopes s ON s.file_edit_id=fe.id LEFT JOIN provenance.file_edit_files captured ON captured.file_edit_id=fe.id LEFT JOIN provenance.files f ON f.id=captured.file_id AND captured.evidence IS DISTINCT FROM 'legacy_scope_conflict' AND f.id=sha256(json_object('path',f.path,'repository',f.repository)) WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='file_edits' AND o.physical_row_id=fe.id)"""+" AND (NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_edit_id=fe.id) OR EXISTS (SELECT 1 FROM provenance.pending p WHERE p.kind='file_edits' AND p.entity=fe.id))"+(f" AND fe.id IN ({','.join('?'*len(ids))})" if ids else " AND FALSE" if ids==[] else "")+" ORDER BY fe.created_at,fe.id",ids or ()).fetchall()] if (ids:=sorted(set(edit_ids or ())) if edit_ids is not None else None) is not False else []
 def _observe_provenance(edits,source="sync",known=None,conversations=(),cache=None):
     cache,captured,records,repos,repo_times,versions,fulls={} if cache is None and _refresh_repository() is None else cache,datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),[],{},{},{},{}
     for e in edits:
@@ -285,7 +288,7 @@ def project_provenance(db,value,map_id=lambda table,value:value,touch=True,repla
     return bool(_archive_touch(db,[(k,value["entity"])])) if touch else True
 def project_native_provenance(db,records):
     keys,local=(keys:=[(r["kind"],r["entity"]) for r in records]),set(db.execute("SELECT kind,entity FROM provenance.local_facts WHERE entity IN (SELECT UNNEST(?))",[[entity for kind,entity in keys]]).fetchall()) if keys else set()
-    with preserve_fact_heads(db,keys,observed=True): [project_provenance(db,record,preserve=False,native=key not in local) for record,key in zip(records,keys)]
+    with preserve_fact_heads(db,keys,observed=True): ([project_provenance(db,record,preserve=False,native=key not in local,touch=False) for record,key in zip(records,keys)],keys and _archive_touch(db,keys))
     _insert_pages(db,"provenance.local_facts",keys,mode=" OR IGNORE")
 def repair_legacy_edit_scopes(db,apply=False):
     # Only migration placeholders: preserve the unique historical file, never reinterpret today's checkout.
@@ -301,7 +304,7 @@ def capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="syn
             if strict or root is None or root in blocked: raise
             blocked.add(root)
             log_parse_error(f"Git provenance pending for {root}: {(error.stderr or b'').decode(errors='replace').strip()}",error)
-        except OSError as error:
+        except (OSError,ProvenanceChanged) as error:
             if strict: raise
             return log_parse_error('Provenance pending; captured conversations are committed',error) or []
 def _capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="sync",blocked=()):
@@ -315,7 +318,9 @@ def _capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="sy
     with _core(path,True,purpose="provenance.plan") as core:
         failed_convs={cid for cid,root in core.execute('SELECT c.id,COALESCE(s.root,c.cwd) FROM conversations c LEFT JOIN provenance.conversation_scopes s ON s.conversation=c.id').fetchall() if excluded(root)} if blocked else set()
         failed_edits={eid for eid,cid,root in core.execute('SELECT e.id,m.conversation_id,COALESCE(s.root,s.route,e.file_path) FROM file_edits e LEFT JOIN messages m ON m.id=e.message_id LEFT JOIN provenance.file_edit_scopes s ON s.file_edit_id=e.id').fetchall() if cid in failed_convs or excluded(root)} if blocked else set()
-        queued,((eids, cids))=(queued:=core.execute("SELECT kind,entity FROM provenance.pending WHERE NOT (kind='conversations' AND entity IN (SELECT UNNEST(?)) OR kind='file_edits' AND entity IN (SELECT UNNEST(?))) ORDER BY generation,kind,entity"+(" LIMIT 500" if targeted else ""),[list(failed_convs),list(failed_edits)]).fetchall()),(sorted(set(eids)|{entity for kind,entity in queued if kind=='file_edits'}),sorted(set(cids)|{entity for kind,entity in queued if kind=='conversations'}))
+        queued=core.execute("SELECT kind,entity FROM provenance.pending WHERE NOT (kind='conversations' AND entity IN (SELECT UNNEST(?)) OR kind='file_edits' AND entity IN (SELECT UNNEST(?))) ORDER BY generation,kind,entity"+(" LIMIT 500" if targeted else ""),[list(failed_convs),list(failed_edits)]).fetchall()
+        selected=list(dict.fromkeys([*queued,*(('file_edits',e) for e in eids),*(('conversations',c) for c in cids)]))[:500 if targeted else None]
+        eids,cids=[entity for kind,entity in selected if kind=='file_edits'],[entity for kind,entity in selected if kind=='conversations']
         eids,cids=sorted(set(eids)-failed_edits),sorted(set(cids)-failed_convs)
         if targeted and not eids and not cids: return []
         if eids: cids=sorted(set(cids)|{r[0] for r in core.execute("SELECT DISTINCT m.conversation_id FROM file_edits fe JOIN messages m ON m.id=fe.message_id WHERE fe.id IN (SELECT UNNEST(?))",[eids]).fetchall()})
@@ -338,7 +343,7 @@ def _capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="sy
     records += [_provenance_record("file.version",vid,{"id":vid,"file":fid,"content_hash":content},captured) for fid,rid,relative,root,checkout in files for target,repo in [(Path(root,relative),_cached_repository(cache,root,known))] if repo and (repo["id"],repo["checkout"])==(rid,checkout) and target.is_file() for content in [provenance_digest(target.read_bytes())] for vid in [provenance_digest({"file":fid,"content":content})]]
     stale,touched=[] if targeted else [root for root,rid in known["roots"].items() if not excluded(root) and (not (repo:=_cached_repository(cache,root,known)) or repo["id"]!=rid)],sorted({e["conversation"] for e in edits})
     with _core(path,purpose="provenance.commit") as core,_transaction(core):
-        ((((((required(generations==_provenance_generations(core,eids,cids),ValueError("Provenance inputs changed during observation; committed conversations are preserved and provenance will retry."))),((stale) and (core.execute("DELETE FROM provenance.repository_checkouts WHERE root IN (SELECT UNNEST(?))",[stale]))))),((scopes) and (core.executemany("UPDATE provenance.conversation_scopes SET cwd=?,repository=?,root=?,checkout=?,observed_at=? WHERE conversation=? AND checkout LIKE 'pending:%'",[(cwd,rid,root,checkout,observed,conversation) for conversation,cwd,rid,root,checkout,observed in scopes]))))),((edit_scopes) and (core.executemany("UPDATE provenance.file_edit_scopes SET path=?,repository=?,root=?,checkout=?,route=?,observed_at=? WHERE file_edit_id=? AND checkout LIKE 'pending:%'",[(relative,rid,root,checkout,route,observed,edit) for edit,relative,rid,root,checkout,route,observed in edit_scopes]))))
+        ((((((required(generations==_provenance_generations(core,eids,cids),ProvenanceChanged("Provenance inputs changed during observation; committed conversations are preserved and provenance will retry."))),((stale) and (core.execute("DELETE FROM provenance.repository_checkouts WHERE root IN (SELECT UNNEST(?))",[stale]))))),((scopes) and (core.executemany("UPDATE provenance.conversation_scopes SET cwd=?,repository=?,root=?,checkout=?,observed_at=? WHERE conversation=? AND checkout LIKE 'pending:%'",[(cwd,rid,root,checkout,observed,conversation) for conversation,cwd,rid,root,checkout,observed in scopes]))))),((edit_scopes) and (core.executemany("UPDATE provenance.file_edit_scopes SET path=?,repository=?,root=?,checkout=?,route=?,observed_at=? WHERE file_edit_id=? AND checkout LIKE 'pending:%'",[(relative,rid,root,checkout,route,observed,edit) for edit,relative,rid,root,checkout,route,observed in edit_scopes]))))
         for repo in repos.values(): _observe_checkout(core,repo)
         ((((project_native_provenance(core,records)),((scopes or touched) and (_archive_touch(core,[("conversations",r[0]) for r in scopes]+[("conversations",c) for c in touched]))))),(core.execute("DELETE FROM provenance.pending WHERE kind='file_edits' AND entity IN (SELECT UNNEST(?)) OR kind='conversations' AND entity IN (SELECT UNNEST(?))",[eids,cids])))
     return records
@@ -985,7 +990,7 @@ def prepare_message_lineage(db,r):
         aliases={v[0] for v in db.execute("SELECT id FROM conversations c WHERE source=? AND (json_extract_string(metadata,'$.session_id') IN (SELECT UNNEST(?)) OR id IN (SELECT UNNEST(?))) AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id)",[conv['source'],list({session}|{v[5] for v in r.message_lineage}),list({v[4] for v in r.message_lineage})]).fetchall()}|set(session_bindings(db).get((conv['source'],session,'legacy'),()))
         candidates=[(current[mid],{**current[mid],'id':gen_id(conv['source'],f'{old}:{index}'),'conversation_id':owner,'parent_id':parent,'model':model,'metadata':metadata,'created_at':stamp}) for mid,index,parent_index,filtered,old_path,old_session,raw_time in r.message_lineage if mid in current and current[mid]['conversation_id']==cid for old in aliases for owner in {old,cid} for parent in ({gen_id(conv['source'],f'{old}:{parent_index}'),None} if filtered and parent_index is not None else {gen_id(conv['source'],f'{old}:{parent_index}') if parent_index is not None else None}) for metadata in ('{}',json.dumps({'provider_index':json.loads(current[mid]['metadata'])['provider_index']})) for model in {current[mid]['model'],'claude' if conv['source']=='claude-code' and current[mid]['role']=='assistant' else None} for stamp in {current[mid]['created_at'],ts_from_iso(raw_time),datetime.fromisoformat(raw_time.replace('Z','+00:00')) if raw_time else None,datetime.fromisoformat(raw_time.replace('Z','+00:00')).astimezone().replace(tzinfo=None) if raw_time else None} if gen_id(conv['source'],f'{old}:{index}')!=mid]
         claims,bodies,foreign=(claims:=[('messages',oid,oid,'','active') for oid in {old['id'] for new,old in candidates}]),(bodies:=typed_logical_rows(db,claims)),{v[0] for v in db.execute("SELECT physical_row_id FROM remote.row_origins WHERE table_name='messages' AND physical_row_id IN (SELECT UNNEST(?))",[[v[1] for v in claims]]).fetchall()}
-        records=[dict(old_id=old['id'],old_hash=provenance_digest(body),current_id=new['id'],current_hash=provenance_digest(parser_logical_row('messages',new))) for new,old in candidates if old['id'] not in foreign|protected and (body:=bodies[('messages',old['id'],old['id'],'','active')]) is not None and provenance_digest(body)==provenance_digest(parser_logical_row('messages',old))]
+        records=[dict(old_id=old['id'],old_hash=provenance_digest(body),current_id=new['id'],current_hash=provenance_digest(parser_logical_row('messages',new))) for new,old in candidates if old['id'] not in foreign and old['id'] not in protected and (body:=bodies[('messages',old['id'],old['id'],'','active')]) is not None and provenance_digest(body)==provenance_digest(parser_logical_row('messages',old))]
         if records:
             metadata,(metadata['convos_message_lineage'])=(metadata:=json.loads(conv['metadata'] or '{}')),({'v':1,'records':sorted({json.dumps(v,sort_keys=True):v for v in [*metadata.get('convos_message_lineage',{}).get('records',[]),*records]}.values(),key=lambda v:(v['old_id'],v['old_hash'],v['current_id'],v['current_hash']))})
             r.convs=[v for v in r.convs if v['id']!=cid]+[{**conv,'metadata':json.dumps(metadata)}]
@@ -1113,7 +1118,7 @@ def upsert(conn, r: ParseResult):
     changed_msgs|={row[0] for row in message_history}
     if message_history: conn.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",message_history)
     with preserve_fact_heads(conn,[("messages",row_id) for row_id in changed_rows if row_id in old_msgs],observed=True): changed_rows and conn.executemany(_MSG_UPS,[list(m.values()) for m in r.msgs if m["id"] in changed_rows])
-    previous_tools,edit_paths,edit_routes=_rows_by_id(conn,"tool_calls",[t["id"] for t in r.tools]),captured_edit_paths(conn,[e['id'] for e in r.edits]),{eid:(route,cwd) for eid,route,cwd in conn.execute("SELECT e.id,s.route,c.cwd FROM file_edits e JOIN provenance.file_edit_scopes s ON s.file_edit_id=e.id JOIN messages m ON m.id=e.message_id JOIN conversations c ON c.id=m.conversation_id WHERE s.observed_at IS NOT NULL AND s.route IS NOT NULL AND e.id IN (SELECT UNNEST(?))",[[e['id'] for e in r.edits]]).fetchall()} if r.edits else {}
+    previous_tools,edit_paths,edit_routes=_rows_by_id(conn,"tool_calls",[t["id"] for t in r.tools]) if r.edits else {},captured_edit_paths(conn,[e['id'] for e in r.edits]),{eid:(route,cwd) for eid,route,cwd in conn.execute("SELECT e.id,s.route,c.cwd FROM file_edits e JOIN provenance.file_edit_scopes s ON s.file_edit_id=e.id JOIN messages m ON m.id=e.message_id JOIN conversations c ON c.id=m.conversation_id WHERE s.observed_at IS NOT NULL AND s.route IS NOT NULL AND e.id IN (SELECT UNNEST(?))",[[e['id'] for e in r.edits]]).fetchall()} if r.edits else {}
     def replace_preserving(table, rows):
         if not rows: return [],0
         old,skip,payload,canonical,changed,histories=(old:=_rows_by_id(conn,table,[r["id"] for r in rows])),(skip:={"tool_calls":7,"attachments":7,"artifacts":6,"file_edits":5}[table]),(payload:=lambda values:tuple(v for i,v in enumerate(values) if i not in (0,skip))),(canonical:=lambda values:payload([edit_paths[values[0]] if table=="file_edits" and i==2 and edit_paths.get(values[0]) and (scope:=edit_routes.get(values[0])) and (v==edit_paths[values[0]] or _resolved(v,scope[1])==scope[0]) else json.dumps(json.loads(v),sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False) if table=="tool_calls" and i in (3,4) and isinstance(v,str) else v for i,v in enumerate(values)])),(changed:=[(list(row.values()),old.get(row["id"])) for row in rows if not old.get(row["id"]) or canonical(old[row["id"]])!=canonical(tuple(row.values())) or old[row["id"]][skip]!=list(row.values())[skip]]),[_history_row(table,previous,payload(previous)) for values,previous in changed if previous and canonical(previous)!=canonical(values)]
@@ -1151,7 +1156,7 @@ def ingest_parts(r,size=500):
     prepared,valid,blank,scopes,edit_scopes,chunks,byid=prepare_result(r),required(not (conflict:=_id_conflict(r.convs,("source","cwd","git_branch","project_id","metadata")) or _id_conflict(r.msgs,("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"))),ValueError(f"divergent provider session in import batch: {conflict}")),lambda **values:ParseResult(**{"scopes":[],"edit_scopes":[],**values}),{v[0]:v for v in r.scopes},{v[0]:v for v in r.edit_scopes},lambda rows:[rows[i:i+size] for i in range(0,len(rows),size)],{m["id"]:m for m in r.msgs}
     rank,messages=(rank:={mid:i for i,mid in enumerate(graphlib.TopologicalSorter({mid:{m["parent_id"]}&byid.keys() for mid,m in byid.items()}).static_order())}),sorted(r.msgs,key=lambda m:rank[m["id"]])
     if sum(map(len,(r.convs,r.msgs,r.tools,r.attachs,r.artifacts,r.edits,r.edit_evidence)))<=size: return (setattr(r,"msgs",messages),[r])[-1]
-    return [*[blank(convs=v,scopes=[scopes[c["id"]] for c in v if c["id"] in scopes]) for v in chunks(r.convs)],*[blank(msgs=v,tool_lineage=[lineage for lineage in r.tool_lineage if lineage[0] in {m["id"] for m in v}],message_lineage=[lineage for lineage in r.message_lineage if lineage[0] in {m["id"] for m in v}]) for v in chunks(messages)],*[blank(tools=v) for v in chunks(r.tools)],*[blank(attachs=v,attachment_indexes={a["id"]:r.attachment_indexes[a["id"]] for a in v if a.get("path")}) for v in chunks(r.attachs)],*[blank(artifacts=v) for v in chunks(r.artifacts)],*[blank(edits=v,edit_scopes=[edit_scopes[e["id"]] for e in v if e["id"] in edit_scopes]) for v in chunks(r.edits)],*[blank(edit_evidence=v) for v in chunks(r.edit_evidence)]]
+    return [*[blank(convs=v,scopes=[scopes[c["id"]] for c in v if c["id"] in scopes]) for v in chunks(r.convs)],*[blank(msgs=v,tool_lineage=[lineage for lineage in r.tool_lineage if lineage[0] in mids],message_lineage=[lineage for lineage in r.message_lineage if lineage[0] in mids]) for v in chunks(messages) for mids in [{m["id"] for m in v}]],*[blank(tools=v) for v in chunks(r.tools)],*[blank(attachs=v,attachment_indexes={a["id"]:r.attachment_indexes[a["id"]] for a in v if a.get("path")}) for v in chunks(r.attachs)],*[blank(artifacts=v) for v in chunks(r.artifacts)],*[blank(edits=v,edit_scopes=[edit_scopes[e["id"]] for e in v if e["id"] in edit_scopes]) for v in chunks(r.edits)],*[blank(edit_evidence=v) for v in chunks(r.edit_evidence)]]
 def commit_result(r,purpose,progress=None,parts=None):
     total,changed,newids=[0]*7,set(),set()
     for part in (p for p in (ingest_parts(r) if parts is None else parts) if any((p.convs,p.msgs,p.tools,p.attachs,p.artifacts,p.edits,p.edit_evidence))):
@@ -1163,6 +1168,9 @@ def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home
 def hook_result(source,path,bindings=None):
     session=(parse_claude_code_session if source=="claude-code" else parse_codex_session)(path,bindings)
     return ParseResult(convs=[session["conv"]],msgs=session["msgs"],tools=session["tools"],attachs=session["attachs"],edits=session["edits"],edit_evidence=session["edit_evidence"],tool_lineage=session["tool_lineage"],message_lineage=session["message_lineage"]) if session else ParseResult()
+def wake_hooks(attempt=None,root=None):
+    with operation_lock((Path(root)/"data/hook_inbox" if root is not None else HOOK_DIR)/".drain.lock","hooks.dispatch",0,mandatory=False) as available:
+        if available: subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env={**os.environ,**({"CONVOS_PROJECT_ROOT":str(root)} if root is not None else {}),**({"CONVOS_HOOK_ATTEMPT":attempt} if attempt else {})})
 def enqueue_hook(source, payload):
     path,root=Path(payload["transcript_path"]).expanduser().resolve(),hook_root(source).expanduser().resolve()
     if source not in ("claude-code", "codex") or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")
@@ -1174,14 +1182,15 @@ def enqueue_hook(source, payload):
             if tick.exists() and now-json.loads(tick.read_text())<60: return
             atomic_json(tick,now)
     if HOOK_STATE.exists() and json.loads(HOOK_STATE.read_text()).get(key)==[st.st_mtime_ns,st.st_size] and not (HOOK_DIR/f"{key}.work").exists() and not (HOOK_DIR/f"{key}.json").exists(): return
-    (atomic_json(HOOK_DIR/f"{key}.json",dict(source=source,path=str(path),mtime=st.st_mtime_ns,size=st.st_size)),subprocess.Popen([sys.executable, "-m", "ai_convos", "drain-hooks", "--no-block"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True))
+    with operation_lock(HOOK_DIR/".lock","hooks.queue"): atomic_json(HOOK_DIR/f"{key}.json",dict(source=source,path=str(path),mtime=st.st_mtime_ns,size=st.st_size))
+    wake_hooks()
 def retry_hook(work, force=False):
     q,target=(q:=work.with_suffix(".json")),q if q.exists() else work
     if force: atomic_json(target,{**json.loads(target.read_text()),"retry":True})
     work.unlink(missing_ok=True) if q.exists() else os.replace(work, q)
 def _hook_stamp(path): return [(st:=path.stat()).st_mtime_ns,st.st_ino,st.st_size]
-def drain_hooks(embed=False, local_only=False,block=False):
-    done,claims,failed,started,attempt=[],[],0,time.monotonic(),os.environ.get("CONVOS_HOOK_ATTEMPT") or str(time.time_ns())
+def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
+    done,claims,failed,started,attempt,remaining,resume,provenance_error=[],[],0,time.monotonic(),os.environ.get("CONVOS_HOOK_ATTEMPT") or str(time.time_ns()),0,False,None
     with operation_lock(HOOK_DIR/".drain.lock","hooks.drain",30 if block else 0,mandatory=block) as pulse:
         if not pulse: return 0
         with operation_lock(HOOK_DIR/".lock","hooks.queue"):
@@ -1208,7 +1217,7 @@ def drain_hooks(embed=False, local_only=False,block=False):
                     done.append((work,key,snap,set()))
                     continue
                 changed=commit_result(r,purpose="hooks.ingest",progress=pulse)[-1]|({m["id"] for m in r.msgs} if e.get("retry") else set())
-                (capture_provenance(edit_ids=r.provenance_edits,conversation_ids=r.provenance_conversations,source=f"{e['source']}.hook",strict=False),atomic_json(work,{**e,"snap":snap,"changed":sorted(changed)}),done.append((work,key,snap,changed)))
+                (atomic_json(work,{**e,"snap":snap,"changed":sorted(changed)}),done.append((work,key,snap,changed)))
             except Exception as error:
                 with operation_lock(HOOK_DIR/".lock","hooks.queue"): retry_hook(work)
                 attempted[work.stem]=stamp
@@ -1218,9 +1227,17 @@ def drain_hooks(embed=False, local_only=False,block=False):
             with operation_lock(HOOK_DIR/".lock","hooks.queue"):
                 (state.update((key,snap) for _,key,snap,_ in done),atomic_json(HOOK_STATE,state))
                 for work,_,_,_ in done: work.unlink(missing_ok=True)
+        if DB_PATH.exists() and (done or provenance or previous.get("provenance_pending")):
+            with _core(read_only=True,purpose="hooks.provenance.plan") as conn: before=conn.execute("SELECT count(*) FROM provenance.pending").fetchone()[0]
+            try:
+                if before: (pulse("capturing provenance batch"),capture_provenance(edit_ids=[],conversation_ids=[],source="hooks",strict=False))
+            except Exception as error: (log_parse_error("Provenance pending; hook imports are committed",error),(provenance_error:=f"{type(error).__name__}: {error}"))
+            with _core(read_only=True,purpose="hooks.provenance.progress") as conn: remaining=conn.execute("SELECT count(*) FROM provenance.pending").fetchone()[0]
+            resume=0<remaining<before
         pending={p:_hook_stamp(p) for p in [*HOOK_DIR.glob("*.json"),*HOOK_DIR.glob("*.work")]}
-        atomic_json(HOOK_PROGRESS,dict(completed_at=time.time_ns(),processed=len(done),failed=failed,pending=len(pending),oldest=min((s[0] for s in pending.values()),default=None),attempt=attempt,failed_claims={p.stem:s for p,s in pending.items() if attempted.get(p.stem)==s}))
-    if any(attempted.get(p.stem)!=s for p,s in pending.items()): subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env={**os.environ,"CONVOS_HOOK_ATTEMPT":attempt})
+        atomic_json(HOOK_PROGRESS,dict(completed_at=time.time_ns(),processed=len(done),failed=failed,pending=len(pending),oldest=min((s[0] for s in pending.values()),default=None),attempt=attempt,failed_claims={p.stem:s for p,s in pending.items() if attempted.get(p.stem)==s},provenance_pending=remaining,provenance_error=provenance_error))
+    with operation_lock(HOOK_DIR/".lock","hooks.queue"):
+        if resume or any(attempted.get(p.stem)!=_hook_stamp(p) for p in [*HOOK_DIR.glob("*.json"),*HOOK_DIR.glob("*.work")]): wake_hooks(attempt)
     return len(done)
 
 _MODELS,_MCFG,_LLAMA_LOG,_SEMANTIC_INSTALL={},dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF",filename="embeddinggemma-300m-qat-q8_0.gguf",revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64",artifact_sha256="6fa0c02a9c302be6f977521d399b4de3a46310a4f2621ee0063747881b673f67",embedding=True,n_ctx=16384,n_batch=2048,n_ubatch=2048,n_seq_max=8,n_gpu_layers=-1),None,"Semantic runtime unavailable. macOS includes it; elsewhere install `convos[semantic]`, set CONVOS_SEMANTIC=llama, then run `convos embed`. Literal `convos search` needs no model."
@@ -1326,7 +1343,7 @@ def capture(source: str):
     try: enqueue_hook(source, json.loads(sys.stdin.read() or "{}"))
     except Exception as e: log_parse_error(f"{source} hook", e)
 
-def drain_hooks_cmd(block:bool=typer.Option(False,"--block/--no-block",hidden=True)): drain_hooks(block=block)
+def drain_hooks_cmd(block:bool=typer.Option(False,"--block/--no-block",hidden=True)): drain_hooks(block=block,provenance=True)
 
 def init():
     with _core(ready=True,purpose="maintenance.fts") as conn: rebuild_fts_index(conn)
@@ -1413,6 +1430,9 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
     typer.echo(f"convos: {version('convos')}")
     pending,state,progress,last,age=(pending:=len(list(HOOK_DIR.glob("*.json")))+len(list(HOOK_DIR.glob("*.work")))),(state:=json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}),(progress:=json.loads(HOOK_PROGRESS.read_text()) if HOOK_PROGRESS.exists() else {}),max((v[0] for v in state.values()),default=0),max(0,time.time_ns()-(progress.get("oldest") or time.time_ns()))/1e9 if pending else 0
     typer.echo(f"ingest: pending={pending}, last={datetime.fromtimestamp(last/1e9).isoformat(timespec='seconds') if last else 'never'}, oldest={age:.0f}s, last_batch={progress.get('processed',0)} ok/{progress.get('failed',0)} failed")
+    if progress.get("provenance_error"): typer.echo(f"provenance last error: {progress['provenance_error']}")
+    for source,checkpoint in load_state().get("local",{}).items():
+        if "files" in checkpoint: typer.echo(f"inputs {source}: tracked={len(checkpoint['files'])}, missing_locally={len(checkpoint.get('missing',[]))}, retry={len(checkpoint.get('failed',[]))}, current_parser={sum(checkpoint.get('epochs',{}).get(p,checkpoint.get('parser'))==PARSER_EPOCH for p in checkpoint['files'])}")
     if DB_PATH.exists():
         try:
             with _core(read_only=True,purpose="doctor") as conn:
@@ -1499,15 +1519,33 @@ def _sync_leader(fn,full=False):
 
 def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch all sources and reconcile all provenance"), verbose: bool = typer.Option(False, "-v", "--verbose"), local_only: bool = typer.Option(False, "--local-only", help="Import local agent sessions and configured exports without contacting web sources.")):
     if sys.argv[1:2] == ["sync"]: signal.signal(signal.SIGINT, signal.SIG_DFL)
-    state,local,web,imports,chatgpt_ok,chatgpt_frontiers,offline,ready={},{},{},{},{},{},local_only is True,False
-    def set_state(section,key,val): state.setdefault(section,{})[key]=val
+    state,local,web,imports,chatgpt_ok,chatgpt_frontiers,offline,ready,checkpoint_lock={},{},{},{},{},{},local_only is True,False,threading.RLock()
+    def set_state(section,key,val):
+        with checkpoint_lock: (state.setdefault(section,{}).__setitem__(key,val),atomic_json(STATE_PATH,state))
     def plan_local(name, path, parser, bindings, sink, progress):
-        if not path.exists(): return None
         if name in ("codex", "claude-code"):
-            prev,mt=local.get(name,{}).get("files",{}),{str(p):m for p in path.rglob("*.jsonl") if (m:=stat_mtime(p)) is not None}
-            if not (chg:=list(map(Path,mt)) if full or local.get(name,{}).get("parser")!=PARSER_EPOCH else [Path(p) for p,m in mt.items() if p not in prev or m!=prev[p]]): return None
-            saved,run=[],lambda p=path,fs=chg:saved.extend((parsed:=parser(p,fs[i:i+20],bindings),value:=sink(parsed),[mt.pop(p,None) for p in parsed.failed_inputs],progress(f"parsing {name} {min(i+20,len(fs))}/{len(fs)}"),value)[-1] for i in range(0,len(fs),20)) or ParseResult()
-            return dict(name=name,label=name.replace("-"," ").title(),source=name,func=run,saved=saved,state=("local",name,{"parser":PARSER_EPOCH,"files":mt}))
+            previous,prev,mt=(previous:=local.get(name,{})),previous.get("files",{}),{str(p):m for p in path.rglob("*.jsonl") if (m:=stat_mtime(p)) is not None}
+            epochs,missing={p:previous.get("epochs",{}).get(p,previous.get("parser")) for p in prev},sorted(set(prev)-mt.keys())
+            if missing!=previous.get("missing",[]): set_state("local",name,{**previous,"missing":missing})
+            if missing: typer.echo(f"{name}: {len(missing)} previously imported transcript(s) missing locally; archived conversations retained.",err=True)
+            if not (chg:=[Path(p) for p,m in mt.items() if full or p not in prev or m!=prev[p] or epochs.get(p)!=PARSER_EPOCH or p in previous.get("failed",[])]): return None
+            saved,checkpoint,rejected=[],dict(parser=PARSER_EPOCH,files=dict(prev),epochs=epochs,missing=missing,failed=previous.get("failed",[])),[]
+            typer.echo(f"{name}: importing {len(chg)} transcript(s); progress is saved after each batch.",err=True)
+            def run():
+                for i in range(0,len(chg),20):
+                    parsed=parser(path,chg[i:i+20],bindings)
+                    saved.append(sink(parsed))
+                    failed,finished=(failed:={str(p) for p in parsed.failed_inputs}),{str(p):mt[str(p)] for p in chg[i:i+20] if str(p) not in failed and stat_mtime(p)==mt[str(p)]}
+                    rejected.extend(str(p) for p in chg[i:i+20] if str(p) not in finished)
+                    with checkpoint_lock:
+                        checkpoint["files"].update(finished)
+                        checkpoint["epochs"].update({p:PARSER_EPOCH for p in finished})
+                        checkpoint["failed"]=sorted((set(checkpoint["failed"])-finished.keys())|failed|{str(p) for p in chg[i:i+20] if str(p) not in finished})
+                        set_state("local",name,checkpoint)
+                    progress(f"parsing {name} {min(i+20,len(chg))}/{len(chg)}")
+                return ParseResult()
+            return dict(name=name,label=name.replace("-"," ").title(),source=name,func=run,saved=saved,failed=rejected)
+        if not path.exists(): return None
         mtime = latest_mtime(path)
         return None if not full and mtime<=local.get(name,{}).get("mtime",0) else dict(name=name,label=name.replace("-"," ").title(),source=name,func=lambda p=path:parser(p),state=("local",name,{"mtime":mtime}))
     def probe_chatgpt(browser):
@@ -1549,11 +1587,11 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         state,before,t0=(state:=pulse("planning") or load_state()),json.dumps(state,sort_keys=True),time.perf_counter()
         local,web,imports=state.setdefault("local",{}),state.setdefault("web",{}),state.setdefault("imports",{})
         chatgpt_ok.clear() or chatgpt_frontiers.clear()
-        total,changed,jobs,newc,updc,provenance_edits,provenance_conversations,repair_attempted=[0]*5,set(),[],0,0,set(),set(),set()
+        total,changed,jobs,newc,updc,provenance_edits,provenance_conversations,repair_attempted,failed_sources=[0]*5,set(),[],0,0,set(),set(),set(),set()
         def checkpoint(r,source):
             parts=ingest_parts(r)
-            with operation_lock(HOOK_DIR/".lock","hooks.queue") as queue:
-                out=commit_result(r,purpose="sync.ingest",progress=lambda stage:(pulse(label:=f"ingesting {source} {stage.removeprefix('sync.ingest ')}"),queue(label))[-1],parts=parts)
+            with checkpoint_lock:
+                out=commit_result(r,purpose="sync.ingest",progress=lambda stage:pulse(f"ingesting {source} {stage.removeprefix('sync.ingest ')}"),parts=parts)
                 (known.update({c["id"]:(u.replace(tzinfo=timezone.utc).timestamp() if (u:=ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"}),repair_attempted.update(c["id"] for c in r.convs if c["id"] in repair_order))
                 return (*out,getattr(r,"provenance_edits",set()),getattr(r,"provenance_conversations",set()))
         with _core(read_only=True,purpose="sync.chatgpt.repair.plan") as conn: repairs=conn.execute("SELECT c.id,MIN(m.created_at),MAX(m.created_at) FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL) AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) GROUP BY c.id").fetchall()
@@ -1565,7 +1603,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
             jobs+=start("imports") or [j for p in paths if (j:=plan_import(p))]
         for name,label,enabled,p,parser in (("claude-code","Claude Code",claude_code,Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))/"projects",parse_claude_code),("codex","Codex",codex,Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),parse_codex)):
-            if enabled and p.exists(): start(label,name) or schedule(plan_local(name,p,parser,bindings,lambda r,name=name:checkpoint(r,name),pulse))
+            if enabled: start(label,name) or schedule(plan_local(name,p,parser,bindings,lambda r,name=name:checkpoint(r,name),pulse))
         if not offline:
             start("ChatGPT"+(f", provider order={len(candidates)-len(repair_order)} attempted/{len(candidates)} unresolved" if candidates else ""),"chatgpt")
             schedule(plan_web("chatgpt",fetch_chatgpt,probe_chatgpt,{} if full else known,lambda r:checkpoint(r,"chatgpt"),legacy,not repair_order))
@@ -1578,6 +1616,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                 for fut in as_completed(futs):
                     try: r=(pulse(f"receiving {(j:=futs[fut])['name']}"),fut.result())[-1]
                     except Exception as e: r=typer.echo(f"{j['name']} failed: {e}")
+                    if r is None or j.get("failed"): failed_sources.add(j["name"])
                     if saved := j.get("saved"):
                         c,m,t,a,e,n,u,changed_ids,provenance_edits,provenance_conversations=(*[sum(s[i] for s in saved) for i in range(7)],set().union(*(s[7] for s in saved)),provenance_edits|set().union(*(s[8] for s in saved)),provenance_conversations|set().union(*(s[9] for s in saved)))
                     elif r is not None:
@@ -1587,8 +1626,11 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     if r is not None: provenance_edits,provenance_conversations=provenance_edits|getattr(r,"provenance_edits",set()),provenance_conversations|getattr(r,"provenance_conversations",set())
                     if r is not None and (st:=j.get("state")): (j["name"]=="chatgpt" and st[2].update(coverage=sorted(known),order_repairs={cid:known[cid] for cid in ({cid for cid in candidates if prior_order.get(cid)==updated[cid]}|repair_attempted)}),set_state(*st))
                     if j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} changed){' before failure' if r is None else ''}{' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
-        (pulse("capturing provenance"),capture_provenance(strict=False) if full else capture_provenance(edit_ids=provenance_edits,conversation_ids=provenance_conversations,strict=False))
         if before!=json.dumps(state,sort_keys=True): atomic_json(STATE_PATH,state)
+        (pulse("capturing provenance"),capture_provenance(strict=False) if full else capture_provenance(edit_ids=provenance_edits,conversation_ids=provenance_conversations,strict=False))
+        with _core(read_only=True,purpose="sync.provenance.progress") as conn: pending=conn.execute("SELECT count(*) FROM provenance.pending").fetchone()[0]
+        if pending: (typer.echo(f"Provenance: {pending} pending; conversations committed, enrichment continues in the background."),wake_hooks())
+        if failed_sources: raise click.ClickException(f"Sync incomplete: {', '.join(sorted(failed_sources))}; completed import checkpoints retained.")
         verbose and typer.echo(f"Total sync time {time.perf_counter()-t0:.2f}s")
         return total, newc, updc
     def do_sync():

@@ -521,7 +521,7 @@ def test_provider_alias_reconciliation_signs_successors_and_replays_mixed_native
     db.close()
     alias={"v":1,"kind":"provider.session","id":provider_alias_id("codex","same"),"state":"active","data":{"source":"codex","session_id":"same","members":["a","b"],"canonical":"a"}}
     assert provider_alias_accept(archive,alias,semantic_proof(root,user,device["id"],"personal",1,alias))
-    pages=projection_module._alias_pages; monkeypatch.setattr(projection_module,"_alias_pages",lambda path,user,members:pages(path,user,members,1))
+    pages=projection_module._alias_pages; monkeypatch.setattr(projection_module,"_alias_pages",lambda path,user,members,**kwargs:pages(path,user,members,1,**kwargs))
     first=reconcile_provider_aliases(path,cfg,"personal")
     assert first=={"changed":1,"settled":0,"blocked":{}}
     db=duckdb.connect(str(path),read_only=True)

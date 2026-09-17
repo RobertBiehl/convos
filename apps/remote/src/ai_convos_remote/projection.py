@@ -5,12 +5,12 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import CORE_VERSION, ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_yield, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_file_edit_evidence_many, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows
+from ai_convos.cli import CORE_VERSION, ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_yield, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_file_edit_evidence_many, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
-STATE_VERSION,ALIAS_VERSION="4",12
+STATE_VERSION,ALIAS_VERSION,ALIAS_WRITE_PAGE="4",12,250
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -597,13 +597,13 @@ def _alias_page(db,user,member_physical,after,page=500):
         required(matched is not None,ValueError(f'provider alias body/proof mismatch: {table}:{source}'))
         out.append((matched,head,(table,physical) not in origins,physical_by_source,values[columns.index('path')] if table=='attachments' else None))
     return out,keys[-1]
-def _alias_pages(db_path,user,member_physical,page=500):
+def _alias_pages(db_path,user,member_physical,page=500,progress=None):
     after=("","")
     while True:
         with contextlib.closing(open_db(db_path,True,purpose="remote.alias.page")) as db: generation,values=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],_alias_page(db,user,member_physical,after,page)
         rows,after=values
         if not rows: return
-        yield generation,rows
+        yield (progress and progress(f"provider alias page {after[0]}:{after[1]}"),generation,rows)[1:]
         archive_yield(db_path)
 def _alias_terminal(links,key):
     seen=set()
@@ -706,8 +706,11 @@ def _alias_fingerprints(db,user,groups):
     return {'provider-session:'+digest([source,session]):digest([ALIAS_VERSION,archive,aliases,bound.get((source,session),[]),inputs.get('provider-session:'+digest([source,session]))]) for (source,session),aliases in groups.items()}
 def reconcile_provider_aliases(db_path,cfg,workspace,progress=None,state=None):
     data=Path(db_path).parent
-    with operation_lock(data/".sync.lock","remote.alias.local",30) as local,operation_lock(data/"hook_inbox/.drain.lock","remote.alias.capture",30) as hooks:
-        return _reconcile_provider_aliases(db_path,cfg,workspace,lambda stage:(local(stage),hooks(stage),progress and progress(stage)),state)
+    try:
+        with operation_lock(data/".sync.lock","remote.alias.local",30) as local,operation_lock(data/"hook_inbox/.drain.lock","remote.alias.capture",30) as hooks:
+            return _reconcile_provider_aliases(db_path,cfg,workspace,lambda stage:(local(stage),hooks(stage),progress and progress(stage)),state)
+    finally:
+        if data.name=='data' and Path(db_path).name=='convos.db' and any(p for pattern in ('*.json','*.work') for p in (data/'hook_inbox').glob(pattern)): wake_hooks(root=data.parent)
 def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
     groups,objects,user={},{},cfg["user"]
     with contextlib.closing(open_db(db_path,purpose="remote.alias.schema")) as db: init_schema(db)
@@ -744,7 +747,7 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
                 present={m for m,p in member_physical.items() if db.execute('SELECT 1 FROM conversations WHERE id=?',[p]).fetchone()}
                 history=[body for raw,expected in db.execute("SELECT body,content_hash FROM parser_retired_rows WHERE kind='messages' AND (author=? OR author='') AND json_extract_string(body,'$.data.conversation_id') IN (SELECT UNNEST(?))",[user,members]).fetchall() if digest(body:=json.loads(raw))==expected]
             losers,moving,message_rows,attachment_paths=set(members)-{canonical},False,[],[]
-            for generation,rows in _alias_pages(db_path,user,member_physical):
+            for generation,rows in _alias_pages(db_path,user,member_physical,progress=progress):
                 for row,head,native,parent_map,path in rows:
                     if row["kind"]=="conversations" and row["id"] in active:
                         required(row["data"]["source"]==source and isinstance(metadata:=row["data"]["metadata"],dict) and provider_session_key(source,metadata.get("session_id"))==session,ValueError("provider alias exact evidence conflicts"))
@@ -767,14 +770,14 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
             changed=bool(attachment_paths)
             if attachment_paths:
                 with contextlib.closing(open_db(db_path,purpose='remote.alias.attachment-paths')) as db,_transaction(db): [set_attachment_path(db,physical,path) for physical,path in attachment_paths]
-            for generation,values in _alias_pages(db_path,user,member_physical):
+            for generation,values in _alias_pages(db_path,user,member_physical,progress=progress):
                 rows=[({**row,"data":{**row["data"],"conversation_id":canonical}} if row["kind"] in ("messages","artifacts") else row,head,native,parent_map) for row,head,native,parent_map,path in values if row["kind"] in ("messages","artifacts") and row["data"]["conversation_id"] in losers or digest(row)!=head["content_hash"]]
                 if not rows: continue
                 proofs=[row_proof(cfg["device"],user,head["workspace"],cfg["workspaces"][workspace]["epoch"],row,head["revision"],workspace) for row,head,native,parent_map in rows]
                 with contextlib.closing(open_db(db_path,purpose="remote.alias.write-page")) as db,_transaction(db),preserve_fact_heads(db,[(row["kind"],row["id"]) for row,head,native,parent_map in rows if native]):
                     (required(db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]==generation,RuntimeError("Archive changed during provider alias reconciliation; retry")),project_workspace_controls(db,controls),project_logical_rows(db,[(row,proof,pid,native,parent_map) for (row,head,native,parent_map),proof,pid in zip(rows,proofs,project_row_proofs(db,proofs,signer["root_public"],signer["certificate"]))]))
                 changed=True
-            current=[item for generation,values in _alias_pages(db_path,user,member_physical) for item in values]
+            current=[item for generation,values in _alias_pages(db_path,user,member_physical,progress=progress) for item in values]
             revisions,lineage=_alias_message_plan(current,source,members,history)
             if lineage:
                 row,head,native,parent_map,path=next(item for item in current if item[0]['kind']=='conversations' and item[0]['id']==canonical)
@@ -793,11 +796,19 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
                 from . import _edit_evidence_project
                 with contextlib.closing(open_db(db_path,True,purpose='remote.alias.message-plan')) as db: evidence_plan=_alias_evidence_successors(db,cfg,revisions,proofs)
                 edit_evidence=[_edit_evidence_project(row,semantic_proof(cfg['root'],user,cfg['device']['id'],ws,cfg['workspaces'][ws]['epoch'],row,previous)) for ws,row,previous in evidence_plan]
-                with contextlib.closing(open_db(db_path,purpose='remote.alias.message-lineage')) as db,_transaction(db),preserve_fact_heads(db,[(row['kind'],parents.get(('file_edits' if row['kind']=='edit.observed' else row['kind'],row['id']),row['id'])) for row,head,native,parents,path in revisions]):
-                    required(db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]==generation,RuntimeError('Archive changed during provider message reconciliation; retry'))
-                    pids=project_row_proofs(db,proofs,signer['root_public'],signer['certificate'])
-                    project_logical_rows(db,[(row,proof,pid,native,parents) for (row,head,native,parents,path),proof,pid in zip(revisions,proofs,pids)])
-                    if edit_evidence: project_file_edit_evidence_many(db,edit_evidence)
+                children=[(row,proof) for row,proof in zip(revisions,proofs) if row[0]['kind'] not in ('conversations','edit.observed')]
+                facts={row[0]['id']:(row,proof) for row,proof in zip(revisions,proofs) if row[0]['kind']=='edit.observed'}
+                # Publish retirement only after every reference and its signed evidence is durable.
+                pages=[([*part,*[facts[row['id']] for (row,*_),proof in part if row['kind']=='file_edits' and row['id'] in facts]],[]) for i in range(0,len(children),ALIAS_WRITE_PAGE) for part in [children[i:i+ALIAS_WRITE_PAGE]]]+[([],edit_evidence[i:i+500]) for i in range(0,len(edit_evidence),500)]+[([(revisions[-1],proofs[-1])],[])]
+                for index,(page,evidence) in enumerate(pages):
+                    progress(f"provider message repair {index}/{len(pages)}")
+                    with contextlib.closing(open_db(db_path,purpose='remote.alias.message-lineage')) as db,_transaction(db),preserve_fact_heads(db,[(row['kind'],parents.get(('file_edits' if row['kind']=='edit.observed' else row['kind'],row['id']),row['id'])) for (row,head,native,parents,path),proof in page]):
+                        required(db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]==generation,RuntimeError('Archive changed during provider message reconciliation; retry'))
+                        pids=project_row_proofs(db,[proof for row,proof in page],signer['root_public'],signer['certificate'])
+                        if page: project_logical_rows(db,[(row,proof,pid,native,parents) for ((row,head,native,parents,path),proof),pid in zip(page,pids)])
+                        if evidence: project_file_edit_evidence_many(db,evidence)
+                        generation=db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]
+                    archive_yield(db_path)
                 changed=True
             with contextlib.closing(open_db(db_path,True,purpose="remote.alias.finish-plan")) as db:
                 generation,(member_heads,member_physical,active,member_native,binding)=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0],_alias_members(db,user,source,session,members,canonical)
