@@ -55,6 +55,32 @@ def test_alias_reimport_marks_only_exact_edit_copies_and_retains_every_body(tmp_
 
 
 @pytest.mark.parametrize('source',['codex','claude-code'])
+def test_received_pre_lineage_message_preserves_pending_native_classification(tmp_path,source):
+    path,parser,old,bound,canonical=fixture(tmp_path,source)
+    dbpath=tmp_path/'data/convos.db'
+    with core._core(dbpath,purpose='test.edit-dirty-native') as db:
+        core.init_schema(db)
+        core.upsert(db,core.ParseResult(convs=[old['conv']],**{k:old[k] for k in ('msgs','tools','edits','edit_evidence')}))
+        db.execute('UPDATE conversations SET id=?',[canonical])
+        db.execute('UPDATE messages SET conversation_id=?',[canonical])
+        db.execute('UPDATE provider_sessions SET conversation_id=?',[canonical])
+        parsed=parser(path,bound)
+        core.upsert(db,core.ParseResult(convs=[parsed['conv']],**{k:parsed[k] for k in ('msgs','tools','edits','edit_evidence','tool_lineage','edit_lineage')}))
+        before=db.execute('SELECT id,metadata FROM messages ORDER BY id').fetchall()
+        current=db.execute('SELECT id FROM current_file_edits ORDER BY id').fetchall()
+        rows=[core.logical_row('messages',core.ARCHIVE_COLUMNS['messages'],row) for row in db.execute('SELECT '+','.join(core.ARCHIVE_COLUMNS['messages'])+' FROM messages').fetchall()]
+    assert len(current)==2
+    _,device,user,control,*_=signed_edit_graph()
+    for row in rows:
+        row['data']['metadata']={k:v for k,v in row['data']['metadata'].items() if k not in ('convos_edit_lineage','convos_tool_lineage')}
+    projection.apply_row_replicas(dbpath,[dict(row=r,proof=row_proof(device,user,'w',1,r)) for r in rows],'w',[control],local_user=user)
+    with core._core(dbpath,True,purpose='test.edit-dirty-preserved') as db:
+        assert db.execute('SELECT id,metadata FROM messages ORDER BY id').fetchall()==before
+        assert db.execute('SELECT id FROM current_file_edits ORDER BY id').fetchall()==current
+        assert db.execute('SELECT count(*) FROM file_edits').fetchone()==(4,)
+
+
+@pytest.mark.parametrize('source',['codex','claude-code'])
 @pytest.mark.parametrize('native',[False,True])
 @pytest.mark.parametrize('reverse',[False,True])
 @pytest.mark.parametrize('upgrade',[False,True])
@@ -80,12 +106,15 @@ def test_edit_lineage_replays_without_source_files_and_keeps_original_rows(tmp_p
         with core._core(receiver,purpose='test.edit-migration') as db:
             snapshot=lambda:{kind:db.execute('SELECT * FROM '+kind+' ORDER BY id').fetchall() for kind in (*core.ARCHIVE_COLUMNS,'remote.row_proofs')}
             before=snapshot()
+            tool_history=db.execute('SELECT * FROM parser_tool_history ORDER BY old_id').fetchall()
+            db.execute('DELETE FROM parser_tool_lineage')
             db.execute('DROP VIEW current_file_edits')
             db.execute('DROP VIEW parser_edit_history')
             db.execute('DROP TABLE parser_edit_lineage')
             db.execute('UPDATE core_schema SET version=15')
             core.init_schema(db)
             assert snapshot()==before
+            assert db.execute('SELECT * FROM parser_tool_history ORDER BY old_id').fetchall()==tool_history
             assert db.execute('SELECT count(*) FROM current_file_edits').fetchone()==(2,)
         assert receiver.with_suffix('.db.pre-v16.bak').is_file()
     for _ in range(2):

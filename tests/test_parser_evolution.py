@@ -23,6 +23,7 @@ def test_lineage_resolution_batches_writes_and_skips_unchanged(tmp_path):
             writes=0
             def __getattr__(self,key): return getattr(db,key)
             def execute(self,sql,*args):
+                assert not args or not any(isinstance(value,(list,tuple)) for value in args[0]), 'nested Python parameters trigger per-value optional dependency imports in DuckDB'
                 if sql.startswith('UPDATE parser_tool_lineage'): self.writes+=1
                 return db.execute(sql,*args)
             def executemany(self,sql,values):
