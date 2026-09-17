@@ -601,10 +601,10 @@ if len(sys.argv)>1:
 else:
  with core.open_db(core.DB_PATH,True,purpose='testbed.private.source-counts') as db:
   for kind in core.ARCHIVE_COLUMNS:
-   joined='conversations c' if kind=='conversations' else 'artifacts t JOIN conversations c ON c.id=t.conversation_id' if kind=='artifacts' else ('messages m' if kind=='messages' else kind+' t JOIN messages m ON m.id=t.message_id')+' JOIN conversations c ON c.id=m.conversation_id'
+   joined='owners c' if kind=='conversations' else 'artifacts t JOIN owners c ON c.id=t.conversation_id' if kind=='artifacts' else ('messages m' if kind=='messages' else kind+' t JOIN messages m ON m.id=t.message_id')+' JOIN owners c ON c.id=m.conversation_id'
    current='' if kind in ('conversations','artifacts') else " AND json_extract_string(m.metadata,'$.history_of') IS NULL"
-   if kind=='tool_calls': current+=' AND NOT EXISTS(SELECT 1 FROM parser_tool_history h WHERE h.old_id=t.id)'
-   for source,session,count in db.execute("SELECT c.source,json_extract_string(c.metadata,'$.session_id'),count(*) FROM "+joined+" WHERE c.source IN ('codex','claude-code')"+current+' GROUP BY 1,2').fetchall(): out[key(source,session)][kind]=count
+   if kind in ('tool_calls','file_edits'): current+=' AND NOT EXISTS(SELECT 1 FROM parser_'+('tool' if kind=='tool_calls' else 'edit')+'_history h WHERE h.old_id=t.id)'
+   for source,session,count in db.execute("WITH owners AS MATERIALIZED (SELECT id,source,json_extract_string(metadata,'$.session_id') AS provider_session FROM conversations) SELECT c.source,c.provider_session,count(*) FROM "+joined+" WHERE c.source IN ('codex','claude-code')"+current+' GROUP BY 1,2').fetchall(): out[key(source,session)][kind]=count
 print(json.dumps(out,sort_keys=True))
 """
     return json.loads(run((client['venv']/'bin/python','-c',code,*([str(corpus)] if corpus else [])),env=client['env'],timeout=600).stdout)

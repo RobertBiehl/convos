@@ -9,6 +9,37 @@ from tests.test_remote_projection import signed_edit_graph
 from tests import legacy_parsers
 
 
+@pytest.mark.parametrize('custom',[False,True])
+def test_alias_reparse_recognizes_each_tool_call_without_collapsing_equal_calls(tmp_path,custom):
+    transcript=tmp_path/'session.jsonl'
+    events=[dict(type='session_meta',timestamp='2026-01-01T00:00:00Z',payload=dict(id='session')),
+            dict(type='response_item',timestamp='2026-01-01T00:00:01Z',payload=dict(type='message',role='user',content=[dict(type='input_text',text='inspect')]))]
+    for i in range(2):
+        call=dict(type='custom_tool_call',name='functions.exec',input='identical code',status='completed') if custom else dict(type='function_call',name='Read',arguments='{"path":"same"}')
+        events.extend([dict(type='response_item',timestamp='2026-01-01T00:00:02Z',payload={**call,'call_id':f'call-{i}'}),dict(type='response_item',timestamp='2026-01-01T00:00:03Z',payload=dict(type='custom_tool_call_output' if custom else 'function_call_output',call_id=f'call-{i}',output='same output'))])
+    transcript.write_text('\n'.join(map(json.dumps,events)))
+    old=core.parse_codex_session(transcript)
+    canonical=core.gen_id('test','canonical')
+    bound={('codex','session'):canonical,('codex','session','legacy'):[old['conv']['id']],('codex',canonical,'message',1):old['msgs'][0]['id']}
+    path=tmp_path/'data/convos.db'
+    with core._core(path,purpose='test.alias-tools') as db:
+        core.init_schema(db)
+        core.upsert(db,core.ParseResult(convs=[old['conv']],msgs=old['msgs'],tools=old['tools']))
+        db.execute('UPDATE conversations SET id=?',[canonical])
+        db.execute('UPDATE messages SET conversation_id=?',[canonical])
+        db.execute('UPDATE provider_sessions SET conversation_id=?',[canonical])
+        parsed=core.parse_codex_session(transcript,bound)
+        result=core.ParseResult(convs=[parsed['conv']],msgs=parsed['msgs'],tools=parsed['tools'],tool_lineage=parsed['tool_lineage'])
+        for part in core.ingest_parts(result,1):
+            with core._transaction(db): core.upsert(db,part)
+        assert db.execute('SELECT id FROM tool_calls WHERE id NOT IN (SELECT old_id FROM parser_tool_history) ORDER BY id').fetchall()==sorted((t['id'],) for t in parsed['tools'])
+        assert len(parsed['tools'])==2
+        for row in old['tools']:
+            claim=('tool_calls',row['id'],row['id'],'','active')
+            assert core.typed_logical_rows(db,[claim])[claim]==core.parser_logical_row('tool_calls',row)
+        assert not core.archive_relationships(db)
+
+
 def fixture(tmp_path,source):
     path=tmp_path/"session.jsonl"
     stamp="2026-01-01T00:00:00.000000"

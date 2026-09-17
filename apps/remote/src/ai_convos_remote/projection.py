@@ -562,7 +562,7 @@ def _alias_merge_native(db,row,head):
             old,local,new=(datetime.fromisoformat(v).isoformat(timespec='microseconds') if isinstance(v,str) else v for v in (old,local,new))
         if equal(local,old): return new
         if equal(new,old) or equal(local,new): return local
-        if key in ('convos_message_lineage','convos_tool_lineage'):
+        if key in ('convos_message_lineage','convos_tool_lineage','convos_edit_lineage'):
             values=[v for v in (old,local,new) if v is not absent]
             return _lineage_union(values)
         if key in ('','metadata') and all(isinstance(v,dict) for v in (old,local,new)):
@@ -650,7 +650,7 @@ def _alias_message_plan(rows,source,members,history=()):
     # Only exact, source-backed lineage can replace an older parser's payload or local timestamp.
     messages={key:{**row,'data':messages[normalized[key]]['data']} if key in normalized else row for key,row in messages.items()}
     indices={key:meta['provider_index'] for key,row in messages.items() for meta in [row['data']['metadata']] if isinstance(meta,dict) and type(meta.get('provider_index')) is int and meta['provider_index']>=0}
-    lineages={key:value['records'] for row,*_ in rows if row['kind']=='messages' for key in [row['id']] for value in [(row['data']['metadata'] or {}).get('convos_tool_lineage')] if isinstance(value,dict) and set(value)=={'v','records'} and type(value['v']) is int and value['v']==1 and isinstance(value['records'],list) and all(isinstance(r,dict) and set(r)=={'old_id','old_hash','current_id','current_hash'} and all(isinstance(r[k],str) and re.fullmatch('[0-9a-f]{'+str(64 if k.endswith('hash') else 16)+'}',r[k]) for k in r) for r in value['records'])}
+    lineages={(label,key):value['records'] for row,*_ in rows if row['kind']=='messages' for key in [row['id']] for label in ('convos_tool_lineage','convos_edit_lineage') for value in [(row['data']['metadata'] or {}).get(label)] if isinstance(value,dict) and set(value)=={'v','records'} and type(value['v']) is int and value['v']==1 and isinstance(value['records'],list) and all(isinstance(r,dict) and set(r)=={'old_id','old_hash','current_id','current_hash'} and all(isinstance(r[k],str) and re.fullmatch('[0-9a-f]{'+str(64 if k.endswith('hash') else 16)+'}',r[k]) for k in r) for r in value['records'])}
     signatures,groups={},{}
     for key in indices:
         chain,visiting=[],set()
@@ -664,13 +664,13 @@ def _alias_message_plan(rows,source,members,history=()):
         for member in reversed(chain):
             if member not in signatures:
                 data=messages[member]['data']
-                metadata={k:v for k,v in data['metadata'].items() if k!='convos_tool_lineage' or member not in lineages and normalized.get(member) not in lineages}
+                metadata={k:v for k,v in data['metadata'].items() if k not in ('convos_tool_lineage','convos_edit_lineage') or (k,member) not in lineages and (k,normalized.get(member)) not in lineages}
                 signatures[member]=digest({**data,'created_at':datetime.fromisoformat(data['created_at']).isoformat(timespec='microseconds') if data['created_at'] else None,'metadata':metadata,'parent_id':signatures.get(data['parent_id'],data['parent_id'])})
         groups.setdefault((indices[key],signatures[key]),[]).append(key)
     replacements={old:min(keys) for keys in groups.values() for old in keys if old!=min(keys)}
     revised=[({**row,'data':{**row['data'],**{column:replacements[row['data'][column]] for column,parent in FKS.get(row['kind'],()) if parent=='messages' and row['data'][column] in replacements}}},head,native,parents,path) for original,head,native,parents,path in rows for row in [messages[original['id']] if original['kind']=='messages' else original]]
-    carriers={min(keys):sorted({canon(record):record for key in keys for record in lineages.get(key,[])}.values(),key=canon) for keys in groups.values() if len(keys)>1}
-    revised=[({**row,'data':{**row['data'],'metadata':{**row['data']['metadata'],'convos_tool_lineage':{'v':1,'records':carriers[row['id']]}}}} if row['kind']=='messages' and carriers.get(row['id']) else row,head,native,parents,path) for row,head,native,parents,path in revised]
+    carriers={min(keys):{label:{'v':1,'records':sorted({canon(record):record for key in keys for record in lineages.get((label,key),[])}.values(),key=canon)} for label in ('convos_tool_lineage','convos_edit_lineage') if any((label,key) in lineages for key in keys)} for keys in groups.values() if len(keys)>1}
+    revised=[({**row,'data':{**row['data'],'metadata':{**row['data']['metadata'],**carriers[row['id']]}}} if row['kind']=='messages' and carriers.get(row['id']) else row,head,native,parents,path) for row,head,native,parents,path in revised]
     current={row['id']:row for row,*_ in revised if row['kind']=='messages'}
     records=[dict(old_id=old,old_hash=digest(current[old]),current_id=new,current_hash=digest(current[new])) for old,new in sorted(replacements.items())]
     return [value for value,prior in zip(revised,rows) if value[0]!=prior[0]],records
@@ -721,7 +721,7 @@ def _alias_fingerprints(db,user,groups):
     return {'provider-session:'+digest([source,session]):digest([ALIAS_VERSION,archive,aliases,bound.get((source,session),[]),inputs.get('provider-session:'+digest([source,session]))]) for (source,session),aliases in groups.items()}
 def _conversation_join(rows):
     required(all(r['kind']=='conversations' and r['state']=='active' and r['id']==rows[0]['id'] and r['data']['source'] in ('codex','claude-code') and isinstance(r['data']['metadata'],dict) and r['data']['metadata'].get('session_id') and r['data']['metadata'].get('timestamp_basis')=='utc' for r in rows),ValueError('conversation fork lacks exact current provider metadata'))
-    lineage={'convos_message_lineage','convos_tool_lineage'}
+    lineage={'convos_message_lineage','convos_tool_lineage','convos_edit_lineage'}
     ordinary=[{**r,'data':{k:({name:value for name,value in v.items() if name not in lineage} if k=='metadata' else datetime.fromisoformat(v).isoformat(timespec='microseconds') if k=='created_at' and v else v) for k,v in r['data'].items() if k!='updated_at'}} for r in rows]
     required(len({digest(r) for r in ordinary})==1,ValueError('conversation content conflict requires resolution'))
     stamps=[datetime.fromisoformat(r['data']['updated_at']) for r in rows if r['data']['updated_at'] is not None]
