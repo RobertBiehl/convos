@@ -1172,8 +1172,8 @@ def hook_result(source,path,bindings=None):
     session=(parse_claude_code_session if source=="claude-code" else parse_codex_session)(path,bindings)
     return ParseResult(convs=[session["conv"]],msgs=session["msgs"],tools=session["tools"],attachs=session["attachs"],edits=session["edits"],edit_evidence=session["edit_evidence"],tool_lineage=session["tool_lineage"],message_lineage=session["message_lineage"]) if session else ParseResult()
 def wake_hooks(attempt=None,root=None):
-    with operation_lock((Path(root)/"data/hook_inbox" if root is not None else HOOK_DIR)/".drain.lock","hooks.dispatch",0,mandatory=False) as available:
-        if available: subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env={**os.environ,**({"CONVOS_PROJECT_ROOT":str(root)} if root is not None else {}),**({"CONVOS_HOOK_ATTEMPT":attempt} if attempt else {})})
+    with operation_lock((Path(root)/"data/hook_inbox" if root is not None else HOOK_DIR)/".drain.lock","hooks.dispatch",0,mandatory=False) as available: pass
+    if available: subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env={**os.environ,**({"CONVOS_PROJECT_ROOT":str(root)} if root is not None else {}),**({"CONVOS_HOOK_ATTEMPT":attempt} if attempt else {})})
 def enqueue_hook(source, payload):
     path,root=Path(payload["transcript_path"]).expanduser().resolve(),hook_root(source).expanduser().resolve()
     if source not in ("claude-code", "codex") or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")

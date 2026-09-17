@@ -604,3 +604,13 @@ def test_install_hooks_preflights_every_config_before_writing(tmp_path, monkeypa
     else: unsafe.parent.mkdir(); outside.write_text("sentinel"); unsafe.symlink_to(outside) if unsafe_kind == "symlink" else unsafe.write_text("{" if unsafe_kind == "malformed" else '{"hooks":[]}')
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(homes["claude"])); monkeypatch.setenv("CODEX_HOME", str(homes["codex"])); result = CliRunner().invoke(cli.app, ["install-hooks",*(["--remove"] if remove else [])])
     assert result.exit_code == 1 and safe.read_text() == '{"keep":1}' and "installed" not in result.output.lower() and (outside.read_text() == "sentinel" if outside.exists() else True)
+
+
+def test_dispatch_releases_worker_lease_before_child_can_start(hooks,monkeypatch):
+    _,data=hooks
+    launched=[]
+    def start(args,**kwargs):
+        with cli.operation_lock(data/'hook_inbox/.drain.lock','test.child',0): launched.append(kwargs['env']['CONVOS_PROJECT_ROOT'])
+    monkeypatch.setattr(cli.subprocess,'Popen',start)
+    cli.wake_hooks(root=data.parent)
+    assert launched==[str(data.parent)]
