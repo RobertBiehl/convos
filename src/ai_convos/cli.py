@@ -1227,9 +1227,10 @@ def ingest_parts(r,size=500):
     rank,messages=(rank:={mid:i for i,mid in enumerate(graphlib.TopologicalSorter({mid:{m["parent_id"]}&byid.keys() for mid,m in byid.items()}).static_order())}),sorted(r.msgs,key=lambda m:rank[m["id"]])
     if sum(map(len,(r.convs,r.msgs,r.tools,r.attachs,r.artifacts,r.edits,r.edit_evidence)))<=size: return (setattr(r,"msgs",messages),[r])[-1]
     return [*[blank(convs=v,scopes=[scopes[c["id"]] for c in v if c["id"] in scopes]) for v in chunks(r.convs)],*[blank(msgs=v) for v in chunks(messages)],*[blank(tools=v) for v in chunks(r.tools)],*[blank(attachs=v,attachment_indexes={a["id"]:r.attachment_indexes[a["id"]] for a in v if a.get("path")}) for v in chunks(r.attachs)],*[blank(artifacts=v) for v in chunks(r.artifacts)],*[blank(edits=v,edit_scopes=[edit_scopes[e["id"]] for e in v if e["id"] in edit_scopes]) for v in chunks(r.edits)],*[blank(edit_evidence=v) for v in chunks(r.edit_evidence)]]
-def commit_result(r,purpose,progress=None,parts=None):
+def commit_result(r,purpose,progress=None):
+    with _core(read_only=True,purpose=purpose) as conn: _prune_remote_rows(conn,r)
     total,changed,newids=[0]*7,set(),set()
-    for page,part in enumerate((p for p in (ingest_parts(r) if parts is None else parts) if any((p.convs,p.msgs,p.tools,p.attachs,p.artifacts,p.edits,p.edit_evidence))),1):
+    for page,part in enumerate((p for p in ingest_parts(r) if any((p.convs,p.msgs,p.tools,p.attachs,p.artifacts,p.edits,p.edit_evidence))),1):
         with _core(purpose=purpose) as conn,_transaction(conn): out=(newids.update({c["id"] for c in part.convs}-{x[0] for x in conn.execute("SELECT id FROM conversations WHERE id IN (SELECT UNNEST(?))",[[c["id"] for c in part.convs]]).fetchall()}) if part.convs else None,upsert(conn,part))[-1]
         ((total.__setitem__(slice(None),[total[i]+out[i] for i in range(7)]),changed.update(out[7]),total.__setitem__(slice(5,7),[len(newids),len({m["conversation_id"] for m in r.msgs if m["id"] in changed}-newids)]),r.provenance_edits.update(part.provenance_edits),r.provenance_conversations.update(part.provenance_conversations),progress and progress(f"{purpose} batch {page}, {sum(total[:5])} rows changed")),archive_yield(DB_PATH))
     return (*total,changed)
@@ -1664,9 +1665,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         chatgpt_ok.clear() or chatgpt_frontiers.clear()
         total,changed,jobs,newc,updc,provenance_edits,provenance_conversations,repair_attempted,failed_sources=[0]*5,set(),[],0,0,set(),set(),set(),set()
         def checkpoint(r,source):
-            parts=ingest_parts(r)
             with checkpoint_lock:
-                out=commit_result(r,purpose="sync.ingest",progress=lambda stage:pulse(f"ingesting {source} {stage.removeprefix('sync.ingest ')}"),parts=parts)
+                out=commit_result(r,purpose="sync.ingest",progress=lambda stage:pulse(f"ingesting {source} {stage.removeprefix('sync.ingest ')}"))
                 (known.update({c["id"]:(u.replace(tzinfo=timezone.utc).timestamp() if (u:=ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs if c["source"]=="chatgpt"}),repair_attempted.update(c["id"] for c in r.convs if c["id"] in repair_order))
                 return (*out,getattr(r,"provenance_edits",set()),getattr(r,"provenance_conversations",set()))
         with _core(read_only=True,purpose="sync.chatgpt.repair.plan") as conn: repairs=conn.execute("SELECT c.id,MIN(m.created_at),MAX(m.created_at) FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL) AND NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) GROUP BY c.id").fetchall()

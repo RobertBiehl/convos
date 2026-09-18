@@ -310,3 +310,15 @@ def test_local_only_upgrade_maps_claude_subagent_and_legacy_blank_line_coordinat
         core.upsert(db,core.parse_claude_code(core.hook_root('claude-code'),bindings=core.session_bindings(db)))
         assert db.execute('SELECT count(*) FROM messages').fetchone()==(2,)
         assert not core.archive_relationships(db)
+
+
+def test_chunked_peer_reimport_skips_children_whose_bodies_have_not_arrived():
+    from ai_convos_remote.projection import apply_row_replicas
+    user,device,peer,control,bodies=signed_graph()
+    apply_row_replicas(core.DB_PATH,bodies[:2],'w',[control],local_user=user,local_device=peer['id'])
+    messages=[dict(id=f'pending-{i}',conversation_id='c',role='assistant',content='pending',thinking=None,created_at=None,model=None,metadata='{}',parent_id=None) for i in range(501)]
+    result=core.ParseResult(msgs=messages,tools=[dict(id='pending-tool',message_id=messages[-1]['id'],tool_name='write',input='{}',output='{}',status='complete',duration_ms=None,created_at=None)],edits=[dict(id='pending-edit',message_id=messages[-1]['id'],file_path='a.txt',edit_type='write',content='pending',created_at=None,old_content=None)],edit_evidence=[dict(file_edit_id='pending-edit',status='confirmed',reason='provider_success',tool_call_id='pending-tool')])
+    assert core.commit_result(result,purpose='test.peer.partial')[:7]==(0,0,0,0,0,0,0)
+    with core.open_db(core.DB_PATH,read_only=True) as db:
+        assert db.execute('SELECT count(*) FROM messages').fetchone()==(1,)
+        assert not db.execute('SELECT * FROM file_edits').fetchall()
