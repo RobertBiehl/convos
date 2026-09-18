@@ -257,14 +257,14 @@ def request(cfg,body,auth=True):
     safe_url(cfg["url"])
     headers={"Content-Type":"application/json"}
     if auth: headers["Authorization"]="Bearer "+cfg["token"]
-    req=urllib.request.Request(cfg["url"].rstrip("/")+"/v1",data=json.dumps(body,separators=(",",":")).encode(),headers=headers,method="POST")
+    req=urllib.request.Request(cfg["url"].rstrip("/")+"/v2",data=json.dumps(body,separators=(",",":")).encode(),headers=headers,method="POST")
     try: return _response_json(_HTTP.open(req,timeout=(timeout:=120 if body["op"] in {"upload_many","replica_upload_many","replica_replace_many","blob_upload","origin_upload"} else 30)),None if body["op"]=="origin_pull" else 64*1024**2)
     except urllib.error.HTTPError as e:
         try: message=_response_json(e,64*1024).get("error",e.reason)
         except ValueError: message=e.reason
         raise (ConnectionError if e.code in (408,429) or e.code>=500 else ValueError)(f"Remote {body['op']} HTTP {e.code}: {str(message)[:1000]}") from e
     except (urllib.error.URLError,TimeoutError,ConnectionError,http.client.HTTPException) as e: raise ConnectionError(f"Remote {body['op']} failed (socket timeout {timeout}s): {e}") from e
-def health(cfg): return (safe_url(cfg["url"]),(lambda result:(required(result.get("version")==1,ValueError("relay protocol v1 required")),result)[-1])(_response_json(_HTTP.open(cfg["url"].rstrip("/")+"/v1/health",timeout=3))))[-1]
+def health(cfg): return (safe_url(cfg["url"]),(lambda result:(required(result.get("version")==2,ValueError("relay protocol v2 required")),result)[-1])(_response_json(_HTTP.open(cfg["url"].rstrip("/")+"/v2/health",timeout=3))))[-1]
 def _manual_waiting(root):
     path=paths(root)[0]/"manual.lock"
     with operation_lock(path,"remote background admission",0,_lock_identity(root),False) as pulse:
@@ -431,7 +431,9 @@ def create(cfg,name,kind="team",root=None):
     entry=own_record(cfg)
     control=control_sign(cfg["device"],{"v":CONTROL_V,"kind":"workspace.state","workspace":ws,"scope":kind,"revision":1,"prev":None,"epoch":1,"boundary":{"epoch":1,"tail":0,"heads":{}},"key_commitment":digest(key_),"members":{cfg["user"]:{"role":"admin","joined":1,"history_from":1}},"devices":{cfg["device"]["id"]:entry},"removed":[],"action":"create","approval":None,"approved_at":time.time()})
     env=seal_key(key_,cfg["device"]["box_public"],f"workspace:{ws}:epoch:1")
-    request(cfg,sign_control(cfg["device"],{"op":"create","workspace":ws,"kind":kind,"control":control,"envelopes":{cfg["device"]["id"]:env}}))
+    _,bundle=recovery_bundle({'root':cfg['root'],'keys':{**cfg['keys'],f'{ws}:1':b64(key_)},'workspaces':{**cfg['workspaces'],ws:{'name':name,'kind':kind,'epoch':1}},'controls':{**cfg['controls'],ws:control}},unb64(cfg['recovery'])) if kind=='personal' else (None,None)
+    result=request(cfg,sign_control(cfg["device"],{"op":"create","workspace":ws,"kind":kind,"control":control,"envelopes":{cfg["device"]["id"]:env},**({'recovery':bundle} if bundle else {})}))
+    if result.get('created') is False: return result['workspace']
     cfg["workspaces"][ws]={"name":name,"kind":kind,"epoch":1}
     cfg["keys"][f"{ws}:1"]=b64(key_)
     cfg["controls"][ws]=control
@@ -454,7 +456,7 @@ def setup_client(url,user,device="computer",recovery=None,root=None):
     dev,uid=identity(device),root_id["id"]
     if not recovery: recovery,bundle=recovery_bundle({"root":root_id,"keys":keys,"workspaces":workspaces})
     registered=enroll(url,user,root_id,dev,bundle if not workspaces else None)
-    cfg={"url":url,"name":user,"user":uid,"token":registered["token"],"root":root_id,"device":dev,"recovery":recovery,"keys":keys,"workspaces":workspaces,"controls":controls,"bindings":{},"sharing":sharing,"server_state":{}}
+    cfg={"url":url,"name":user,"user":uid,"token":registered["token"],"root":root_id,"device":dev,"recovery":recovery,"keys":keys,"workspaces":workspaces,"controls":controls,"bindings":{},"sharing":sharing,"server_state":{},"sync_version":2,"relay_generation":registered['generation']}
     save(cfg,root)
     if not workspaces: create(cfg,"Personal","personal",root)
     else:
@@ -470,6 +472,42 @@ def rehome_client(cfg,url,root=None):
     save(fresh,root)
     create(fresh,"Personal","personal",root)
     return fresh,recovery
+def reenroll_client(cfg,root=None):
+    from .projection import reset_sync_state
+    _,bundle=recovery_bundle({'root':cfg['root'],'keys':{},'workspaces':{}},unb64(cfg['recovery']))
+    registered=enroll(cfg['url'],cfg['name'],cfg['root'],cfg['device'],bundle)
+    recovered=recover(request({'url':cfg['url']},{'op':'recovery_fetch','user':cfg['user']},False)['bundle'],cfg['recovery'])
+    required(recovered['root']==cfg['root'],ValueError('Recovery bundle does not match the existing user identity'))
+    reset_sync_state(paths(root)[2])
+    if (directory:=paths(root)[0]/'outbox').exists(): shutil.rmtree(directory)
+    fresh={**cfg,'token':registered['token'],'keys':recovered['keys'],'workspaces':recovered['workspaces'],'controls':recovered.get('controls',{}),'bindings':{},'sharing':{},'server_state':{},'sync_version':1,'relay_generation':registered['generation']}
+    save(fresh,root)
+    state=refresh(fresh,root)
+    if not any(w['kind']=='personal' for w in state['workspaces']):
+        create(fresh,'Personal','personal',root)
+        state=refresh(fresh,root)
+    recovered=recover(request({'url':cfg['url']},{'op':'recovery_fetch','user':cfg['user']},False)['bundle'],cfg['recovery'])
+    required(recovered['root']==cfg['root'],ValueError('Recovery bundle does not match the existing user identity'))
+    fresh['keys'].update(recovered['keys'])
+    for ws in [w['id'] for w in state['workspaces'] if w['kind']=='personal' and not w['device_authorized']]:
+        rotate(fresh,ws,{u:m['role'] for u,m in fresh['controls'][ws]['members'].items()},[],root=root)
+        grant_all(fresh,ws,fresh['user'],root)
+    fresh['sync_version']=2
+    update_recovery(fresh,root)
+    return fresh
+def upgrade_sync(cfg,root):
+    from ai_convos.cli import reset_archive_sync
+    version=cfg.get('sync_version',1)
+    required(version in (1,2),ValueError(f'Unsupported local sync version: {version}'))
+    if version==2: return cfg
+    status=request(cfg,{'op':'status'},False)
+    required(status['version']==2 and status['generation'],ValueError('Upgrade the relay before upgrading sync'))
+    with local_lock(root,'mutation',True):
+        cfg=load(root)
+        if cfg.get('sync_version',1)==2: return cfg
+        result=reset_archive_sync(core_path(root),cfg['user'],cfg['device']['id'])
+        if result: typer.echo(f"Sync upgrade: retained owned archive; removed {result['removed']} received rows; backup: {result['backup']}",err=True)
+        return reenroll_client(cfg,root)
 def rotate(cfg,ws,members,devices,deactivate=(),root=None):
     refresh(cfg,root)
     previous=cfg["controls"][ws]
@@ -997,7 +1035,7 @@ def fetch_lazy(cfg,state,event_id=None,root=None):
 def sync_once(root=None,repair=False,manual=False):
     root=local_root(root)
     with sync_run(root,manual):
-        cfg=load(root)
+        cfg=upgrade_sync(load(root),root)
         discard_replicas((p,None) for p in (paths(root)[0]/"outbox").glob(".replica-*"))
         _,_,state_path=paths(root)
         info=inspect_state(state_path,manual or repair)

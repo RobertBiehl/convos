@@ -37,6 +37,154 @@ def test_upload_batches_bound_count_and_wire_size():
     row=lambda size:{"size":size}
     assert [len(x) for x in _upload_batches([row(1)]*501,1000)]==[500,1] and [len(x) for x in _upload_batches([row(6)]*2,10)]==[1,1]
 
+def test_cutover_preserves_owned_archive_without_source_files_and_removes_received_rows(tmp_path):
+    path=tmp_path/'data/convos.db'
+    write_archive(path,'owned conversation without a transcript')
+    with duckdb.connect(str(path)) as db:
+        for cid in ('c','received'):
+            if cid!='c': project_archive_row(db,'conversations',ARCHIVE_COLUMNS['conversations'],[cid,'codex','received','2026-01-01','2026-01-01',None,None,None,None,'{}'])
+            project_archive_row(db,'messages',ARCHIVE_COLUMNS['messages'],[cid+'-message',cid,'user',cid+' text',None,'2026-01-01',None,'{}',None])
+            project_archive_row(db,'tool_calls',ARCHIVE_COLUMNS['tool_calls'],[cid+'-tool',cid+'-message','test','{}','{}','complete',None,'2026-01-01'])
+            project_archive_row(db,'file_edits',ARCHIVE_COLUMNS['file_edits'],[cid+'-edit',cid+'-message','test.py','write',cid+' content','2026-01-01',None])
+            db.execute('INSERT OR REPLACE INTO provenance.file_edit_evidence VALUES (?,?,?,?)',[cid+'-edit','confirmed','provider_success',cid+'-tool'])
+            project_archive_row(db,'attachments',ARCHIVE_COLUMNS['attachments'],[cid+'-attachment',cid+'-message','metadata only','text/plain',10,None,None,'2026-01-01'])
+        db.executemany('INSERT INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)',[(table,rid,'old-workspace','user','other-device',rid,None,None,None,None) for table,rid in [('conversations','received'),('messages','received-message'),('tool_calls','received-tool'),('file_edits','received-edit'),('attachments','received-attachment')]])
+        owned={table:db.execute(f"SELECT * FROM {table} WHERE id LIKE 'c%' ORDER BY id").fetchall() for table in ARCHIVE_COLUMNS}
+    result=core_module.reset_archive_sync(path,'user','device')
+    assert result['removed']==5 and Path(result['backup']).is_file()
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert {table:db.execute(f'SELECT * FROM {table} ORDER BY id').fetchall() for table in ARCHIVE_COLUMNS}==owned
+        assert not core_module.archive_relationships(db)
+        assert db.execute('SELECT * FROM provenance.file_edit_evidence').fetchall()==[('c-edit','confirmed','provider_success','c-tool')]
+        assert not db.execute('SELECT * FROM remote.row_origins').fetchall()
+    assert core_module.reset_archive_sync(path,'user','device') is None
+    assert len(list(path.parent.glob('convos.db.pre-sync-v2.bak*')))==2
+
+def test_cutover_refuses_to_orphan_owned_data_and_rolls_back(tmp_path):
+    path=tmp_path/'data/convos.db'
+    write_archive(path,'received parent with owned child')
+    with duckdb.connect(str(path)) as db:
+        project_archive_row(db,'messages',ARCHIVE_COLUMNS['messages'],['owned','c','user','keep me',None,None,None,'{}',None])
+        db.execute('INSERT INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)',['conversations','c','old','user','sibling','c',None,None,None,None])
+    with pytest.raises(ValueError,match='owned rows reference received parents'): core_module.reset_archive_sync(path,'user','device')
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT content FROM messages').fetchall()==[('keep me',)]
+        assert db.execute('SELECT id FROM conversations').fetchall()==[('c',)]
+        assert db.execute('SELECT count(*) FROM remote.row_origins').fetchone()==(1,)
+        assert not db.execute('SELECT * FROM archive_sync').fetchall()
+
+
+def test_cutover_reenrolls_existing_users_and_devices_without_new_secrets(tmp_path,monkeypatch):
+    server_path=tmp_path/'server.db'
+    server=server_connect(server_path)
+    monkeypatch.setattr(remote_client,'request',transport(server))
+    roots=[tmp_path/name for name in ('laptop','desktop','other-user')]
+    a,recovery=setup_client('http://server','alice',device='laptop',root=roots[0])
+    b,_=setup_client('http://server','alice',device='desktop',recovery=recovery,root=roots[1])
+    c,_=setup_client('http://server','bob',root=roots[2])
+    old=[a,b,c]
+    old_spaces=set().union(*(v['workspaces'] for v in old))
+    server.execute('PRAGMA user_version=2')
+    server.commit()
+    server.close()
+    server=server_connect(server_path)
+    monkeypatch.setattr(remote_client,'request',transport(server))
+    try:
+        fresh=[remote_client.reenroll_client(cfg,root) for cfg,root in zip(old,roots)]
+        for previous,current in zip(old,fresh):
+            assert all(previous[key]==current[key] for key in ('user','root','device','recovery','name','url'))
+            assert current['sync_version']==2 and current['token']!=previous['token']
+            assert not old_spaces&current['workspaces'].keys()
+        assert fresh[0]['workspaces'].keys()==fresh[1]['workspaces'].keys()
+        assert not fresh[0]['workspaces'].keys()&fresh[2]['workspaces'].keys()
+        assert server.execute('SELECT count(*) FROM users').fetchone()[0]==2
+        assert server.execute('SELECT count(*) FROM devices').fetchone()[0]==3
+        assert server.execute('SELECT count(*) FROM workspaces').fetchone()[0]==2
+        retried=remote_client.reenroll_client(fresh[1],roots[1])
+        assert retried['workspaces'].keys()==fresh[1]['workspaces'].keys()
+        assert server.execute('SELECT count(*) FROM devices').fetchone()[0]==3
+    finally: server.close()
+
+@pytest.mark.parametrize('operation',['register','create','rotate','grant_all'])
+def test_cutover_enrollment_resumes_after_server_committed_but_response_was_lost(tmp_path,monkeypatch,operation):
+    server_path=tmp_path/'server.db'
+    server=server_connect(server_path)
+    monkeypatch.setattr(remote_client,'request',transport(server))
+    root,peer=tmp_path/'client',tmp_path/'peer'
+    old,recovery=setup_client('http://server','alice',root=root)
+    sibling,_=setup_client('http://server','alice',recovery=recovery,root=peer)
+    server.execute('PRAGMA user_version=2')
+    server.commit()
+    server.close()
+    server=server_connect(server_path)
+    direct,interrupted=transport(server),[]
+    monkeypatch.setattr(remote_client,'request',direct)
+    if operation in ('rotate','grant_all'): remote_client.reenroll_client(sibling,peer)
+    def lost_response(cfg,body,auth=True):
+        result=direct(cfg,body,auth)
+        if body['op']==operation and not interrupted:
+            interrupted.append(operation)
+            raise ConnectionError('response lost after commit')
+        return result
+    monkeypatch.setattr(remote_client,'request',lost_response)
+    try:
+        with pytest.raises(ConnectionError,match='response lost'): remote_client.reenroll_client(old,root)
+        fresh=remote_client.reenroll_client(load(root),root)
+        assert interrupted==[operation] and fresh['sync_version']==2
+        assert all(fresh[k]==old[k] for k in ('root','device','user','recovery'))
+        state=refresh(fresh,root)
+        assert len(state['workspaces'])==1 and state['workspaces'][0]['device_authorized']
+        ws=state['workspaces'][0]
+        assert all(f"{ws['id']}:{epoch}" in fresh['keys'] for epoch in range(1,ws['epoch']+1))
+    finally: server.close()
+
+def test_sync_automatically_cuts_over_and_reseeds_existing_owned_database(tmp_path,monkeypatch):
+    server_path=tmp_path/'server.db'
+    server=server_connect(server_path)
+    monkeypatch.setattr(remote_client,'request',transport(server))
+    monkeypatch.setattr(remote_client,'drain_hooks',lambda:None)
+    aroot,broot=tmp_path/'laptop',tmp_path/'desktop'
+    a,recovery=setup_client('http://server','alice',root=aroot)
+    b,_=setup_client('http://server','alice',recovery=recovery,root=broot)
+    write_archive(aroot/'data/convos.db','only copy is in the owned database')
+    attachment=aroot/'remote/attachments/legacy-body'
+    attachment.parent.mkdir(parents=True)
+    attachment.write_bytes(b'owned attachment bytes')
+    with duckdb.connect(str(aroot/'data/convos.db')) as db:
+        project_archive_row(db,'messages',ARCHIVE_COLUMNS['messages'],['owned-message','c','user','has attachment',None,None,None,'{}',None])
+        project_archive_row(db,'attachments',ARCHIVE_COLUMNS['attachments'],['owned-attachment','owned-message','owned.txt','text/plain',len(attachment.read_bytes()),str(attachment),None,None])
+        index_attachment_body(db,'owned-attachment',attachment)
+    sync_once(aroot)
+    sync_once(broot)
+    attachment.write_bytes(b'owned attachment bytes')
+    with duckdb.connect(str(aroot/'data/convos.db')) as db:
+        current=Path(db.execute("SELECT path FROM attachments WHERE id='owned-attachment'").fetchone()[0])
+        current.unlink()
+        db.execute("UPDATE attachments SET path=? WHERE id='owned-attachment'",[str(attachment)])
+    for root in (aroot,broot):
+        cfg=load(root)
+        cfg.pop('sync_version')
+        cfg.pop('relay_generation')
+        remote_client.save(cfg,root)
+    server.execute('PRAGMA user_version=2')
+    server.commit()
+    server.close()
+    server=server_connect(server_path)
+    monkeypatch.setattr(remote_client,'request',transport(server))
+    try:
+        sync_once(broot)
+        with duckdb.connect(str(broot/'data/convos.db'),read_only=True) as db:
+            assert db.execute('SELECT count(*) FROM conversations').fetchone()==(0,), 'peer must not reseed received same-user data as its own'
+        for root in (aroot,broot,aroot,broot): sync_once(root)
+        for root in (aroot,broot):
+            assert load(root)['sync_version']==2
+            with duckdb.connect(str(root/'data/convos.db'),read_only=True) as db:
+                assert db.execute('SELECT title FROM conversations').fetchall()==[('only copy is in the owned database',)]
+                assert not core_module.archive_relationships(db)
+                assert Path(db.execute('SELECT path FROM attachments').fetchone()[0]).read_bytes()==b'owned attachment bytes'
+        assert server.execute('SELECT count(*) FROM workspaces').fetchone()[0]==1
+    finally: server.close()
+
 def test_replica_outbox_is_disk_and_request_bounded(tmp_path,monkeypatch):
     root=tmp_path/"client"; monkeypatch.setattr(remote_client,"REPLICA_BATCH_BYTES",700); envs=[{"workspace":"w","replica":f"{i:064x}","epoch":1,"payload":"x"*120} for i in range(19)]; prepared=remote_client.prepare_replicas(root,envs); remote_client.publish_replicas(prepared); files=list((root/"remote/outbox").glob("replica-batch-*")); calls=[]
     assert len(files)>1 and max(p.stat().st_size for p in files)<=700

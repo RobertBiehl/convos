@@ -32,18 +32,25 @@ def test_relay_health_does_not_depend_on_reverse_dns(running_relay,monkeypatch):
     with running_relay() as (address,_):
         conn=http.client.HTTPConnection(*address,timeout=2)
         try:
-            conn.request('GET','/v1/health')
+            conn.request('GET','/v2/health')
             result=conn.getresponse()
-            assert result.status==200 and json.loads(result.read())==dict(ok=True,version=1)
+            value=json.loads(result.read())
+            assert result.status==200 and value['ok'] and value['version']==2 and value['generation']
         finally: conn.close()
 
 
-def response(address,headers,body=b"",eof=False,path="/v1"):
+def response(address,headers,body=b"",eof=False,path="/v2"):
     with socket.create_connection(address,timeout=2) as conn:
         conn.sendall(f"POST {path} HTTP/1.1\r\nHost: relay\r\n{headers}\r\n".encode()+body)
         if eof: conn.shutdown(socket.SHUT_WR)
         out=http.client.HTTPResponse(conn); out.begin()
         return out.status,json.loads(out.read())
+
+def test_old_clients_are_rejected_before_dispatch(running_relay,monkeypatch):
+    monkeypatch.setattr(relay,'action',lambda *args:pytest.fail('old client reached dispatch'))
+    with running_relay() as (address,_):
+        status,value=response(address,'Content-Length: 2\r\n',b'{}',path='/v1')
+        assert status==404 and 'v2' in value['error']
 
 
 @pytest.mark.parametrize("headers",[
@@ -89,7 +96,7 @@ def test_worker_limit_returns_retryable_overload_then_recovers(running_relay):
 def test_absolute_deadline_closes_trickling_request(running_relay):
     with running_relay(workers=1,idle=.2,deadline=.15) as (address,started),socket.create_connection(address,timeout=2) as conn:
         assert started.wait(2)
-        conn.sendall(b"POST /v1 HTTP/1.1\r\nHost: relay\r\nContent-Length: 1000\r\n\r\n")
+        conn.sendall(b"POST /v2 HTTP/1.1\r\nHost: relay\r\nContent-Length: 1000\r\n\r\n")
         began=time.monotonic()
         for _ in range(15):
             try: conn.sendall(b" ")

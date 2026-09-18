@@ -29,6 +29,37 @@ def test_incompatible_relay_database_is_rejected_instead_of_mutated(tmp_path):
     with pytest.raises(ValueError,match="incompatible"): connect(path)
 
 
+def test_source_device_cutover_resets_old_relay_once(tmp_path):
+    path=tmp_path/'relay.db'
+    with closing(connect(path)) as db:
+        old=account(db,'alice')
+        create_ws(db,old,'old-personal',bytes(32),'personal')
+        db.execute('PRAGMA user_version=2')
+        db.commit()
+    with closing(connect(path)) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0]==3
+        assert db.execute('SELECT count(*) FROM users').fetchone()[0]==0
+        assert db.execute('SELECT count(*) FROM workspaces').fetchone()[0]==0
+        with pytest.raises(PermissionError): action(db,{'op':'state'},old['token'])
+        new=register_device(db,'alice',old['root'],old['device'])
+        generation=db.execute("SELECT value FROM relay_meta WHERE key='sync_generation'").fetchone()[0]
+    with closing(connect(path)) as db:
+        assert action(db,{'op':'state'},new['token'])['device']==old['device']['id']
+        assert db.execute("SELECT value FROM relay_meta WHERE key='sync_generation'").fetchone()[0]==generation
+
+
+def test_unknown_future_relay_version_is_not_reset(tmp_path):
+    path=tmp_path/'relay.db'
+    with closing(connect(path)) as db:
+        account(db,'alice')
+        db.execute('PRAGMA user_version=999')
+        db.commit()
+    with pytest.raises(ValueError,match='incompatible'): connect(path)
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0]==999
+        assert db.execute('SELECT count(*) FROM users').fetchone()[0]==1
+
+
 def test_paged_ledgers_seek_workspace_cursor_indexes(tmp_path):
     db=connect(tmp_path/"server.db"); tables={"events":"event_workspace_cursor","row_replicas":"replica_workspace_cursor","semantic_replicas":"semantic_workspace_cursor","blob_replicas":"blob_workspace_cursor","origin_bundles":"origin_workspace_cursor"}
     for table,index in tables.items():
@@ -190,7 +221,9 @@ def test_relay_has_no_memory_specific_purge_ledger(tmp_path):
 
 def test_legacy_purge_relay_requires_clean_cutover(tmp_path):
     path=tmp_path/"legacy.db"; db=sqlite3.connect(path); db.execute("CREATE TABLE events(id TEXT)"); db.execute("CREATE TABLE event_purges(id TEXT)"); db.execute("PRAGMA user_version=1"); db.commit(); db.close()
-    with pytest.raises(ValueError,match="fresh relay"): connect(path)
+    with closing(connect(path)) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0]==3
+        assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='event_purges'").fetchone()
 
 
 def test_restart_preserves_events_tokens_and_idempotency(tmp_path):

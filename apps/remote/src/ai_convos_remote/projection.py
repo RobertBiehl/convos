@@ -50,6 +50,17 @@ def _connect(path,journal="WAL"):
     db.row_factory=sqlite3.Row
     db.executescript(f"PRAGMA journal_mode={journal};PRAGMA secure_delete=ON;"+STATE)
     return db
+def reset_sync_state(path):
+    path=Path(path)
+    path.parent.mkdir(parents=True,exist_ok=True)
+    required(not path.is_symlink(),ValueError('remote state must not be a symlink'))
+    with contextlib.closing(sqlite3.connect(path)) as db,db:
+        db.execute('BEGIN IMMEDIATE')
+        tables=[r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        [db.execute('DROP TABLE "'+name.replace('"','""')+'"') for name in tables]
+        [db.execute(sql) for sql in STATE.split(';') if sql.strip()]
+        db.execute("INSERT INTO meta VALUES ('state_schema',?)",[STATE_VERSION])
+    os.chmod(path,0o600)
 def _fsync(path):
     fd=os.open(path,os.O_RDONLY)
     try: os.fsync(fd)

@@ -182,6 +182,7 @@ CREATE TABLE IF NOT EXISTS attachment_bodies(attachment_id VARCHAR PRIMARY KEY,c
 CREATE TABLE IF NOT EXISTS embedding_state(singleton BOOLEAN PRIMARY KEY,profile JSON NOT NULL);
 CREATE TABLE IF NOT EXISTS core_schema(singleton BOOLEAN PRIMARY KEY,version USMALLINT NOT NULL);
 CREATE TABLE IF NOT EXISTS core_migrations(name VARCHAR PRIMARY KEY,state VARCHAR NOT NULL);
+CREATE TABLE IF NOT EXISTS archive_sync(singleton BOOLEAN PRIMARY KEY,version USMALLINT NOT NULL,user_id VARCHAR NOT NULL,device_id VARCHAR NOT NULL);
 CREATE TABLE IF NOT EXISTS archive_state(singleton BOOLEAN PRIMARY KEY,archive_id UUID NOT NULL,generation UBIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS archive_changes(kind VARCHAR,entity VARCHAR,generation UBIGINT,PRIMARY KEY(kind,entity));
 CREATE TABLE IF NOT EXISTS retrieval_state(singleton BOOLEAN PRIMARY KEY,messages_generation UBIGINT NOT NULL,fts_generation UBIGINT,fts_definition_hash VARCHAR);
@@ -667,6 +668,35 @@ def _migration_backup(conn,version=1):
     backup=backup.with_name(f"{backup.name}.{time.time_ns()}") if backup.exists() or backup.with_name(backup.name+".attachments").exists() else backup
     (_backup_attachments(conn,path,backup,source),atomic_publish(backup,lambda tmp:(_backup_copy(path,tmp),required(_file_sha256(tmp)==source,ValueError("archive backup verification failed")),_check_archive(tmp))))
     return backup
+def reset_archive_sync(path,user,device):
+    if not Path(path).is_file(): return None
+    with contextlib.closing(get_db(path=path,purpose='sync.cutover')) as db:
+        init_schema(db)
+        if prior:=db.execute('SELECT version,user_id,device_id FROM archive_sync WHERE singleton').fetchone():
+            required(prior==(2,user,device),ValueError('Archive sync identity or format does not match this device'))
+            return None
+        db.execute('CREATE OR REPLACE TEMP TABLE sync_received AS SELECT table_name,physical_row_id FROM remote.row_origins')
+        peers=db.execute("SELECT p.row_kind,p.source_row_id,list(DISTINCT p.content_hash) FROM remote.row_proofs p WHERE p.author_user_id=? AND p.author_device_id<>? AND p.row_kind IN (SELECT UNNEST(?)) AND NOT EXISTS(SELECT 1 FROM remote.row_proofs own WHERE (own.row_kind,own.source_row_id,own.author_user_id)=(p.row_kind,p.source_row_id,p.author_user_id) AND own.author_device_id=?) GROUP BY p.row_kind,p.source_row_id",[user,device,list(ARCHIVE_COLUMNS),device]).fetchall()
+        for at in range(0,len(peers),500):
+            claims=[(kind,source,source,user,'active') for kind,source,hashes in peers[at:at+500]]
+            bodies=typed_logical_rows(db,claims)
+            if received:=[(kind,source) for (kind,source,hashes),claim in zip(peers[at:at+500],claims) if any(matching_logical_row(bodies[claim],h) is not None for h in hashes)]: db.executemany('INSERT INTO sync_received VALUES (?,?)',received)
+        db.execute('CREATE OR REPLACE TEMP TABLE sync_received AS SELECT DISTINCT * FROM sync_received')
+        blocked=[f'{table}.{column}' for table,refs in ARCHIVE_FKS.items() for column,parent in refs if db.execute(f"SELECT 1 FROM {table} c JOIN sync_received p ON p.table_name=? AND p.physical_row_id=c.{column} WHERE NOT EXISTS(SELECT 1 FROM sync_received o WHERE o.table_name=? AND o.physical_row_id=c.id) LIMIT 1",[parent,table]).fetchone()]
+        required(not blocked,ValueError(f'Cannot reset sync: owned rows reference received parents: {blocked}; archive unchanged'))
+        backup=_migration_backup(db,'sync-v2')
+        with _transaction(db):
+            removed=sum(db.execute(f"SELECT count(*) FROM {table} t JOIN sync_received o ON o.table_name=? AND o.physical_row_id=t.id",[table]).fetchone()[0] for table in ARCHIVE_COLUMNS)
+            changed=db.execute('SELECT table_name,physical_row_id FROM sync_received').fetchall()
+            for table in reversed(ARCHIVE_COLUMNS): db.execute(f"DELETE FROM {table} t USING sync_received o WHERE o.table_name=? AND o.physical_row_id=t.id",[table])
+            for table,column,parent in [('attachment_bodies','attachment_id','attachments'),('provider_sessions','conversation_id','conversations'),('provenance.conversation_scopes','conversation','conversations'),*[(f'provenance.{table}','file_edit_id','file_edits') for table in ('file_edit_scopes','file_edit_files','file_edit_evidence','checkpoint_edits')]]: db.execute(f'DELETE FROM {table} x WHERE NOT EXISTS(SELECT 1 FROM {parent} p WHERE p.id=x.{column})')
+            for table,kind,retain in [('git_checkpoints','git.checkpoint','EXISTS(SELECT 1 FROM provenance.checkpoint_edits e WHERE e.checkpoint_id=x.id)'),('file_versions','file.version','FALSE'),('files','file.observed','EXISTS(SELECT 1 FROM provenance.file_edit_files e WHERE e.file_id=x.id) OR EXISTS(SELECT 1 FROM provenance.file_versions v WHERE v.file_id=x.id)'),('repositories','repository.observed','EXISTS(SELECT 1 FROM provenance.conversation_scopes c WHERE c.repository=x.id) OR EXISTS(SELECT 1 FROM provenance.file_edit_scopes e WHERE e.repository=x.id) OR EXISTS(SELECT 1 FROM provenance.files f WHERE f.repository=x.id) OR EXISTS(SELECT 1 FROM provenance.git_checkpoints g WHERE g.repository=x.id) OR EXISTS(SELECT 1 FROM provenance.repository_checkouts c WHERE c.repository=x.id)')]: db.execute(f'DELETE FROM provenance.{table} x WHERE EXISTS(SELECT 1 FROM remote.provenance_origins o WHERE o.kind=? AND o.physical_entity=x.id) AND NOT EXISTS(SELECT 1 FROM provenance.local_facts l WHERE l.kind=? AND l.entity=x.id) AND NOT ({retain})',[kind,kind])
+            db.execute("DELETE FROM provenance.repository_aliases a WHERE NOT EXISTS(SELECT 1 FROM provenance.repositories r WHERE r.id=a.repository); DELETE FROM provenance.pending p USING sync_received o WHERE (p.kind,p.entity)=(o.table_name,o.physical_row_id)")
+            [db.execute(f'DELETE FROM remote.{table}') for table, in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='remote' AND table_type='BASE TABLE'").fetchall()]
+            db.execute("INSERT INTO remote.edit_ready VALUES ('',''); INSERT INTO archive_sync VALUES (TRUE,2,?,?)",[user,device])
+            required(not (issues:=archive_relationships(db)),ValueError(f'Archive relationship validation failed during sync reset: {issues}'))
+            _archive_touch(db,changed)
+        return dict(removed=removed,backup=str(backup) if backup else None)
 def merge_archive_backup(path,backup,page=500):
     def restore(db,table,rows,columns=None): return (((bodies:=dict(rows)),(proofs:=db.execute("SELECT * FROM remote.row_proofs WHERE id IN (SELECT UNNEST(?))",[list(bodies)]).fetchall()),required(len(proofs)==len(bodies),ValueError("Recovery bodies require stored proofs")),restore_signed_bodies(db,[dict(proof_id=p[0],proof_row=p,body=json.loads(bodies[p[0]])) for p in proofs]))[-1] if table=="remote.row_conflicts" and rows else _insert_pages(db,table,rows,columns,mode=" OR IGNORE"),project_edit_dependencies(db,advanced=[('', '')]))[0]
     path,backup=Path(path).resolve(),Path(backup).resolve()

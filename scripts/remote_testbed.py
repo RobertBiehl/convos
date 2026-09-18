@@ -69,7 +69,7 @@ def wait_health(url,process,timeout=15,diagnostics=None):
     started,opener,last=time.monotonic(),urllib.request.build_opener(urllib.request.ProxyHandler({})),None
     while time.monotonic()-started<timeout:
         if process.poll() is not None: raise RuntimeError(f"relay exited ({process.returncode}): {process.stderr.read() if process.stderr else 'see relay.log'}")
-        try: return json.loads(opener.open(url+"/v1/health",timeout=1).read())
+        try: return json.loads(opener.open(url+"/v2/health",timeout=1).read())
         except Exception as error:
             last=error
             time.sleep(.1)

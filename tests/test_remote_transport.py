@@ -35,7 +35,7 @@ def test_redirect_never_forwards_bearer_or_replays_request(status):
     with endpoint(200,b'{}') as (target,received),endpoint(status,b'',{"Location":target+"/capture"}) as (source,sent):
         with pytest.raises(ValueError,match="redirects are not allowed"):
             remote.request({"url":source,"token":"synthetic-secret"},{"op":"state"})
-        assert sent==[("/v1","Bearer synthetic-secret")] and received==[]
+        assert sent==[("/v2","Bearer synthetic-secret")] and received==[]
 
 
 @pytest.mark.parametrize("status,error",[(403,ValueError),(429,ConnectionError),(503,ConnectionError)])
