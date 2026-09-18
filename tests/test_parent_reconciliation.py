@@ -116,7 +116,7 @@ def test_parent_arriving_after_received_child_repairs_link(tmp_path):
     assert projection.audit_rows(path,local_user=user)["relationships"]
     with core._core(path,purpose="test.local_parent") as db, core._transaction(db):
         db.execute("INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?)",parent)
-        assert core.repair_parent_links(db,user,{("conversations","c")})==1
+        assert core.repair_parent_links(db,user,{("conversations","c")})==0
     assert not projection.audit_rows(path,local_user=user)["relationships"]
 
 

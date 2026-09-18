@@ -13,13 +13,20 @@ from tests.test_provenance import core as archive, repo
 from tests.test_remote_projection import signed_edit_graph
 
 
-def signed_native_edit(tmp_path):
+def signed_native_edit(tmp_path,legacy=False):
     path, checkout = tmp_path / "archive.db", repo(tmp_path / "repo")
     with archive(path, checkout, [(tmp_path / "outside.txt", "write", "one\n", None)]):
         pass
     core.capture_provenance(path)
     users, devices, control, cfg = people()
-    projection.attest_rows(path, cfg, "w", scanned(path, tmp_path / "state.db"))
+    records=scanned(path,tmp_path/'state.db')
+    if legacy:
+        rows=[projection.signed_row(r) if r['kind'] in projection.TABLES else core.logical_fact(r) for r in records]
+        for row in rows:
+            if row['kind'] in ('messages','tool_calls'): row['data'].pop('edits')
+        signer=control['devices'][devices[0]['id']]
+        with core.open_db(path,purpose='fixture.legacy-sign') as db,core._transaction(db): core.project_attested_rows(db,[(row,protocol.row_proof(devices[0],users[0],'w',1,row)) for row in rows],signer['root_public'],signer['certificate'])
+    else: projection.attest_rows(path,cfg,'w',records)
     with core.open_db(path, purpose="fixture.inspect") as db:
         proof = db.execute("SELECT * FROM remote.row_proofs WHERE row_kind='edit.observed'").fetchone()
         assert not db.execute("SELECT 1 FROM remote.provenance_origins WHERE kind='edit.observed'").fetchone()
@@ -42,7 +49,7 @@ def test_invalidation_preserves_exact_signed_body_and_failed_status(tmp_path):
 
 
 def test_donor_recovers_legacy_filtered_body_without_confirming_failed_edit(tmp_path):
-    path, cfg, proof = signed_native_edit(tmp_path)
+    path, cfg, proof = signed_native_edit(tmp_path,legacy=True)
     with core.open_db(path, purpose="fixture.legacy-invalid") as db:
         db.execute("UPDATE provenance.file_edit_evidence SET status='invalid',reason='provider_failure'")
         db.execute("DELETE FROM remote.row_conflicts WHERE proof_id=?", [proof[0]])
@@ -65,7 +72,7 @@ def test_donor_recovers_legacy_filtered_body_without_confirming_failed_edit(tmp_
 @pytest.mark.parametrize('apply', [False, True])
 def test_narrow_repair_reconstructs_failed_edit_without_retained_donor_json(tmp_path, apply):
     from tests.test_recovery_script import repair
-    path, cfg, proof = signed_native_edit(tmp_path)
+    path, cfg, proof = signed_native_edit(tmp_path,legacy=True)
     root = tmp_path / 'source'
     (root / 'data').mkdir(parents=True)
     path = path.rename(root / 'data/convos.db')
@@ -147,3 +154,16 @@ def test_unrelated_writer_still_invalidates_audit_instead_of_reporting_mixed_sta
             core._archive_touch(db)
     with pytest.raises(RuntimeError, match='Archive changed'):
         projection.audit_rows(path, page=1, progress=mutate, local_user=user)
+
+
+def test_adding_edit_preserves_parent_message_and_tool_signed_revisions(tmp_path):
+    path,cfg,proof=signed_native_edit(tmp_path)
+    with core.open_db(path,purpose='fixture.add-edit') as db,core._transaction(db):
+        edit=dict(zip(core.ARCHIVE_COLUMNS['file_edits'],db.execute('SELECT * FROM file_edits LIMIT 1').fetchone()))
+        edit['id']='another-edit'
+        tool='new-tool'
+        db.execute("INSERT INTO tool_calls(id,message_id,status) VALUES (?,?,'complete')",[tool,edit['message_id']])
+    projection.attest_rows(path,cfg,'w',scanned(path,tmp_path/'additional-state.db'))
+    with core.open_db(path,purpose='fixture.add-edit') as db,core._transaction(db):
+        core.upsert(db,core.ParseResult(edits=[edit],edit_evidence=[dict(file_edit_id=edit['id'],status='confirmed',reason='provider_success',tool_call_id=tool)]))
+    assert projection.audit_rows(path,local_user=cfg['user'])['totals']['unavailable']==0

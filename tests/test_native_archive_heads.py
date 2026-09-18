@@ -55,12 +55,12 @@ def test_change_inventory_handles_repeated_capture_and_evidence_rows_across_page
     ('artifacts','artifacts','content','replacement'),('file_edits','edits','content','replacement')])
 def test_real_ingestion_preserves_signed_native_head_across_restart(tmp_path,monkeypatch,table,attribute,column,value):
     path,body,cfg,state,result,records=native_archive(tmp_path,monkeypatch)
-    before=archive_row(records,table)
+    before=archive_row(records,'tool_calls' if table=='file_edits' else table)
     assert attest_rows(path,cfg,'w',records)>0
     getattr(result,attribute)[0][column]=value
     core.commit_result(result,'test.native.update')
     with duckdb.connect(str(path),read_only=True) as db:
-        assert db.execute(f'SELECT {column} FROM {table} WHERE id=?',[before['id']]).fetchone()[0]==value
+        assert db.execute(f'SELECT {column} FROM {table} WHERE id=?',['e' if table=='file_edits' else before['id']]).fetchone()[0]==value
     assert before in [v['row'] for v in retained(path,cfg)]
     assert audit_rows(path,local_user=cfg['user'])['totals']['unavailable']==0
 
@@ -241,7 +241,7 @@ def test_matching_native_heads_do_not_reproject_or_write_bases_per_row(tmp_path,
         generation=db.execute('SELECT generation FROM archive_state').fetchone()[0]
         monkeypatch.setattr(core,'record_local_row_bases',bases)
         pending=set()
-        assert core.project_logical_rows(db,[(row,head,digest(head),True) for row,head in zip(rows,heads)],defer=pending.add,advance_native='receiving-device')==[]
+        assert core.project_logical_rows(db,[(row,head,digest(head),True) for row,head in zip(rows,heads)],defer=pending.add)==[]
         assert not pending and calls==[len(rows)]
         assert db.execute('SELECT generation FROM archive_state').fetchone()[0]==generation
         assert set(db.execute("SELECT entity,revision FROM remote.local_row_bases WHERE starts_with(entity,'unchanged-')").fetchall())=={(p['row_id'],p['revision']) for p in heads}
@@ -266,8 +266,8 @@ def test_native_successor_checks_are_batched_without_overwriting_unpublished_row
                 statements.append(sql)
                 return db.execute(sql,*args)
         pending=set()
-        selected=core._protect_native_replicas(Counted(),[(row,head,digest(head),True) for row,head in zip(changed,heads)],pending.add,'receiving-device')
-        assert {row['id'] for row,*_ in selected}=={r['id'] for r in rows[:10]}
-        assert pending=={digest(p) for p in heads[10:]}
+        selected=core._protect_native_replicas(Counted(),[(row,head,digest(head),True) for row,head in zip(changed,heads)],pending.add)
+        assert not selected
+        assert pending=={digest(p) for p in heads}
         assert len(statements)<len(rows), 'Successor validation must batch its proof lookups'
         assert db.execute("SELECT count(*) FROM messages WHERE content='remote successor'").fetchone()==(0,)

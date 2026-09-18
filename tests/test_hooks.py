@@ -5,22 +5,18 @@ from typer.testing import CliRunner
 from ai_convos import cli
 POPEN=subprocess.Popen
 
-def test_ingest_chunk_identity_work_is_bounded_and_lineage_stays_with_message():
+def test_ingest_chunk_identity_work_is_bounded_and_parents_precede_children():
     reads=[]
     class Message(dict):
         def __getitem__(self,key):
             if key=='id': reads.append(key)
             return super().__getitem__(key)
     rows=[Message(id=str(i),conversation_id='conversation',role='user',content=f'turn {i}',thinking=None,created_at=None,model=None,parent_id=str(i-1) if i else None,metadata='{}') for i in range(1000)]
-    tools=[(str(i),f'old-{i}',f'hash-{i}',f'new-{i}',f'hash-new-{i}') for i in range(1000)]
-    messages=[(str(i),i,None,False,'old-conversation','session',None) for i in range(1000)]
-    result=cli.ParseResult(msgs=list(reversed(rows)),tool_lineage=tools,message_lineage=messages,scopes=[],edit_scopes=[])
+    result=cli.ParseResult(msgs=list(reversed(rows)),scopes=[],edit_scopes=[])
     parts=cli.ingest_parts(result,size=100)
-    assert len(reads)<20*len(rows), 'Chunk planning must not rebuild identities for every lineage candidate'
+    assert len(reads)<20*len(rows), 'Chunk planning must not rebuild identities for every chunk'
     assert [m for part in parts for m in part.msgs]==rows
-    assert [lineage for part in parts for lineage in part.tool_lineage]==tools
-    assert [lineage for part in parts for lineage in part.message_lineage]==messages
-    assert all(len(part.msgs)<=100 and {v[0] for v in part.tool_lineage+part.message_lineage}<={m['id'] for m in part.msgs} for part in parts)
+    assert all(len(part.msgs)<=100 for part in parts)
 
 def test_unchanged_ingest_reports_committed_progress_without_dirtying_archive():
     conv=dict(id='c',source='codex',title='source',created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata='{}')
@@ -663,7 +659,7 @@ def test_unchanged_source_reparses_only_after_its_provider_binding_changes(hooks
     monkeypatch.setattr(cli,'STATE_PATH',data/'sync_state.json')
     cli.sync(False,300,False,True,False,False,True)
     with cli._core(purpose='test.source.alias') as db,cli._transaction(db):
-        cid=cli.gen_id('codex',str(sessions/'affected.jsonl'))
+        cid=cli.gen_id('codex','affected')
         session=json.loads(db.execute('SELECT metadata FROM conversations WHERE id=?',[cid]).fetchone()[0])['session_id']
         db.execute("INSERT INTO conversations SELECT 'new-canonical',* EXCLUDE(id) FROM conversations WHERE id=?",[cid])
         cli.project_provider_bindings(db,'codex',session,'new-canonical',[cid])

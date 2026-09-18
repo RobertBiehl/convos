@@ -65,11 +65,11 @@ def as_user(client,*command,input=None,check=True):
 def cli(client,*args,input=None,check=True): return as_user(client,client.convos,*args,input=input,check=check)
 def sha256(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 def package_version(client): return as_user(client,client.python,"-c","import importlib.metadata\nprint(importlib.metadata.version('convos'))").stdout.strip()
-def wait_health(url,process,timeout=15,diagnostics=None):
+def wait_health(url,process,timeout=15,diagnostics=None,version=2):
     started,opener,last=time.monotonic(),urllib.request.build_opener(urllib.request.ProxyHandler({})),None
     while time.monotonic()-started<timeout:
         if process.poll() is not None: raise RuntimeError(f"relay exited ({process.returncode}): {process.stderr.read() if process.stderr else 'see relay.log'}")
-        try: return json.loads(opener.open(url+"/v2/health",timeout=1).read())
+        try: return json.loads(opener.open(url+f"/v{version}/health",timeout=1).read())
         except Exception as error:
             last=error
             time.sleep(.1)
@@ -433,12 +433,30 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
         sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
         sock.bind(('127.0.0.1',manifest['port']))
     clients=[desktop_client(root/name,venv) for name in ('laptop','desktop','other-user')]
-    if baseline_venv: clients[1]=desktop_client(root/'desktop',baseline_venv)
     url=f"http://127.0.0.1:{manifest['port']}"
     evidence=root/f"run-{len(manifest['runs'])+1}-{int(time.time())}"
     evidence.mkdir()
     log=(evidence/'relay.log').open('w')
     relay=Path(relay_venv or venv)/'bin/convos-server'
+    if baseline_venv and not manifest['runs']:
+        old=[desktop_client(root/name,baseline_venv) for name in ('laptop','desktop','other-user')]
+        baseline=subprocess.Popen((Path(baseline_venv)/'bin/convos-server','serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
+        try:
+            wait_health(url,baseline,version=1)
+            desktop_cli(old[0],'remote','setup',url,'canary-alice','--device','laptop')
+            recovery=json.loads((old[0]['root']/'archive/remote/config.json').read_text())['recovery']
+            desktop_cli(old[1],'remote','recover',url,'canary-alice','--device','desktop',input=recovery+'\n')
+            desktop_cli(old[2],'remote','setup',url,'canary-bob','--device','independent-author')
+            for client in (old[0],old[2]):
+                path=desktop_transcript(client,manifest['session'],client['root']/'deleted-checkout',2)
+                desktop_cli(client,'capture','codex',input=json.dumps(dict(transcript_path=str(path),hook_event_name='Stop')))
+                desktop_cli(client,'drain-hooks','--block')
+                desktop_cli(client,'remote','sync')
+            desktop_cli(old[1],'remote','sync')
+            manifest['upgrade_identities']=[dict(user=cfg['user'],device=cfg['device']['id']) for client in old for cfg in [json.loads((client['root']/'archive/remote/config.json').read_text())]]
+        finally:
+            baseline.terminate()
+            baseline.wait(timeout=10)
     server=subprocess.Popen((relay,'serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
     started=time.monotonic()
     try:
@@ -453,6 +471,9 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
         session,turns=manifest['session'],manifest.get('turns',2)
         native_edits=[]
         for client in clients:
+            if client is b:
+                desktop_cli(a,'remote','sync')
+                desktop_cli(b,'remote','sync')
             repo=client['root']/'checkout'
             if not repo.exists():
                 repo.mkdir(parents=True)
@@ -475,14 +496,10 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
                 output=desktop_cli(client,'remote','sync')
                 (evidence/f'sync-{iteration}-{index}.log').write_text(output.stdout+output.stderr)
         if baseline_venv:
-            for index,client in enumerate(clients):
-                (evidence/f'before-upgrade-{index}.json').write_text(json.dumps(desktop_inventory(client),indent=2)+'\n')
-            clients[1]=desktop_client(root/'desktop',venv)
-            for client in clients: desktop_cli(client,'sync','--local-only')
-            for iteration in range(3):
-                for index,client in enumerate(clients):
-                    output=desktop_cli(client,'remote','sync')
-                    (evidence/f'upgrade-{iteration}-{index}.log').write_text(output.stdout+output.stderr)
+            rejected=desktop_cli(desktop_client(root/'desktop',baseline_venv),'remote','sync',check=False)
+            if rejected.returncode==0: raise AssertionError('legacy client was allowed across the reset boundary')
+            identities=[dict(user=cfg['user'],device=cfg['device']['id']) for client in clients for cfg in [json.loads((client['root']/'archive/remote/config.json').read_text())]]
+            if identities!=manifest['upgrade_identities']: raise AssertionError('automatic reenrollment changed a user or device identity')
         inventories=[desktop_inventory(client) for client in clients]
         for index,values in enumerate(inventories):
             (evidence/f'archive-{index}.json').write_text(json.dumps(values,indent=2)+'\n')
@@ -635,24 +652,26 @@ def customer_resume(client,session,evidence,measure):
 
 
 def customer_activity(clients,session,turns,measure):
-    turns=max([turns,*[sum(json.loads(line)['type']=='response_item' for line in p.read_text().splitlines()) for c in clients[:2] for p in [c['root']/'codex/sessions'/f'rollout-2026-01-01T00-00-00-{session}.jsonl'] if p.exists()]])
+    turns=max([turns,*[sum(json.loads(line)['type']=='response_item' for line in p.read_text().splitlines()) for c in clients[:2] for p in [c['root']/'codex/sessions'/f'rollout-2026-01-01T00-00-00-{session}-{c["root"].name}.jsonl'] if p.exists()]])
     for client in clients[:2]:
+        owned=session+'-'+client['root'].name
         repo=client['root']/'activity-checkout'
         if not repo.exists():
             repo.mkdir()
             run(('git','-C',repo,'init','-q'))
             run(('git','-C',repo,'-c','user.name=Convos Testbed','-c','user.email=test@example.invalid','commit','--allow-empty','-qm','initial'))
-        desktop_transcript(client,session,repo,turns)
-        desktop_claude_transcript(client,session+'-claude',repo)
+        desktop_transcript(client,owned,repo,turns)
+        desktop_claude_transcript(client,owned+'-claude',repo)
         measure('activity-seed-'+client['root'].name,client,'sync','--local-only',budget=60)
     def append(client):
-        path=client['root']/'codex/sessions'/f'rollout-2026-01-01T00-00-00-{session}.jsonl'
+        owned=session+'-'+client['root'].name
+        path=client['root']/'codex/sessions'/f'rollout-2026-01-01T00-00-00-{owned}.jsonl'
         for i in range(turns,turns+4):
-            row=dict(type='response_item',timestamp=(datetime(2026,1,1)+timedelta(seconds=i+1)).isoformat()+'Z',payload=dict(type='message',role='user' if i%2==0 else 'assistant',content=[dict(type='input_text' if i%2==0 else 'output_text',text=f'canary {session} turn {i}')]))
+            row=dict(type='response_item',timestamp=(datetime(2026,1,1)+timedelta(seconds=i+1)).isoformat()+'Z',payload=dict(type='message',role='user' if i%2==0 else 'assistant',content=[dict(type='input_text' if i%2==0 else 'output_text',text=f'canary {owned} turn {i}')]))
             with path.open('a') as stream: stream.write(json.dumps(row)+'\n')
             for event in ('PostToolUse','Stop','SessionEnd'):
                 measure(f'capture-{client["root"].name}-{i}-{event}',client,'capture','codex',input=json.dumps(dict(transcript_path=str(path),hook_event_name=event)),budget=5)
-        claude=client['root']/'claude/projects/checkout'/f'{session}-claude.jsonl'
+        claude=client['root']/'claude/projects/checkout'/f'{owned}-claude.jsonl'
         measure('capture-claude-'+client['root'].name,client,'capture','claude-code',input=json.dumps(dict(transcript_path=str(claude),hook_event_name='Stop')),budget=5)
     with ThreadPoolExecutor(max_workers=10) as pool:
         jobs=[pool.submit(append,client) for client in clients[:2]]
@@ -666,7 +685,9 @@ def customer_activity(clients,session,turns,measure):
     rows=[desktop_inventory(client) for client in clients]
     if rows[0]!=rows[1] or rows[2]: raise AssertionError('concurrent customer capture did not converge privately')
     for values in rows[:2]:
-        if sorted(v['content'] for v in values if v['provider_session']==session)!=sorted(f'canary {session} turn {i}' for i in range(turns+4)): raise AssertionError('concurrent capture lost or duplicated a turn')
+        for client in clients[:2]:
+            owned=session+'-'+client['root'].name
+            if sorted(v['content'] for v in values if v['provider_session']==owned)!=sorted(f'canary {owned} turn {i}' for i in range(turns+4)): raise AssertionError('concurrent capture lost or duplicated a turn')
     return rows,turns+4
 
 
@@ -794,6 +815,9 @@ def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
                     desktop_cli(b,'remote','recover',url,'customer-alice','--device','desktop',input=recovery+'\n')
                 if not (c['root']/'archive/remote/config.json').exists(): desktop_cli(c,'remote','setup',url,'customer-bob','--device','independent-user')
                 for index,client in enumerate(clients):
+                    if index==1:
+                        measure('source-owner-seed',clients[0],'remote','sync',budget=600)
+                        measure('peer-owner-receive',client,'remote','sync',budget=600)
                     measure(f'import-{index}',client,'sync','--local-only',*(['--full'] if full else []),budget=600)
                 before=[desktop_inventory(client) for client in clients[:2]]
                 activity=manifest.setdefault('activity_session','qualification-live-'+hashlib.sha256(str(root).encode()).hexdigest()[:16])

@@ -52,7 +52,7 @@ def relay(base):
     port=free_port(); url=f"http://127.0.0.1:{port}"; db=base/"relay.db"; process=subprocess.Popen((sys.executable,"-c","from ai_convos_remote_server import main; main()","serve","--db",str(db),"--port",str(port)),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     try:
         for _ in range(100):
-            try: urllib.request.urlopen(url+"/v1/health",timeout=.1).read(); break
+            try: urllib.request.urlopen(url+"/v2/health",timeout=.1).read(); break
             except Exception: time.sleep(.05)
         else: raise RuntimeError("relay did not start")
         yield url,db
