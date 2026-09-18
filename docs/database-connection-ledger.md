@@ -117,8 +117,8 @@ The AST ledger has 94 archive acquisition sites and 21 SQLite constructor sites.
 | A102 | `src/ai_convos/cli.py::drain_hooks` | `hooks.provenance.plan` | Shared | Pending enrichment count | Briefly delays a writer | Closes before the bounded enrichment batch |
 | A103 | `src/ai_convos/cli.py::drain_hooks` | `hooks.provenance.progress` | Shared | Remaining enrichment count | Briefly delays a writer | Schedules a successor only after measurable progress |
 | A104 | `src/ai_convos/cli.py::run_sync` | `sync.provenance.progress` | Shared | Remaining enrichment count | Briefly delays a writer | Closes before scheduling background enrichment |
-| A105 | `apps/remote/src/ai_convos_remote/projection.py::_reconcile_conversation_heads` | `remote.conversations.forks` | Shared | At most 100 native conversation IDs with incompatible signed tips | Conversation-proof inventory can delay writers | Keyset paging, closes before reconciliation |
-| A106 | `apps/remote/src/ai_convos_remote/projection.py::_reconcile_conversation_heads` | `remote.conversations.merge` | Exclusive | One native conversation and at most 64 signed tips | Large metadata bodies can delay readers | Atomic validated metadata union, preserves fork bodies, yields per conversation |
+| A105 | `apps/remote/src/ai_convos_remote/projection.py::_reconcile_parser_heads` | `remote.parser.plan` | Shared | At most 20 native conversation/message IDs, up to 64 signed tips each, and exact source history for their conversations | Large retained source histories can delay writers | Keyset paging, closes before committing the planned batch |
+| A106 | `apps/remote/src/ai_convos_remote/projection.py::_reconcile_parser_heads` | `remote.parser.merge` | Exclusive | At most 20 validated metadata merges and 64 successor proofs each | Large metadata bodies can delay readers | Generation check, atomic batch, preserves fork bodies, releases writer and yields after each committed batch |
 
 ## Direct DuckDB constructors
 
