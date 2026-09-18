@@ -691,11 +691,11 @@ def migrate_provider_ids(db):
         changed=[(old,new) for old,new in ids.items() if old!=new]
         if not changed: continue
         db.execute('CREATE OR REPLACE TEMP TABLE identity_map(old VARCHAR,new VARCHAR)')
-        db.executemany('INSERT INTO identity_map VALUES (?,?)',changed)
+        _insert_pages(db,'identity_map',changed)
         refs=[(t,column) for t,columns in ARCHIVE_FKS.items() for column,parent in columns if parent==table]+({'conversations':[('provider_sessions','conversation_id'),('provenance.conversation_scopes','conversation')],'tool_calls':[('provenance.file_edit_evidence','tool_call_id')],'attachments':[('attachment_bodies','attachment_id')]}.get(table,[]))
         for target,column in [(table,'id'),*refs]: db.execute(f'UPDATE {target} x SET {column}=m.new FROM identity_map m WHERE x.{column}=m.old')
         if table=='messages': db.execute("UPDATE messages x SET metadata=json_merge_patch(x.metadata,json_object('history_of',m.new)) FROM identity_map m WHERE json_extract_string(x.metadata,'$.history_of')=m.old")
-    if bindings: db.executemany('INSERT OR REPLACE INTO parser_id_bindings VALUES (?,?,?)',[(src,new,old) for (src,new),old in bindings.items()])
+    if bindings: _insert_pages(db,'parser_id_bindings',[(src,new,old) for (src,new),old in bindings.items()],mode=' OR REPLACE')
     _archive_touch(db,[(table,new) for table,ids in mapping.items() for old,new in ids.items()])
 
 def reset_archive_sync(path,user,device):
