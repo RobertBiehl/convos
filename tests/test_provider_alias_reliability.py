@@ -375,7 +375,8 @@ def test_alias_reconciles_independent_native_changes_but_preserves_content_confl
 
 
 @pytest.mark.parametrize('parent_evidence',['valid','wrong_hash','fork','cycle'])
-def test_timestamp_repair_requires_exact_retired_parent_lineage(parent_evidence):
+@pytest.mark.parametrize('metadata_changed',[False,True])
+def test_timestamp_repair_requires_exact_retired_parent_lineage(tmp_path,parent_evidence,metadata_changed):
     def message(key,parent,stamp,index):
         return core.logical_row('messages',list(data:=dict(id=key,conversation_id='a',role='user',content='event',thinking=None,created_at=stamp,model=None,metadata=dict(provider_index=index),parent_id=parent)),list(data.values()))
     old_parent,new_parent,old,new,alternate=[core.gen_id('codex',label) for label in ('old-parent','new-parent','old','new','alternate')]
@@ -389,11 +390,29 @@ def test_timestamp_repair_requires_exact_retired_parent_lineage(parent_evidence)
     if parent_evidence=='fork': records.append({**records[0],'current_id':alternate})
     if parent_evidence=='cycle': records.append(dict(old_id=new_parent,old_hash=projection.digest(parent),current_id=old_parent,current_hash=projection.digest(retired)))
     carrier=core.logical_row('conversations',list(data:={**dict.fromkeys(core.ROW_FIELDS_V1['conversations']), 'id':'a','source':'codex','metadata':dict(convos_message_lineage=dict(v=1,records=records))}),list(data.values()))
-    revisions,lineage=projection._alias_message_plan([(row,{},True,{},None) for row in [carrier,*rows]],'codex',['a'],[retired])
+    if metadata_changed: rows[-1]={**current,'data':{**current['data'],'metadata':{**current['data']['metadata'],'convos_edit_lineage':dict(v=1,records=[dict(old_id=old,old_hash='a'*64,current_id=new,current_hash='b'*64)])}}}
+    revisions,lineage=projection._alias_message_plan([(row,{},True,{},None) for row in [carrier,*rows]],'codex',['a'],[retired,current])
     assert bool(lineage)==(parent_evidence=='valid')
     if parent_evidence=='valid':
         assert {(row['data']['created_at'],row['data']['parent_id']) for row,*_ in revisions if row['kind']=='messages'}=={('2026-01-01T00:00:02',new_parent)}
     else: assert revisions==[]
+    from ai_convos_remote.protocol import certificate,identity,public_id,row_proof
+    signer,device=identity('source'),identity('capture')
+    user=public_id(signer['sign_public'])
+    with core.open_db(tmp_path/'source-forks.db',purpose='test.source-forks') as db:
+        core.init_schema(db)
+        for body in [carrier,*rows]: core._insert_pages(db,body['kind'],[[body['id'] if k=='id' else json.dumps(body['data'][k]) if k=='metadata' else body['data'].get(k) for k in core.ARCHIVE_COLUMNS[body['kind']]]],core.ARCHIVE_COLUMNS[body['kind']])
+        db.execute('INSERT INTO parser_retired_rows VALUES (?,?,?,?,?,?,?,?)',['messages',old_parent,old_parent,'',projection.digest(retired),json.dumps(retired),'{}',new_parent])
+        proof=row_proof(device,user,'w',1,current)
+        pid=core.project_row_proof(db,proof,signer['sign_public'],certificate(signer,user,device))
+        db.execute('INSERT INTO remote.row_conflicts VALUES (?,?)',[pid,json.dumps(current)])
+        versions=[rows[1],{**rows[1],'data':rows[-1]['data']}]
+        if parent_evidence=='valid':
+            merged=projection._source_message_join(db,versions,user)
+            assert merged['data']['created_at']=='2026-01-01T00:00:02.000000'
+            assert merged['data']['parent_id']==new_parent
+        else:
+            with pytest.raises(ValueError,match='content conflict'): projection._source_message_join(db,versions,user)
 def test_alias_reconciliation_wakes_hooks_after_releasing_capture_lease(tmp_path,monkeypatch):
     from ai_convos import cli as core
     from ai_convos_remote import projection

@@ -639,11 +639,16 @@ def _alias_message_plan(rows,source,members,history=()):
     declared={key:next(iter(targets)) if len(targets:={r['current_id'] for r in group})==1 else None for key,group in itertools.groupby(sorted(records,key=lambda r:r['old_id']),key=lambda r:r['old_id'])}
     records=[r for r in records if _alias_terminal(declared,r['old_id']) is not None]
     bodies={key:[row] for key,row in messages.items()}
-    for row in history:
-        if row['id'] not in messages: bodies.setdefault(row['id'],[]).append(row)
+    for row in history: bodies.setdefault(row['id'],[]).append(row)
     equivalent,pairs={},set()
+    def available(row):
+        if row['id'] not in messages or row is messages[row['id']]: return True
+        current=messages[row['id']]
+        if current['data']['parent_id'] not in {row['data']['parent_id'],*equivalent.get(row['data']['parent_id'],())}: return False
+        try: return bool(_parser_metadata_join([current,{**row,'data':{**row['data'],'parent_id':current['data']['parent_id']}}]))
+        except ValueError: return False
     while True:
-        fresh={(r['old_id'],r['current_id']) for r in records if r['old_id']!=r['current_id'] and all(any(matching_logical_row({**row,'data':{**row['data'],'parent_id':parent}},expected) is not None for row in bodies.get(key,[]) for parent in {row['data']['parent_id'],*equivalent.get(row['data']['parent_id'],())}) for key,expected in ((r['old_id'],r['old_hash']),(r['current_id'],r['current_hash'])))}-pairs
+        fresh={(r['old_id'],r['current_id']) for r in records if r['old_id']!=r['current_id'] and all(any(matching_logical_row({**row,'data':{**row['data'],'parent_id':parent}},expected) is not None for row in bodies.get(key,[]) if available(row) for parent in {row['data']['parent_id'],*equivalent.get(row['data']['parent_id'],())}) for key,expected in ((r['old_id'],r['old_hash']),(r['current_id'],r['current_hash'])))}-pairs
         if not fresh: break
         pairs|=fresh
         for old,new in fresh:
@@ -734,31 +739,46 @@ def _parser_metadata_join(rows):
     required(all(t.tzinfo is None for t in stamps),ValueError('conversation fork timestamp representation is not canonical UTC'))
     metadata={**ordinary[0]['data']['metadata'],**{key:_lineage_union([r['data']['metadata'][key] for r in rows if key in r['data']['metadata']]) for key in sorted(lineage) if any(key in r['data']['metadata'] for r in rows)}}
     return {**ordinary[0],'data':{**ordinary[0]['data'],**({'updated_at':max(stamps).isoformat(timespec='microseconds') if stamps else None} if kind=='conversations' else {}),'metadata':metadata}}
+def _message_history(db,user,owners): return [body for raw,expected in db.execute("SELECT body,content_hash FROM parser_retired_rows WHERE kind='messages' AND (author=? OR author='') AND json_extract_string(body,'$.data.conversation_id') IN (SELECT UNNEST(?)) UNION SELECT c.body,p.content_hash FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.row_kind='messages' AND p.author_user_id=? AND json_extract_string(c.body,'$.data.conversation_id') IN (SELECT UNNEST(?))",[user,list(owners),user,list(owners)]).fetchall() if digest(body:=json.loads(raw))==expected]
+def _source_message_join(db,rows,user):
+    owners={r['data']['conversation_id'] for r in rows}
+    claims=[(kind,entity,entity,user,'active') for kind,entity in db.execute("SELECT 'conversations',id FROM conversations c WHERE id IN (SELECT UNNEST(?)) AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) UNION ALL SELECT 'messages',id FROM messages m WHERE conversation_id IN (SELECT UNNEST(?)) AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='messages' AND o.physical_row_id=m.id)",[list(owners),list(owners)]).fetchall()]
+    current,history=list(typed_logical_rows(db,claims).values()),_message_history(db,user,owners)
+    required(sum(r['kind']=='conversations' for r in current)==len(owners) and all(r['data']['source'] in ('codex','claude-code') for r in current if r['kind']=='conversations'),ValueError('source-lineage carrier is not a native provider conversation'))
+    normalized=[next((value for value,*_ in revisions if value['kind']=='messages' and value['id']==row['id']),row) for row in rows for revisions,lineage in [_alias_message_plan([(v,{},True,{},None) for v in [*[r for r in current if (r['kind'],r['id'])!=('messages',row['id'])],row]],next(r['data']['source'] for r in current if r['kind']=='conversations'),owners,history)]]
+    return _parser_metadata_join(normalized)
 def _reconcile_parser_heads(db_path,cfg,workspace,progress):
     user,after,blocked,changed=cfg['user'],('',''),{},0
     while True:
-        with contextlib.closing(open_db(db_path,True,purpose='remote.parser.forks')) as db:
-            ids=db.execute("SELECT p.row_kind,p.source_row_id FROM remote.row_proofs p JOIN (SELECT 'conversations' kind,id FROM conversations UNION ALL SELECT 'messages',m.id FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.source IN ('codex','claude-code')) c ON (c.kind,c.id)=(p.row_kind,p.source_row_id) WHERE p.author_user_id=? AND p.workspace_id=? AND (p.row_kind,p.source_row_id)>(?,?) AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE (o.table_name,o.physical_row_id)=(c.kind,c.id)) AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) GROUP BY p.row_kind,p.source_row_id HAVING count(DISTINCT p.content_hash)>1 ORDER BY p.row_kind,p.source_row_id LIMIT 100",[user,workspace,*after]).fetchall()
-        if not ids: return changed,blocked
-        for kind,entity in ids:
-            try:
-                with contextlib.closing(open_db(db_path,purpose='remote.parser.merge')) as db,_transaction(db),preserve_fact_heads(db,[(kind,entity)]):
-                    values=db.execute("SELECT "+','.join('p.'+name for name in ('workspace_id','authorization_workspace_id','row_kind','source_row_id','encoding_v','content_hash','revision','previous_revision','state','author_user_id','author_device_id','authorization_epoch','signature'))+",c.body FROM remote.row_proofs p LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) ORDER BY p.revision LIMIT 65",[kind,entity,user]).fetchall()
+        with contextlib.closing(open_db(db_path,True,purpose='remote.parser.plan')) as db:
+            ids=db.execute("SELECT p.row_kind,p.source_row_id FROM remote.row_proofs p JOIN (SELECT 'conversations' kind,id FROM conversations UNION ALL SELECT 'messages',m.id FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.source IN ('codex','claude-code')) c ON (c.kind,c.id)=(p.row_kind,p.source_row_id) WHERE p.author_user_id=? AND p.workspace_id=? AND (p.row_kind,p.source_row_id)>(?,?) AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE (o.table_name,o.physical_row_id)=(c.kind,c.id)) AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) GROUP BY p.row_kind,p.source_row_id HAVING count(DISTINCT p.content_hash)>1 ORDER BY p.row_kind,p.source_row_id LIMIT 20",[user,workspace,*after]).fetchall()
+            if not ids: return changed,blocked
+            generation=db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]
+            values=db.execute("SELECT "+','.join('p.'+name for name in ('workspace_id','authorization_workspace_id','row_kind','source_row_id','encoding_v','content_hash','revision','previous_revision','state','author_user_id','author_device_id','authorization_epoch','signature'))+",c.body FROM remote.row_proofs p LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE (p.row_kind,p.source_row_id) IN (SELECT json_extract_string(value,'$[0]'),json_extract_string(value,'$[1]') FROM json_each(?)) AND p.author_user_id=? AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) QUALIFY row_number() OVER(PARTITION BY p.row_kind,p.source_row_id ORDER BY p.revision)<=65 ORDER BY p.row_kind,p.source_row_id,p.revision",[json.dumps(ids),user]).fetchall()
+            groups,bodies,plans={key:list(group) for key,group in itertools.groupby(values,key=lambda v:(v[2],v[3]))},typed_logical_rows(db,[(kind,entity,entity,user,'active') for kind,entity in ids]),{}
+            for kind,entity in ids:
+                try:
+                    values=groups[(kind,entity)]
                     required(len(values)<=64,ValueError('parser fork exceeds automatic reconciliation limit'))
-                    claim=(kind,entity,entity,user,'active')
-                    native=typed_logical_rows(db,[claim])[claim]
+                    native=bodies[(kind,entity,entity,user,'active')]
                     rows=[required(row if row is not None and digest(row)==v[5] else None,ValueError('parser fork body unavailable')) for v in values for row in [json.loads(v[-1]) if v[-1] else matching_logical_row(native,v[5])]]
-                    merged=_parser_metadata_join([native,*rows])
-                    proofs=[row_proof(cfg['device'],user,v[0],cfg['workspaces'][workspace]['epoch'],merged,v[6],workspace) for v in values]
-                    signer=cfg['controls'][workspace]['devices'][cfg['device']['id']]
-                    project_workspace_controls(db,next(w['controls'] for w in cfg['server_state']['workspaces'] if w['id']==workspace))
-                    project_attested_rows(db,[(merged,p) for p in proofs],signer['root_public'],signer['certificate'])
-                    proof=min(proofs,key=lambda p:p['revision'])
-                    project_logical_rows(db,[(merged,proof,digest(proof),True)])
-                changed+=1
-            except ValueError as e: blocked[kind+':'+entity]=str(e)
-            progress('reconciling '+kind+' metadata '+entity)
-            archive_yield(db_path)
+                    try: merged=_parser_metadata_join([native,*rows])
+                    except ValueError:
+                        if kind!='messages': raise
+                        merged=_source_message_join(db,[native,*rows],user)
+                    plans[(kind,entity)]=(merged,[row_proof(cfg['device'],user,v[0],cfg['workspaces'][workspace]['epoch'],merged,v[6],workspace) for v in values])
+                except ValueError as e: blocked[kind+':'+entity]=str(e)
+                progress('planning '+kind+' metadata '+entity)
+        if plans:
+            with contextlib.closing(open_db(db_path,purpose='remote.parser.merge')) as db,_transaction(db),preserve_fact_heads(db,list(plans)):
+                required(db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]==generation,RuntimeError('Archive changed during parser metadata reconciliation; retry'))
+                signer=cfg['controls'][workspace]['devices'][cfg['device']['id']]
+                project_workspace_controls(db,next(w['controls'] for w in cfg['server_state']['workspaces'] if w['id']==workspace))
+                project_attested_rows(db,[(row,proof) for row,proofs in plans.values() for proof in proofs],signer['root_public'],signer['certificate'])
+                project_logical_rows(db,[(row,proof,digest(proof),True) for row,proofs in plans.values() for proof in [min(proofs,key=lambda p:p['revision'])]])
+            changed+=len(plans)
+            progress('reconciled parser metadata batch '+str(len(plans)))
+        archive_yield(db_path)
         after=ids[-1]
 def reconcile_provider_aliases(db_path,cfg,workspace,progress=None,state=None):
     data=Path(db_path).parent
@@ -802,7 +822,7 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
             with contextlib.closing(open_db(db_path,True,purpose="remote.alias.members")) as db: member_heads,member_physical,active,member_native,binding=_alias_members(db,user,source,session,members,canonical)
             with contextlib.closing(open_db(db_path,True,purpose='remote.alias.present')) as db:
                 present={m for m,p in member_physical.items() if db.execute('SELECT 1 FROM conversations WHERE id=?',[p]).fetchone()}
-                history=[body for raw,expected in db.execute("SELECT body,content_hash FROM parser_retired_rows WHERE kind='messages' AND (author=? OR author='') AND json_extract_string(body,'$.data.conversation_id') IN (SELECT UNNEST(?))",[user,members]).fetchall() if digest(body:=json.loads(raw))==expected]
+                history=_message_history(db,user,members)
             losers,moving,message_rows,attachment_paths=set(members)-{canonical},False,[],[]
             for generation,rows in _alias_pages(db_path,user,member_physical,progress=progress):
                 for row,head,native,parent_map,path in rows:

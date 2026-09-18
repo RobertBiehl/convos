@@ -183,6 +183,36 @@ def test_exact_parser_metadata_joins_across_equivalent_signed_branches(tmp_path)
     assert remote.audit_rows(path,local_user=cfg['user'])['totals']['unavailable']==0
 
 
+def test_parser_merge_batches_resume_without_reopening_the_archive_for_each_row(tmp_path,monkeypatch):
+    paths,configs,templates=fork(tmp_path)
+    ids=[core.gen_id('conversation',str(i)) for i in range(25)]
+    bodies=[dict(row=(row:={**template['row'],'id':entity,'data':{**template['row']['data'],'metadata':{**template['row']['data']['metadata'],'session_id':entity}}}),proof=row_proof(cfg['device'],cfg['user'],'w',1,row)) for entity in ids for cfg,template in zip(configs,templates)]
+    for path,cfg in zip(paths,configs):
+        own=[b for b in bodies if b['proof']['author_device_id']==cfg['device']['id']]
+        signer=cfg['controls']['w']['devices'][cfg['device']['id']]
+        with core.open_db(path,purpose='test.many-forks') as db,core._transaction(db):
+            core.project_attested_rows(db,[(b['row'],b['proof']) for b in own],signer['root_public'],signer['certificate'])
+            core.project_logical_rows(db,[(b['row'],b['proof'],digest(b['proof']),True) for b in own])
+        remote.apply_row_replicas(path,bodies,'w',[cfg['controls']['w']],local_user=cfg['user'],local_device=cfg['device']['id'])
+    opened=[]
+    original=remote.open_db
+    def traced(*args,**kwargs):
+        if kwargs.get('purpose')=='remote.parser.merge': opened.append(args[0])
+        return original(*args,**kwargs)
+    monkeypatch.setattr(remote,'open_db',traced)
+    def interrupt(stage):
+        if stage.startswith('reconciled parser metadata batch'): raise RuntimeError('stop after committed batch')
+    with pytest.raises(RuntimeError,match='stop after committed batch'): remote.reconcile_provider_aliases(paths[0],configs[0],'w',interrupt)
+    with core.open_db(paths[0],True,purpose='test.partial-forks') as db:
+        remaining=db.execute("SELECT count(*) FROM (SELECT p.source_row_id FROM remote.row_proofs p WHERE p.row_kind='conversations' AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE n.previous_revision=p.revision) GROUP BY p.source_row_id HAVING count(DISTINCT p.content_hash)>1)").fetchone()[0]
+        assert 0<remaining<25
+    assert not remote.reconcile_provider_aliases(paths[0],configs[0],'w')['blocked']
+    assert len(opened)<=3
+    retained=exported(paths[0],configs[0])
+    assert all(any(x['row']==b['row'] and x['proof']==b['proof'] for x in retained) for b in bodies)
+    assert remote.audit_rows(paths[0],local_user=configs[0]['user'])['totals']['unavailable']==0
+
+
 def test_alias_successor_extends_all_equivalent_conversation_tips(tmp_path):
     paths,configs,bodies=fork(tmp_path); path,cfg=paths[0],configs[0]; user=cfg['user']
     assert not remote.reconcile_provider_aliases(path,cfg,'w')['blocked']
