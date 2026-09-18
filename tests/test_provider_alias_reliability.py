@@ -159,7 +159,7 @@ def test_alias_repair_merges_native_lineage_with_equal_bases_signed_by_multiple_
     state=projection.connect(tmp_path/'equal-bases-state.db')
     if cached:
         with monkeypatch.context() as old:
-            old.setattr(projection,'ALIAS_VERSION',13)
+            old.setattr(projection,'ALIAS_VERSION',14)
             old.setattr(projection,'_alias_merge_native',lambda *args:None)
             assert projection.reconcile_provider_aliases(path,cfg,'personal',state=state)['blocked']
     result=projection.reconcile_provider_aliases(path,cfg,'personal',state=state)

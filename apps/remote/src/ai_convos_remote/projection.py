@@ -10,7 +10,7 @@ from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
-STATE_VERSION,ALIAS_VERSION,ALIAS_WRITE_PAGE="4",14,250
+STATE_VERSION,ALIAS_VERSION,ALIAS_WRITE_PAGE="4",15,250
 REPLICA_VERSIONS=(16,15)  # Schema 16 only rebuilds derived edit lineage locally; projection changes must invalidate these epochs.
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -554,6 +554,9 @@ def _lineage_union(values):
 def _alias_merge_native(db,row,head):
     if row is None: return None
     records=db.execute("WITH RECURSIVE ancestors(revision) AS (SELECT CAST(? AS VARCHAR) UNION SELECT p.previous_revision FROM remote.row_proofs p JOIN ancestors a ON p.revision=a.revision WHERE (p.row_kind,p.source_row_id,p.author_user_id)=(?,?,?) AND p.previous_revision IS NOT NULL) SELECT DISTINCT 0 slot,p.content_hash,c.body FROM remote.local_row_bases b JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(b.kind,b.entity,b.author,b.revision) JOIN ancestors a ON a.revision=b.revision JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE (b.kind,b.entity,b.author)=(?,?,?) UNION ALL SELECT 1 slot,p.content_hash,c.body FROM remote.row_proofs p JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE p.id=? ORDER BY slot",[head['revision'],row['kind'],row['id'],head['author_user_id'],row['kind'],row['id'],head['author_user_id'],digest(head)]).fetchall()
+    if row['kind'] in ('conversations','messages') and len(current:=[json.loads(raw) for slot,expected,raw in records if slot==1 and digest(json.loads(raw))==expected])==1:
+        try: return _parser_metadata_join([row,*current])
+        except ValueError: pass  # Other independent changes still require a shared signed base.
     if len(records)!=2 or any(digest(json.loads(raw))!=expected for slot,expected,raw in records): return None
     base,remote=(json.loads(raw) for slot,expected,raw in records)
     if any(v['state']!='active' or (v['kind'],v['id'])!=(row['kind'],row['id']) for v in (base,remote)): return None

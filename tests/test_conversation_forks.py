@@ -161,6 +161,28 @@ def test_conversation_fork_does_not_overwrite_unpublished_content(tmp_path):
     assert remote.audit_rows(path,local_user=cfg['user'])['totals']['unavailable']==0
 
 
+def test_exact_parser_metadata_joins_across_equivalent_signed_branches(tmp_path):
+    paths,configs,_=fork(tmp_path)
+    path,cfg=paths[0],configs[0]
+    assert not remote.reconcile_provider_aliases(path,cfg,'w')['blocked']
+    with core.open_db(path,purpose='test.parallel-bases') as db:
+        heads=remote._heads(db,cfg['user'],{'conversations':{'c'}},True)[('conversations','c')]
+        assert len(heads)==2
+        head,other=heads
+        core.record_local_row_bases(db,[other])
+        claim=('conversations','c','c',cfg['user'],'active')
+        row=core.typed_logical_rows(db,[claim])[claim]
+        metadata=copy.deepcopy(row['data']['metadata'])
+        metadata['convos_message_lineage']['records'].reverse()
+        with core.preserve_fact_heads(db,[('conversations','c')]): db.execute("UPDATE conversations SET metadata=? WHERE id='c'",[json.dumps(metadata)])
+        core._archive_touch(db,[('conversations','c')])
+        local=core.typed_logical_rows(db,[claim])[claim]
+        merged=remote._alias_merge_native(db,local,head)
+        assert merged is not None
+        assert core.matching_logical_row(merged,head['content_hash']) is not None
+    assert remote.audit_rows(path,local_user=cfg['user'])['totals']['unavailable']==0
+
+
 def test_alias_successor_extends_all_equivalent_conversation_tips(tmp_path):
     paths,configs,bodies=fork(tmp_path); path,cfg=paths[0],configs[0]; user=cfg['user']
     assert not remote.reconcile_provider_aliases(path,cfg,'w')['blocked']
