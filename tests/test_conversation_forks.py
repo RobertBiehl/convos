@@ -83,6 +83,45 @@ def test_concurrent_conversation_bookkeeping_converges_and_can_advance(tmp_path)
         assert all(any(x['proof']==body['proof'] and x['row']==body['row'] for x in retained) for body in bodies)
 
 
+@pytest.mark.parametrize('conflict',[None,'content','provider_index','lineage'])
+def test_concurrent_message_classification_preserves_bodies_and_merges_only_exact_metadata(tmp_path,conflict):
+    paths,configs,_=fork(tmp_path)
+    user=configs[0]['user']
+    read=lambda path:core.typed_logical_rows(path,[('messages','m','m',user,'active')])[('messages','m','m',user,'active')]
+    for path,cfg in zip(paths,configs):
+        assert not remote.reconcile_provider_aliases(path,cfg,'w')['blocked']
+        with core.open_db(path,purpose='test.message-fork.basis') as db,core.preserve_fact_heads(db,[('messages','m')]):
+            db.execute("UPDATE messages SET metadata=? WHERE id='m'",[json.dumps(dict(provider_index=1))])
+            core._archive_touch(db,[('messages','m')])
+        remote.attest_rows(path,cfg,'w',scanned(path,path.with_suffix('.basis.db')))
+    with core.open_db(paths[0],True,purpose='test.message-fork.source') as db:
+        original=read(db)
+        base=remote._heads(db,user,{'messages':{'m'}})[('messages','m')]
+    rows=[{**original,'data':{**original['data'],'metadata':dict(provider_index=1,convos_edit_lineage=dict(v=1,records=[lineage(str(i))]))}} for i in (1,2)]
+    if conflict=='content': rows[1]['data']['content']='different message'
+    if conflict=='provider_index': rows[1]['data']['metadata']['provider_index']=2
+    if conflict=='lineage': rows[1]['data']['metadata']['convos_edit_lineage']['records'][0]['old_hash']='invalid'
+    bodies=[dict(row=row,proof=row_proof(cfg['device'],user,'w',1,row,base['revision'])) for row,cfg in zip(rows,configs)]
+    for path,cfg,body in zip(paths,configs,bodies):
+        signer=cfg['controls']['w']['devices'][cfg['device']['id']]
+        with core.open_db(path,purpose='test.message-fork.local') as db,core._transaction(db):
+            core.project_attested_rows(db,[(body['row'],body['proof'])],signer['root_public'],signer['certificate'])
+            core.project_logical_rows(db,[(body['row'],body['proof'],digest(body['proof']),True)])
+        remote.apply_row_replicas(path,list(reversed(bodies)),'w',[cfg['controls']['w']],local_user=user,local_device=cfg['device']['id'])
+    for path,cfg,body in zip(paths,configs,bodies):
+        result=remote.reconcile_provider_aliases(path,cfg,'w')
+        with core.open_db(path,True,purpose='test.message-fork.result') as db: actual=read(db)
+        if conflict:
+            assert result['blocked']
+            assert actual==body['row']
+        else:
+            assert not result['blocked']
+            assert actual['data']['metadata']['convos_edit_lineage']==remote._lineage_union([row['data']['metadata']['convos_edit_lineage'] for row in rows])
+        retained=[open_replica(env,bytes(32)) for env in remote.row_replicas(path,cfg,'w',[],{1:bytes(32)})] if conflict else exported(path,cfg)
+        assert all(any(x['row']==b['row'] and x['proof']==b['proof'] for x in retained) for b in bodies)
+        assert remote.audit_rows(path,local_user=user)['totals']['unavailable']==0
+
+
 @pytest.mark.parametrize('conflict',['title','legacy','session','lineage'])
 def test_conversation_merge_keeps_incompatible_forks(tmp_path,conflict):
     paths,configs,bodies=fork(tmp_path,conflict)

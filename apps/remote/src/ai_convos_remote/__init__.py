@@ -11,7 +11,7 @@ _pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases"
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, project_file_edit_evidence, project_file_edit_evidence_many, project_provider_alias, provider_session_key, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import _reconcile_conversation_heads, ALIAS_VERSION, PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_stamps, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, local_repack_envelopes, repack_index, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, retry_edit_replicas, retry_own_replicas, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
+from .projection import _reconcile_parser_heads, ALIAS_VERSION, PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_stamps, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, local_repack_envelopes, repack_index, project, project_many, read_state, reconcile_provider_aliases, relocate_attachments, reset_history, retained_proof_pages, retry_edit_replicas, retry_own_replicas, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
                        recovery_bundle, registration_proof, repack_replica, replica_compression, replica_plain_size, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
@@ -1031,7 +1031,7 @@ def sync_once(root=None,repair=False,manual=False):
             retry_edit_replicas(core_path(root),cfg['user'],cfg['device']['id'],root,_progress)
             ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
             authorized={w["id"] for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
-            [_reconcile_conversation_heads(core_path(root),cfg,ws,_progress) for ws in ready&authorized if cfg["workspaces"].get(ws,{}).get("kind")=="personal"]
+            [_reconcile_parser_heads(core_path(root),cfg,ws,_progress) for ws in ready&authorized if cfg["workspaces"].get(ws,{}).get("kind")=="personal"]
             reconciled=_archive_marker(root)
             path,active=core_path(root),authorized
             generation=archive_info(root)[1] if path.is_file() else 0

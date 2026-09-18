@@ -10,7 +10,7 @@ from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
-STATE_VERSION,ALIAS_VERSION,ALIAS_WRITE_PAGE="4",13,250
+STATE_VERSION,ALIAS_VERSION,ALIAS_WRITE_PAGE="4",14,250
 REPLICA_VERSIONS=(16,15)  # Schema 16 only rebuilds derived edit lineage locally; projection changes must invalidate these epochs.
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -721,30 +721,31 @@ def _alias_fingerprints(db,user,groups):
     for source,session,physical in bindings: bound.setdefault((source,provider_session_key(source,session)),[]).append((session,physical))
     archive=db.execute('SELECT archive_id::VARCHAR,(SELECT version FROM core_schema WHERE singleton) FROM archive_state WHERE singleton').fetchone()
     return {'provider-session:'+digest([source,session]):digest([ALIAS_VERSION,archive,aliases,bound.get((source,session),[]),inputs.get('provider-session:'+digest([source,session]))]) for (source,session),aliases in groups.items()}
-def _conversation_join(rows):
-    required(all(r['kind']=='conversations' and r['state']=='active' and r['id']==rows[0]['id'] and r['data']['source'] in ('codex','claude-code') and isinstance(r['data']['metadata'],dict) and r['data']['metadata'].get('session_id') and r['data']['metadata'].get('timestamp_basis')=='utc' for r in rows),ValueError('conversation fork lacks exact current provider metadata'))
-    lineage={'convos_message_lineage','convos_tool_lineage','convos_edit_lineage'}
+def _parser_metadata_join(rows):
+    kind=rows[0]['kind']
+    required(all(r['kind']==kind and r['state']=='active' and r['id']==rows[0]['id'] and isinstance(r['data']['metadata'],dict) and (r['data']['source'] in ('codex','claude-code') and r['data']['metadata'].get('session_id') and r['data']['metadata'].get('timestamp_basis')=='utc' if kind=='conversations' else kind=='messages' and type(r['data']['metadata'].get('provider_index')) is int and r['data']['metadata']['provider_index']>=0) for r in rows),ValueError('parser fork lacks exact current provider metadata'))
+    lineage={'convos_tool_lineage','convos_edit_lineage'}|({'convos_message_lineage'} if kind=='conversations' else set())
     ordinary=[{**r,'data':{k:({name:value for name,value in v.items() if name not in lineage} if k=='metadata' else datetime.fromisoformat(v).isoformat(timespec='microseconds') if k=='created_at' and v else v) for k,v in r['data'].items() if k!='updated_at'}} for r in rows]
-    required(len({digest(r) for r in ordinary})==1,ValueError('conversation content conflict requires resolution'))
-    stamps=[datetime.fromisoformat(r['data']['updated_at']) for r in rows if r['data']['updated_at'] is not None]
+    required(len({digest(r) for r in ordinary})==1,ValueError('parser content conflict requires resolution'))
+    stamps=[datetime.fromisoformat(r['data']['updated_at']) for r in rows if kind=='conversations' and r['data']['updated_at'] is not None]
     required(all(t.tzinfo is None for t in stamps),ValueError('conversation fork timestamp representation is not canonical UTC'))
     metadata={**ordinary[0]['data']['metadata'],**{key:_lineage_union([r['data']['metadata'][key] for r in rows if key in r['data']['metadata']]) for key in sorted(lineage) if any(key in r['data']['metadata'] for r in rows)}}
-    return {**ordinary[0],'data':{**ordinary[0]['data'],'updated_at':max(stamps).isoformat(timespec='microseconds') if stamps else None,'metadata':metadata}}
-def _reconcile_conversation_heads(db_path,cfg,workspace,progress):
-    user,after,blocked,changed=cfg['user'],'',{},0
+    return {**ordinary[0],'data':{**ordinary[0]['data'],**({'updated_at':max(stamps).isoformat(timespec='microseconds') if stamps else None} if kind=='conversations' else {}),'metadata':metadata}}
+def _reconcile_parser_heads(db_path,cfg,workspace,progress):
+    user,after,blocked,changed=cfg['user'],('',''),{},0
     while True:
-        with contextlib.closing(open_db(db_path,True,purpose='remote.conversations.forks')) as db:
-            ids=[r[0] for r in db.execute("SELECT p.source_row_id FROM remote.row_proofs p JOIN conversations c ON c.id=p.source_row_id WHERE p.author_user_id=? AND p.workspace_id=? AND p.row_kind='conversations' AND p.source_row_id>? AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) GROUP BY p.source_row_id HAVING count(DISTINCT p.content_hash)>1 ORDER BY p.source_row_id LIMIT 100",[user,workspace,after]).fetchall()]
+        with contextlib.closing(open_db(db_path,True,purpose='remote.parser.forks')) as db:
+            ids=db.execute("SELECT p.row_kind,p.source_row_id FROM remote.row_proofs p JOIN (SELECT 'conversations' kind,id FROM conversations UNION ALL SELECT 'messages',m.id FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.source IN ('codex','claude-code')) c ON (c.kind,c.id)=(p.row_kind,p.source_row_id) WHERE p.author_user_id=? AND p.workspace_id=? AND (p.row_kind,p.source_row_id)>(?,?) AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE (o.table_name,o.physical_row_id)=(c.kind,c.id)) AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) GROUP BY p.row_kind,p.source_row_id HAVING count(DISTINCT p.content_hash)>1 ORDER BY p.row_kind,p.source_row_id LIMIT 100",[user,workspace,*after]).fetchall()
         if not ids: return changed,blocked
-        for entity in ids:
+        for kind,entity in ids:
             try:
-                with contextlib.closing(open_db(db_path,purpose='remote.conversations.merge')) as db,_transaction(db),preserve_fact_heads(db,[('conversations',entity)]):
-                    values=db.execute("SELECT "+','.join('p.'+name for name in ('workspace_id','authorization_workspace_id','row_kind','source_row_id','encoding_v','content_hash','revision','previous_revision','state','author_user_id','author_device_id','authorization_epoch','signature'))+",c.body FROM remote.row_proofs p LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE p.row_kind='conversations' AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) ORDER BY p.revision LIMIT 65",[entity,user]).fetchall()
-                    required(len(values)<=64,ValueError('conversation fork exceeds automatic reconciliation limit'))
-                    claim=('conversations',entity,entity,user,'active')
+                with contextlib.closing(open_db(db_path,purpose='remote.parser.merge')) as db,_transaction(db),preserve_fact_heads(db,[(kind,entity)]):
+                    values=db.execute("SELECT "+','.join('p.'+name for name in ('workspace_id','authorization_workspace_id','row_kind','source_row_id','encoding_v','content_hash','revision','previous_revision','state','author_user_id','author_device_id','authorization_epoch','signature'))+",c.body FROM remote.row_proofs p LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) ORDER BY p.revision LIMIT 65",[kind,entity,user]).fetchall()
+                    required(len(values)<=64,ValueError('parser fork exceeds automatic reconciliation limit'))
+                    claim=(kind,entity,entity,user,'active')
                     native=typed_logical_rows(db,[claim])[claim]
-                    rows=[required(row if row is not None and digest(row)==v[5] else None,ValueError('conversation fork body unavailable')) for v in values for row in [json.loads(v[-1]) if v[-1] else matching_logical_row(native,v[5])]]
-                    merged=_conversation_join([native,*rows])
+                    rows=[required(row if row is not None and digest(row)==v[5] else None,ValueError('parser fork body unavailable')) for v in values for row in [json.loads(v[-1]) if v[-1] else matching_logical_row(native,v[5])]]
+                    merged=_parser_metadata_join([native,*rows])
                     proofs=[row_proof(cfg['device'],user,v[0],cfg['workspaces'][workspace]['epoch'],merged,v[6],workspace) for v in values]
                     signer=cfg['controls'][workspace]['devices'][cfg['device']['id']]
                     project_workspace_controls(db,next(w['controls'] for w in cfg['server_state']['workspaces'] if w['id']==workspace))
@@ -752,8 +753,8 @@ def _reconcile_conversation_heads(db_path,cfg,workspace,progress):
                     proof=min(proofs,key=lambda p:p['revision'])
                     project_logical_rows(db,[(merged,proof,digest(proof),True)])
                 changed+=1
-            except ValueError as e: blocked['conversation:'+entity]=str(e)
-            progress('reconciling conversation metadata '+entity)
+            except ValueError as e: blocked[kind+':'+entity]=str(e)
+            progress('reconciling '+kind+' metadata '+entity)
             archive_yield(db_path)
         after=ids[-1]
 def reconcile_provider_aliases(db_path,cfg,workspace,progress=None,state=None):
@@ -774,7 +775,7 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
         key=(values[0][1],provider_session_key(values[0][1],values[0][2]))
         groups.setdefault(key,[]).append((object_id,leaves))
     result,controls,signer,backed_up={"changed":0,"settled":0,"blocked":{}},next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace),cfg["controls"][workspace]["devices"][cfg["device"]["id"]],False
-    result["changed"],result["blocked"]=_reconcile_conversation_heads(db_path,cfg,workspace,progress)
+    result["changed"],result["blocked"]=_reconcile_parser_heads(db_path,cfg,workspace,progress)
     cache_key=f'provider_alias_cache:{workspace}:{user}'
     cached=json.loads(row[0]) if state is not None and (row:=state.execute('SELECT value FROM meta WHERE key=?',[cache_key]).fetchone()) else {}
     with contextlib.closing(open_db(db_path,True,purpose='remote.alias.dependencies')) as db: fingerprints=_alias_fingerprints(db,user,groups) if state is not None else {}

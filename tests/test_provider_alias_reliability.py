@@ -133,7 +133,8 @@ def test_cache_rechecks_changed_child_and_preserves_integrity_failure(tmp_path):
 
 
 @pytest.mark.parametrize('copies',[1,2,3])
-def test_alias_repair_merges_native_lineage_with_equal_bases_signed_by_multiple_devices(tmp_path,copies):
+@pytest.mark.parametrize('cached',[False,True])
+def test_alias_repair_merges_native_lineage_with_equal_bases_signed_by_multiple_devices(tmp_path,monkeypatch,copies,cached):
     from ai_convos_remote.protocol import certificate,identity,public,row_proof
     root,path,signer,device,user,cfg,_=_provider_alias_archive(tmp_path)
     with core.open_db(path,purpose='test.same-base') as db:
@@ -155,7 +156,14 @@ def test_alias_repair_merges_native_lineage_with_equal_bases_signed_by_multiple_
     incoming={**base,'data':{**base['data'],'metadata':dict(convos_edit_lineage=remote)}}
     proof=row_proof(other,user,'personal',1,incoming,original['revision'])
     projection.apply_row_replicas(path,[dict(row=incoming,proof=proof)],'personal',[cfg['controls']['personal']],local_user=user,local_device=device['id'])
-    result=projection.reconcile_provider_aliases(path,cfg,'personal')
+    state=projection.connect(tmp_path/'equal-bases-state.db')
+    if cached:
+        with monkeypatch.context() as old:
+            old.setattr(projection,'ALIAS_VERSION',13)
+            old.setattr(projection,'_alias_merge_native',lambda *args:None)
+            assert projection.reconcile_provider_aliases(path,cfg,'personal',state=state)['blocked']
+    result=projection.reconcile_provider_aliases(path,cfg,'personal',state=state)
+    state.close()
     assert not result['blocked']
     with core.open_db(path,True,purpose='test.merged-native-lineage') as db:
         metadata=json.loads(db.execute("SELECT metadata FROM messages WHERE id='message-b'").fetchone()[0])
