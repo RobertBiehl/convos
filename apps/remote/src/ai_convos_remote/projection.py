@@ -802,10 +802,11 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
     cache_key=f'provider_alias_cache:{workspace}:{user}'
     cached=json.loads(row[0]) if state is not None and (row:=state.execute('SELECT value FROM meta WHERE key=?',[cache_key]).fetchone()) else {}
     with contextlib.closing(open_db(db_path,True,purpose='remote.alias.dependencies')) as db: fingerprints=_alias_fingerprints(db,user,groups) if state is not None else {}
-    outcomes={}
+    outcomes,checkpoint={},False
     for at,((source,session),aliases) in enumerate(groups.items()):
+        if state is not None and checkpoint: (state.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',[cache_key,json.dumps(cached|outcomes,sort_keys=True,separators=(',',':'))]),state.commit())
         progress(f"provider aliases {at}/{len(groups)}")
-        object_id='provider-session:'+digest([source,session])
+        object_id,checkpoint='provider-session:'+digest([source,session]),False
         token=digest([fingerprints.get(object_id),controls,cfg['device']['id']])
         if state is not None and object_id in cached and cached[object_id][0]==token:
             previous=cached[object_id][1]
@@ -838,7 +839,7 @@ def _reconcile_provider_aliases(db_path,cfg,workspace,progress,state=None):
             result["blocked"][object_id]=str(e)
             continue
         if not moving and present=={canonical} and not binding and not attachment_paths and not _alias_message_plan(message_rows,source,members,history)[1]:
-            result["settled"]+=1
+            result['settled'],outcomes[object_id],checkpoint=result['settled']+1,[token,None],True
             continue
         if not backed_up:
             with contextlib.closing(open_db(db_path,purpose="maintenance.remote.alias-backup")) as db: _migration_backup(db,"provider-alias-reconciliation")

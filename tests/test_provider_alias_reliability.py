@@ -132,6 +132,36 @@ def test_cache_rechecks_changed_child_and_preserves_integrity_failure(tmp_path):
     state.close()
 
 
+@pytest.mark.parametrize('interrupt',[False,True])
+def test_settled_alias_checkpoint_survives_other_repairs_and_interruption(tmp_path,monkeypatch,interrupt):
+    root,path,identity,device,user,cfg,_=_provider_alias_archive(tmp_path)
+    assert projection.reconcile_provider_aliases(path,cfg,'personal')['changed']==1
+    session=next('other-'+str(i) for i in range(100) if provider_alias_id('codex','other-'+str(i))>provider_alias_id('codex','same'))
+    with core.open_db(path,purpose='test.additional-session') as db:
+        db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex',?)",[(key,json.dumps(dict(session_id=session))) for key in ('c','d')])
+        db.execute("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('message-d','d','user','D','{}')")
+        db.execute("INSERT INTO provider_sessions VALUES ('codex',?,'d')",[session])
+    attest(tmp_path,path,cfg)
+    accept(root,identity,device,user,session,['c','d'])
+    state=projection.connect(tmp_path/'cache.db')
+    def progress(stage):
+        if interrupt and stage=='provider aliases 1/2': raise KeyboardInterrupt()
+    if interrupt:
+        with pytest.raises(KeyboardInterrupt): projection.reconcile_provider_aliases(path,cfg,'personal',progress=progress,state=state)
+    else:
+        assert projection.reconcile_provider_aliases(path,cfg,'personal',progress=progress,state=state)==dict(changed=1,settled=1,blocked={})
+    state.close()
+    state=projection.connect(tmp_path/'cache.db')
+    original=projection._alias_pages
+    def pages(db_path,author,members,**kwargs):
+        assert set(members)!={'a','b'},'a settled alias was rescanned after another group changed or the process stopped'
+        return original(db_path,author,members,**kwargs)
+    monkeypatch.setattr(projection,'_alias_pages',pages)
+    assert projection.reconcile_provider_aliases(path,cfg,'personal',state=state)==dict(changed=int(interrupt),settled=1 if interrupt else 2,blocked={})
+    assert projection.audit_rows(path,local_user=user)['totals']['unavailable']==0
+    state.close()
+
+
 @pytest.mark.parametrize('copies',[1,2,3])
 @pytest.mark.parametrize('cached',[False,True])
 def test_alias_repair_merges_native_lineage_with_equal_bases_signed_by_multiple_devices(tmp_path,monkeypatch,copies,cached):
