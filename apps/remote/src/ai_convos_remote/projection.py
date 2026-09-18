@@ -740,10 +740,10 @@ def _parser_metadata_join(rows):
     metadata={**ordinary[0]['data']['metadata'],**{key:_lineage_union([r['data']['metadata'][key] for r in rows if key in r['data']['metadata']]) for key in sorted(lineage) if any(key in r['data']['metadata'] for r in rows)}}
     return {**ordinary[0],'data':{**ordinary[0]['data'],**({'updated_at':max(stamps).isoformat(timespec='microseconds') if stamps else None} if kind=='conversations' else {}),'metadata':metadata}}
 def _message_history(db,user,owners): return [body for raw,expected in db.execute("SELECT body,content_hash FROM parser_retired_rows WHERE kind='messages' AND (author=? OR author='') AND json_extract_string(body,'$.data.conversation_id') IN (SELECT UNNEST(?)) UNION SELECT c.body,p.content_hash FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.row_kind='messages' AND p.author_user_id=? AND json_extract_string(c.body,'$.data.conversation_id') IN (SELECT UNNEST(?))",[user,list(owners),user,list(owners)]).fetchall() if digest(body:=json.loads(raw))==expected]
-def _source_message_join(db,rows,user):
-    owners={r['data']['conversation_id'] for r in rows}
-    claims=[(kind,entity,entity,user,'active') for kind,entity in db.execute("SELECT 'conversations',id FROM conversations c WHERE id IN (SELECT UNNEST(?)) AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) UNION ALL SELECT 'messages',id FROM messages m WHERE conversation_id IN (SELECT UNNEST(?)) AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='messages' AND o.physical_row_id=m.id)",[list(owners),list(owners)]).fetchall()]
-    current,history=list(typed_logical_rows(db,claims).values()),_message_history(db,user,owners)
+def _source_message_join(db,rows,user,cache=None):
+    owners,cache={r['data']['conversation_id'] for r in rows},{} if cache is None else cache
+    claims=[(kind,entity,entity,user,'active') for kind,entity in db.execute("SELECT 'conversations',id FROM conversations c WHERE id IN (SELECT UNNEST(?)) AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) UNION ALL SELECT 'messages',id FROM messages m WHERE conversation_id IN (SELECT UNNEST(?)) AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='messages' AND o.physical_row_id=m.id)",[list(owners),list(owners)]).fetchall()] if (key:=(user,tuple(sorted(owners)))) not in cache else []
+    current,history=cache[key] if key in cache else cache.setdefault(key,(list(typed_logical_rows(db,claims).values()),_message_history(db,user,owners)))
     required(sum(r['kind']=='conversations' for r in current)==len(owners) and all(r['data']['source'] in ('codex','claude-code') for r in current if r['kind']=='conversations'),ValueError('source-lineage carrier is not a native provider conversation'))
     normalized=[next((value for value,*_ in revisions if value['kind']=='messages' and value['id']==row['id']),row) for row in rows for revisions,lineage in [_alias_message_plan([(v,{},True,{},None) for v in [*[r for r in current if (r['kind'],r['id'])!=('messages',row['id'])],row]],next(r['data']['source'] for r in current if r['kind']=='conversations'),owners,history)]]
     return _parser_metadata_join(normalized)
@@ -755,7 +755,7 @@ def _reconcile_parser_heads(db_path,cfg,workspace,progress):
             if not ids: return changed,blocked
             generation=db.execute('SELECT generation FROM archive_state WHERE singleton').fetchone()[0]
             values=db.execute("SELECT "+','.join('p.'+name for name in ('workspace_id','authorization_workspace_id','row_kind','source_row_id','encoding_v','content_hash','revision','previous_revision','state','author_user_id','author_device_id','authorization_epoch','signature'))+",c.body FROM remote.row_proofs p LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE (p.row_kind,p.source_row_id) IN (SELECT json_extract_string(value,'$[0]'),json_extract_string(value,'$[1]') FROM json_each(?)) AND p.author_user_id=? AND NOT EXISTS(SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) QUALIFY row_number() OVER(PARTITION BY p.row_kind,p.source_row_id ORDER BY p.revision)<=65 ORDER BY p.row_kind,p.source_row_id,p.revision",[json.dumps(ids),user]).fetchall()
-            groups,bodies,plans={key:list(group) for key,group in itertools.groupby(values,key=lambda v:(v[2],v[3]))},typed_logical_rows(db,[(kind,entity,entity,user,'active') for kind,entity in ids]),{}
+            groups,bodies,plans,contexts={key:list(group) for key,group in itertools.groupby(values,key=lambda v:(v[2],v[3]))},typed_logical_rows(db,[(kind,entity,entity,user,'active') for kind,entity in ids]),{},{}
             for kind,entity in ids:
                 try:
                     values=groups[(kind,entity)]
@@ -765,7 +765,7 @@ def _reconcile_parser_heads(db_path,cfg,workspace,progress):
                     try: merged=_parser_metadata_join([native,*rows])
                     except ValueError:
                         if kind!='messages': raise
-                        merged=_source_message_join(db,[native,*rows],user)
+                        merged=_source_message_join(db,[native,*rows],user,contexts)
                     plans[(kind,entity)]=(merged,[row_proof(cfg['device'],user,v[0],cfg['workspaces'][workspace]['epoch'],merged,v[6],workspace) for v in values])
                 except ValueError as e: blocked[kind+':'+entity]=str(e)
                 progress('planning '+kind+' metadata '+entity)

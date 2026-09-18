@@ -698,8 +698,8 @@ def customer_large_append(client,manifest,evidence,measure):
                 for i,text in enumerate(sentinels):
                     stream.write(json.dumps(dict(type='response_item',timestamp=f'2026-09-18T00:00:0{i}Z',payload=dict(type='message',role='user' if i==0 else 'assistant',content=[dict(type='input_text' if i==0 else 'output_text',text=text)])))+'\n')
             measure('large-append-capture',clone,'capture','codex',input=json.dumps(dict(transcript_path=str(source),hook_event_name='Stop')),budget=5)
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                jobs=[pool.submit(measure,'large-append-'+label,clone,*args,budget=budget) for label,args,budget in (('drain',('drain-hooks','--block'),120),('search',('search','qualification'),15),('doctor',('doctor',),15))]
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                jobs=[pool.submit(measure,'large-append-'+label,clone,*args,budget=budget) for label,args,budget in (('drain',('drain-hooks','--block'),120),('sync',('sync','--local-only'),120),('search',('search','qualification'),15),('doctor',('doctor',),15))]
                 for job in jobs: job.result()
             after=desktop_inventory(clone)
             if [row for row in after if row['content'] not in sentinels]!=before or sorted(row['content'] for row in after if row['content'] in sentinels)!=sorted(sentinels): raise AssertionError('large transcript append lost, duplicated, or changed existing turns')

@@ -406,7 +406,7 @@ def test_alias_reconciles_independent_native_changes_but_preserves_content_confl
 
 @pytest.mark.parametrize('parent_evidence',['valid','wrong_hash','fork','cycle'])
 @pytest.mark.parametrize('metadata_changed',[False,True])
-def test_timestamp_repair_requires_exact_retired_parent_lineage(tmp_path,parent_evidence,metadata_changed):
+def test_timestamp_repair_requires_exact_retired_parent_lineage(tmp_path,monkeypatch,parent_evidence,metadata_changed):
     def message(key,parent,stamp,index):
         return core.logical_row('messages',list(data:=dict(id=key,conversation_id='a',role='user',content='event',thinking=None,created_at=stamp,model=None,metadata=dict(provider_index=index),parent_id=parent)),list(data.values()))
     old_parent,new_parent,old,new,alternate=[core.gen_id('codex',label) for label in ('old-parent','new-parent','old','new','alternate')]
@@ -437,12 +437,19 @@ def test_timestamp_repair_requires_exact_retired_parent_lineage(tmp_path,parent_
         pid=core.project_row_proof(db,proof,signer['sign_public'],certificate(signer,user,device))
         db.execute('INSERT INTO remote.row_conflicts VALUES (?,?)',[pid,json.dumps(current)])
         versions=[rows[1],{**rows[1],'data':rows[-1]['data']}]
-        if parent_evidence=='valid':
-            merged=projection._source_message_join(db,versions,user)
-            assert merged['data']['created_at']=='2026-01-01T00:00:02.000000'
-            assert merged['data']['parent_id']==new_parent
-        else:
-            with pytest.raises(ValueError,match='content conflict'): projection._source_message_join(db,versions,user)
+        history,loaded,context=projection._message_history,[],{}
+        def load(*args):
+            loaded.append(args[2])
+            return history(*args)
+        monkeypatch.setattr(projection,'_message_history',load)
+        for _ in range(2):
+            if parent_evidence=='valid':
+                merged=projection._source_message_join(db,versions,user,context)
+                assert merged['data']['created_at']=='2026-01-01T00:00:02.000000'
+                assert merged['data']['parent_id']==new_parent
+            else:
+                with pytest.raises(ValueError,match='content conflict'): projection._source_message_join(db,versions,user,context)
+        assert len(loaded)==1
 def test_alias_reconciliation_wakes_hooks_after_releasing_capture_lease(tmp_path,monkeypatch):
     from ai_convos import cli as core
     from ai_convos_remote import projection
