@@ -132,6 +132,38 @@ def test_cache_rechecks_changed_child_and_preserves_integrity_failure(tmp_path):
     state.close()
 
 
+@pytest.mark.parametrize('copies',[1,2,3])
+def test_alias_repair_merges_native_lineage_with_equal_bases_signed_by_multiple_devices(tmp_path,copies):
+    from ai_convos_remote.protocol import certificate,identity,public,row_proof
+    root,path,signer,device,user,cfg,_=_provider_alias_archive(tmp_path)
+    with core.open_db(path,purpose='test.same-base') as db:
+        base=core.typed_logical_rows(db,[('messages','message-b','message-b',user,'active')])[('messages','message-b','message-b',user,'active')]
+        original=projection._heads(db,user,{'messages':{'message-b'}})[('messages','message-b')]
+        for index in range(copies):
+            other=identity('other-'+str(index))
+            entry=dict(user=user,root_public=signer['sign_public'],device=public(other),certificate=certificate(signer,user,other),history=True)
+            cfg['controls']['personal']['devices'][other['id']]=entry
+            proof=row_proof(other,user,'personal',1,base,original['previous_revision'])
+            assert proof['revision']==original['revision']
+            core.project_row_proof(db,proof,signer['sign_public'],entry['certificate'])
+        lineage=lambda tag:dict(v=1,records=[dict(old_id=core.gen_id('old',tag),old_hash=core.provenance_digest(['old',tag]),current_id=core.gen_id('new',tag),current_hash=core.provenance_digest(['new',tag]))])
+        local,remote=lineage('local'),lineage('remote')
+        with core.preserve_fact_heads(db,[('messages','message-b')],observed=True):
+            db.execute('UPDATE messages SET metadata=?',[json.dumps(dict(convos_edit_lineage=local))])
+        core._archive_touch(db,[('messages','message-b')])
+    cfg['controls']['personal']['revision']=2
+    incoming={**base,'data':{**base['data'],'metadata':dict(convos_edit_lineage=remote)}}
+    proof=row_proof(other,user,'personal',1,incoming,original['revision'])
+    projection.apply_row_replicas(path,[dict(row=incoming,proof=proof)],'personal',[cfg['controls']['personal']],local_user=user,local_device=device['id'])
+    result=projection.reconcile_provider_aliases(path,cfg,'personal')
+    assert not result['blocked']
+    with core.open_db(path,True,purpose='test.merged-native-lineage') as db:
+        metadata=json.loads(db.execute("SELECT metadata FROM messages WHERE id='message-b'").fetchone()[0])
+        assert metadata['convos_edit_lineage']==projection._lineage_union([local,remote])
+        assert db.execute("SELECT content,conversation_id FROM messages WHERE id='message-b'").fetchone()==('B','a')
+    assert projection.audit_rows(path,local_user=user)['totals']['unavailable']==0
+
+
 def test_cache_rechecks_new_proofs_without_archive_generation_change(tmp_path):
     path,user,cfg,state=settled(tmp_path)
     with duckdb.connect(str(path)) as db:
