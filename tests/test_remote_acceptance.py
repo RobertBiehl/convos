@@ -37,9 +37,12 @@ def test_real_http_background_two_device_delivery_under_ten_seconds(tmp_path):
 
 def test_real_http_background_delivers_large_encrypted_memory_without_lazy_fetch(tmp_path):
     p=port(); url=f"http://127.0.0.1:{p}"; server=subprocess.Popen(("convos-server","serve","--db",str(tmp_path/"server.db"),"--port",str(p)),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True); workers=[]
+    def diagnostics():
+        return {root.name:{str(path.relative_to(root)):path.read_text()[-4000:] for path in (root/'watch.log',root/'remote/watch.json',root/'remote/last_error',root/'remote/sync.lock') if path.exists()} for root in (tmp_path/'a',tmp_path/'b')}
     try:
         wait(url+"/v1/health"); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client(url,"alice","laptop",root=a); setup_client(url,"alice","desktop",recovery,root=b); content="private large memory marker\n"+"x"*70000; env={**os.environ,"CONVOS_PROJECT_ROOT":str(a)}; created=json.loads(subprocess.run(("convos","memory","remember","-","--project","global","--json"),input=content,text=True,env=env,check=True,capture_output=True).stdout)
-        for root in (a,b): workers.append(subprocess.Popen(("convos","remote","watch","--interval","1"),env={**os.environ,"CONVOS_PROJECT_ROOT":str(root)},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+        for root in (a,b):
+            with (root/'watch.log').open('w') as log: workers.append(subprocess.Popen(("convos","remote","watch","--interval","1"),env={**os.environ,"CONVOS_PROJECT_ROOT":str(root)},stdout=log,stderr=subprocess.STDOUT))
         end=time.time()+10; found=False
         while time.time()<end:
             try: db=sqlite3.connect(b/"memory/state.db"); found=db.execute("SELECT content FROM canonicals").fetchone()==(content,) and db.execute("SELECT state,COUNT(*) FROM remote_semantics GROUP BY state").fetchall()==[("active",1)]; db.close()
@@ -47,21 +50,21 @@ def test_real_http_background_delivers_large_encrypted_memory_without_lazy_fetch
             if found: break
             time.sleep(.2)
         state=connect(b/"remote/state.db"); lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; state.close(); raw=(tmp_path/"server.db").read_bytes().decode(errors="ignore")
-        assert found and lazy==0 and "private large memory marker" not in raw and str(a) not in raw and str(b) not in raw
+        assert found and lazy==0 and "private large memory marker" not in raw and str(a) not in raw and str(b) not in raw,diagnostics()
         subprocess.run(("convos","memory","forget",created["id"],"--project","global","--json"),env=env,check=True,capture_output=True); end=time.time()+10; forgotten=False
         while time.time()<end:
             try: db=sqlite3.connect(b/"memory/state.db"); forgotten=db.execute("SELECT COUNT(*) FROM canonicals").fetchone()[0]==0 and db.execute("SELECT state FROM remote_semantics").fetchall()==[("deleted",)]; db.close()
             except Exception: forgotten=False
             if forgotten: break
             time.sleep(.2)
-        state=connect(b/"remote/state.db"); settled=state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]; state.close(); assert forgotten and settled and b"private large memory marker" not in (b/"remote/state.db").read_bytes()
+        state=connect(b/"remote/state.db"); settled=state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]; state.close(); assert forgotten and settled and b"private large memory marker" not in (b/"remote/state.db").read_bytes(),diagnostics()
         subprocess.run(("convos","memory","remember","-","--project","global","--json"),input=content,text=True,env=env,check=True,capture_output=True); end=time.time()+10; restored=False
         while time.time()<end:
             try: db=sqlite3.connect(b/"memory/state.db"); restored=db.execute("SELECT content FROM canonicals").fetchone()==(content,); db.close()
             except Exception: pass
             if restored: break
             time.sleep(.2)
-        assert restored
+        assert restored,diagnostics()
     finally:
         [w.terminate() for w in workers]; [w.wait(timeout=3) for w in workers]; server.terminate(); server.wait(timeout=3)
 

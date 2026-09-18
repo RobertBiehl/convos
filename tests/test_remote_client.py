@@ -405,6 +405,45 @@ def test_noop_fast_path_tracks_external_bridge_state(tmp_path,monkeypatch):
     memory_module.remember_data("new remote memory","global"); calls.clear(); sync_once(root); assert len(calls)>1 and server.execute("SELECT COUNT(*) FROM semantic_replicas").fetchone()[0]>0
     calls.clear(); sync_once(root); assert calls==["state"]
 
+@pytest.mark.parametrize('change',['delete','revise','create'])
+def test_memory_change_after_publication_cannot_be_marked_settled(tmp_path,monkeypatch,change):
+    server=server_connect(tmp_path/'server.db')
+    monkeypatch.setattr(remote_client,'request',transport(server))
+    monkeypatch.setattr(remote_client,'drain_hooks',lambda:None)
+    a,b=tmp_path/'a',tmp_path/'b'
+    _,recovery=setup_client('http://server','alice','laptop',root=a)
+    setup_client('http://server','alice','desktop',recovery,root=b)
+    monkeypatch.delenv('CONVOS_MEMORY_DB',raising=False)
+    monkeypatch.setenv('CONVOS_PROJECT_ROOT',str(a))
+    original=memory_module.remember_data('original memory','global')
+    sync_once(a)
+    sync_once(b)
+    sync_once(a)
+    memory_module.remember_data('transmitted revision','global',original['id'])
+    reconcile,changed=remote_client.reconcile_replicas,[]
+    def concurrent(cfg,state,root,ws,envelopes,semantic=False):
+        result=reconcile(cfg,state,root,ws,envelopes,semantic)
+        if root==a and semantic and not changed:
+            changed.append(True)
+            if change=='delete': memory_module.forget_data(original['id'],'global')
+            else: memory_module.remember_data('changed during sync','global',original['id'] if change=='revise' else None)
+        return result
+    monkeypatch.setattr(remote_client,'reconcile_replicas',concurrent)
+    sync_once(a)
+    assert changed
+    with connect(a/'remote/state.db') as state: settled=state.execute("SELECT value FROM meta WHERE key='sync_settled'").fetchone()
+    monkeypatch.setattr(remote_client,'reconcile_replicas',reconcile)
+    sync_once(a)
+    sync_once(b)
+    with sqlite3.connect(b/'memory/state.db') as db:
+        found=db.execute('SELECT content FROM canonicals ORDER BY content').fetchall()
+        received=db.execute("SELECT content FROM sources WHERE provider='remote' ORDER BY content").fetchall()
+    expected=[] if change=='delete' else [('changed during sync' if change=='revise' else 'transmitted revision',)]
+    assert found==expected
+    assert received==([('changed during sync',),('transmitted revision',)] if change=='create' else expected)
+    assert not settled
+
+
 def test_manual_sync_cli_repairs_only_when_requested(monkeypatch):
     calls=[]; monkeypatch.setattr(remote_client,"sync_once",lambda *args,**kwargs:calls.append(kwargs))
     remote_client.sync_cmd(); remote_client.sync_cmd(True)

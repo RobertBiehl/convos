@@ -177,7 +177,11 @@ def test_exact_parser_metadata_joins_across_equivalent_signed_branches(tmp_path)
         with core.preserve_fact_heads(db,[('conversations','c')]): db.execute("UPDATE conversations SET metadata=? WHERE id='c'",[json.dumps(metadata)])
         core._archive_touch(db,[('conversations','c')])
         local=core.typed_logical_rows(db,[claim])[claim]
-        merged=remote._alias_merge_native(db,local,head)
+        class CurrentHeadReader:
+            def execute(self,query,*args):
+                assert 'WITH RECURSIVE ancestors' not in query, 'equivalent parser metadata must not walk the entire signed history'
+                return db.execute(query,*args)
+        merged=remote._alias_merge_native(CurrentHeadReader(),local,head)
         assert merged is not None
         assert core.matching_logical_row(merged,head['content_hash']) is not None
     assert remote.audit_rows(path,local_user=cfg['user'])['totals']['unavailable']==0

@@ -204,7 +204,7 @@ def event_support(value):
 def bridge_records(root,cfg,workspace,kind,archive=True,changes=None): return [record for bridge in bridges() if archive or bridge.get("source")!="archive" for record in (bridge["delta"](root,cfg["user"],workspace,kind,changes) if changes is not None and "delta" in bridge else bridge["records"](root,cfg["user"],workspace,kind))]
 def bridge_stamps(root): return tuple(digest({"core":version,"bridges":{kind:(bridge["v"],bridge["schema"]) for bridge in bridges() for kind in bridge["objects"]}}) for version in REPLICA_VERSIONS)
 def bridge_stamp(root): return bridge_stamps(root)[0]
-def bridge_state(root,cfg,workspace,kind,generation): return digest((generation,bridge_stamp(root),bridge_records(root,cfg,workspace,kind,False)))
+def bridge_state(root,cfg,workspace,kind,generation): return (lambda records:digest((generation,bridge_stamp(root),records)) if all(r['proof'] is not None for r in records) else None)(bridge_records(root,cfg,workspace,kind,False))
 def bridge_accept_many(root,values,project=True):
     groups=[(bridge,selected) for bridge in bridges() if (selected:=[(i,value) for i,value in enumerate(values) if value[0]["kind"] in bridge["objects"]])]
     batches=[(selected,bridge["accept_many"](root,[value for _,value in selected],project) if "accept_many" in bridge else [bridge["accept"](root,*value,project) for _,value in selected]) for bridge,selected in groups]
@@ -553,11 +553,11 @@ def _lineage_union(values):
     return dict(v=1,records=sorted({canon(r):r for v in values for r in v['records']}.values(),key=canon))
 def _alias_merge_native(db,row,head):
     if row is None: return None
-    records=db.execute("WITH RECURSIVE ancestors(revision) AS (SELECT CAST(? AS VARCHAR) UNION SELECT p.previous_revision FROM remote.row_proofs p JOIN ancestors a ON p.revision=a.revision WHERE (p.row_kind,p.source_row_id,p.author_user_id)=(?,?,?) AND p.previous_revision IS NOT NULL) SELECT DISTINCT 0 slot,p.content_hash,c.body FROM remote.local_row_bases b JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(b.kind,b.entity,b.author,b.revision) JOIN ancestors a ON a.revision=b.revision JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE (b.kind,b.entity,b.author)=(?,?,?) UNION ALL SELECT 1 slot,p.content_hash,c.body FROM remote.row_proofs p JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE p.id=? ORDER BY slot",[head['revision'],row['kind'],row['id'],head['author_user_id'],row['kind'],row['id'],head['author_user_id'],digest(head)]).fetchall()
+    records=db.execute("SELECT 1 slot,p.content_hash,c.body FROM remote.row_proofs p JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE p.id=?",[digest(head)]).fetchall()
     if row['kind'] in ('conversations','messages') and len(current:=[json.loads(raw) for slot,expected,raw in records if slot==1 and digest(json.loads(raw))==expected])==1:
         try: return _parser_metadata_join([row,*current])
         except ValueError: pass  # Other independent changes still require a shared signed base.
-    if len(records)!=2 or any(digest(json.loads(raw))!=expected for slot,expected,raw in records): return None
+    if len(records:=[*db.execute("WITH RECURSIVE ancestors(revision) AS (SELECT CAST(? AS VARCHAR) UNION SELECT p.previous_revision FROM remote.row_proofs p JOIN ancestors a ON p.revision=a.revision WHERE (p.row_kind,p.source_row_id,p.author_user_id)=(?,?,?) AND p.previous_revision IS NOT NULL) SELECT DISTINCT 0 slot,p.content_hash,c.body FROM remote.local_row_bases b JOIN remote.row_proofs p ON (p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(b.kind,b.entity,b.author,b.revision) JOIN ancestors a ON a.revision=b.revision JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE (b.kind,b.entity,b.author)=(?,?,?)",[head['revision'],row['kind'],row['id'],head['author_user_id'],row['kind'],row['id'],head['author_user_id']]).fetchall(),*records])!=2 or any(digest(json.loads(raw))!=expected for slot,expected,raw in records): return None
     base,remote=(json.loads(raw) for slot,expected,raw in records)
     if any(v['state']!='active' or (v['kind'],v['id'])!=(row['kind'],row['id']) for v in (base,remote)): return None
     absent=object()
