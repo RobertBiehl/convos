@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
-from ai_convos.cli import capture_provenance, init_schema
+from ai_convos.cli import ARCHIVE_COLUMNS, ParseResult, _transaction, capture_provenance, init_schema, open_db, upsert
 from ai_convos_remote import add_member, create, setup_client
 
 
@@ -16,12 +16,14 @@ def run(root,*args):
     return subprocess.run((sys.executable,"-m","ai_convos",*args),env=env,text=True,capture_output=True,check=True).stdout.strip()
 def git(root,*args): return subprocess.run(("git","-C",str(root),*args),check=True,text=True,capture_output=True).stdout.strip()
 def seed(root,cid,title,prompt,cwd=None,edit=None):
-    path=Path(root)/"data/convos.db"; path.parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(path)); init_schema(db)
-    db.execute("INSERT INTO conversations (id,source,title,created_at,updated_at,cwd,metadata) VALUES (?,?,?,'2026-01-01','2026-01-01',?,'{}')",(cid,"demo",title,str(cwd) if cwd else None)); db.execute("INSERT INTO messages (id,conversation_id,role,content,created_at,metadata) VALUES (?,?, 'user',?,'2026-01-01 00:00:00','{}'),(?,?, 'assistant','done','2026-01-01 00:00:01','{}')",(f"u-{cid}",cid,prompt,f"a-{cid}",cid))
-    if edit:
-        db.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at,old_content) VALUES (?,?,?,'write',?,'2026-01-01 00:00:01',?)",(f"e-{cid}",f"a-{cid}",str(edit[0]),edit[1],edit[2]))
-        db.execute("INSERT INTO provenance.file_edit_evidence VALUES (?,'confirmed','synthetic_fixture',NULL)",(f"e-{cid}",))
-    db.close(); capture_provenance(path)
+    path=Path(root)/"data/convos.db"
+    path.parent.mkdir(parents=True,exist_ok=True)
+    records=lambda table,rows:[dict(zip(ARCHIVE_COLUMNS[table],row)) for row in rows]
+    result=ParseResult(convs=records('conversations',[[cid,'demo',title,'2026-01-01','2026-01-01',None,str(cwd) if cwd else None,None,None,'{}']]),msgs=records('messages',[[f'u-{cid}',cid,'user',prompt,None,'2026-01-01 00:00:00',None,'{}',None],[f'a-{cid}',cid,'assistant','done',None,'2026-01-01 00:00:01',None,'{}',None]]),edits=records('file_edits',[[f'e-{cid}',f'a-{cid}',str(edit[0]),'write',edit[1],'2026-01-01 00:00:01',edit[2]]]) if edit else [],edit_evidence=[dict(file_edit_id=f'e-{cid}',status='confirmed',reason='synthetic_fixture',tool_call_id=None)] if edit else [])
+    with open_db(path,purpose='example.seed') as db:
+        init_schema(db)
+        with _transaction(db): upsert(db,result)
+    capture_provenance(path)
 def wait_message(root,content,workers,timeout=10,graph=False):
     start=time.monotonic(); path=Path(root)/"data/convos.db"
     while time.monotonic()-start<timeout:
@@ -69,6 +71,7 @@ def watchers(*roots):
 def personal(keep=False):
     with sandbox("personal",keep) as base, relay(base) as (url,server):
         laptop,desktop=base/"laptop",base/"desktop"; _,recovery=setup_client(url,"demo-alice","laptop",root=laptop); setup_client(url,"demo-alice","desktop",recovery,root=desktop)
+        run(laptop,"remote","sync"); run(desktop,"remote","sync")
         with watchers(laptop,desktop) as running:
             prompt="Preserve causal parents in the parser."; seed(laptop,"personal-demo","Personal demo",prompt); elapsed=wait_message(desktop,prompt,running)
         assert_opaque(server,prompt,laptop,desktop); db=duckdb.connect(str(desktop/"data/convos.db"),read_only=True); title=db.execute("SELECT title FROM conversations WHERE source='demo'").fetchone()[0]; db.close(); result={"scenario":"personal","automatic":True,"seconds":round(elapsed,2),"title":title,"relay_plaintext":False}; print(json.dumps(result)); return result

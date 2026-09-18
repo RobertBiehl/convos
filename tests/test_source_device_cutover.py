@@ -322,3 +322,18 @@ def test_chunked_peer_reimport_skips_children_whose_bodies_have_not_arrived():
     with core.open_db(core.DB_PATH,read_only=True) as db:
         assert db.execute('SELECT count(*) FROM messages').fetchone()==(1,)
         assert not db.execute('SELECT * FROM file_edits').fetchall()
+
+
+def test_unchanged_received_source_is_not_reparsed_on_every_sync(monkeypatch):
+    from ai_convos_remote.projection import apply_row_replicas
+    from ai_convos_remote.protocol import row_proof
+    user,device,peer,control,_=signed_graph()
+    root=core.hook_root('codex')
+    root.mkdir(parents=True)
+    (root/'session.jsonl').write_text('\n'.join(map(json.dumps,[dict(type='session_meta',payload=dict(id='session')),dict(type='response_item',payload=dict(type='message',role='user',content=[dict(type='input_text',text='hello')]))])))
+    parsed=core.parse_codex(root.parent)
+    rows=[core.logical_row(kind,list(row),list(row.values())) for kind,records in [('conversations',parsed.convs),('messages',parsed.msgs)] for row in records]
+    apply_row_replicas(core.DB_PATH,[dict(row=row,proof=row_proof(device,user,'w',1,row)) for row in rows],'w',[control],local_user=user,local_device=peer['id'])
+    core.sync(False,300,False,True,False,False,True)
+    monkeypatch.setattr(core,'parse_codex',lambda *args:pytest.fail('unchanged peer source was parsed again'))
+    core.sync(False,300,False,True,False,False,True)
