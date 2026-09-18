@@ -64,7 +64,7 @@ def run(module,path,args):
         def request(body):
             began=time.perf_counter()
             with closing(http.client.HTTPConnection(*server.server_address,timeout=40)) as client:
-                client.request("POST","/v1",current.canon(body),{"Authorization":"Bearer "+actor["token"],"Content-Type":"application/json"})
+                client.request("POST","/v2",current.canon(body),{"Authorization":"Bearer "+actor["token"],"Content-Type":"application/json"})
                 response=client.getresponse()
                 content=response.read()
                 assert response.status==200,(response.status,content)

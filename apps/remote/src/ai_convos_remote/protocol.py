@@ -64,7 +64,7 @@ def verify_row_proof_header(value,cert,root_public):
 def verify_row_proof(value,row,cert,root_public):
     try:
         verify_row_proof_header(value,cert,root_public)
-        if set(row)!={"v","kind","id","state","data"} or row["kind"] not in SEMANTIC_FIELDS_V1 or not isinstance(row["id"],str) or not row["id"] or row["v"]!=1 or row["state"] not in ("active","deleted") or row["kind"] in PROVENANCE_FIELDS_V1 and row["state"]!="active" or row["data"] is not None and (row["state"]!="active" or set(row["data"])!=set(SEMANTIC_FIELDS_V1[row["kind"]])) or row["state"]=="deleted" and row["data"] is not None or (value["row_kind"],value["row_id"],value["encoding_v"],value["content_hash"],value["state"])!=(row["kind"],row["id"],row["v"],digest(row),row["state"]): raise ValueError
+        if set(row)!={"v","kind","id","state","data"} or row["kind"] not in SEMANTIC_FIELDS_V1 or not isinstance(row["id"],str) or not row["id"] or row["v"]!=1 or row["state"] not in ("active","deleted") or row["kind"] in PROVENANCE_FIELDS_V1 and row["state"]!="active" or row["data"] is not None and (row["state"]!="active" or set(row["data"]) not in (set(SEMANTIC_FIELDS_V1[row["kind"]]),set(SEMANTIC_FIELDS_V1[row["kind"]])-({'edits'} if row["kind"] in ('messages','tool_calls') else set()))) or row["state"]=="deleted" and row["data"] is not None or (value["row_kind"],value["row_id"],value["encoding_v"],value["content_hash"],value["state"])!=(row["kind"],row["id"],row["v"],digest(row),row["state"]): raise ValueError
         return value
     except (KeyError,TypeError,ValueError) as e: raise ValueError("invalid row proof") from e
 

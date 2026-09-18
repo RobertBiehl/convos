@@ -52,9 +52,9 @@ class Client:
     def python(self): return self.venv/"bin/python"
 
 
-def run(command,*,input=None,check=True,env=None):
+def run(command,*,input=None,check=True,env=None,timeout=None):
     command=tuple(map(str,command))
-    try: return subprocess.run(command,input=input,text=True,capture_output=True,check=check,env=env)
+    try: return subprocess.run(command,input=input,text=True,capture_output=True,check=check,env=env,timeout=timeout)
     except subprocess.CalledProcessError as error:
         shown=['<redacted>' if i and command[i-1] in ('--recovery','--token','--password') else value for i,value in enumerate(command)]
         output=re.sub(r'(Recovery key \(store offline\): )\S+',r'\1<redacted>',(error.stdout or '')+(error.stderr or ''))
@@ -65,11 +65,11 @@ def as_user(client,*command,input=None,check=True):
 def cli(client,*args,input=None,check=True): return as_user(client,client.convos,*args,input=input,check=check)
 def sha256(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 def package_version(client): return as_user(client,client.python,"-c","import importlib.metadata\nprint(importlib.metadata.version('convos'))").stdout.strip()
-def wait_health(url,process,timeout=15,diagnostics=None):
+def wait_health(url,process,timeout=15,diagnostics=None,version=2):
     started,opener,last=time.monotonic(),urllib.request.build_opener(urllib.request.ProxyHandler({})),None
     while time.monotonic()-started<timeout:
         if process.poll() is not None: raise RuntimeError(f"relay exited ({process.returncode}): {process.stderr.read() if process.stderr else 'see relay.log'}")
-        try: return json.loads(opener.open(url+"/v1/health",timeout=1).read())
+        try: return json.loads(opener.open(url+f"/v{version}/health",timeout=1).read())
         except Exception as error:
             last=error
             time.sleep(.1)
@@ -376,8 +376,8 @@ def desktop_client(root,venv):
     return dict(root=root,venv=Path(venv).resolve(),env={**os.environ,'CONVOS_PROJECT_ROOT':str(root/'archive'),'CODEX_HOME':str(root/'codex'),'CLAUDE_CONFIG_DIR':str(root/'claude'),'TZ':{'laptop':'America/Los_Angeles','desktop':'UTC','other-user':'Asia/Kathmandu'}[root.name],'CONVOS_SEMANTIC':'off','NO_PROXY':'127.0.0.1,localhost,::1','no_proxy':'127.0.0.1,localhost,::1'})
 
 
-def desktop_cli(client,*args,input=None,check=True):
-    return run((client['venv']/'bin/convos',*args),input=input,check=check,env=client['env'])
+def desktop_cli(client,*args,input=None,check=True,timeout=None):
+    return run((client['venv']/'bin/convos',*args),input=input,check=check,env=client['env'],timeout=timeout)
 
 
 def desktop_transcript(client,session,worktree,turns=2):
@@ -433,12 +433,30 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
         sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
         sock.bind(('127.0.0.1',manifest['port']))
     clients=[desktop_client(root/name,venv) for name in ('laptop','desktop','other-user')]
-    if baseline_venv: clients[1]=desktop_client(root/'desktop',baseline_venv)
     url=f"http://127.0.0.1:{manifest['port']}"
     evidence=root/f"run-{len(manifest['runs'])+1}-{int(time.time())}"
     evidence.mkdir()
     log=(evidence/'relay.log').open('w')
     relay=Path(relay_venv or venv)/'bin/convos-server'
+    if baseline_venv and not manifest['runs']:
+        old=[desktop_client(root/name,baseline_venv) for name in ('laptop','desktop','other-user')]
+        baseline=subprocess.Popen((Path(baseline_venv)/'bin/convos-server','serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
+        try:
+            wait_health(url,baseline,version=1)
+            desktop_cli(old[0],'remote','setup',url,'canary-alice','--device','laptop')
+            recovery=json.loads((old[0]['root']/'archive/remote/config.json').read_text())['recovery']
+            desktop_cli(old[1],'remote','recover',url,'canary-alice','--device','desktop',input=recovery+'\n')
+            desktop_cli(old[2],'remote','setup',url,'canary-bob','--device','independent-author')
+            for client in (old[0],old[2]):
+                path=desktop_transcript(client,manifest['session'],client['root']/'deleted-checkout',2)
+                desktop_cli(client,'capture','codex',input=json.dumps(dict(transcript_path=str(path),hook_event_name='Stop')))
+                desktop_cli(client,'drain-hooks','--block')
+                desktop_cli(client,'remote','sync')
+            desktop_cli(old[1],'remote','sync')
+            manifest['upgrade_identities']=[dict(user=cfg['user'],device=cfg['device']['id']) for client in old for cfg in [json.loads((client['root']/'archive/remote/config.json').read_text())]]
+        finally:
+            baseline.terminate()
+            baseline.wait(timeout=10)
     server=subprocess.Popen((relay,'serve','--db',root/'relay.db','--port',str(manifest['port'])),stdout=log,stderr=subprocess.STDOUT)
     started=time.monotonic()
     try:
@@ -453,6 +471,9 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
         session,turns=manifest['session'],manifest.get('turns',2)
         native_edits=[]
         for client in clients:
+            if client is b:
+                desktop_cli(a,'remote','sync')
+                desktop_cli(b,'remote','sync')
             repo=client['root']/'checkout'
             if not repo.exists():
                 repo.mkdir(parents=True)
@@ -475,14 +496,10 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
                 output=desktop_cli(client,'remote','sync')
                 (evidence/f'sync-{iteration}-{index}.log').write_text(output.stdout+output.stderr)
         if baseline_venv:
-            for index,client in enumerate(clients):
-                (evidence/f'before-upgrade-{index}.json').write_text(json.dumps(desktop_inventory(client),indent=2)+'\n')
-            clients[1]=desktop_client(root/'desktop',venv)
-            for client in clients: desktop_cli(client,'sync','--local-only')
-            for iteration in range(3):
-                for index,client in enumerate(clients):
-                    output=desktop_cli(client,'remote','sync')
-                    (evidence/f'upgrade-{iteration}-{index}.log').write_text(output.stdout+output.stderr)
+            rejected=desktop_cli(desktop_client(root/'desktop',baseline_venv),'remote','sync',check=False)
+            if rejected.returncode==0: raise AssertionError('legacy client was allowed across the reset boundary')
+            identities=[dict(user=cfg['user'],device=cfg['device']['id']) for client in clients for cfg in [json.loads((client['root']/'archive/remote/config.json').read_text())]]
+            if identities!=manifest['upgrade_identities']: raise AssertionError('automatic reenrollment changed a user or device identity')
         inventories=[desktop_inventory(client) for client in clients]
         for index,values in enumerate(inventories):
             (evidence/f'archive-{index}.json').write_text(json.dumps(values,indent=2)+'\n')
@@ -541,8 +558,8 @@ def _desktop_lane(root,venv,commit,baseline_venv=None,relay_venv=None):
         path=desktop_transcript(a,ownership_session,repo)
         desktop_cli(untrusted,'capture','codex',input=json.dumps(dict(transcript_path=str(path),hook_event_name='Stop')))
         desktop_cli(untrusted,'drain-hooks','--block')
-        if len([v for v in desktop_inventory(a) if v['provider_session']==ownership_session])!=2: raise AssertionError('Git ownership failure lost captured turns')
-        pending=json.loads(desktop_cli(a,'sql','SELECT count(*) pending FROM provenance.pending','--format','json').stdout)[0]['pending']
+        if len([v for v in desktop_inventory(untrusted) if v['provider_session']==ownership_session])!=2: raise AssertionError('Git ownership failure lost captured turns')
+        pending=json.loads(desktop_cli(untrusted,'sql','SELECT count(*) pending FROM provenance.pending','--format','json').stdout)[0]['pending']
         if not pending: raise AssertionError('failed Git enrichment was not retained for retry')
         desktop_cli(a,'sync','--local-only')
         for _ in range(3):
@@ -584,6 +601,137 @@ with core.open_db(root/'data/convos.db',True,purpose='testbed.private.projection
     return json.loads(run((client['venv']/'bin/python','-c',code),env=client['env']).stdout)
 
 
+def customer_source_counts(client,corpus=None):
+    code="""import collections,json,sys
+from pathlib import Path
+from ai_convos import cli as core
+out=collections.defaultdict(lambda:dict.fromkeys(core.ARCHIVE_COLUMNS,0))
+key=lambda source,session:json.dumps([source,session],separators=(',',':'))
+if len(sys.argv)>1:
+ for source,parser,path in [('codex',core.parse_codex,Path(sys.argv[1])/'codex'),('claude-code',core.parse_claude_code,Path(sys.argv[1])/'claude/projects')]:
+  parsed=parser(path)
+  conversations={c['id']:key(source,json.loads(c['metadata']).get('session_id')) for c in parsed.convs}
+  messages={m['id']:conversations[m['conversation_id']] for m in parsed.msgs}
+  for kind,rows in [('conversations',parsed.convs),('messages',parsed.msgs),('tool_calls',parsed.tools),('attachments',parsed.attachs),('artifacts',parsed.artifacts),('file_edits',parsed.edits)]:
+   owners={r['id']:conversations[r['id']] if kind=='conversations' else conversations[r['conversation_id']] if kind in ('messages','artifacts') else messages[r['message_id']] for r in rows}
+   for owner,count in collections.Counter(owners.values()).items(): out[owner][kind]+=count
+else:
+ with core.open_db(core.DB_PATH,True,purpose='testbed.private.source-counts') as db:
+  for kind in core.ARCHIVE_COLUMNS:
+   joined='owners c' if kind=='conversations' else 'artifacts t JOIN owners c ON c.id=t.conversation_id' if kind=='artifacts' else ('messages m' if kind=='messages' else ('current_file_edits' if kind=='file_edits' else kind)+' t JOIN messages m ON m.id=t.message_id')+' JOIN owners c ON c.id=m.conversation_id'
+   current='' if kind in ('conversations','artifacts') else " AND json_extract_string(m.metadata,'$.history_of') IS NULL"
+   if kind=='tool_calls': current+=' AND NOT EXISTS(SELECT 1 FROM parser_tool_history h WHERE h.old_id=t.id)'
+   for source,session,count in db.execute("WITH owners AS MATERIALIZED (SELECT id,source,json_extract_string(metadata,'$.session_id') AS provider_session FROM conversations) SELECT c.source,c.provider_session,count(*) FROM "+joined+" WHERE c.source IN ('codex','claude-code')"+current+' GROUP BY 1,2').fetchall(): out[key(source,session)][kind]=count
+print(json.dumps(out,sort_keys=True))
+"""
+    return json.loads(run((client['venv']/'bin/python','-c',code,*([str(corpus)] if corpus else [])),env=client['env'],timeout=600).stdout)
+
+
+def customer_resume(client,session,evidence,measure):
+    paths=[desktop_transcript(client,f'{session}-resume-{i}',client['root']/'absent-worktree') for i in range(25)]
+    ledger=client['root']/'archive/data/sync_state.json'
+    with (evidence/'interrupted-import.log').open('w') as log:
+        process=subprocess.Popen((client['venv']/'bin/convos','sync','--local-only'),env=client['env'],stdout=log,stderr=subprocess.STDOUT)
+        deadline=time.monotonic()+30
+        try:
+            while process.poll() is None and time.monotonic()<deadline:
+                files=json.loads(ledger.read_text()).get('local',{}).get('codex',{}).get('files',{}) if ledger.exists() else {}
+                completed=[str(p) for p in paths if str(p) in files]
+                if len(completed)==20:
+                    process.send_signal(signal.SIGINT)
+                    break
+                time.sleep(.01)
+            else: raise AssertionError('installed import did not expose its first saved batch for interruption')
+            if process.wait(timeout=10)==0: raise AssertionError('interruption did not stop the installed importer')
+        finally:
+            if process.poll() is None: process.kill()
+            process.wait(timeout=10)
+    output=measure('resume-import',client,'sync','--local-only',budget=30)
+    if 'importing 5 transcript(s)' not in output.stderr: raise AssertionError('resume repeated completed transcript imports')
+    (evidence/'resume.json').write_text(json.dumps(dict(checkpointed=20,resumed=5,interrupted_returncode=process.returncode))+'\n')
+
+
+def customer_activity(clients,session,turns,measure):
+    turns=max([turns,*[sum(json.loads(line)['type']=='response_item' for line in p.read_text().splitlines()) for c in clients[:2] for p in [c['root']/'codex/sessions'/f'rollout-2026-01-01T00-00-00-{session}-{c["root"].name}.jsonl'] if p.exists()]])
+    for client in clients[:2]:
+        owned=session+'-'+client['root'].name
+        repo=client['root']/'activity-checkout'
+        if not repo.exists():
+            repo.mkdir()
+            run(('git','-C',repo,'init','-q'))
+            run(('git','-C',repo,'-c','user.name=Convos Testbed','-c','user.email=test@example.invalid','commit','--allow-empty','-qm','initial'))
+        desktop_transcript(client,owned,repo,turns)
+        desktop_claude_transcript(client,owned+'-claude',repo)
+        measure('activity-seed-'+client['root'].name,client,'sync','--local-only',budget=60)
+    def append(client):
+        owned=session+'-'+client['root'].name
+        path=client['root']/'codex/sessions'/f'rollout-2026-01-01T00-00-00-{owned}.jsonl'
+        for i in range(turns,turns+4):
+            row=dict(type='response_item',timestamp=(datetime(2026,1,1)+timedelta(seconds=i+1)).isoformat()+'Z',payload=dict(type='message',role='user' if i%2==0 else 'assistant',content=[dict(type='input_text' if i%2==0 else 'output_text',text=f'canary {owned} turn {i}')]))
+            with path.open('a') as stream: stream.write(json.dumps(row)+'\n')
+            for event in ('PostToolUse','Stop','SessionEnd'):
+                measure(f'capture-{client["root"].name}-{i}-{event}',client,'capture','codex',input=json.dumps(dict(transcript_path=str(path),hook_event_name=event)),budget=5)
+        claude=client['root']/'claude/projects/checkout'/f'{owned}-claude.jsonl'
+        measure('capture-claude-'+client['root'].name,client,'capture','claude-code',input=json.dumps(dict(transcript_path=str(claude),hook_event_name='Stop')),budget=5)
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        jobs=[pool.submit(append,client) for client in clients[:2]]
+        jobs += [pool.submit(measure,f'concurrent-{client["root"].name}-{args[0]}',client,*args,budget=budget,check=args[0]!='sync') for client in clients[:2] for args,budget in ((('sync','--local-only'),30),(('remote','sync'),120),(('search','canary'),15),(('doctor',),15))]
+        for job in jobs: job.result()
+    for client in clients[:2]:
+        measure('settle-hooks-'+client['root'].name,client,'drain-hooks','--block',budget=30)
+        measure('settle-local-'+client['root'].name,client,'sync','--local-only',budget=30)
+    for iteration in range(3):
+        for client in clients: measure(f'activity-remote-{iteration}-{client["root"].name}',client,'remote','sync',budget=120)
+    rows=[desktop_inventory(client) for client in clients]
+    if rows[0]!=rows[1] or rows[2]: raise AssertionError('concurrent customer capture did not converge privately')
+    for values in rows[:2]:
+        for client in clients[:2]:
+            owned=session+'-'+client['root'].name
+            if sorted(v['content'] for v in values if v['provider_session']==owned)!=sorted(f'canary {owned} turn {i}' for i in range(turns+4)): raise AssertionError('concurrent capture lost or duplicated a turn')
+    return rows,turns+4
+
+
+def customer_large_append(client,manifest,evidence,measure):
+    from ai_convos.cli import _backup_copy, open_db
+    entry=max((v for v in manifest['corpus'] if v['path'].startswith('codex/sessions/')),key=lambda v:v['bytes'])
+    source=client['root']/entry['path']
+    archive=client['root']/'archive'
+    clone=desktop_client(evidence/'large-append/laptop',client['venv'])
+    clone['env']={**client['env'],'CONVOS_PROJECT_ROOT':str(clone['root']/'archive')}
+    target=clone['root']/'archive'
+    (target/'data').mkdir(parents=True,mode=0o700)
+    (target/'remote').mkdir(mode=0o700)
+    backup=evidence/'large-append/transcript.original'
+    with operation_lock(archive/'data/.sync.lock','testbed.large-append.snapshot',0),operation_lock(archive/'data/hook_inbox/.drain.lock','testbed.large-append.capture',30):
+        with open_db(archive/'data/convos.db',True,purpose='testbed.large-append.snapshot'):
+            if (archive/'data/convos.db.wal').exists(): raise ValueError('large-append snapshot requires a checkpointed archive')
+            _backup_copy(archive/'data/convos.db',target/'data/convos.db')
+        for relative in ('data/sync_state.json','remote/config.json'):
+            shutil.copy2(archive/relative,target/relative)
+        if (archive/'data/attachments').exists(): shutil.copytree(archive/'data/attachments',target/'data/attachments',copy_function=_backup_copy)
+        before,children=desktop_inventory(clone),customer_projection(clone)
+        if sha256(source)!=entry['sha256']: raise ValueError('large-append input differs from its frozen source')
+        _backup_copy(source,backup)
+        shutil.copystat(source,backup)
+        sentinels=[f'private large-transcript qualification {evidence.name} turn {i}' for i in range(2)]
+        try:
+            with source.open('a') as stream:
+                for i,text in enumerate(sentinels):
+                    stream.write(json.dumps(dict(type='response_item',timestamp=f'2026-09-18T00:00:0{i}Z',payload=dict(type='message',role='user' if i==0 else 'assistant',content=[dict(type='input_text' if i==0 else 'output_text',text=text)])))+'\n')
+            measure('large-append-capture',clone,'capture','codex',input=json.dumps(dict(transcript_path=str(source),hook_event_name='Stop')),budget=5)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                jobs=[pool.submit(measure,'large-append-'+label,clone,*args,budget=budget) for label,args,budget in (('drain',('drain-hooks','--block'),120),('sync',('sync','--local-only'),120),('search',('search','qualification'),15),('doctor',('doctor',),15))]
+                for job in jobs: job.result()
+            after=desktop_inventory(clone)
+            if [row for row in after if row['content'] not in sentinels]!=before or sorted(row['content'] for row in after if row['content'] in sentinels)!=sorted(sentinels): raise AssertionError('large transcript append lost, duplicated, or changed existing turns')
+            changed=customer_projection(clone)
+            if any(changed[kind]!=value for kind,value in children.items() if kind not in ('conversations','messages')): raise AssertionError('large transcript append changed unrelated child rows')
+            (evidence/'large-append.json').write_text(json.dumps(dict(bytes=entry['bytes'],added_messages=2,original_messages=len(before),success=True),indent=2)+'\n')
+        finally:
+            os.replace(backup,source)
+            if sha256(source)!=entry['sha256']: raise AssertionError('large-append test did not restore its private transcript copy')
+
+
 def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
     import socket
     root,venv=Path(root).resolve(),Path(venv).resolve()
@@ -606,8 +754,8 @@ def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
             for target,source in sources.items():
                 files=sorted(p for p in source.rglob('*.jsonl') if p.is_file() and not p.is_symlink() and inside(p,source) and p.stat().st_mtime<time.time()-60)
                 if target.startswith('codex'):
-                    files=[p for p in files if p.stat().st_size<=16*1024**2]
-                    files=[files[i] for i in sorted({round(j*(len(files)-1)/max(1,min(sessions,len(files))-1)) for j in range(min(sessions,len(files)))})]
+                    selected=[files[i] for i in sorted({round(j*(len(files)-1)/max(1,min(sessions,len(files))-1)) for j in range(min(sessions,len(files)))})]
+                    files=sorted(set(selected+sorted(files,key=lambda p:p.stat().st_size)[-2:]))
                 if not files: raise ValueError(f'no stable transcript inputs in {source}')
                 for path in files:
                     with path.open('rb') as stream:
@@ -642,6 +790,17 @@ def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
         evidence=root/f"check-{len(manifest['runs'])+1}-{int(time.time())}"
         evidence.mkdir(mode=0o700)
         started=time.monotonic()
+        timings=[]
+        def measure(label,client,*args,budget,input=None,check=True):
+            tick=time.monotonic()
+            try:
+                output=desktop_cli(client,*args,input=input,check=check,timeout=budget)
+                (evidence/f'{label}.log').write_text(output.stdout+output.stderr)
+                return output
+            except subprocess.TimeoutExpired as error:
+                (evidence/f'{label}.log').write_bytes((error.stdout or b'')+(error.stderr or b''))
+                raise
+            finally: timings.append(dict(workload=label,seconds=time.monotonic()-tick,budget=budget))
         with socket.socket() as sock:
             sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
             sock.bind(('127.0.0.1',manifest['port']))
@@ -656,32 +815,51 @@ def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
                     desktop_cli(b,'remote','recover',url,'customer-alice','--device','desktop',input=recovery+'\n')
                 if not (c['root']/'archive/remote/config.json').exists(): desktop_cli(c,'remote','setup',url,'customer-bob','--device','independent-user')
                 for index,client in enumerate(clients):
-                    output=desktop_cli(client,'sync','--local-only',*(['--full'] if full else []))
-                    (evidence/f'import-{index}.log').write_text(output.stdout+output.stderr)
+                    if index==1:
+                        measure('source-owner-seed',clients[0],'remote','sync',budget=600)
+                        measure('peer-owner-receive',client,'remote','sync',budget=600)
+                    measure(f'import-{index}',client,'sync','--local-only',*(['--full'] if full else []),budget=600)
                 before=[desktop_inventory(client) for client in clients[:2]]
-                content=lambda rows:sorted((json.dumps({k:v for k,v in row.items() if k not in ('conversation_id','message_id','parent_id')},sort_keys=True) for row in rows))
+                activity=manifest.setdefault('activity_session','qualification-live-'+hashlib.sha256(str(root).encode()).hexdigest()[:16])
+                content=lambda rows:sorted((json.dumps({k:v for k,v in row.items() if k not in ('conversation_id','message_id','parent_id')},sort_keys=True) for row in rows if not (row['provider_session'] or '').startswith(activity)))
                 content_hash=lambda rows:hashlib.sha256(json.dumps(content(rows)).encode()).hexdigest()
                 if 'source_projection' not in manifest:
                     if content(before[0])!=content(before[1]): raise AssertionError('same source snapshots parsed differently across device timezones')
                     manifest['source_projection']=content_hash(before[0])
                     atomic_json(marker,manifest)
+                if 'source_counts' not in manifest:
+                    manifest['source_counts']=customer_source_counts(a,root/'corpus')
+                    atomic_json(marker,manifest)
                 for iteration in range(3):
                     for index,client in enumerate(clients):
-                        output=desktop_cli(client,'remote','sync')
-                        (evidence/f'sync-{iteration}-{index}.log').write_text(output.stdout+output.stderr)
+                        measure(f'sync-{iteration}-{index}',client,'remote','sync',budget=600)
+                    if iteration<2:
+                        for index,client in enumerate(clients[:2]): measure(f'source-bindings-{iteration}-{index}',client,'sync','--local-only',budget=600)
+                source_counts=[{key:value for key,value in customer_source_counts(client).items() if not (json.loads(key)[1] or '').startswith(activity)} for client in clients]
+                (evidence/'source-counts.json').write_text(json.dumps(dict(expected=manifest['source_counts'],clients=source_counts),indent=2)+'\n')
+                if source_counts[:2]!=[manifest['source_counts']]*2 or source_counts[2]: raise AssertionError('synced current rows do not match frozen source multiplicity')
                 inventories=[desktop_inventory(client) for client in clients]
                 if inventories[0]!=inventories[1]: raise AssertionError('real conversation IDs, parents, or content diverged between same-user devices')
                 if content_hash(inventories[0])!=manifest['source_projection']: raise AssertionError('real conversation sync lost or duplicated source turns')
                 if inventories[2]: raise AssertionError('independent user received private conversation content')
                 projections=[customer_projection(client) for client in clients]
                 if projections[0]!=projections[1] or any(v['rows'] for v in projections[2].values()): raise AssertionError('real conversation child rows diverged or crossed users')
-                prior=next((run for run in reversed(manifest['runs']) if run['success'] and run['commit']==commit and run.get('full_reimport')),None)
-                if full and prior and projections!=prior['projections']: raise AssertionError('unchanged corpus and package produced different rows after another full import')
+                for index,client in enumerate(clients): measure(f'noop-local-{index}',client,'sync','--local-only',budget=15)
+                for index,client in enumerate(clients): measure(f'noop-remote-{index}',client,'remote','sync',budget=15)
+                if [customer_projection(client) for client in clients]!=projections: raise AssertionError('no-op import changed retained logical rows')
+                if not manifest.get('resume_verified'):
+                    customer_resume(clients[0],activity+f'-attempt-{len(manifest["runs"])}',evidence,measure)
+                    manifest['resume_verified']=True
+                inventories,manifest['activity_turns']=customer_activity(clients,activity,manifest.get('activity_turns',2),measure)
+                if content_hash(inventories[0])!=manifest['source_projection']: raise AssertionError('concurrent activity changed frozen source turns')
+                projections=[customer_projection(client) for client in clients]
+                if projections[0]!=projections[1]: raise AssertionError('concurrent activity diverged in child rows')
                 for index,client in enumerate(clients):
                     audit=json.loads(desktop_cli(client,'remote','audit','--format','json').stdout)
                     (evidence/f'audit-{index}.json').write_text(json.dumps(audit,indent=2)+'\n')
                     if audit['totals'].get('unavailable',0) or any(v['rows'] for v in audit['relationships'].values()): raise AssertionError(f'client {index}: unresolved real archive evidence')
-                    (evidence/f'doctor-{index}.log').write_text(desktop_cli(client,'doctor').stdout)
+                    measure(f'doctor-{index}',client,'doctor',budget=15)
+                customer_large_append(a,manifest,evidence,measure)
                 outcome=dict(commit=commit,success=True,full_reimport=full,seconds=time.monotonic()-started,projections=projections,messages=[len(rows) for rows in inventories],projection_sha256=[hashlib.sha256(json.dumps(rows,sort_keys=True).encode()).hexdigest() for rows in inventories],evidence=str(evidence))
             except BaseException as error:
                 outcome=dict(commit=commit,success=False,seconds=time.monotonic()-started,error=f'{type(error).__name__}: {error}',evidence=str(evidence))
@@ -690,6 +868,7 @@ def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
                 server.terminate()
                 server.wait(timeout=10)
                 manifest['runs'].append(outcome)
+                (evidence/'timings.json').write_text(json.dumps(timings,indent=2)+'\n')
                 atomic_json(marker,manifest)
         print(json.dumps(outcome,indent=2))
 

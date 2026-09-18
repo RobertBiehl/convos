@@ -66,19 +66,13 @@ jobs:
       - name: Check out released upgrade baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: v0.11.6b11
-          path: .baseline-b11
+          ref: v0.11.6b12
+          path: .baseline-b12
       - name: Install released baseline
-        working-directory: .baseline-b11
+        working-directory: .baseline-b12
         run: uv sync --locked --extra dev
-      - name: Prove released clients diverge against the current relay
-        run: |
-          if uv run python scripts/remote_testbed.py desktop --root "$RUNNER_TEMP/customer-upgrade" --venv "$GITHUB_WORKSPACE/.baseline-b11/.venv" --relay-venv "$RUNNER_TEMP/customer-install" --commit v0.11.6b11; then
-            exit 1
-          fi
-          uv run python -c 'import json,os,pathlib; r=json.loads((pathlib.Path(os.environ["RUNNER_TEMP"])/"customer-upgrade/testbed.json").read_text())["runs"][-1]; assert not r["success"] and "expected 2 exact Codex turns, got 4" in r["error"], r'
-      - name: Upgrade the retained archives through mixed client versions
-        run: uv run python scripts/remote_testbed.py desktop --root "$RUNNER_TEMP/customer-upgrade" --venv "$RUNNER_TEMP/customer-install" --baseline-venv "$GITHUB_WORKSPACE/.baseline-b11/.venv" --commit "$GITHUB_SHA"
+      - name: Upgrade released archives and reset the relay once
+        run: uv run python scripts/remote_testbed.py desktop --root "$RUNNER_TEMP/customer-upgrade" --venv "$RUNNER_TEMP/customer-install" --baseline-venv "$GITHUB_WORKSPACE/.baseline-b12/.venv" --commit "$GITHUB_SHA"
       - name: Preserve qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

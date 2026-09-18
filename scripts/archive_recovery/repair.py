@@ -119,7 +119,7 @@ def run(root, output, apply=False, database_only=False, donor=None, diagnosis=No
                 core.required(plan(db, donor, diagnosis) == expected, ValueError('Archive or donor changed since planning'))
                 repaired = core.repair_legacy_edit_scopes(db, apply=True)
                 restored = core.restore_signed_bodies(db, expected['bodies'])
-                allowed = {('provenance', 'file_edit_scopes'), ('main', 'archive_state'), ('main', 'archive_changes')}
+                allowed = {('provenance', 'file_edit_scopes'), ('main', 'archive_state'), ('main', 'archive_changes'), ('main', 'retrieval_state')}
                 if restored: allowed |= {('remote', 'row_conflicts'), ('main', 'retrieval_state')}
                 protected = verify_unchanged(db, backup, allowed)
                 remaining = plan(db, donor, diagnosis)

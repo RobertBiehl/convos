@@ -1,4 +1,4 @@
-"""Binary relay migrations preserve encrypted history and publish verified copies only."""
+"""The one-time relay boundary resets old replicas; explicit backups preserve the old file."""
 import json, sqlite3, stat
 from contextlib import closing
 
@@ -34,87 +34,40 @@ def legacy_relay(path):
     return author,envelopes
 
 
-def test_binary_migration_preserves_every_envelope_cursor_and_source(tmp_path,capsys):
-    source,target=tmp_path/"old.db",tmp_path/"binary.db"
+@pytest.mark.parametrize('version',[1,2])
+def test_upgrade_resets_encrypted_history_once_with_optional_explicit_backup(tmp_path,version):
+    source,target=tmp_path/'old.db',tmp_path/'backup.db'
     author,envelopes=legacy_relay(source)
-    original,modified=source.read_bytes(),source.stat().st_mtime_ns
-    server.main(["migrate","--db",str(source),"--output",str(target)])
-    assert capsys.readouterr().out.strip()==str(target)
-    assert source.read_bytes()==original and source.stat().st_mtime_ns==modified
+    with closing(sqlite3.connect(source)) as db:
+        db.execute(f'PRAGMA user_version={version}')
+        db.commit()
+    server.main(['backup','--db',str(source),'--output',str(target)])
     assert stat.S_IMODE(target.stat().st_mode)==0o600
-    with closing(server.connect(target)) as db,closing(sqlite3.connect(source)) as old:
-        assert db.execute("PRAGMA user_version").fetchone()[0]==2
-        for table,env in envelopes.items():
-            row=db.execute(f"SELECT * FROM {table}").fetchone()
-            assert isinstance(row["ciphertext"],bytes) and "ciphertext" not in json.loads(row["envelope"])
-            assert server.stored_envelope(row)==env and row["wire_hash"]==server.digest(env)
-            assert row["wire_size"]==len(canon(env))
-            assert tuple(row[k] for k in row.keys() if k not in ("envelope","ciphertext","wire_size"))==tuple(v for k,v in zip([d[0] for d in old.execute(f"SELECT * FROM {table}").description],old.execute(f"SELECT * FROM {table}").fetchone()) if k!="envelope")
-        tables=[r[0] for r in old.execute("SELECT name FROM sqlite_master WHERE type='table'") if r[0] not in (*server.ENCRYPTED_TABLES,"replica_usage")]
-        for table in tables: assert [tuple(r) for r in db.execute(f"SELECT * FROM {table}")]==old.execute(f"SELECT * FROM {table}").fetchall()
-        stored=db.execute("SELECT SUM(LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext)) FROM (SELECT envelope,ciphertext FROM row_replicas UNION ALL SELECT envelope,ciphertext FROM semantic_replicas)").fetchone()[0]
-        assert db.execute("SELECT bytes FROM replica_usage").fetchone()[0]==stored
-        token=author["token"]
-        assert server.action(db,{"op":"pull","workspace":"personal"},token)["events"][0]["envelope"]==envelopes["events"]
-        assert server.action(db,{"op":"replica_pull","workspace":"personal","semantic":True},token)["replicas"]==[{"cursor":2,"envelope":envelopes["row_replicas"]},{"cursor":3,"envelope":envelopes["semantic_replicas"]}]
-        assert server.action(db,{"op":"origin_pull","workspace":"personal"},token)["origins"]==[{"cursor":4,"envelope":envelopes["origin_bundles"]}]
-        assert not server.action(db,{"op":"upload","envelope":envelopes["events"]},token)["created"]
-    again=tmp_path/"binary-again.db"
-    server.main(["migrate","--db",str(target),"--output",str(again)])
-    with closing(server.connect(again)) as db:
-        for table,env in envelopes.items(): assert server.stored_envelope(db.execute(f"SELECT * FROM {table}").fetchone())==env
+    with closing(sqlite3.connect(target)) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0]==version
+        assert db.execute('SELECT count(*) FROM events').fetchone()[0]==1
+    with closing(server.connect(source)) as db:
+        generation=server.action(db,{'op':'status'})['generation']
+        assert db.execute('PRAGMA user_version').fetchone()[0]==server.STORAGE_VERSION
+        assert all(db.execute(f'SELECT count(*) FROM {table}').fetchone()[0]==0 for table in (*server.ENCRYPTED_TABLES,'users','devices','workspaces'))
+        fresh=account(db,'alice')
+    with closing(server.connect(source)) as db:
+        assert server.action(db,{'op':'status'})['generation']==generation
+        assert server.auth(db,fresh['token'])['id']==fresh['device']['id']
+        with pytest.raises(PermissionError): server.auth(db,author['token'])
 
 
-@pytest.mark.parametrize("damage",["wire_hash","ciphertext"])
-def test_migration_rejects_corruption_without_publishing_a_partial_copy(tmp_path,damage):
-    source,target=tmp_path/"old.db",tmp_path/"binary.db"
-    legacy_relay(source)
-    with closing(sqlite3.connect(source)) as db:
-        if damage=="wire_hash": db.execute("UPDATE row_replicas SET wire_hash=?",("0"*64,))
-        else:
-            env=json.loads(db.execute("SELECT envelope FROM row_replicas").fetchone()[0])
-            env["ciphertext"]+="="
-            db.execute("UPDATE row_replicas SET envelope=?,wire_hash=?",(json.dumps(env),server.digest(env)))
-        db.commit()
-    original=source.read_bytes()
-    with pytest.raises(ValueError): server.main(["migrate","--db",str(source),"--output",str(target)])
-    assert source.read_bytes()==original and not target.exists()
-    assert not list(tmp_path.glob(".binary.db.*"))
-
-
-def test_migration_never_overwrites_existing_output_and_old_server_state_is_explicit(tmp_path):
-    source,target=tmp_path/"old.db",tmp_path/"binary.db"
-    legacy_relay(source)
-    original=source.read_bytes()
-    with pytest.raises(ValueError,match="migration required"): server.connect(source)
-    assert source.read_bytes()==original
-    target.write_bytes(b"existing backup")
-    with pytest.raises(SystemExit): server.main(["migrate","--db",str(source),"--output",str(target)])
-    assert target.read_bytes()==b"existing backup" and source.read_bytes()==original
-
-
-def test_migration_never_overwrites_output_created_during_conversion(tmp_path,monkeypatch):
-    source,target=tmp_path/"old.db",tmp_path/"binary.db"
-    legacy_relay(source)
-    original,migrate=source.read_bytes(),server.migrate_storage
-    def concurrent_output(db):
-        migrate(db)
-        target.write_bytes(b"concurrently published backup")
-    monkeypatch.setattr(server,"migrate_storage",concurrent_output)
-    with pytest.raises(FileExistsError): server.main(["migrate","--db",str(source),"--output",str(target)])
-    assert target.read_bytes()==b"concurrently published backup" and source.read_bytes()==original
-    assert not list(tmp_path.glob(".binary.db.*"))
-
-
-def test_migration_accounting_does_not_sort_ciphertext(tmp_path):
-    source=tmp_path/"legacy.db"
+def test_interrupted_relay_reset_rolls_back_all_old_data(tmp_path,monkeypatch):
+    source=tmp_path/'old.db'
     author,envelopes=legacy_relay(source)
-    env={**envelopes["row_replicas"],"ciphertext":server.b64(b"x"*(128*1024))}
+    def fail(db): raise KeyboardInterrupt
+    with monkeypatch.context() as patch:
+        patch.setattr(server,'binary_schema',fail)
+        with pytest.raises(KeyboardInterrupt): server.connect(source)
     with closing(sqlite3.connect(source)) as db:
-        db.execute("UPDATE row_replicas SET envelope=?,wire_hash=?",(json.dumps(env),server.digest(env)))
-        db.commit()
-        expected=sum(len(server.split_envelope(e)[0].encode())+len(server.split_envelope(e)[1]) for e in (env,envelopes["semantic_replicas"]))
-        # A diagnostic limit at accounting time rejects payload-sized sorter records.
-        db.set_trace_callback(lambda sql:db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH,64*1024) if sql.startswith("INSERT INTO replica_usage") else None)
-        server.migrate_storage(db)
-        assert db.execute("SELECT bytes FROM replica_usage WHERE uploader=?",(author["device"]["id"],)).fetchone()[0]==expected
+        assert db.execute('PRAGMA user_version').fetchone()[0]==1
+        assert db.execute('SELECT count(*) FROM users').fetchone()[0]==1
+        assert json.loads(db.execute('SELECT envelope FROM events').fetchone()[0])==envelopes['events']
+    with closing(server.connect(source)) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0]==server.STORAGE_VERSION
+        assert db.execute('SELECT count(*) FROM users').fetchone()[0]==0

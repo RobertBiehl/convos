@@ -4,6 +4,31 @@ import pytest, json, tempfile, zipfile
 from pathlib import Path
 from datetime import datetime
 
+@pytest.mark.parametrize('source',['codex','claude-code'])
+def test_provider_ids_survive_path_changes_and_inserted_unparsed_events(tmp_path,source):
+    from ai_convos import cli
+    events=([{'type':'session_meta','payload':{'id':'session'}},{'type':'response_item','payload':{'type':'message','id':'message','role':'user','content':[{'type':'input_text','text':'hello'}]}},{'type':'response_item','payload':{'type':'function_call','call_id':'call','name':'test','arguments':'{}'}}] if source=='codex' else [{'type':'system','sessionId':'session'},{'type':'user','uuid':'message','message':{'content':'hello'}},{'type':'assistant','uuid':'tool-message','parentUuid':'message','message':{'content':[{'type':'tool_use','id':'call','name':'test','input':{}}]}}])
+    parser=cli.parse_codex_session if source=='codex' else cli.parse_claude_code_session
+    first,second=tmp_path/'original.jsonl',tmp_path/'moved.jsonl'
+    first.write_text('\n'.join(map(json.dumps,events)))
+    second.write_text('\n'.join(map(json.dumps,[events[0],{'type':'ignored-event'},*events[1:]])))
+    a,b=parser(first),parser(second)
+    assert a['conv']['id']==b['conv']['id']==cli.gen_id(source,'session')
+    assert [m['id'] for m in a['msgs']]==[m['id'] for m in b['msgs']]
+    assert [t['id'] for t in a['tools']]==[t['id'] for t in b['tools']]
+
+@pytest.mark.parametrize('source',['codex','claude-code'])
+def test_idless_messages_use_original_record_index_and_keep_assigned_ids(tmp_path,source):
+    from ai_convos import cli
+    events=([{'type':'session_meta','payload':{'id':'session'}},{'type':'ignored'},{'type':'response_item','payload':{'type':'message','role':'user','content':[{'type':'input_text','text':'hello'}]}}] if source=='codex' else [{'type':'system','sessionId':'session'},{'type':'ignored'},{'type':'user','message':{'content':'hello'}}])
+    path=tmp_path/'session.jsonl'
+    path.write_text('\n'.join(map(json.dumps,events)))
+    parser=cli.parse_codex_session if source=='codex' else cli.parse_claude_code_session
+    row=parser(path)
+    cid=row['conv']['id']
+    assert row['msgs'][0]['id']==cli.gen_id(source,f'{cid}:2')
+    assert parser(path,{(source,'session'):cid,(source,cid,'message',2):'already-assigned'})['msgs'][0]['id']=='already-assigned'
+
 
 # ---- Claude Code JSONL Parser Tests ----
 

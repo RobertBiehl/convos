@@ -9,6 +9,7 @@ from ai_convos import cli
 ROOT=Path(__file__).resolve().parents[1]
 SOURCES=[ROOT/"src/ai_convos/cli.py",*ROOT.glob("apps/*/src/**/*.py")]
 SQLITE=Counter({
+    ("apps/remote/src/ai_convos_remote/projection.py","reset_sync_state"):1,
     ("src/ai_convos/cli.py","read_chrome_cookies"):1,("src/ai_convos/cli.py","chrome_cookie_domains"):1,
     ("apps/memory/src/ai_convos_memory/__init__.py","_scope"):1,("apps/memory/src/ai_convos_memory/__init__.py","connect"):1,("apps/memory/src/ai_convos_memory/__init__.py","backup_data"):1,("apps/memory/src/ai_convos_memory/__init__.py","_health_data"):1,("apps/memory/src/ai_convos_memory/__init__.py","_snapshot"):3,
     ("apps/redact/src/ai_convos_redact/__init__.py","_audit"):1,("apps/redact/src/ai_convos_redact/__init__.py","audit_data"):1,
