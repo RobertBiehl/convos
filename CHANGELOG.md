@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.11.6b13
+
+- Make the source device the sole writer of a conversation and its children.
+  Use provider IDs when available, and retain assigned IDs for legacy rows.
+- Back up owned local archives and attachment bytes before the identity migration.
+  Remove received copies, reset the previous relay format once, and automatically
+  reenroll existing users and devices with their current keys. Old clients must
+  upgrade; unknown future storage versions are rejected without resetting them.
+- Carry edits as tool or message metadata, preserving their original turn and
+  signed history. Remove ongoing parser-alias reconciliation.
+- Buffer hooks durably, import in bounded transactions, and retry Git provenance
+  independently. Preserve completed tool output when an incomplete snapshot arrives.
+- Keep unchanged peer imports cheap, and avoid attachment history duplicates when
+  cached bytes move. Validate complete archive equality and account isolation using
+  real transcript copies, interrupted imports, concurrent hooks, and large appends.
+
+All eight products are aligned to b13. Core schema 17 and parser epoch 12 apply
+the one-time source-device boundary. The existing release gate tests installed
+packages on Linux and macOS, including upgrades from b12.
+
 ## 0.11.6b12
 
 - Require DuckDB 1.4.5 or newer to avoid a known column-update assertion in
