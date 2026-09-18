@@ -441,6 +441,9 @@ def project_workspace_controls(db,controls):
 def _logical_parts(row,proof,proof_id,native,parent_map):
     table,source,mapped,physical,origin=(table:=row["kind"]),(source:=row["id"]),(mapped:=lambda kind,value:(parent_map or {}).get((kind,value),value if native else remote_id(proof["author_user_id"],kind,value))),*((source,None) if native else (remote_id(proof["author_user_id"],table,source),{"workspace_id":proof["workspace"],"author_user_id":proof["author_user_id"],"author_device_id":proof["author_device_id"],"source_row_id":source,"source_event_id":proof["revision"],"content_key":f"{table}:{source}","observed_at":None,"proof_id":proof_id}))
     return table,source,mapped,physical,origin
+def parser_lineage_union(values):
+    required(all(isinstance(v,dict) and set(v)=={'v','records'} and type(v['v']) is int and v['v']==1 and isinstance(v['records'],list) and all(isinstance(r,dict) and set(r)=={'old_id','old_hash','current_id','current_hash'} and all(isinstance(r[k],str) and re.fullmatch('[0-9a-f]{'+str(64 if k.endswith('hash') else 16)+'}',r[k]) for k in r) for r in v['records']) for v in values),ValueError('provider alias lineage merge is invalid'))
+    return (lambda canon:dict(v=1,records=sorted({canon(r):r for v in values for r in v['records']}.values(),key=canon)))(lambda value:json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True,allow_nan=False))
 def record_tool_lineage(db,messages,kind="tool_calls",metadata=None):
     label,owner={"tool_calls":("tool","messages"),"file_edits":("edit","messages"),"messages":("message","conversations")}[kind]
     if not messages: return
@@ -1002,7 +1005,7 @@ def prepare_edit_lineage(db,r):
     snapshots=[(original,current,snapshot) for original,current in r.edit_lineage for prior in variants(original,current) for snapshot in (prior,dict(zip(prior,_history_row('file_edits',list(prior.values()),tuple(v for i,v in enumerate(prior.values()) if i not in (0,5))))))]
     scopes|=captured({snapshot['id'] for original,current,snapshot in snapshots}-set(scopes))
     pairs=[(old,new) for original,current,snapshot in snapshots for parent in {snapshot['message_id'],current['message_id']} for old in variants({**snapshot,'message_id':parent},current) for new in variants(current,current)]
-    prepare_tool_lineage(db,r,'file_edits',parser_tool_lineage(pairs,'file_edits',True))
+    return prepare_tool_lineage(db,r,'file_edits',parser_tool_lineage(pairs,'file_edits',True))
 def prepare_tool_lineage(db,r,kind="tool_calls",lineage=None):
     lineage,label=r.tool_lineage if lineage is None else lineage,'tool' if kind=='tool_calls' else 'edit'
     if not lineage: return
@@ -1010,6 +1013,7 @@ def prepare_tool_lineage(db,r,kind="tool_calls",lineage=None):
     kept=[(mid,dict(zip(('old_id','old_hash','current_id','current_hash'),value))) for mid,*value in lineage if value[0] not in received and ((body:=bodies.get((kind,value[0],value[0],'','active'))) is None and len(value)==5 and value[4] or body is not None and provenance_digest(body)==value[1])]
     for m in r.msgs:
         if records:=[value for mid,value in kept if mid==m['id']]: m['metadata']=json.dumps({**json.loads(m['metadata'] or '{}'),f'convos_{label}_lineage':{'v':1,'records':records}})
+    return {v[1] for v in lineage}
 
 def prepare_message_lineage(db,r):
     stored={cid:json.loads(meta or '{}') for cid,meta in db.execute("SELECT id,metadata FROM conversations WHERE id IN (SELECT UNNEST(?))",[[c['id'] for c in r.convs]]).fetchall()} if r.convs else {}
@@ -1142,13 +1146,26 @@ def _prune_remote_rows(conn,r):
     before,((r.convs, r.msgs, r.tools, r.attachs, r.artifacts, r.edits))=(before:=sum(map(len,(r.convs,r.msgs,r.tools,r.attachs,r.artifacts,r.edits,r.edit_evidence)))),([v for v in r.convs if v["id"] not in convs],[v for v in r.msgs if v["id"] not in msgs],[v for v in r.tools if v["id"] not in tools],[v for v in r.attachs if v["id"] not in attachs],[v for v in r.artifacts if v["id"] not in artifacts],[v for v in r.edits if v["id"] not in edits])
     r.edit_evidence=[v for v in r.edit_evidence if v["file_edit_id"] not in edits and v["tool_call_id"] not in tools]
     if skipped:=before-sum(map(len,(r.convs,r.msgs,r.tools,r.attachs,r.artifacts,r.edits,r.edit_evidence))): typer.echo(f"  skipped {skipped} local row(s) owned by signed Remote data",err=True)
+def preserve_parser_metadata(messages,stored,managed):
+    for message in messages:
+        if (prior:=stored.get(message['id'])) is None: continue
+        old,metadata,previous,labels=dict(zip(ARCHIVE_COLUMNS['messages'],prior[:8]+prior[9:])),json.loads(message['metadata'] or '{}'),json.loads(prior[7] or '{}'),('convos_tool_lineage','convos_edit_lineage')
+        if not isinstance(metadata,dict) or not isinstance(previous,dict) or any(message[k]!=v for k,v in old.items() if k!='metadata') or {k:v for k,v in metadata.items() if k not in labels}!={k:v for k,v in previous.items() if k not in labels}: continue
+        baseline=previous.copy()
+        for key in labels:
+            try:
+                if key in previous: baseline[key]=parser_lineage_union([previous[key]])
+                if values:=[*([metadata[key]] if key in metadata else []),*([dict(v=1,records=retained)] if key in baseline and (retained:=[r for r in baseline[key]['records'] if r['old_id'] not in (managed[key] or ())]) else [])]: metadata[key]=parser_lineage_union(values)
+            except ValueError: pass
+        message['metadata']=prior[7] if metadata==baseline else json.dumps(metadata)
+    return stored
 def upsert(conn, r: ParseResult):
     (required(not (conflict:=_id_conflict(r.convs,("source","cwd","git_branch","project_id","metadata")) or _id_conflict(r.msgs,("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"))),ValueError(f"divergent provider session in import batch: {conflict}")),_prune_remote_rows(conn,r))
     if uncertain:={v["file_edit_id"] for v in r.edit_evidence if v["status"]!="confirmed"}: r.edit_evidence=[v for v in r.edit_evidence if v["status"]=="confirmed" or v["file_edit_id"] in {e["id"] for e in r.edits}|{x[0] for x in conn.execute("SELECT id FROM file_edits WHERE id IN (SELECT UNNEST(?))",(list(uncertain),)).fetchall()}]
-    (_parse_result_refs(conn,r),prepare_tool_lineage(conn,r),prepare_edit_lineage(conn,r),prepare_message_lineage(conn,r),_quarantine_stubs(r))
+    (_parse_result_refs(conn,r),(tool_sources:=prepare_tool_lineage(conn,r)),(edit_sources:=prepare_edit_lineage(conn,r)),prepare_message_lineage(conn,r),_quarantine_stubs(r))
     cids,mids,bindings=[c["id"] for c in r.convs],[m["id"] for m in r.msgs],[(c["source"],meta["session_id"],c["id"]) for c in r.convs if (meta:=json.loads(c["metadata"] or "{}")).get("session_id")]
     required(not (conflict:=conn.execute("SELECT p.source,p.session_id,p.conversation_id,json_extract_string(j.value,'$.conversation_id') FROM provider_sessions p JOIN json_each(?) j ON p.source=json_extract_string(j.value,'$.source') AND p.session_id=json_extract_string(j.value,'$.session_id') WHERE p.conversation_id<>json_extract_string(j.value,'$.conversation_id') LIMIT 1",(json.dumps([dict(source=s,session_id=i,conversation_id=c) for s,i,c in bindings]),)).fetchone() if bindings else None),ValueError(f"provider session identity conflict: {conflict}"))
-    old_convs,old_msgs,new_convs,changed_rows,changed_msgs,updated,changed_conversations=(old_convs:=_rows_by_id(conn,"conversations",cids)),(old_msgs:=_rows_by_id(conn,"messages",mids)),(new_convs:=set(cids)-set(old_convs)),(changed_rows:={m["id"] for m in r.msgs if m["id"] not in old_msgs or old_msgs[m["id"]][:8]+old_msgs[m["id"]][9:]!=tuple(m.values())}),(changed_msgs:={m["id"] for m in r.msgs if m["id"] not in old_msgs or old_msgs[m["id"]][2:5]!=tuple(m[k] for k in ("role","content","thinking"))}),{m["conversation_id"] for m in r.msgs if m["id"] in changed_msgs}-new_convs,[list(c.values()) for c in r.convs if old_convs.get(c["id"])!=tuple(c.values())]
+    old_convs,old_msgs,new_convs,changed_rows,changed_msgs,updated,changed_conversations=(old_convs:=_rows_by_id(conn,"conversations",cids)),(old_msgs:=preserve_parser_metadata(r.msgs,_rows_by_id(conn,"messages",mids),dict(convos_tool_lineage=tool_sources,convos_edit_lineage=edit_sources))),(new_convs:=set(cids)-set(old_convs)),(changed_rows:={m["id"] for m in r.msgs if m["id"] not in old_msgs or old_msgs[m["id"]][:8]+old_msgs[m["id"]][9:]!=tuple(m.values())}),(changed_msgs:={m["id"] for m in r.msgs if m["id"] not in old_msgs or old_msgs[m["id"]][2:5]!=tuple(m[k] for k in ("role","content","thinking"))}),{m["conversation_id"] for m in r.msgs if m["id"] in changed_msgs}-new_convs,[list(c.values()) for c in r.convs if old_convs.get(c["id"])!=tuple(c.values())]
     with preserve_fact_heads(conn,[("conversations",row[0]) for row in changed_conversations if row[0] in old_convs],observed=True): changed_conversations and conn.executemany(_CONV_UPS,changed_conversations)
     (((bindings) and (conn.executemany("INSERT INTO provider_sessions VALUES (?,?,?) ON CONFLICT(source,session_id) DO NOTHING",list(dict.fromkeys(bindings))))),((frozen:=r.scopes if r.scopes is not None else pending_scopes([(c["id"],c["cwd"]) for c in r.convs])) and (conn.executemany("INSERT OR IGNORE INTO provenance.conversation_scopes VALUES (?,?,?,?,?,?)",frozen))))
     message_history=[_history_row("messages",old,old[2:5]) for m in r.msgs if (old:=old_msgs.get(m["id"])) and old[2:5]!=tuple(m[k] for k in ("role","content","thinking"))]

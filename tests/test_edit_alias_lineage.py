@@ -31,6 +31,62 @@ def fixture(tmp_path,source):
 
 
 @pytest.mark.parametrize('source',['codex','claude-code'])
+@pytest.mark.parametrize('label',['convos_tool_lineage','convos_edit_lineage'])
+@pytest.mark.parametrize('change',['format','additional','content','malformed'])
+def test_reimport_preserves_equivalent_parser_metadata_without_rewriting_messages(tmp_path,source,label,change):
+    path,parser,_,_,_=fixture(tmp_path,source)
+    def result():
+        parsed=parser(path)
+        return core.ParseResult(convs=[parsed['conv']],**{key:parsed[key] for key in ('msgs','tools','edits','edit_evidence','tool_lineage','edit_lineage','message_lineage')})
+    with core.open_db(tmp_path/'archive.db',purpose='test.reimport.metadata') as db:
+        core.init_schema(db)
+        core.upsert(db,result())
+        core.upsert(db,result())
+        message=db.execute('SELECT id,metadata FROM messages ORDER BY id LIMIT 1').fetchone()
+        metadata=json.loads(message[1])
+        extra=dict(old_id='a'*16,old_hash='a'*64,current_id='b'*16,current_hash='b'*64)
+        if change!='format': metadata[label]=projection._lineage_union([metadata.get(label,dict(v=1,records=[])),dict(v=1,records=[extra])])
+        if change=='malformed': metadata[label]['records'][0]['old_hash']='invalid'
+        encoded=json.dumps(metadata,sort_keys=True,separators=(',',':'))
+        db.execute('UPDATE messages SET metadata=? WHERE id=?',[encoded,message[0]])
+        incoming=result()
+        if change=='content': next(m for m in incoming.msgs if m['id']==message[0])['content']='a real source revision'
+        changed=core.upsert(db,incoming)[1]
+        stored=json.loads(db.execute('SELECT metadata FROM messages WHERE id=?',[message[0]]).fetchone()[0])
+        if change in ('format','additional'):
+            assert changed==0
+            assert stored==metadata
+        else:
+            assert changed==1
+            assert extra not in stored.get(label,{}).get('records',[])
+        assert not core.archive_relationships(db)
+
+
+@pytest.mark.parametrize('source',['codex','claude-code'])
+@pytest.mark.parametrize('kind,label,field',[('tool_calls','convos_tool_lineage','output'),('file_edits','convos_edit_lineage','content')])
+def test_reimport_withdraws_own_classification_when_legacy_body_no_longer_matches(tmp_path,source,kind,label,field):
+    path,parser,old,bound,canonical=fixture(tmp_path,source)
+    def result(parsed):
+        return core.ParseResult(convs=[parsed['conv']],**{key:parsed[key] for key in ('msgs','tools','edits','edit_evidence','tool_lineage','edit_lineage','message_lineage')})
+    with core.open_db(tmp_path/'archive.db',purpose='test.reimport.withdraw') as db:
+        core.init_schema(db)
+        core.upsert(db,result(old))
+        db.execute('UPDATE conversations SET id=?',[canonical])
+        db.execute('UPDATE messages SET conversation_id=?',[canonical])
+        db.execute('UPDATE provider_sessions SET conversation_id=?',[canonical])
+        core.upsert(db,result(parser(path,bound)))
+        legacy=old['tools' if kind=='tool_calls' else 'edits'][0]['id']
+        claims=lambda:[r for metadata, in db.execute('SELECT metadata FROM messages').fetchall() for r in json.loads(metadata).get(label,{}).get('records',[]) if r['old_id']==legacy]
+        assert claims()
+        retained=json.dumps('unique retained evidence') if kind=='tool_calls' else 'unique retained evidence'
+        db.execute(f'UPDATE {kind} SET {field}=? WHERE id=?',[retained,legacy])
+        core.upsert(db,result(parser(path,bound)))
+        assert not claims()
+        assert db.execute(f'SELECT {field} FROM {kind} WHERE id=?',[legacy]).fetchone()==(retained,)
+        assert not core.archive_relationships(db)
+
+
+@pytest.mark.parametrize('source',['codex','claude-code'])
 @pytest.mark.parametrize('alter',[False,True])
 def test_alias_reimport_marks_only_exact_edit_copies_and_retains_every_body(tmp_path,source,alter):
     path,parser,old,bound,canonical=fixture(tmp_path,source)

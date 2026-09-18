@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_yield, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_file_edit_evidence_many, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_yield, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, parser_lineage_union as _lineage_union, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_file_edit_evidence_many, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
@@ -548,9 +548,6 @@ def _alias_members(db,user,source,session,members,canonical):
     required(all(actual==source and isinstance(metadata:=json.loads(raw) if raw else None,dict) and provider_session_key(source,metadata.get("session_id"))==provider_session_key(source,session) for actual,raw in db.execute("SELECT source,metadata FROM conversations WHERE id IN (SELECT UNNEST(?))",[[member_physical[m] for m in active]]).fetchall()),ValueError("provider alias exact evidence conflicts"))
     member_physical|={member:foreign_id(user,'conversations',member) if member in origin_members else member for member in set(members)-set(member_physical)}
     return member_heads,member_physical,active,{member:member_physical[member]==member and member in local or member not in origin_members and member not in present for member in members},not (binding:=db.execute("SELECT conversation_id FROM provider_sessions WHERE source=? AND session_id=?",(source,provider_session_key(source,session))).fetchone()) or binding[0]!=member_physical[canonical]
-def _lineage_union(values):
-    required(all(isinstance(v,dict) and set(v)=={'v','records'} and type(v['v']) is int and v['v']==1 and isinstance(v['records'],list) and all(isinstance(r,dict) and set(r)=={'old_id','old_hash','current_id','current_hash'} and all(isinstance(r[k],str) and re.fullmatch('[0-9a-f]{'+str(64 if k.endswith('hash') else 16)+'}',r[k]) for k in r) for r in v['records']) for v in values),ValueError('provider alias lineage merge is invalid'))
-    return dict(v=1,records=sorted({canon(r):r for v in values for r in v['records']}.values(),key=canon))
 def _alias_merge_native(db,row,head):
     if row is None: return None
     records=db.execute("SELECT 1 slot,p.content_hash,c.body FROM remote.row_proofs p JOIN remote.row_conflicts c ON c.proof_id=p.id WHERE p.id=?",[digest(head)]).fetchall()
