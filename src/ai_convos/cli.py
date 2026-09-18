@@ -717,7 +717,7 @@ def reset_archive_sync_db(db,user,device):
     db.execute('CREATE OR REPLACE TEMP TABLE sync_received AS SELECT DISTINCT * FROM sync_received')
     blocked=[f'{table}.{column}' for table,refs in ARCHIVE_FKS.items() for column,parent in refs if db.execute(f"SELECT 1 FROM {table} c JOIN sync_received p ON p.table_name=? AND p.physical_row_id=c.{column} WHERE NOT EXISTS(SELECT 1 FROM sync_received o WHERE o.table_name=? AND o.physical_row_id=c.id) LIMIT 1",[parent,table]).fetchone()]
     required(not blocked,ValueError(f'Cannot reset sync: owned rows reference received parents: {blocked}; archive unchanged'))
-    backup=_migration_backup(db,'sync-v2')
+    before,backup=(missing:=lambda:{(table,column,value) for table,refs in ARCHIVE_FKS.items() for column,parent in refs for value, in db.execute(f'SELECT DISTINCT c.{column} FROM {table} c LEFT JOIN {parent} p ON p.id=c.{column} WHERE p.id IS NULL'+(f' AND c.{column} IS NOT NULL' if (table,column)==('messages','parent_id') else '')).fetchall()})(),_migration_backup(db,'sync-v2')
     with _transaction(db):
         removed=sum(db.execute(f"SELECT count(*) FROM {table} t JOIN sync_received o ON o.table_name=? AND o.physical_row_id=t.id",[table]).fetchone()[0] for table in ARCHIVE_COLUMNS)
         changed=db.execute('SELECT table_name,physical_row_id FROM sync_received').fetchall()
@@ -728,9 +728,9 @@ def reset_archive_sync_db(db,user,device):
         [db.execute(f'DELETE FROM remote.{table}') for table, in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='remote' AND table_type='BASE TABLE'").fetchall()]
         migrate_provider_ids(db)
         db.execute("INSERT INTO remote.edit_ready VALUES ('',''); INSERT INTO archive_sync VALUES (TRUE,2,?,?)",[user,device])
-        required(not (issues:=archive_relationships(db)),ValueError(f'Archive relationship validation failed during sync reset: {issues}'))
+        required(not (introduced:=missing()-before),ValueError(f'Archive relationship validation failed during sync reset: {sorted(introduced,key=str)}'))
         _archive_touch(db,changed)
-    return dict(removed=removed,backup=str(backup) if backup else None)
+    return ((issues:=archive_relationships(db)) and typer.echo(f'Sync upgrade preserved pre-existing unresolved relationships: {issues}',err=True),dict(removed=removed,backup=str(backup) if backup else None,unresolved=issues))[-1]
 
 def merge_archive_backup(path,backup,page=500):
     def restore(db,table,rows,columns=None): return (((bodies:=dict(rows)),(proofs:=db.execute("SELECT * FROM remote.row_proofs WHERE id IN (SELECT UNNEST(?))",[list(bodies)]).fetchall()),required(len(proofs)==len(bodies),ValueError("Recovery bodies require stored proofs")),restore_signed_bodies(db,[dict(proof_id=p[0],proof_row=p,body=json.loads(bodies[p[0]])) for p in proofs]))[-1] if table=="remote.row_conflicts" and rows else _insert_pages(db,table,rows,columns,mode=" OR IGNORE"),project_edit_dependencies(db,advanced=[('', '')]))[0]

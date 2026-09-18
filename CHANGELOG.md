@@ -9,7 +9,8 @@
   reenroll existing users and devices with their current keys. Old clients must
   upgrade; unknown future storage versions are rejected without resetting them.
 - Carry edits as tool or message metadata, preserving their original turn and
-  signed history. Remove ongoing parser-alias reconciliation.
+  signed history. Remove ongoing parser-alias reconciliation. Existing unresolved
+  archive references are preserved and reported; upgrades reject newly broken links.
 - Buffer hooks durably, import in bounded transactions, and retry Git provenance
   independently. Preserve completed tool output when an incomplete snapshot arrives.
 - Keep unchanged peer imports cheap, and avoid attachment history duplicates when

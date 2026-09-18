@@ -337,3 +337,25 @@ def test_unchanged_received_source_is_not_reparsed_on_every_sync(monkeypatch):
     core.sync(False,300,False,True,False,False,True)
     monkeypatch.setattr(core,'parse_codex',lambda *args:pytest.fail('unchanged peer source was parsed again'))
     core.sync(False,300,False,True,False,False,True)
+
+
+@pytest.mark.parametrize('damage',[False,True])
+def test_cutover_preserves_existing_orphans_but_rejects_new_missing_parents(tmp_path,monkeypatch,capsys,damage):
+    path=tmp_path/'archive.db'
+    with duckdb.connect(str(path)) as db:
+        core.init_schema(db)
+        db.execute("INSERT INTO conversations (id,source) VALUES ('c','codex')")
+        db.execute("INSERT INTO messages (id,conversation_id,parent_id,content,role) VALUES ('m','c','missing-parent','kept','assistant')")
+        db.execute("INSERT INTO tool_calls (id,message_id,tool_name) VALUES ('valid','m','test'),('orphan','missing-message','test')")
+        db.execute("INSERT INTO attachments (id,message_id) VALUES ('a','missing-message')")
+    if damage:
+        monkeypatch.setattr(core,'migrate_provider_ids',lambda db:db.execute("DELETE FROM messages WHERE id='m'"))
+        with pytest.raises(ValueError,match='relationship validation failed'): core.reset_archive_sync(path,'user','device')
+    else:
+        result=core.reset_archive_sync(path,'user','device')
+        assert result['removed']==0 and set(result['unresolved'])=={'messages.parent_id','tool_calls.message_id','attachments.message_id'}
+        assert 'preserved pre-existing unresolved relationships' in capsys.readouterr().err
+    with duckdb.connect(str(path)) as db:
+        assert db.execute('SELECT id,parent_id,content FROM messages').fetchall()==[('m','missing-parent','kept')]
+        assert db.execute('SELECT count(*) FROM tool_calls').fetchone()==(2,)
+        assert db.execute('SELECT count(*) FROM archive_sync').fetchone()==(int(not damage),)
