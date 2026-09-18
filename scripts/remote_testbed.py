@@ -670,6 +670,47 @@ def customer_activity(clients,session,turns,measure):
     return rows,turns+4
 
 
+def customer_large_append(client,manifest,evidence,measure):
+    from ai_convos.cli import _backup_copy, open_db
+    entry=max((v for v in manifest['corpus'] if v['path'].startswith('codex/sessions/')),key=lambda v:v['bytes'])
+    source=client['root']/entry['path']
+    archive=client['root']/'archive'
+    clone=desktop_client(evidence/'large-append/laptop',client['venv'])
+    clone['env']={**client['env'],'CONVOS_PROJECT_ROOT':str(clone['root']/'archive')}
+    target=clone['root']/'archive'
+    (target/'data').mkdir(parents=True,mode=0o700)
+    (target/'remote').mkdir(mode=0o700)
+    backup=evidence/'large-append/transcript.original'
+    with operation_lock(archive/'data/.sync.lock','testbed.large-append.snapshot',0),operation_lock(archive/'data/hook_inbox/.drain.lock','testbed.large-append.capture',30):
+        with open_db(archive/'data/convos.db',True,purpose='testbed.large-append.snapshot'):
+            if (archive/'data/convos.db.wal').exists(): raise ValueError('large-append snapshot requires a checkpointed archive')
+            _backup_copy(archive/'data/convos.db',target/'data/convos.db')
+        for relative in ('data/sync_state.json','remote/config.json'):
+            shutil.copy2(archive/relative,target/relative)
+        if (archive/'data/attachments').exists(): shutil.copytree(archive/'data/attachments',target/'data/attachments',copy_function=_backup_copy)
+        before,children=desktop_inventory(clone),customer_projection(clone)
+        if sha256(source)!=entry['sha256']: raise ValueError('large-append input differs from its frozen source')
+        _backup_copy(source,backup)
+        shutil.copystat(source,backup)
+        sentinels=[f'private large-transcript qualification {evidence.name} turn {i}' for i in range(2)]
+        try:
+            with source.open('a') as stream:
+                for i,text in enumerate(sentinels):
+                    stream.write(json.dumps(dict(type='response_item',timestamp=f'2026-09-18T00:00:0{i}Z',payload=dict(type='message',role='user' if i==0 else 'assistant',content=[dict(type='input_text' if i==0 else 'output_text',text=text)])))+'\n')
+            measure('large-append-capture',clone,'capture','codex',input=json.dumps(dict(transcript_path=str(source),hook_event_name='Stop')),budget=5)
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                jobs=[pool.submit(measure,'large-append-'+label,clone,*args,budget=budget) for label,args,budget in (('drain',('drain-hooks','--block'),120),('search',('search','qualification'),15),('doctor',('doctor',),15))]
+                for job in jobs: job.result()
+            after=desktop_inventory(clone)
+            if [row for row in after if row['content'] not in sentinels]!=before or sorted(row['content'] for row in after if row['content'] in sentinels)!=sorted(sentinels): raise AssertionError('large transcript append lost, duplicated, or changed existing turns')
+            changed=customer_projection(clone)
+            if any(changed[kind]!=value for kind,value in children.items() if kind not in ('conversations','messages')): raise AssertionError('large transcript append changed unrelated child rows')
+            (evidence/'large-append.json').write_text(json.dumps(dict(bytes=entry['bytes'],added_messages=2,original_messages=len(before),success=True),indent=2)+'\n')
+        finally:
+            os.replace(backup,source)
+            if sha256(source)!=entry['sha256']: raise AssertionError('large-append test did not restore its private transcript copy')
+
+
 def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
     import socket
     root,venv=Path(root).resolve(),Path(venv).resolve()
@@ -794,6 +835,7 @@ def customer_lane(root,venv,commit,codex,claude,sessions=12,full=False):
                     (evidence/f'audit-{index}.json').write_text(json.dumps(audit,indent=2)+'\n')
                     if audit['totals'].get('unavailable',0) or any(v['rows'] for v in audit['relationships'].values()): raise AssertionError(f'client {index}: unresolved real archive evidence')
                     measure(f'doctor-{index}',client,'doctor',budget=15)
+                customer_large_append(a,manifest,evidence,measure)
                 outcome=dict(commit=commit,success=True,full_reimport=full,seconds=time.monotonic()-started,projections=projections,messages=[len(rows) for rows in inventories],projection_sha256=[hashlib.sha256(json.dumps(rows,sort_keys=True).encode()).hexdigest() for rows in inventories],evidence=str(evidence))
             except BaseException as error:
                 outcome=dict(commit=commit,success=False,seconds=time.monotonic()-started,error=f'{type(error).__name__}: {error}',evidence=str(evidence))
