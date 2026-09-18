@@ -359,3 +359,26 @@ def test_cutover_preserves_existing_orphans_but_rejects_new_missing_parents(tmp_
         assert db.execute('SELECT id,parent_id,content FROM messages').fetchall()==[('m','missing-parent','kept')]
         assert db.execute('SELECT count(*) FROM tool_calls').fetchone()==(2,)
         assert db.execute('SELECT count(*) FROM archive_sync').fetchone()==(int(not damage),)
+
+
+@pytest.mark.parametrize('facts_first',[False,True])
+def test_same_user_peer_provenance_keeps_native_turn_and_edit_ids_on_retry(tmp_path,facts_first):
+    from ai_convos_remote.projection import apply_row_replicas,retry_edit_replicas,audit_rows
+    from ai_convos_remote.protocol import row_proof
+    user,device,peer,control,bodies=signed_graph()
+    file_id=core.provenance_digest(dict(repository=None,path='a.py'))
+    rows=[dict(v=1,kind='file.observed',id=file_id,state='active',data=dict(repository=None,path='a.py',kind='external')),
+          dict(v=1,kind='edit.observed',id='e',state='active',data=dict(turn='m',file=file_id,repository=None,old_content_hash=None,new_content_hash=core.provenance_digest(b'one'),evidence='captured_exact')),
+          dict(v=1,kind='checkpoint.link',id=core.provenance_digest(dict(checkpoint='cp',edit='e')),state='active',data=dict(checkpoint='cp',edit='e',evidence='full_content_match'))]
+    signed=[dict(row=row,proof=row_proof(device,user,'w',1,row)) for row in rows]
+    path=tmp_path/'peer.db'
+    apply=lambda values:apply_row_replicas(path,values,'w',[control],local_user=user,local_device=peer['id'])
+    if facts_first: apply(signed)
+    apply(bodies)
+    if not facts_first: apply(signed)
+    retry_edit_replicas(path,user,peer['id'])
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute('SELECT file_edit_id,file_id FROM provenance.file_edit_files').fetchall()==[('e',file_id)]
+        assert db.execute('SELECT file_edit_id FROM provenance.checkpoint_edits').fetchall()==[('e',)]
+        assert not db.execute('SELECT * FROM remote.edit_dependencies').fetchall()
+    assert audit_rows(path,local_user=user)['totals']['unavailable']==0
