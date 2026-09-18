@@ -81,6 +81,73 @@ def test_received_pre_lineage_message_preserves_pending_native_classification(tm
 
 
 @pytest.mark.parametrize('source',['codex','claude-code'])
+@pytest.mark.parametrize('normalized',[False,True])
+@pytest.mark.parametrize('hook',[False,True])
+def test_reparented_edit_snapshots_keep_their_original_identity(tmp_path,source,normalized,hook):
+    path,parser,old,bound,canonical=fixture(tmp_path,source)
+    if normalized and source=='codex': path.write_text(path.read_text().replace('File: x.py','File: '+str(tmp_path/'x.py')))
+    first=parser(path,{key:value for key,value in bound.items() if len(key)!=4})
+    parsed=parser(path,bound)
+    result=lambda value:core.ParseResult(convs=[value['conv']],**{k:value[k] for k in ('msgs','tools','edits','edit_evidence','tool_lineage','edit_lineage')})
+    with core._core(tmp_path/'data/convos.db',purpose='test.edit-snapshot-parent') as db:
+        core.init_schema(db)
+        core.upsert(db,result(first))
+        core.upsert(db,result(parsed))
+        assert db.execute('SELECT count(*) FROM file_edits').fetchone()==(4,)
+        for before,after in zip(first['msgs'],parsed['msgs']): db.execute('UPDATE file_edits SET message_id=? WHERE message_id=?',[after['id'],before['id']])
+        if normalized:
+            fid=core.provenance_digest(dict(repository=None,path='x.py'))
+            db.execute("INSERT OR IGNORE INTO provenance.files VALUES (?,NULL,'x.py','external')",[fid])
+            db.execute("UPDATE file_edits SET file_path='x.py'")
+            for edit in parsed['edits']:
+                db.execute('UPDATE provenance.file_edit_scopes SET route=? WHERE file_edit_id=?',[str(tmp_path/'x.py'),edit['id']])
+                db.execute("INSERT INTO provenance.file_edit_files VALUES (?,?,NULL,NULL,'captured_exact')",[edit['id'],fid])
+                db.execute("INSERT OR IGNORE INTO provenance.local_facts VALUES ('edit.observed',?),('file.observed',?)",[edit['id'],fid])
+        originals=db.execute('SELECT * FROM file_edits ORDER BY id').fetchall()
+        core.upsert(db,core.hook_result(source,path,bound) if hook else result(parser(path,bound)))
+        assert db.execute('SELECT count(*) FROM current_file_edits').fetchone()==(2,)
+        assert db.execute('SELECT * FROM file_edits ORDER BY id').fetchall()==originals
+
+
+@pytest.mark.parametrize('source',['codex','claude-code'])
+@pytest.mark.parametrize('normalized',[False,True])
+@pytest.mark.parametrize('alter',[False,True])
+def test_exact_source_lineage_classifies_legacy_children_arriving_after_source_is_gone(tmp_path,source,normalized,alter):
+    path,parser,old,bound,canonical=fixture(tmp_path,source)
+    parsed=parser(path,bound)
+    dbpath=tmp_path/'data/convos.db'
+    with core._core(dbpath,purpose='test.late-alias-source') as db:
+        core.init_schema(db)
+        core.upsert(db,core.ParseResult(convs=[parsed['conv']],**{k:parsed[k] for k in ('msgs','tools','edits','edit_evidence','tool_lineage','edit_lineage')}))
+        if normalized:
+            fid=core.provenance_digest(dict(repository=None,path='x.py'))
+            db.execute("INSERT OR IGNORE INTO provenance.files VALUES (?,NULL,'x.py','external')",[fid])
+            for edit in old['edits']: db.execute('INSERT OR IGNORE INTO provenance.file_edit_scopes(file_edit_id,path,route) VALUES (?,?,?)',[edit['id'],'external/pending/x.py',str(tmp_path/'x.py')])
+            for edit in parsed['edits']:
+                db.execute('UPDATE provenance.file_edit_scopes SET route=? WHERE file_edit_id=?',[str(tmp_path/'x.py'),edit['id']])
+                db.execute("INSERT INTO provenance.file_edit_files VALUES (?,?,NULL,NULL,'captured_exact')",[edit['id'],fid])
+                db.execute("INSERT OR IGNORE INTO provenance.local_facts VALUES ('edit.observed',?),('file.observed',?)",[edit['id'],fid])
+            parsed=parser(path,bound)
+            core.upsert(db,core.ParseResult(convs=[parsed['conv']],**{k:parsed[k] for k in ('msgs','tools','edits','edit_evidence','tool_lineage','edit_lineage')}))
+            old['edits']=[{**edit,'file_path':'x.py'} for edit in old['edits']]
+        before_count=db.execute('SELECT count(*) FROM file_edits').fetchone()[0]
+    path.unlink()
+    if alter: old['edits'][0]['content']='unique late evidence'
+    _,device,user,control,*_=signed_edit_graph()
+    rows=[core.parser_logical_row(kind,row) for kind,values in [('tool_calls',old['tools']),('file_edits',old['edits'])] for row in values]
+    bodies=[dict(row=r,proof=row_proof(device,user,'w',1,r)) for r in rows]
+    for _ in range(2):
+        projection.apply_row_replicas(dbpath,bodies,'w',[control],local_user=user)
+        with core._core(dbpath,True,purpose='test.late-alias-result') as db:
+            assert db.execute('SELECT count(*) FROM current_file_edits').fetchone()==(len(parsed['edits'])+int(alter),)
+            assert db.execute('SELECT count(*) FROM file_edits').fetchone()==(len(old['edits'])+before_count,)
+            assert db.execute('SELECT count(*) FROM tool_calls WHERE id NOT IN (SELECT old_id FROM parser_tool_history)').fetchone()==(len(parsed['tools']),)
+            claims=[(r['kind'],r['id'],r['id'],user,'active') for r in rows]
+            assert list(core.typed_logical_rows(db,claims).values())==rows
+        assert projection.audit_rows(dbpath,local_user=user)['totals']['unavailable']==0
+
+
+@pytest.mark.parametrize('source',['codex','claude-code'])
 @pytest.mark.parametrize('native',[False,True])
 @pytest.mark.parametrize('reverse',[False,True])
 @pytest.mark.parametrize('upgrade',[False,True])
@@ -164,3 +231,18 @@ def test_edit_history_requires_an_unambiguous_terminal_identity(tmp_path,links,e
         db.executemany("INSERT INTO parser_edit_lineage VALUES ('m','',TRUE,?,'old',?,'new',?,?)",[(str(a),str(b),str(a),str(b)) for a,b in links])
         assert db.execute('SELECT old_id,current_id FROM parser_edit_history ORDER BY old_id').fetchall()==[(str(a),str(b)) for a,b in expected]
         assert db.execute('SELECT count(*) FROM file_edits').fetchone()==(3,)
+
+
+def test_current_edit_view_composes_with_parent_queries_in_bounded_memory(tmp_path):
+    with core._core(tmp_path/'data/convos.db',purpose='test.edit-view-cost') as db:
+        core.init_schema(db)
+        db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('c','codex','{}')")
+        db.execute("INSERT INTO messages(id,conversation_id,role,metadata) VALUES ('m','c','user','{}')")
+        db.execute("INSERT INTO file_edits(id,message_id) SELECT 'edit-'||range,'m' FROM range(32000)")
+        db.execute("INSERT INTO parser_edit_lineage SELECT 'm','',TRUE,'edit-'||range,'old','edit-'||(range+16000),'new','edit-'||range,'edit-'||(range+16000) FROM range(16000)")
+        db.execute("SET memory_limit='128MB'")
+        db.execute('SET threads=1')
+        timer=core.threading.Timer(10,db.interrupt)
+        timer.start()
+        try: assert db.execute("WITH owners AS MATERIALIZED (SELECT id,source,json_extract_string(metadata,'$.session_id') AS provider_session FROM conversations) SELECT c.source,c.provider_session,count(*) FROM current_file_edits t JOIN messages m ON m.id=t.message_id JOIN owners c ON c.id=m.conversation_id WHERE json_extract_string(m.metadata,'$.history_of') IS NULL GROUP BY 1,2").fetchall()==[('codex',None,16000)]
+        finally: timer.cancel()

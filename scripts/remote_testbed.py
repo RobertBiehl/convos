@@ -601,9 +601,9 @@ if len(sys.argv)>1:
 else:
  with core.open_db(core.DB_PATH,True,purpose='testbed.private.source-counts') as db:
   for kind in core.ARCHIVE_COLUMNS:
-   joined='owners c' if kind=='conversations' else 'artifacts t JOIN owners c ON c.id=t.conversation_id' if kind=='artifacts' else ('messages m' if kind=='messages' else kind+' t JOIN messages m ON m.id=t.message_id')+' JOIN owners c ON c.id=m.conversation_id'
+   joined='owners c' if kind=='conversations' else 'artifacts t JOIN owners c ON c.id=t.conversation_id' if kind=='artifacts' else ('messages m' if kind=='messages' else ('current_file_edits' if kind=='file_edits' else kind)+' t JOIN messages m ON m.id=t.message_id')+' JOIN owners c ON c.id=m.conversation_id'
    current='' if kind in ('conversations','artifacts') else " AND json_extract_string(m.metadata,'$.history_of') IS NULL"
-   if kind in ('tool_calls','file_edits'): current+=' AND NOT EXISTS(SELECT 1 FROM parser_'+('tool' if kind=='tool_calls' else 'edit')+'_history h WHERE h.old_id=t.id)'
+   if kind=='tool_calls': current+=' AND NOT EXISTS(SELECT 1 FROM parser_tool_history h WHERE h.old_id=t.id)'
    for source,session,count in db.execute("WITH owners AS MATERIALIZED (SELECT id,source,json_extract_string(metadata,'$.session_id') AS provider_session FROM conversations) SELECT c.source,c.provider_session,count(*) FROM "+joined+" WHERE c.source IN ('codex','claude-code')"+current+' GROUP BY 1,2').fetchall(): out[key(source,session)][kind]=count
 print(json.dumps(out,sort_keys=True))
 """
