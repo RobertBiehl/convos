@@ -148,6 +148,70 @@ def test_exact_source_lineage_classifies_legacy_children_arriving_after_source_i
 
 
 @pytest.mark.parametrize('source',['codex','claude-code'])
+@pytest.mark.parametrize('fault',['none','path','content','route'])
+@pytest.mark.parametrize('snapshot_owner',['original','current'])
+def test_edit_history_recaptured_after_path_normalization_preserves_every_binding(tmp_path,source,fault,snapshot_owner):
+    path,parser,old,bound,canonical=fixture(tmp_path,source)
+    result=lambda value:core.ParseResult(convs=[value['conv']],**{k:value[k] for k in ('msgs','tools','edits','edit_evidence','tool_lineage','edit_lineage')})
+    with core._core(tmp_path/'data/convos.db',purpose='test.edit-recaptured-path') as db:
+        core.init_schema(db)
+        core.upsert(db,result(old))
+        db.execute('UPDATE conversations SET id=?',[canonical])
+        db.execute('UPDATE messages SET conversation_id=?',[canonical])
+        db.execute('UPDATE provider_sessions SET conversation_id=?',[canonical])
+        parsed=parser(path,bound)
+        core.upsert(db,result(parsed))
+        snapshots=[]
+        for before,current in zip(old['edits'],parsed['edits']):
+            first,second='external/first/x.py','external/second/x.py'
+            normalized={**(before if snapshot_owner=='original' else current),'message_id':current['message_id'],'file_path':first}
+            snapshot=core._history_row('file_edits',list(normalized.values()),tuple(v for i,v in enumerate(normalized.values()) if i not in (0,5)))
+            snapshot[2]=second
+            db.execute('INSERT INTO file_edits VALUES (?,?,?,?,?,?,?)',snapshot)
+            snapshots.append(snapshot[0])
+            db.execute('UPDATE file_edits SET message_id=?,file_path=? WHERE id=?',[current['message_id'],first,before['id']])
+            db.execute('UPDATE provenance.file_edit_scopes SET path=?,route=? WHERE file_edit_id=?',[first,core._resolved(current['file_path'],str(tmp_path)),current['id']])
+            db.execute('UPDATE provenance.file_edit_scopes SET path=?,route=? WHERE file_edit_id=?',[second,core._resolved(first if fault!='route' else 'unrelated.py',str(tmp_path)),before['id']])
+        if fault in ('path','content'): db.execute('UPDATE file_edits SET '+('file_path' if fault=='path' else 'content')+'=? WHERE id=?',['unique evidence',snapshots[0]])
+        original=db.execute('SELECT * FROM file_edits ORDER BY id').fetchall()
+        scopes=db.execute('SELECT * FROM provenance.file_edit_scopes ORDER BY file_edit_id').fetchall()
+        for part in core.ingest_parts(result(parser(path,bound)),1): core.upsert(db,part)
+        assert db.execute('SELECT count(*) FROM current_file_edits').fetchone()==(2+(2 if fault=='route' else int(fault!='none')),)
+        assert db.execute('SELECT * FROM file_edits ORDER BY id').fetchall()==original
+        assert db.execute('SELECT * FROM provenance.file_edit_scopes ORDER BY file_edit_id').fetchall()==scopes
+
+
+@pytest.mark.parametrize('source',['codex','claude-code'])
+@pytest.mark.parametrize('observed',[False,True])
+def test_normalized_reimport_and_real_edit_revision_keep_the_captured_file(tmp_path,source,observed):
+    path,parser,old,bound,canonical=fixture(tmp_path,source)
+    result=lambda value:core.ParseResult(convs=[value['conv']],**{k:value[k] for k in ('msgs','tools','edits','edit_evidence','tool_lineage','edit_lineage')})
+    with core._core(tmp_path/'data/convos.db',purpose='test.edit-snapshot-scope') as db:
+        core.init_schema(db)
+        core.upsert(db,result(old))
+        fid=core.provenance_digest(dict(repository=None,path='external/captured/x.py'))
+        db.execute("INSERT INTO provenance.files VALUES (?,NULL,'external/captured/x.py','external')",[fid])
+        for edit in old['edits']:
+            db.execute("UPDATE file_edits SET file_path='external/captured/x.py' WHERE id=?",[edit['id']])
+            db.execute("UPDATE provenance.file_edit_scopes SET path='external/captured/x.py',observed_at=? WHERE file_edit_id=?",['2026-01-01' if observed else None,edit['id']])
+            db.execute("INSERT INTO provenance.file_edit_files VALUES (?,?,NULL,NULL,'captured_exact')",[edit['id'],fid])
+            db.execute("INSERT OR IGNORE INTO provenance.local_facts VALUES ('edit.observed',?),('file.observed',?)",[edit['id'],fid])
+        before=db.execute('SELECT * FROM file_edits ORDER BY id').fetchall()
+        core.upsert(db,result(parser(path)))
+        assert db.execute('SELECT * FROM file_edits ORDER BY id').fetchall()==before
+        changed=parser(path)
+        changed['edits']=[{**edit,'content':'a real new revision'} for edit in changed['edits']]
+        core.upsert(db,result(changed))
+        current={e['id'] for e in old['edits']}
+        histories=[r for r in db.execute('SELECT * FROM file_edits').fetchall() if r[0] not in current]
+        assert len(histories)==2
+        for history in histories:
+            assert db.execute('SELECT path,route FROM provenance.file_edit_scopes WHERE file_edit_id=?',[history[0]]).fetchone()==('external/captured/x.py',core._resolved(old['edits'][0]['file_path'],str(tmp_path)))
+            assert db.execute('SELECT file_id,evidence FROM provenance.file_edit_files WHERE file_edit_id=?',[history[0]]).fetchone()==(fid,'captured_exact')
+            assert db.execute("SELECT 1 FROM provenance.local_facts WHERE kind='edit.observed' AND entity=?",[history[0]]).fetchone()==(1,)
+
+
+@pytest.mark.parametrize('source',['codex','claude-code'])
 @pytest.mark.parametrize('native',[False,True])
 @pytest.mark.parametrize('reverse',[False,True])
 @pytest.mark.parametrize('upgrade',[False,True])
