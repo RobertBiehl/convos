@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.6b14
+
+- Complete the b11/b12 source-device cutover for archives where a locally captured
+  provider session also carries an old received-row marker. Keep the locally bound
+  conversation and its children, and report exact counts for unresolved legacy
+  parent ownership without deleting either side.
+- Converge identical provider rows imported on two devices onto one deterministic
+  source device, including simultaneous first publication. Preserve divergent local
+  rows and reject revisions or new children from a device that does not own them.
+
 ## 0.11.6b13
 
 - Make the source device the sole writer of a conversation and its children.

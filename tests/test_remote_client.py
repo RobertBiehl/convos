@@ -62,16 +62,82 @@ def test_cutover_preserves_owned_archive_without_source_files_and_removes_receiv
 
 def test_cutover_refuses_to_orphan_owned_data_and_rolls_back(tmp_path):
     path=tmp_path/'data/convos.db'
-    write_archive(path,'received parent with owned child')
+    path.parent.mkdir(parents=True)
     with duckdb.connect(str(path)) as db:
+        init_schema(db)
+        project_archive_row(db,'conversations',ARCHIVE_COLUMNS['conversations'],['c','codex','received parent with owned child',None,None,None,None,None,None,'{}'])
         project_archive_row(db,'messages',ARCHIVE_COLUMNS['messages'],['owned','c','user','keep me',None,None,None,'{}',None])
         db.execute('INSERT INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)',['conversations','c','old','user','sibling','c',None,None,None,None])
-    with pytest.raises(ValueError,match='owned rows reference received parents'): core_module.reset_archive_sync(path,'user','device')
+    with pytest.raises(ValueError,match='owned rows reference received parents') as error: core_module.reset_archive_sync(path,'user','device')
+    assert "'messages.conversation_id': 1" in str(error.value)
     with duckdb.connect(str(path),read_only=True) as db:
         assert db.execute('SELECT content FROM messages').fetchall()==[('keep me',)]
         assert db.execute('SELECT id FROM conversations').fetchall()==[('c',)]
         assert db.execute('SELECT count(*) FROM remote.row_origins').fetchone()==(1,)
         assert not db.execute('SELECT * FROM archive_sync').fetchall()
+
+def test_cutover_local_capture_wins_over_received_marker(tmp_path):
+    path=tmp_path/'data/convos.db'
+    write_archive(path,'captured on this device')
+    with duckdb.connect(str(path)) as db:
+        db.execute("INSERT INTO provider_sessions VALUES ('codex','local-session','c')")
+        project_archive_row(db,'messages',ARCHIVE_COLUMNS['messages'],['m','c','user','local message',None,None,None,'{}',None])
+        project_archive_row(db,'tool_calls',ARCHIVE_COLUMNS['tool_calls'],['t','m','test','{}','{}','complete',None,None])
+        project_archive_row(db,'file_edits',ARCHIVE_COLUMNS['file_edits'],['e','m','test.py','write','local edit',None,None])
+        db.executemany('INSERT INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)',[(table,rid,'old','user','sibling',rid,None,None,None,None) for table,rid in [('conversations','c'),('messages','m'),('tool_calls','t'),('file_edits','e')]])
+        before={table:db.execute(f'SELECT * FROM {table} ORDER BY id').fetchall() for table in ARCHIVE_COLUMNS}
+    result=core_module.reset_archive_sync(path,'user','device')
+    assert result['removed']==0 and Path(result['backup']).exists()
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert {table:db.execute(f'SELECT * FROM {table} ORDER BY id').fetchall() for table in ARCHIVE_COLUMNS}==before
+        assert not core_module.archive_relationships(db)
+        assert not db.execute('SELECT 1 FROM remote.row_origins').fetchone()
+
+@pytest.mark.parametrize('titles,conflict',[(('same','same'),False),(('first','second'),True)])
+def test_two_devices_with_same_native_session_choose_one_exact_owner(tmp_path,monkeypatch,titles,conflict):
+    server=server_connect(tmp_path/'server.db')
+    monkeypatch.setattr(remote_client,'request',transport(server))
+    monkeypatch.setattr(remote_client,'drain_hooks',lambda:None)
+    roots=[tmp_path/name for name in ('laptop','desktop')]
+    first,recovery=setup_client('http://server','alice',device='laptop',root=roots[0])
+    second,_=setup_client('http://server','alice',device='desktop',recovery=recovery,root=roots[1])
+    for root,cfg,title in zip(roots,(first,second),titles):
+        path=root/'data/convos.db'
+        write_archive(path,title)
+        with duckdb.connect(str(path)) as db: db.execute("INSERT INTO provider_sessions VALUES ('codex','shared-session','c'); DELETE FROM archive_sync; INSERT INTO remote.row_origins VALUES ('conversations','c','legacy','legacy-user','legacy-device','c',NULL,NULL,NULL,NULL)")
+        core_module.reset_archive_sync(path,cfg['user'],cfg['device']['id'])
+    try:
+        sync_once(roots[0],manual=True)
+        if conflict:
+            with pytest.raises(ValueError,match='ownership conflict'): sync_once(roots[1],manual=True)
+            with duckdb.connect(str(roots[1]/'data/convos.db'),read_only=True) as db: assert db.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==('second',)
+        else:
+            sync_once(roots[1],manual=True)
+            sync_once(roots[0],manual=True)
+            with duckdb.connect(str(roots[1]/'data/convos.db'),read_only=True) as db: assert db.execute("SELECT author_device_id FROM remote.row_origins WHERE table_name='conversations' AND physical_row_id='c'").fetchone()==(first['device']['id'],)
+    finally: server.close()
+
+def test_simultaneous_identical_source_claims_choose_same_device(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/'server.db'); direct=transport(server)
+    monkeypatch.setattr(remote_client,'request',direct); monkeypatch.setattr(remote_client,'drain_hooks',lambda:None)
+    roots=[tmp_path/name for name in ('laptop','desktop')]
+    first,recovery=setup_client('http://server','alice',device='laptop',root=roots[0]); second,_=setup_client('http://server','alice',device='desktop',recovery=recovery,root=roots[1])
+    try:
+        [sync_once(root,manual=True) for root in roots]
+        for root in roots:
+            write_archive(root/'data/convos.db','same')
+            with duckdb.connect(str(root/'data/convos.db')) as db:
+                db.execute("INSERT INTO provider_sessions VALUES ('codex','shared-session','c')")
+                project_archive_row(db,'messages',ARCHIVE_COLUMNS['messages'],['m','c','assistant','same message',None,None,None,'{}',None])
+                project_archive_row(db,'tool_calls',ARCHIVE_COLUMNS['tool_calls'],['t','m','test','{}','{}','complete',None,None])
+        real=remote_client.pull; monkeypatch.setattr(remote_client,'pull',lambda *args,**kwargs:{})
+        [sync_once(root,manual=True) for root in roots]
+        monkeypatch.setattr(remote_client,'pull',real)
+        [sync_once(root,manual=True) for root in roots]
+        owner=min(first['device']['id'],second['device']['id'])
+        for root in roots:
+            with duckdb.connect(str(root/'data/convos.db'),read_only=True) as db: assert db.execute("SELECT DISTINCT device FROM remote.row_owners WHERE (kind,source) IN (('conversations','c'),('messages','m'),('tool_calls','t'))").fetchall()==[(owner,)]
+    finally: server.close()
 
 
 def test_cutover_reenrolls_existing_users_and_devices_without_new_secrets(tmp_path,monkeypatch):
