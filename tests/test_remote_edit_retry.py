@@ -37,6 +37,13 @@ def test_shared_file_from_another_author_wakes_pending_edit(tmp_path):
     assert remaining(path)==0 and projection.audit_rows(path,local_user='receiver')['totals']['unavailable']==0
 
 
+def test_deferred_facts_emit_one_batch_summary(tmp_path,capsys):
+    user,control,rows,bodies,file,fact,signed=graph(); path=tmp_path/'db'
+    projection.apply_row_replicas(path,[signed(fact(f'e{i}')) for i in range(3)],'w',[control],local_user='receiver')
+    lines=[line for line in capsys.readouterr().err.splitlines() if 'Remote facts retained pending dependencies' in line]
+    assert lines==['Remote facts retained pending dependencies: 3'] and remaining(path)==3
+
+
 def test_archive_edit_dependency_is_author_qualified(tmp_path,monkeypatch):
     user,control,rows,bodies,file,fact,signed=graph(); path=tmp_path/'db'
     apply=lambda values:projection.apply_row_replicas(path,values,'w',[control],local_user='receiver')

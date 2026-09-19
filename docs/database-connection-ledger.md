@@ -94,6 +94,7 @@ The AST ledger has 94 archive acquisition sites and 21 SQLite constructor sites.
 | A102 | `src/ai_convos/cli.py::drain_hooks` | `hooks.provenance.plan` | Shared | Pending enrichment count | Briefly delays a writer | Closes before the bounded enrichment batch |
 | A103 | `src/ai_convos/cli.py::drain_hooks` | `hooks.provenance.progress` | Shared | Remaining enrichment count | Briefly delays a writer | Schedules a successor only after measurable progress |
 | A104 | `src/ai_convos/cli.py::run_sync` | `sync.provenance.progress` | Shared | Remaining enrichment count | Briefly delays a writer | Closes before scheduling background enrichment |
+| A105 | `src/ai_convos/cli.py::_verify_worker` | `archive.verify` | Shared | Full single-column primary-key and variable-width storage scan before a sync cutover or explicit verification | Delays writers for the archive scan | Runs in an isolated process so a storage SIGBUS cannot kill the migration process; reports the active table and column |
 
 | A99 | `src/ai_convos/cli.py::reset_archive_sync` | `sync.cutover` | Exclusive | One-time backed-up archive reset and identity migration | Temporarily blocks archive access during upgrade | Idempotent marker and atomic rollback; local conversations and attachment backup preserved |
 
