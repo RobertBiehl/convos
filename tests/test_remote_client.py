@@ -81,15 +81,20 @@ def test_cutover_local_capture_wins_over_received_marker(tmp_path):
     write_archive(path,'captured on this device')
     with duckdb.connect(str(path)) as db:
         db.execute("INSERT INTO provider_sessions VALUES ('codex','local-session','c')")
+        body=tmp_path/'data.txt'; body.write_text('data')
         project_archive_row(db,'messages',ARCHIVE_COLUMNS['messages'],['m','c','user','local message',None,None,None,'{}',None])
         project_archive_row(db,'tool_calls',ARCHIVE_COLUMNS['tool_calls'],['t','m','test','{}','{}','complete',None,None])
+        project_archive_row(db,'attachments',ARCHIVE_COLUMNS['attachments'],['a','m','data.txt','text/plain',4,str(body),None,None])
+        project_archive_row(db,'artifacts',ARCHIVE_COLUMNS['artifacts'],['r','c','text','result','data','text',None,1])
         project_archive_row(db,'file_edits',ARCHIVE_COLUMNS['file_edits'],['e','m','test.py','write','local edit',None,None])
-        db.executemany('INSERT INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)',[(table,rid,'old','user','sibling',rid,None,None,None,None) for table,rid in [('conversations','c'),('messages','m'),('tool_calls','t'),('file_edits','e')]])
+        index_attachment_body(db,'a',body)
+        db.executemany('INSERT INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)',[(table,rid,'old','user','sibling',rid,None,None,None,None) for table,rid in [('conversations','c'),('messages','m'),('tool_calls','t'),('attachments','a'),('artifacts','r'),('file_edits','e')]])
         before={table:db.execute(f'SELECT * FROM {table} ORDER BY id').fetchall() for table in ARCHIVE_COLUMNS}
     result=core_module.reset_archive_sync(path,'user','device')
     assert result['removed']==0 and Path(result['backup']).exists()
     with duckdb.connect(str(path),read_only=True) as db:
         assert {table:db.execute(f'SELECT * FROM {table} ORDER BY id').fetchall() for table in ARCHIVE_COLUMNS}==before
+        assert db.execute("SELECT size FROM attachment_bodies WHERE attachment_id='a'").fetchone()==(4,)
         assert not core_module.archive_relationships(db)
         assert not db.execute('SELECT 1 FROM remote.row_origins').fetchone()
 

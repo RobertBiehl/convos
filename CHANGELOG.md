@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.6b15
+
+- Retain locally captured attachments, attachment bodies, and artifacts when old
+  relay markers overlap a provider-bound conversation during the b11/b12 cutover.
+  This completes the source-device ownership rule for every conversation child.
+
 ## 0.11.6b14
 
 - Complete the b11/b12 source-device cutover for archives where a locally captured
