@@ -3,8 +3,7 @@ from contextlib import contextmanager,suppress
 _BATCH,_MEMORY=50_000,1536*2**20
 
 
-def _bad(db,sql,message):
-    if db.execute(sql).fetchone(): raise ValueError(message)
+def _bad(db,sql,message): return (_ for _ in ()).throw(ValueError(message)) if db.execute(sql).fetchone() else None
 
 
 def _bytes(value): return float(value.split()[0])*{"B":1,"bytes":1,"KiB":2**10,"MiB":2**20,"GiB":2**30,"TiB":2**40}[value.split()[1]]

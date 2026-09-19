@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.6b16
+
+- Verify every single-column primary-key index and read every VARCHAR/JSON column
+  in an isolated process before the one-time sync reset. A damaged index or storage
+  segment now stops before backup or mutation and names the active table/column;
+  SIGBUS cannot take down the migration process.
+- Summarize deferred provenance facts once per received batch instead of printing
+  one expected dependency message per fact.
+
 ## 0.11.6b15
 
 - Retain locally captured attachments, attachment bodies, and artifacts when old

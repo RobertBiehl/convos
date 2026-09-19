@@ -1,5 +1,5 @@
 """Portable record/event projection. The immutable relay ledger can rebuild every local view."""
-import contextlib, duckdb, hashlib, itertools, json, os, re, shutil, sqlite3, time
+import contextlib, duckdb, hashlib, itertools, json, os, re, shutil, sqlite3, sys, time
 from datetime import date, datetime
 from functools import lru_cache
 from importlib.metadata import entry_points
@@ -660,6 +660,7 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
             own_ids={(kind,entity):entity for row,p,pid,native in projected if p['author_user_id']==local_user for kind,entity in [(row['kind'],row['id']),*[(parent,row['data'][column]) for column,parent in FKS.get(row['kind'],()) if row['state']=='active' and row['data'][column]],*[(kind,entity) for e in (row['data'] or {}).get('edits',[]) for kind,entity in [('file_edits',e['id']),('messages',e['message_id'])]],*([('file_edits',row['id']),('messages',row['data']['turn'])] if row['kind']=='edit.observed' else [('file_edits',row['data']['edit'])] if row['kind']=='checkpoint.link' else [])]}
             own_ids.update({(kind,source):physical for kind,source,physical in db.execute('SELECT table_name,source_row_id,physical_row_id FROM remote.row_origins WHERE author_user_id=? AND source_row_id IN (SELECT UNNEST(?))',[local_user,[entity for kind,entity in own_ids]]).fetchall()})
             project_logical_rows(db,[(row,p,pid,native,own_ids if p['author_user_id']==local_user else {}) for row,p,pid,native in projected],defer=pending.add)
+            if pending and not retry: print(f"Remote facts retained pending dependencies: {len(pending)}",file=sys.stderr)
             [set_attachment_path(db,row['id'] if p['author_user_id']==local_user else foreign_id(p['author_user_id'],'attachments',row['id']),attachment_paths[key],key) for row,p,*_ in values if row['kind']=='attachments' and row['state']=='active' and (key:=(row['data']['body_hash'],row['data']['size'])) in attachment_paths]
             resolved=[(row["kind"],row["id"],p["author_user_id"]) for row,p,pid,native in projected if pid not in pending]
             missing={scope:chains[scope][revision] for scope,revision in chosen.items() if chains[scope][revision][1] is None}
