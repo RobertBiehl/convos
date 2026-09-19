@@ -374,12 +374,11 @@ def project_archive_rows(db,table,columns,rows,preserve=True):
             for mode,foreign in ((" OR REPLACE",True),(" OR IGNORE",False)): _insert_pages(db,"provenance.file_edit_evidence",[(v[0],"unverified","signed_replica_missing_evidence",None) for v,o in rows if bool(o)==foreign],mode=mode)
         (((origins) and ((_insert_pages(db,"remote.row_origins",origins,mode=" OR REPLACE"),db.execute("DELETE FROM remote.row_references r USING remote.row_origins o WHERE (r.table_name,r.physical_row_id,r.author_user_id,r.source_row_id)=(o.table_name,o.physical_row_id,o.author_user_id,o.source_row_id) AND r.table_name=? AND r.physical_row_id IN (SELECT UNNEST(?))",[table,ids])))),((table in ("file_edits","tool_calls")) and (_apply_signed_edit_evidence(db,[v[0] for v in values] if table=="file_edits" else (),[v[0] for v in values] if table=="tool_calls" else ()))))
 def claim_row_owners(db,records):
-    claims={(kind,entity,p['author_user_id'],p['author_device_id']) for row,p in records if row['kind'] in ARCHIVE_COLUMNS|{'edit.observed':(),'checkpoint.link':()} for kind,entity in ([(row['kind'],row['id']),*[(parent,row['data'][column]) for column,parent in ARCHIVE_FKS.get(row['kind'],()) if row['state']=='active' and row['data'][column]],*[(kind,entity) for e in (row['data'] or {}).get('edits',[]) for kind,entity in [('file_edits',e['id']),('messages',e['message_id'])]]] if row['kind'] in ARCHIVE_COLUMNS else [('file_edits',row['id']),('messages',row['data']['turn'])] if row['kind']=='edit.observed' else [('file_edits',row['data']['edit'])])}
+    claims={(kind,entity,p['author_user_id'],p['author_device_id'],(primary:=(kind,entity)==(row['kind'],row['id'])),primary and row['kind'] in ARCHIVE_COLUMNS and not p['previous_revision']) for row,p in records if row['kind'] in ARCHIVE_COLUMNS|{'edit.observed':(),'checkpoint.link':()} for kind,entity in ([(row['kind'],row['id']),*[(parent,row['data'][column]) for column,parent in ARCHIVE_FKS.get(row['kind'],()) if row['state']=='active' and row['data'][column]],*[(kind,entity) for e in (row['data'] or {}).get('edits',[]) for kind,entity in [('file_edits',e['id']),('messages',e['message_id'])]]] if row['kind'] in ARCHIVE_COLUMNS else [('file_edits',row['id']),('messages',row['data']['turn'])] if row['kind']=='edit.observed' else [('file_edits',row['data']['edit'])])}
     if not claims: return
-    db.execute('CREATE OR REPLACE TEMP TABLE owner_claims(kind VARCHAR,source VARCHAR,author VARCHAR,device VARCHAR)')
+    db.execute('CREATE OR REPLACE TEMP TABLE owner_claims(kind VARCHAR,source VARCHAR,author VARCHAR,device VARCHAR,primary_row BOOLEAN,base BOOLEAN)')
     _insert_pages(db,'owner_claims',list(claims))
-    required(not db.execute('SELECT 1 FROM (SELECT * FROM owner_claims UNION ALL SELECT o.* FROM remote.row_owners o JOIN owner_claims c USING(kind,source,author)) GROUP BY kind,source,author HAVING count(DISTINCT device)>1 LIMIT 1').fetchone(),ValueError('Source device ownership conflict; replica cannot revise this conversation'))
-    db.execute('INSERT OR IGNORE INTO remote.row_owners SELECT * FROM owner_claims')
+    (required(not db.execute("SELECT 1 FROM remote.row_owners o JOIN (SELECT kind,source,author,device,bool_or(base) OR bool_or(NOT primary_row) AND EXISTS(SELECT 1 FROM remote.row_proofs p WHERE (p.row_kind,p.source_row_id,p.author_user_id,p.author_device_id)=(kind,source,author,device) AND p.previous_revision IS NULL) allowed FROM owner_claims GROUP BY kind,source,author,device) c USING(kind,source,author) WHERE o.device<>c.device AND NOT c.allowed LIMIT 1").fetchone(),ValueError('Source device ownership conflict; replica cannot revise this conversation')),db.execute('INSERT INTO remote.row_owners SELECT DISTINCT kind,source,author,device FROM owner_claims ON CONFLICT(kind,source,author) DO UPDATE SET device=least(row_owners.device,excluded.device)'))
 def project_row_proofs(db,proofs,root_public,certificate):
     if not proofs: return []
     fields,expected,signer,packed,columns=(fields:=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")),{"v","kind",*fields},(proofs[0]["author_user_id"],proofs[0]["author_device_id"]),json.dumps(certificate,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False),("workspace_id","authorization_workspace_id","row_kind","source_row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature")
@@ -462,16 +461,17 @@ def repair_parent_links(db,local_user=None,parents=None):
                 changed,after=changed+len(selected),rows[-1][0]
     return changed
 def _protect_native_replicas(db,items,defer):
-    refs,wanted,existing=(refs:={"conversation_id":"conversations","message_id":"messages","parent_id":"messages","turn":"messages","edit":"file_edits"}),(wanted:={(row["kind"],row["id"]) for row,p,pid,native,*maps in items if native}|{(refs[key],value) for row,p,pid,native,*maps in items if native for key,value in (row["data"] or {}).items() if key in refs and value}),{table:{row[0]:row for row in db.execute(f"SELECT {','.join(ARCHIVE_COLUMNS[table])} FROM {table} WHERE id IN (SELECT json_extract_string(value,'$') FROM json_each(?))",[json.dumps(ids,separators=(",",":"))]).fetchall()} if (ids:=[value for kind,value in wanted if kind==table]) else {} for table in ARCHIVE_COLUMNS}
+    identity,owners,owner,protect=(identity:=db.execute('SELECT user_id,device_id FROM archive_sync WHERE singleton').fetchone() or (None,None)),(owners:={(kind,source,author):device for kind,source,author,device in db.execute('SELECT * FROM remote.row_owners WHERE source IN (SELECT UNNEST(?)) AND author IN (SELECT UNNEST(?))',[[row['id'] for row,p,pid,native,*maps in items],[p['author_user_id'] for row,p,pid,native,*maps in items]]).fetchall()}),(owner:=lambda row,p:owners.get((row['kind'],row['id'],p['author_user_id']))),lambda row,p,native:native or p['author_user_id']==identity[0] and owner(row,p) is not None
+    refs,wanted,existing=(refs:={"conversation_id":"conversations","message_id":"messages","parent_id":"messages","turn":"messages","edit":"file_edits"}),(wanted:={(row["kind"],row["id"]) for row,p,pid,native,*maps in items if protect(row,p,native)}|{(refs[key],value) for row,p,pid,native,*maps in items if protect(row,p,native) for key,value in (row["data"] or {}).items() if key in refs and value}),{table:{row[0]:row for row in db.execute(f"SELECT {','.join(ARCHIVE_COLUMNS[table])} FROM {table} WHERE id IN (SELECT json_extract_string(value,'$') FROM json_each(?))",[json.dumps(ids,separators=(",",":"))]).fetchall()} if (ids:=[value for kind,value in wanted if kind==table]) else {} for table in ARCHIVE_COLUMNS}
     received,occupied,bindings=(received:=db.execute("SELECT author_user_id,table_name,source_row_id,physical_row_id FROM remote.row_origins WHERE source_row_id IN (SELECT UNNEST(?)) OR physical_row_id IN (SELECT UNNEST(?))",[[value for kind,value in wanted]]*2).fetchall()),(occupied:={(kind,physical) for author,kind,source,physical in received}),{author:({(kind,source):physical for user,kind,source,physical in received if user==author and source not in existing[kind]}|{(kind,source):source for kind,rows in existing.items() for source in rows if (kind,source) not in occupied}) for author in {p["author_user_id"] for row,p,pid,native,*maps in items if native}}
     [bindings[p["author_user_id"]].setdefault((row["kind"],row["id"]),row["id"]) for row,p,pid,native,*maps in items if native and (row["kind"],row["id"]) not in occupied]
     paths,selected,unchanged=captured_edit_paths(db,list(existing["file_edits"])),[],[]
     embedded={(kind,entity):edits for kind in ('messages','tool_calls') for entity,edits in edit_metadata(db,kind,list(existing[kind])).items()}
     for item in items:
         row,p,pid,native,*maps=item
-        bound=bindings[p["author_user_id"]] if native else {}
+        protected,bound=protect(row,p,native),bindings[p["author_user_id"]] if native else {}
         if native: item=(row,p,pid,(native:=bound.get((row["kind"],row["id"]),row["id"])==row["id"]),bound|(maps[0] if maps else {}))
-        if not native or row["kind"] not in existing or not (old:=existing[row["kind"]].get(row["id"])):
+        if not protected or row["kind"] not in existing or not (old:=existing[row["kind"]].get(row["id"])):
             selected.append(item)
             continue
         columns,raw,norm=(columns:=[*ARCHIVE_COLUMNS[row["kind"]]]),(raw:=dict(zip(columns,old))),lambda key,value:row["data"][key] if row["data"] and key in refs and value==bound.get((refs[key],row["data"][key]),row["data"][key]) else json.loads(value) if key in ("metadata","input","output") and isinstance(value,str) else value.isoformat() if isinstance(value,datetime) else value
@@ -480,9 +480,10 @@ def _protect_native_replicas(db,items,defer):
         if row["kind"]=="file_edits" and row["id"] in paths and row["data"] and row["data"]["file_path"]==paths[row["id"]]: data["file_path"]=paths[row["id"]]
         if row["kind"]=="attachments": data["body_hash"]=(db.execute("SELECT content_hash FROM attachment_bodies WHERE attachment_id=?",[row["id"]]).fetchone() or [None])[0]
         if row["state"]=="active" and matching_logical_row({**row,"data":data},p["content_hash"]) is not None:
-            unchanged.append(p)
+            if native: unchanged.append(p)
+            elif owner(row,p)!=identity[1]: (_insert_pages(db,'remote.row_origins',[(row['kind'],row['id'],p['workspace'],p['author_user_id'],p['author_device_id'],row['id'],p['revision'],f"{row['kind']}:{row['id']}",None,pid)],mode=' OR REPLACE'),selected.append(item))
             continue
-        defer(pid)
+        selected.append(item) if not native else defer(pid)
     return (record_local_row_bases(db,unchanged),selected)[-1]
 def project_logical_rows(db,items,defer=False):
     evidence=items
@@ -701,21 +702,20 @@ def migrate_provider_ids(db):
 def reset_archive_sync(path,user,device):
     if not Path(path).is_file(): return None
     with contextlib.closing(get_db(path=path,purpose='sync.cutover')) as db:
-        init_schema(db,cutover=False)
-        return reset_archive_sync_db(db,user,device)
+        return (init_schema(db,cutover=False),reset_archive_sync_db(db,user,device))[-1]
 def reset_archive_sync_db(db,user,device):
     if prior:=db.execute('SELECT version,user_id,device_id FROM archive_sync WHERE singleton').fetchone():
         required(prior==(2,user,device),ValueError('Archive sync identity or format does not match this device'))
         return None
     db.execute("CREATE OR REPLACE TEMP TABLE sync_received AS SELECT table_name,physical_row_id FROM remote.row_origins UNION SELECT 'file_edits',physical_id FROM remote.derived_edits")
-    db.execute("CREATE OR REPLACE TEMP TABLE sync_local AS SELECT 'conversations' kind,c.id FROM conversations c JOIN provider_sessions s ON s.conversation_id=c.id WHERE NOT EXISTS(SELECT 1 FROM sync_received r WHERE r.table_name='conversations' AND r.physical_row_id=c.id) UNION SELECT 'messages',m.id FROM messages m JOIN provider_sessions s ON s.conversation_id=m.conversation_id UNION SELECT 'tool_calls',t.id FROM tool_calls t JOIN messages m ON m.id=t.message_id JOIN provider_sessions s ON s.conversation_id=m.conversation_id UNION SELECT 'file_edits',e.id FROM file_edits e JOIN messages m ON m.id=e.message_id JOIN provider_sessions s ON s.conversation_id=m.conversation_id")
+    db.execute("CREATE OR REPLACE TEMP TABLE sync_local AS SELECT 'conversations' kind,c.id FROM conversations c JOIN provider_sessions s ON s.conversation_id=c.id UNION SELECT 'messages',m.id FROM messages m JOIN provider_sessions s ON s.conversation_id=m.conversation_id UNION SELECT 'tool_calls',t.id FROM tool_calls t JOIN messages m ON m.id=t.message_id JOIN provider_sessions s ON s.conversation_id=m.conversation_id UNION SELECT 'file_edits',e.id FROM file_edits e JOIN messages m ON m.id=e.message_id JOIN provider_sessions s ON s.conversation_id=m.conversation_id")
     peers=db.execute("SELECT p.row_kind,p.source_row_id,list(DISTINCT p.content_hash) FROM remote.row_proofs p WHERE p.author_user_id=? AND p.author_device_id<>? AND p.row_kind IN (SELECT UNNEST(?)) AND NOT EXISTS(SELECT 1 FROM sync_local l WHERE (l.kind,l.id)=(p.row_kind,p.source_row_id)) AND NOT EXISTS(SELECT 1 FROM remote.row_proofs own WHERE (own.row_kind,own.source_row_id,own.author_user_id)=(p.row_kind,p.source_row_id,p.author_user_id) AND own.author_device_id=?) GROUP BY p.row_kind,p.source_row_id",[user,device,list(ARCHIVE_COLUMNS),device]).fetchall()
     for at in range(0,len(peers),500):
         claims=[(kind,source,source,user,'active') for kind,source,hashes in peers[at:at+500]]
         bodies=typed_logical_rows(db,claims)
         if received:=[(kind,source) for (kind,source,hashes),claim in zip(peers[at:at+500],claims) if any(matching_logical_row(bodies[claim],h) is not None for h in hashes)]: db.executemany('INSERT INTO sync_received VALUES (?,?)',received)
-    db.execute('CREATE OR REPLACE TEMP TABLE sync_received AS SELECT DISTINCT * FROM sync_received')
-    blocked=[f'{table}.{column}' for table,refs in ARCHIVE_FKS.items() for column,parent in refs if db.execute(f"SELECT 1 FROM {table} c JOIN sync_received p ON p.table_name=? AND p.physical_row_id=c.{column} WHERE NOT EXISTS(SELECT 1 FROM sync_received o WHERE o.table_name=? AND o.physical_row_id=c.id) LIMIT 1",[parent,table]).fetchone()]
+    db.execute('CREATE OR REPLACE TEMP TABLE sync_received AS SELECT DISTINCT r.* FROM sync_received r WHERE NOT EXISTS(SELECT 1 FROM sync_local l WHERE (l.kind,l.id)=(r.table_name,r.physical_row_id))')
+    blocked={f'{table}.{column}':n for table,refs in ARCHIVE_FKS.items() for column,parent in refs for n, in [db.execute(f"SELECT count(*) FROM {table} c JOIN sync_received p ON p.table_name=? AND p.physical_row_id=c.{column} WHERE NOT EXISTS(SELECT 1 FROM sync_received o WHERE o.table_name=? AND o.physical_row_id=c.id)",[parent,table]).fetchone()] if n}
     required(not blocked,ValueError(f'Cannot reset sync: owned rows reference received parents: {blocked}; archive unchanged'))
     before,backup=(missing:=lambda:{(table,column,value) for table,refs in ARCHIVE_FKS.items() for column,parent in refs for value, in db.execute(f'SELECT DISTINCT c.{column} FROM {table} c LEFT JOIN {parent} p ON p.id=c.{column} WHERE p.id IS NULL'+(f' AND c.{column} IS NOT NULL' if (table,column)==('messages','parent_id') else '')).fetchall()})(),_migration_backup(db,'sync-v2')
     with _transaction(db):
