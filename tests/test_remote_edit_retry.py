@@ -37,6 +37,13 @@ def test_shared_file_from_another_author_wakes_pending_edit(tmp_path):
     assert remaining(path)==0 and projection.audit_rows(path,local_user='receiver')['totals']['unavailable']==0
 
 
+def test_deferred_facts_emit_one_batch_summary(tmp_path,capsys):
+    user,control,rows,bodies,file,fact,signed=graph(); path=tmp_path/'db'
+    projection.apply_row_replicas(path,[signed(fact(f'e{i}')) for i in range(3)],'w',[control],local_user='receiver')
+    lines=[line for line in capsys.readouterr().err.splitlines() if 'Remote facts retained pending dependencies' in line]
+    assert lines==['Remote facts retained pending dependencies: 3'] and remaining(path)==3
+
+
 def test_archive_edit_dependency_is_author_qualified(tmp_path,monkeypatch):
     user,control,rows,bodies,file,fact,signed=graph(); path=tmp_path/'db'
     apply=lambda values:projection.apply_row_replicas(path,values,'w',[control],local_user='receiver')
@@ -187,23 +194,26 @@ def test_late_ancestor_body_is_kept_when_the_current_head_cannot_reconstruct(tmp
         assert json.loads(db.execute('SELECT body FROM remote.row_conflicts WHERE proof_id=?',[digest(original['proof'])]).fetchone()[0])==original['row']
 
 
-def test_core_body_retirement_is_exact_and_transactional():
+@pytest.mark.parametrize('fork',[False,True])
+def test_core_body_retirement_is_exact_and_transactional(fork):
     revision=('conversations',"quoted'source",'author','head')
     rows=[(f'p{i}',*value) for i,value in enumerate([revision,revision,('messages',*revision[1:]),(revision[0],'other',*revision[2:]),(*revision[:2],'other',revision[3]),(*revision[:3],'fork')])]
     with duckdb.connect() as db:
         core.init_schema(db)
         core._insert_pages(db,'remote.row_proofs',rows,('id','row_kind','source_row_id','author_user_id','revision'))
         core._insert_pages(db,'remote.row_conflicts',[(r[0],json.dumps({'id':r[0]})) for r in rows])
+        if not fork: db.execute("UPDATE remote.row_proofs SET previous_revision='head' WHERE id='p5'")
+        retained=[(f'p{i}',) for i in range(0 if fork else 2,6)]
         with pytest.raises(RuntimeError,match='rollback'):
             with core._transaction(db):
                 core.retire_row_bodies(db,[revision,revision])
-                assert db.execute('SELECT proof_id FROM remote.row_conflicts ORDER BY proof_id').fetchall()==[(f'p{i}',) for i in range(2,6)]
+                assert db.execute('SELECT proof_id FROM remote.row_conflicts ORDER BY proof_id').fetchall()==retained
                 raise RuntimeError('rollback')
         assert db.execute('SELECT count(*) FROM remote.row_conflicts').fetchone()[0]==6
         with core._transaction(db): core.retire_row_bodies(db,[revision])
         core.retire_row_bodies(db,[])
         with pytest.raises(ValueError): core.retire_row_bodies(db,[revision[:3]])
-        assert db.execute('SELECT proof_id FROM remote.row_conflicts ORDER BY proof_id').fetchall()==[(f'p{i}',) for i in range(2,6)]
+        assert db.execute('SELECT proof_id FROM remote.row_conflicts ORDER BY proof_id').fetchall()==retained
 
 
 def test_settled_sync_resumes_ready_metadata_without_generation_change(tmp_path,monkeypatch):

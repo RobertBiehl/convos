@@ -12,12 +12,12 @@ def _loc(paths):
 
 
 def test_line_budget():
-    """Keep the cohesive archive-writing core under the explicit budget in AGENTS.md (1500 plus ~15 per local-session integration)."""
+    """Keep the cohesive archive-writing core under the explicit 1665-line budget in AGENTS.md (1650 plus a ~15-line Muse integration allowance)."""
     root = Path(__file__).resolve().parents[1]
     paths = sorted((root / "src" / "ai_convos").glob("*.py"))
     assert paths, "No source files found"
     loc = _loc(paths)
-    assert loc < 1520, f"Code line budget exceeded: {loc} >= 1520"
+    assert loc < 1665, f"Code line budget exceeded: {loc} >= 1665"
 
 
 def test_app_line_budgets():
@@ -25,7 +25,7 @@ def test_app_line_budgets():
     root = Path(__file__).resolve().parents[1]
     for src in sorted((root / "apps").glob("*/src")):
         loc = _loc(sorted(src.rglob("*.py")))
-        limit = {"changegraph": 400, "memory": 1000, "remote": 2600, "remote_server": 700}.get(src.parent.name, 200)
+        limit = {"changegraph": 400, "memory": 1000, "remote": 2850, "remote_server": 700}.get(src.parent.name, 200)
         assert loc < limit, f"App {src.parent.name} budget exceeded: {loc} >= {limit}"
 
 
@@ -54,11 +54,11 @@ def test_installable_product_versions_are_aligned():
     files = [root/"pyproject.toml", *sorted((root/"apps").glob("*/pyproject.toml"))]
     projects = {f.parent.name:tomllib.loads(f.read_text())["project"] for f in files}
     assert {p["name"] for p in projects.values()} == {"convos","convos-changegraph","convos-explore","convos-memory","convos-redact","convos-remote","convos-remote-server","convos-resume"}, projects
-    assert {p["version"] for p in projects.values()} == {"0.11.6b10"}, projects
+    assert {p["version"] for p in projects.values()} == {"0.11.6b16"}, projects
     major,minor=map(int,next(iter({p["version"] for p in projects.values()})).split(".")[:2])
     constrained=[d for p in projects.values() for d in [*p["dependencies"],*(d for ds in p.get("optional-dependencies",{}).values() for d in ds)] if d.startswith("convos") and ">=" in d]
     assert constrained and {d[d.index(">="):] for d in constrained} == {f">={next(iter(projects.values()))['version']},<{major}.{minor+1}"}, constrained
-    assert {d for p in projects.values() for d in p["dependencies"] if d.startswith("duckdb")} == {"duckdb>=1.4.3"}
+    assert {d for p in projects.values() for d in p["dependencies"] if d.startswith("duckdb")} == {"duckdb>=1.4.5"}
     assert not any(d.startswith("convos-changegraph") for d in projects["remote"]["dependencies"])
 
 

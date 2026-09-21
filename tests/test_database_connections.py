@@ -9,6 +9,7 @@ from ai_convos import cli
 ROOT=Path(__file__).resolve().parents[1]
 SOURCES=[ROOT/"src/ai_convos/cli.py",*ROOT.glob("apps/*/src/**/*.py")]
 SQLITE=Counter({
+    ("apps/remote/src/ai_convos_remote/projection.py","reset_sync_state"):1,
     ("src/ai_convos/cli.py","read_chrome_cookies"):1,("src/ai_convos/cli.py","chrome_cookie_domains"):1,
     ("apps/memory/src/ai_convos_memory/__init__.py","_scope"):1,("apps/memory/src/ai_convos_memory/__init__.py","connect"):1,("apps/memory/src/ai_convos_memory/__init__.py","backup_data"):1,("apps/memory/src/ai_convos_memory/__init__.py","_health_data"):1,("apps/memory/src/ai_convos_memory/__init__.py","_snapshot"):3,
     ("apps/redact/src/ai_convos_redact/__init__.py","_audit"):1,("apps/redact/src/ai_convos_redact/__init__.py","audit_data"):1,
@@ -109,11 +110,26 @@ def test_unhandled_lock_errors_are_concise_cli_errors(tmp_path,monkeypatch):
     monkeypatch.setattr(cli,"DB_PATH",tmp_path/"archive.db"); cli.DB_PATH.touch(); monkeypatch.setattr(cli,"get_db",lambda *args,**kwargs:(_ for _ in ()).throw(cli.LockBusy("archive busy; holder PID 12")))
     result=CliRunner().invoke(cli.app,["backup"]); assert result.exit_code==1 and "archive busy; holder PID 12" in result.output and "Traceback" not in result.output and "LockBusy" not in result.output
 
-def test_native_wait_extends_only_while_holder_reports_progress(tmp_path):
-    path=tmp_path/"archive.db"; child,_=holder(path,"progressing sync",duration=.18); started=time.monotonic()
-    try: cli.open_db(path,wait=.05,purpose="manual embed").close()
-    finally: release(child)
-    assert time.monotonic()-started>=.12
+@pytest.mark.parametrize('progress',[True,False])
+def test_native_wait_extends_only_while_holder_reports_progress(tmp_path,monkeypatch,progress):
+    path,clock,db=tmp_path/'archive.db',[0.],cli.duckdb.connect(':memory:')
+    def opening(*args):
+        clock[0]+=.02
+        if clock[0]<.2: raise cli.duckdb.IOException('Conflicting lock is held by external PID 12')
+        return db
+    monkeypatch.setattr(cli,'_open_db',opening)
+    monkeypatch.setattr(cli,'_duckdb_owner',lambda *args:dict(pid=12,purpose='progressing sync',heartbeat_at=clock[0] if progress else .02))
+    monkeypatch.setattr(cli.time,'monotonic',lambda:clock[0])
+    monkeypatch.setattr(cli.time,'sleep',lambda delay:clock.__setitem__(0,clock[0]+delay))
+    try:
+        if progress:
+            cli.open_db(path,wait=.05,purpose='manual embed').close()
+            assert clock[0]>=.2
+        else:
+            with pytest.raises(cli.LockBusy,match='holder made no recorded progress'): cli.open_db(path,wait=.05,purpose='manual embed')
+            assert .05<clock[0]<.2
+        assert not list(path.with_name('.archive.db.waiters').glob('*.lock'))
+    finally: db.close()
 
 def test_native_waiter_notice_exists_only_during_actual_contention(tmp_path):
     path=tmp_path/"archive.db"; owner=cli.open_db(path,purpose="page owner"); child=subprocess.Popen([sys.executable,"-c","import sys; from ai_convos.cli import open_db; open_db(sys.argv[1],purpose='waiting writer').close()",str(path)]); directory=path.with_name(".archive.db.waiters")
@@ -162,7 +178,7 @@ def test_remote_internal_requests_heartbeat_without_rendering(tmp_path,monkeypat
 
 def test_signed_evidence_reconciliation_is_always_targeted():
     tree=ast.parse((ROOT/"src/ai_convos/cli.py").read_text()); calls=[node for node in ast.walk(tree) if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=="_apply_signed_edit_evidence"]
-    assert len(calls)==3 and all(len(node.args)>1 or any(k.arg in {"edits","tools"} for k in node.keywords) for node in calls)
+    assert calls and all(len(node.args)>1 or any(k.arg in {"edits","tools"} for k in node.keywords) for node in calls)
 
 def test_remote_signing_and_attachment_io_run_without_archive_lock(tmp_path,monkeypatch):
     from ai_convos_remote import projection

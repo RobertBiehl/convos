@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.11.6b16
+
+- Verify every single-column primary-key index and read every VARCHAR/JSON column
+  in an isolated process before the one-time sync reset. A damaged index or storage
+  segment now stops before backup or mutation and names the active table/column;
+  SIGBUS cannot take down the migration process.
+- Summarize deferred provenance facts once per received batch instead of printing
+  one expected dependency message per fact.
+
+## 0.11.6b15
+
+- Retain locally captured attachments, attachment bodies, and artifacts when old
+  relay markers overlap a provider-bound conversation during the b11/b12 cutover.
+  This completes the source-device ownership rule for every conversation child.
+
+## 0.11.6b14
+
+- Complete the b11/b12 source-device cutover for archives where a locally captured
+  provider session also carries an old received-row marker. Keep the locally bound
+  conversation and its children, and report exact counts for unresolved legacy
+  parent ownership without deleting either side.
+- Converge identical provider rows imported on two devices onto one deterministic
+  source device, including simultaneous first publication. Preserve divergent local
+  rows and reject revisions or new children from a device that does not own them.
+
+## 0.11.6b13
+
+- Make the source device the sole writer of a conversation and its children.
+  Use provider IDs when available, and retain assigned IDs for legacy rows.
+- Back up owned local archives and attachment bytes before the identity migration.
+  Remove received copies, reset the previous relay format once, and automatically
+  reenroll existing users and devices with their current keys. Old clients must
+  upgrade; unknown future storage versions are rejected without resetting them.
+- Carry edits as tool or message metadata, preserving their original turn and
+  signed history. Remove ongoing parser-alias reconciliation. Existing unresolved
+  archive references are preserved and reported; upgrades reject newly broken links.
+- Buffer hooks durably, import in bounded transactions, and retry Git provenance
+  independently. Preserve completed tool output when an incomplete snapshot arrives.
+- Keep unchanged peer imports cheap, and avoid attachment history duplicates when
+  cached bytes move. Validate complete archive equality and account isolation using
+  real transcript copies, interrupted imports, concurrent hooks, and large appends.
+
+All eight products are aligned to b13. Core schema 17 and parser epoch 12 apply
+the one-time source-device boundary. The existing release gate tests installed
+packages on Linux and macOS, including upgrades from b12.
+
+## 0.11.6b12
+
+- Require DuckDB 1.4.5 or newer to avoid a known column-update assertion in
+  earlier 1.4 releases; validate the locked minimum in CI.
+- Reconcile exact provider identities and signed parser history across devices,
+  including source-backed repair of older timestamps. Store provider timestamps
+  in UTC so machines in different timezones converge on the same rows.
+- Preserve signed bodies, native edits, tool evidence, and parent relationships
+  during replay. Publish retained signed corrections when parser rows retire.
+  Reject ambiguous replacement chains and retain unresolved
+  history. Avoid creating edit history when only a portable file path changes.
+- Keep conversation capture working after worktree deletion or Git ownership
+  failures; retry provenance separately without starving other repositories.
+- Reuse alias dependency inventories and skip settled groups. Avoid blocking
+  relay startup on reverse DNS and return a failing exit status for SQL errors.
+- Gate publication on installed-package lifecycle tests on Linux and macOS:
+  same-account sync across timezones, account isolation, deleted worktrees,
+  offline recovery, repeated imports, and retained-archive upgrades from b11.
+  Extend the existing testbed with private, local-only transcript snapshots.
+
+All eight products are aligned to b12. Core schema 15 uses a validated backup
+before migration; parser epoch 8 reprocesses local sources. Released signed
+encodings remain readable. Historical gaps still require original source or
+signed evidence, and large archive replay can take time.
+
+## 0.11.6b11
+
+- Preserve author-scoped native parent bindings during signed replay, and repair
+  proven mixed-archive parent gaps through a backed-up core migration.
+- Retain thinking-only Claude Code parent turns. Reconstruct supported historical
+  Claude Code/Codex message and tool identities from source events, including
+  changed session bindings, and replicate exact replacement evidence in signed
+  metadata.
+- Delete verified obsolete active copies when their complete replacements exist
+  and no unique dependent needs them. Retain required historical bodies
+  separately, prevent resurrection through replay or backup merge, and restore
+  exact parents for late unique children. Physical retirement does not publish
+  a permanent logical deletion.
+- Make parser evolution and archive cleanliness explicit product invariants.
+  Unknown historical gaps remain visible; a missing parent alone never justifies
+  deletion.
+
+All eight products are aligned to b11. Core schema 14 and parser epoch 6 use the
+existing validated migration backup process; released signed encodings and the
+relay protocol stay unchanged. See [parser evolution](docs/parser-evolution.md).
+
 ## 0.11.6b10
 
 - Preserve metadata-only signed attachment history without requiring nonexistent

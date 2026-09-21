@@ -9,7 +9,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  qualify:
+    uses: ./.github/workflows/tests.yml
+    permissions:
+      contents: read
+
   build:
+    needs: qualify
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -20,8 +26,8 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
-      - run: uv sync --extra dev
-      - run: uv run pytest -m "not integration" -q
+      - run: uv sync --extra dev --locked
+      - run: uv run pytest -m "not integration" -x -q -o faulthandler_timeout=180
         env:
           CONVOS_PROJECT_ROOT: ${{ runner.temp }}/external-convos
           CODEX_HOME: ${{ runner.temp }}/external-codex

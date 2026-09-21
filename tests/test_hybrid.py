@@ -336,7 +336,7 @@ def test_sql_select_and_blocks_writes(tmp_path, monkeypatch):
     assert r.exit_code == 0, r.output
     assert '"c1"' in r.output and '"test"' in r.output
     w = CliRunner().invoke(cli.app, ["sql", "UPDATE conversations SET title='x'"])
-    assert w.exit_code == 0
+    assert w.exit_code == 1
     assert "Query failed" in (w.output + (w.stderr if w.stderr_bytes is not None else ""))
 
 

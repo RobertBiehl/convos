@@ -429,19 +429,66 @@ def test_provenance_commit_revalidates_only_observed_inputs(tmp_path,monkeypatch
         assert not db.execute("SELECT 1 FROM provenance.pending").fetchone()
         assert db.execute("SELECT new_content_hash FROM provenance.file_edit_files WHERE file_edit_id='e0'").fetchone()[0]==digest(b"concurrent\n" if related else b"one\n")
 
-def test_provenance_retry_batch_is_bounded_and_same_version_schema_is_additive(tmp_path,monkeypatch):
+@pytest.mark.parametrize('explicit',[False,True])
+def test_provenance_retry_batch_is_bounded_and_same_version_schema_is_additive(tmp_path,monkeypatch,explicit):
     path=tmp_path/"core.db"; root=repo(tmp_path/"repo"); db=graph(path); db.execute("DROP TABLE provenance.pending"); before=archive_state(db); init_schema(db); assert archive_state(db)==before; db.close(); monkeypatch.setattr(core_module,"DB_PATH",path)
     rows=[dict(id=f"c{i}",source="codex",title="pending",created_at=None,updated_at=None,model=None,cwd=str(root),git_branch=None,project_id=None,metadata="{}") for i in range(501)]
     core_module.commit_result(core_module.ParseResult(convs=rows),purpose="test.ingest")
     for remaining in (1,0):
-        capture(path,edit_ids=set(),conversation_ids=set())
+        capture(path,edit_ids=set(),conversation_ids={r['id'] for r in rows} if explicit else set())
         with core_module.open_db(path,read_only=True,purpose="fixture.read") as db: assert db.execute("SELECT COUNT(*) FROM provenance.pending").fetchone()[0]==remaining
+
+def test_nonstrict_provenance_race_defers_only_enrichment(tmp_path,monkeypatch,capsys):
+    root=repo(tmp_path/'repo')
+    path=tmp_path/'core.db'
+    db=core(path,root,[(root/'x.py','write','one\n',None)])
+    db.execute("INSERT INTO provenance.pending VALUES ('file_edits','e0',1)")
+    db.close()
+    observe=core_module._observe_provenance
+    def raced(*args,**kwargs):
+        with core_module._core(path,purpose='test.race') as db: core_module._archive_touch(db,[('file_edits','e0')])
+        return observe(*args,**kwargs)
+    monkeypatch.setattr(core_module,'_observe_provenance',raced)
+    assert capture(path,edit_ids=['e0'],strict=False)==[]
+    assert 'provenance' in capsys.readouterr().err.lower()
+    with core_module._core(path,True,purpose='test.read') as db:
+        assert db.execute('SELECT content FROM file_edits').fetchone()==('one\n',)
+        assert db.execute('SELECT entity FROM provenance.pending').fetchall()==[('e0',)]
+        assert not db.execute('SELECT 1 FROM provenance.file_edit_files').fetchone()
+    monkeypatch.setattr(core_module,'_observe_provenance',observe)
+    assert capture(path,edit_ids=[],conversation_ids=[],strict=False)
+
+def test_legacy_scope_placeholder_cannot_replace_existing_exact_binding(tmp_path):
+    root=repo(tmp_path/'repo')
+    path=tmp_path/'core.db'
+    db=core(path,root,[(root/'x.py','write','one\n',None)])
+    db.close()
+    capture(path)
+    with core_module._core(path,purpose='test.legacy') as db:
+        before=db.execute('SELECT file_id FROM provenance.file_edit_files').fetchone()
+        db.execute("UPDATE provenance.file_edit_scopes SET path='external/legacy/unknown',repository=NULL,root=NULL,checkout=NULL,route=NULL,observed_at=NULL")
+        db.execute("INSERT INTO provenance.pending VALUES ('file_edits','e0',1)")
+    capture(path,edit_ids=['e0'])
+    with core_module._core(path,True,purpose='test.read') as db:
+        assert db.execute('SELECT file_id FROM provenance.file_edit_files').fetchone()==before
+        assert not db.execute('SELECT 1 FROM provenance.pending').fetchone()
 
 def test_provenance_targets_rollback_with_ingestion(tmp_path):
     path=tmp_path/"core.db"; db=graph(path); row=dict(id="rollback",source="codex",title="pending",created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")
     with pytest.raises(RuntimeError,match="crash"):
         with core_module._transaction(db): core_module.upsert(db,core_module.ParseResult(convs=[row])); raise RuntimeError("crash")
     assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==db.execute("SELECT COUNT(*) FROM provenance.pending").fetchone()[0]==0; db.close()
+
+def test_native_provenance_publishes_one_complete_change_batch(tmp_path):
+    db=graph(tmp_path/'batch.db')
+    records=[dict(kind='file.observed',entity=(fid:=digest(dict(repository=None,path=f'external/{i}'))),payload=dict(id=fid,repository=None,path=f'external/{i}',kind='external'),observed_at=None) for i in range(20)]
+    before=archive_state(db)[1]
+    with core_module._transaction(db): core_module.project_native_provenance(db,records)
+    generation,changes=archive_changes(db,before)
+    assert generation==before+1
+    assert set(changes)=={(r['kind'],r['entity']) for r in records}
+    assert db.execute('SELECT count(*) FROM provenance.files').fetchone()[0]==len(records)
+    db.close()
 
 
 def test_cwd_only_ingestion_persists_moved_checkout_without_changing_identity(tmp_path):

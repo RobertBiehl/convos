@@ -41,3 +41,47 @@ def test_relay_isolation_requires_only_test_users_and_exact_memberships(tmp_path
         path=tmp_path/f"{name}.db"
         relay(path,**options)
         with pytest.raises(AssertionError,match=match): module.assert_relay_isolation(path,{"alice","bob"},"team")
+
+
+def test_private_customer_lane_refuses_ci_and_nonempty_foreign_storage(tmp_path,monkeypatch):
+    module=load_testbed()
+    marker=tmp_path/'personal-data'
+    marker.write_text('preserve')
+    monkeypatch.setenv('CI','true')
+    with pytest.raises(ValueError,match='local-only'): module.customer_lane(tmp_path,tmp_path,'test',tmp_path,tmp_path)
+    monkeypatch.delenv('CI')
+    with pytest.raises(ValueError,match='non-customer-testbed'): module.customer_lane(tmp_path,tmp_path,'test',tmp_path,tmp_path)
+    assert marker.read_text()=='preserve'
+
+
+@pytest.mark.parametrize('failure',['large-append-capture','large-append-drain'])
+def test_large_append_restores_private_source_when_capture_or_drain_fails(tmp_path,monkeypatch,failure):
+    from contextlib import nullcontext
+    import hashlib
+    from ai_convos import cli as core
+    module=load_testbed()
+    client=module.desktop_client(tmp_path/'laptop',tmp_path/'venv')
+    source=client['root']/'codex/sessions/session.jsonl'
+    source.parent.mkdir(parents=True)
+    original=b'{"type":"session_meta","payload":{"id":"private-session"}}\n'
+    source.write_bytes(original)
+    before=source.stat()
+    for relative in ('data/convos.db','data/sync_state.json','remote/config.json'):
+        path=client['root']/'archive'/relative
+        path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text('{}')
+    evidence=tmp_path/'evidence'
+    evidence.mkdir()
+    entry=dict(path='codex/sessions/session.jsonl',bytes=len(original),sha256=hashlib.sha256(original).hexdigest())
+    monkeypatch.setattr(module,'operation_lock',lambda *args,**kwargs:nullcontext())
+    monkeypatch.setattr(core,'open_db',lambda *args,**kwargs:nullcontext())
+    monkeypatch.setattr(module,'desktop_inventory',lambda client:[])
+    monkeypatch.setattr(module,'customer_projection',lambda client:{})
+    def measure(label,cloned,*args,**kwargs):
+        assert cloned['env']['CONVOS_PROJECT_ROOT']!=client['env']['CONVOS_PROJECT_ROOT']
+        assert source.read_bytes().startswith(original) and source.stat().st_size>len(original)
+        if label==failure: raise RuntimeError('injected qualification failure')
+    with pytest.raises(RuntimeError,match='injected qualification failure'):
+        module.customer_large_append(client,dict(corpus=[entry]),evidence,measure)
+    assert source.read_bytes()==original and source.stat().st_mtime_ns==before.st_mtime_ns
+    assert (client['root']/'archive/data/convos.db').read_text()=='{}'

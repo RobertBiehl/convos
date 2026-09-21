@@ -25,8 +25,7 @@ def test_legacy_scope_recovery_unblocks_capture_without_changing_signed_history(
     path, original = legacy_archive(tmp_path)
     users, _, _, cfg = people()
     attest_rows(path, cfg, "w", scanned(path, tmp_path / "state.db"))
-    with pytest.raises(ValueError, match="provenance edit scope conflict"):
-        core.capture_provenance(path)
+    assert any(r['kind']=='edit.observed' for r in core.capture_provenance(path))
     with duckdb.connect(str(path)) as db:
         tables = ("file_edits", "provenance.file_edit_files", "provenance.file_edit_evidence", "remote.row_proofs")
         before = {t: db.execute(f"SELECT * FROM {t}").fetchall() for t in tables}
@@ -36,7 +35,6 @@ def test_legacy_scope_recovery_unblocks_capture_without_changing_signed_history(
             assert core.repair_legacy_edit_scopes(db, apply=True) == planned
         assert {t: db.execute(f"SELECT * FROM {t}").fetchall() for t in tables} == before
         assert core.repair_legacy_edit_scopes(db, apply=True) == []
-    assert any(r["kind"] == "edit.observed" for r in core.capture_provenance(path))
     assert not any(r["kind"] == "edit.observed" for r in core.capture_provenance(path))
     assert audit_rows(path, local_user=users[0])["totals"]["unavailable"] == 0
 

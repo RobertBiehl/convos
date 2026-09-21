@@ -3,11 +3,13 @@ import argparse, base64, hashlib, hmac, json, logging, os, secrets, socket, sqli
 from contextlib import closing, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 V=CONTROL_V=1
+HTTP_VERSION,STORAGE_VERSION=2,3
 APPROVAL_DELAY=int(os.environ.get("CONVOS_REMOTE_APPROVAL_DELAY","3600"))
 REPLICA_QUOTA=int(os.environ.get("CONVOS_REMOTE_REPLICA_QUOTA",str(10*1024**3)))
 BLOB_LIMIT,BLOB_QUOTA=32*1024**2,int(os.environ.get("CONVOS_REMOTE_BLOB_QUOTA",str(10*1024**3)))
@@ -66,42 +68,27 @@ def binary_schema(db):
         columns={r[1] for r in db.execute(f"PRAGMA table_info({table})")}
         if "ciphertext" not in columns: db.execute(f"ALTER TABLE {table} ADD COLUMN ciphertext BLOB")
         if "wire_size" not in columns: db.execute(f"ALTER TABLE {table} ADD COLUMN wire_size INTEGER")
-    db.execute("PRAGMA user_version=2")
-def migrate_storage(db):
-    if db.execute("PRAGMA user_version").fetchone()[0] not in (1,2) or db.execute("SELECT 1 FROM sqlite_master WHERE name='event_purges'").fetchone(): raise ValueError("relay database is incompatible with binary migration")
-    binary_schema(db)
-    for table in ENCRYPTED_TABLES:
-        after=0
-        while page:=bounded(db.execute(f"SELECT cursor,envelope,ciphertext,wire_hash FROM {table} WHERE cursor>? ORDER BY cursor LIMIT 500",(after,)),lambda r:len(r[1])+len(r[2] or b""),4*1024**2):
-            for cursor,raw,encrypted,wire_hash in page:
-                env={**json.loads(raw),"ciphertext":b64(encrypted)} if encrypted is not None else json.loads(raw)
-                if digest(env)!=wire_hash: raise ValueError(f"stored envelope digest mismatch: {table} cursor {cursor}")
-                header,ciphertext,size=split_envelope(env)
-                if stored_envelope({"envelope":header,"ciphertext":ciphertext})!=env: raise ValueError("binary envelope round trip mismatch")
-                db.execute(f"UPDATE {table} SET envelope=?,ciphertext=?,wire_size=? WHERE cursor=?",(header,ciphertext,size,cursor))
-            after=page[-1][0]
-            db.commit()
-    db.execute("DELETE FROM replica_usage")
-    db.execute("INSERT INTO replica_usage SELECT workspace,uploader,SUM(bytes) FROM (SELECT workspace,uploader,LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext) bytes FROM row_replicas UNION ALL SELECT workspace,uploader,LENGTH(CAST(envelope AS BLOB))+LENGTH(ciphertext) bytes FROM semantic_replicas) GROUP BY workspace,uploader")
-    db.commit()
-
+    db.execute(f"PRAGMA user_version={STORAGE_VERSION}")
 def connect(path,initialize=True):
     db=sqlite3.connect(path if initialize else Path(path).absolute().as_uri()+"?mode=rw",uri=not initialize,timeout=30)
     db.row_factory=sqlite3.Row
     db.executescript("PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;")
     if not initialize: return db
-    old=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
-    version=db.execute("PRAGMA user_version").fetchone()[0]
-    if old and version==1 and not db.execute("SELECT 1 FROM sqlite_master WHERE name='event_purges'").fetchone():
+    db.execute("PRAGMA journal_mode=WAL")
+    try:
+        with db:
+            db.execute('BEGIN EXCLUSIVE')
+            tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            version=db.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (0,1,2,STORAGE_VERSION) or tables and ('events' not in tables or version==0): raise ValueError('relay database is incompatible')
+            if tables and version in (1,2):
+                [db.execute('DROP TABLE "'+name.replace('"','""')+'"') for name in tables]
+            [db.execute(sql) for sql in SCHEMA.split(';') if sql.strip()]
+            binary_schema(db)
+            db.executemany("INSERT OR IGNORE INTO relay_meta VALUES (?,?)",[(name,b64(os.urandom(32))) for name in ('registration_secret','sync_generation')])
+    except BaseException:
         db.close()
-        raise ValueError("relay storage migration required: run convos-server migrate --db SOURCE --output NEW_DATABASE before serving the new database")
-    if old and (version!=2 or db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_purges'").fetchone()):
-        db.close()
-        raise ValueError("relay database is incompatible; create a fresh relay")
-    db.executescript("PRAGMA journal_mode=WAL;"+SCHEMA)
-    binary_schema(db)
-    db.execute("INSERT OR IGNORE INTO relay_meta VALUES ('registration_secret',?)",(b64(os.urandom(32)),))
-    db.commit()
+        raise
     return db
 def token_hash(token): return hashlib.sha256(token.encode()).hexdigest()
 def auth(db, token):
@@ -284,9 +271,11 @@ def register(db,req):
     if old and old[0]!=root: raise PermissionError("user root mismatch")
     if not old: db.execute("INSERT INTO users VALUES (?,?,?,?,?)",(user,req["user_name"],root,json.dumps(req.get("recovery")),time.time()))
     token=secrets.token_urlsafe(32)
-    db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?)",(dev["id"],user,dev["name"],dev["sign_public"],dev["box_public"],token_hash(token),1,time.time()))
-    db.execute("INSERT INTO device_certificates VALUES (?,?)",(dev["id"],json.dumps(cert)))
-    return dict(user=user,device=dev["id"],token=token)
+    prior=db.execute('SELECT user_id,sign_public,box_public,active FROM devices WHERE id=?',[dev['id']]).fetchone()
+    if prior and tuple(prior)!=(user,dev['sign_public'],dev['box_public'],1): raise PermissionError('device registration conflicts with retained identity')
+    db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash",(dev["id"],user,dev["name"],dev["sign_public"],dev["box_public"],token_hash(token),1,time.time()))
+    db.execute("INSERT OR REPLACE INTO device_certificates VALUES (?,?)",(dev["id"],json.dumps(cert)))
+    return dict(user=user,device=dev["id"],token=token,generation=db.execute("SELECT value FROM relay_meta WHERE key='sync_generation'").fetchone()[0])
 
 def rotate(db, actor, req):
     previous=current_control(db,req["workspace"])
@@ -403,6 +392,7 @@ def action(db, req, token=None):
         return dispatch(db,req,token)
 def dispatch(db, req, token):
     op = req["op"]
+    if op == 'status': return dict(version=HTTP_VERSION,generation=db.execute("SELECT value FROM relay_meta WHERE key='sync_generation'").fetchone()[0])
     if op == "register_challenge": return {"challenge":registration_challenge(db,req)}
     if op == "register": return register(db, req)
     if op == "recovery_fetch":
@@ -416,8 +406,10 @@ def dispatch(db, req, token):
         ws,control=req["workspace"],req["control"]
         verify_control(db,actor,control)
         if (control["workspace"],control["scope"])!=(ws,req["kind"]): raise ValueError("workspace create scope mismatch")
+        if req['kind']=='personal' and (existing:=db.execute("SELECT id FROM workspaces WHERE kind='personal' AND created_by=?",[actor['user_id']]).fetchone()): return {'workspace':existing[0],'created':False}
         db.execute("INSERT INTO workspaces VALUES (?,?,?,?,?)",(ws,req["kind"],1,actor["user_id"],time.time()))
         result=apply_control(db,control,req["envelopes"])
+        if req['kind']=='personal' and 'recovery' in req: db.execute('UPDATE users SET recovery=? WHERE id=?',[json.dumps(req['recovery']),actor['user_id']])
         return result
     if op == "rotate": return rotate(db,actor,req)
     if op == "propose":
@@ -610,6 +602,10 @@ class Server(ThreadingHTTPServer):
         self.slots=threading.BoundedSemaphore(max(1,int(os.environ.get("CONVOS_SERVER_WORKERS","32"))))
         self.deadlines={}
         super().__init__(*args,**kwargs)
+    def server_bind(self):
+        # HTTPServer's reverse-DNS lookup must not delay a bound relay's startup.
+        TCPServer.server_bind(self)
+        self.server_name,self.server_port=self.server_address
     def process_request(self,request,client_address):
         if not self.slots.acquire(False):
             with suppress(OSError):
@@ -645,10 +641,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length",str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-    def do_GET(self): self.send(200,{"ok":True,"version":1}) if self.path == "/v1/health" else self.send(404,{"error":"not found"})
+    def do_GET(self):
+        if self.path!=f'/v{HTTP_VERSION}/health': return self.send(404,{"error":"upgrade required: relay protocol v2"})
+        with closing(connect(DB,False)) as db: self.send(200,{"ok":True,"version":HTTP_VERSION,"generation":db.execute("SELECT value FROM relay_meta WHERE key='sync_generation'").fetchone()[0]})
     def do_POST(self):
-        if self.path!="/v1":
-            self.send(404,{"error":"protocol v1 endpoint required"})
+        if self.path!=f'/v{HTTP_VERSION}':
+            self.send(404,{"error":"upgrade required: relay protocol v2"})
             return
         try:
             length=self.headers.get("Content-Length","")
@@ -669,16 +667,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send(500,{"error":"relay request failed"})
 
 def main(argv=None):
-    (p:=argparse.ArgumentParser()).add_argument("command",choices=("serve","backup","migrate"))
+    (p:=argparse.ArgumentParser()).add_argument("command",choices=("serve","backup"))
     for name,default in (("db",os.environ.get("CONVOS_SERVER_DB","convos-server.db")),("host","127.0.0.1"),("output",None)): p.add_argument("--"+name,default=default)
     p.add_argument("--port",type=int,default=8787)
     a=p.parse_args(argv)
-    if a.command in ("backup","migrate"):
+    if a.command=="backup":
         if not a.output: p.error("backup requires --output")
         source,output=Path(a.db).resolve(),Path(a.output).absolute()
         if not source.is_file(): p.error("backup requires an existing source database")
         if output.exists() and source.samefile(output): p.error("backup output must be a different file from the source")
-        if a.command=="migrate" and output.exists(): p.error("migration requires a new output path")
         if any(Path(str(output)+suffix).exists() for suffix in ("-wal","-shm","-journal")): p.error("backup output has SQLite sidecars; choose a fresh output path")
         output.parent.mkdir(parents=True,exist_ok=True)
         fd,stage=tempfile.mkstemp(prefix=f".{output.name}.",dir=output.parent)
@@ -686,13 +683,9 @@ def main(argv=None):
             with os.fdopen(fd,"r+b") as handle,closing(sqlite3.connect(source.as_uri()+"?mode=ro",uri=True)) as src,closing(sqlite3.connect(stage)) as dst:
                 src.backup(dst)
                 dst.execute("PRAGMA journal_mode=DELETE").fetchone()
-                if a.command=="migrate":
-                    migrate_storage(dst)
-                    dst.execute("VACUUM")
                 if dst.execute("PRAGMA quick_check").fetchall()!=[("ok",)]: raise sqlite3.DatabaseError("backup integrity check failed")
                 os.fsync(handle.fileno())
-            if a.command=="migrate": os.link(stage,output)
-            else: os.replace(stage,output)
+            os.replace(stage,output)
             directory=os.open(output.parent,os.O_RDONLY)
             try: os.fsync(directory)
             finally: os.close(directory)

@@ -1,4 +1,1 @@
-from .cli import app
-
-if __name__ == "__main__":
-    app()
+__import__("ai_convos.cli",fromlist=["app"]).app()

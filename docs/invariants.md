@@ -79,8 +79,10 @@ they do not depend on relay or `state.db` history.
 > A peer that accepts a signed logical row stores its proof and projects it into
 > typed archive tables in one transaction. That projection is origin-owned:
 > ordinary ingestion, enrichment, and maintenance cannot update or delete it.
-> Only a verified newer revision from the same author and source row may
-> supersede it. A receiver never re-attests another author's row.
+> A verified newer revision from the same author and source row may supersede
+> it; verified parser lineage from that author may retire an obsolete physical
+> representation under the parser-evolution rules below. A receiver never
+> re-attests another author's row.
 
 > Randomized re-encryption creates a delivery replica, not new semantic
 > content. The relay attributes replicas to their authenticated uploader and
@@ -198,6 +200,18 @@ they do not depend on relay or `state.db` history.
 > authorize a rewrite or deletion. Unique orphan edits and other unresolved
 > records remain retained and explicitly diagnosed; missing parents are never
 > fabricated to make an audit pass.
+
+> Verified obsolete representations are physically removed from the active
+> archive once their complete replacement is available and no unique dependent
+> evidence requires them. Keeping the database clean is part of reconciliation,
+> not an optional manual purge. Original signed bodies and the compact evidence
+> needed to interpret retained replicas remain available separately for their
+> required lifetime; preservation does not require duplicate active rows.
+
+> Cleanup is idempotent across re-import, replay, delivery order, and backup
+> merge. A stale replica must not resurrect an already verified obsolete copy.
+> A late unique dependent restores its exact retained parent when necessary;
+> a changed body or ambiguous replacement is not silently discarded.
 
 ## Retained semantic state
 

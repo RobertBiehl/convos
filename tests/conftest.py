@@ -1,4 +1,4 @@
-import gc, os, sys, tempfile
+import gc, hashlib, os, sys, tempfile
 from pathlib import Path
 
 import pytest
@@ -27,3 +27,13 @@ def isolated_product_state(tmp_path,monkeypatch):
 
 
 def pytest_runtest_teardown(): gc.collect()
+
+
+def pytest_collection_modifyitems(config,items):
+    if not (value:=os.environ.get('CONVOS_TEST_SHARD')): return
+    index,count=map(int,value.split('/'))
+    if not 0<=index<count: raise pytest.UsageError('CONVOS_TEST_SHARD requires index/count with 0 <= index < count')
+    chosen=[item for item in items if int.from_bytes(hashlib.sha256(item.nodeid.encode()).digest(),'big')%count==index]
+    selected=set(chosen)
+    config.hook.pytest_deselected(items=[item for item in items if item not in selected])
+    items[:]=chosen
