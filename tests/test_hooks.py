@@ -42,6 +42,28 @@ def test_intermediate_capture_minute_limit_and_completion_bypass(hooks,monkeypat
     event("Stop"); event("SessionEnd"); assert len(launched)==3
     now[0]=1060; event("PostToolUse"); assert len(launched)==4
 
+def test_muse_stop_hook_captures_session_by_id(hooks,monkeypatch,tmp_path):
+    muse=tmp_path/"muse"; session=muse/"sessions"/"2026"/"09"/"20"/"deadbeef-1234-5678-9abc-def012345678"/"session.jsonl"; session.parent.mkdir(parents=True)
+    session.write_text(json.dumps({"schema_version":1,"id":"e1","stream":{"kind":"session","id":"deadbeef-1234-5678-9abc-def012345678"},"sequence":1,"recorded_at":1789934104303999,"record_type":"event","durability":"durable","causation_id":None,"payload_type":"runtime.session","payload_schema_version":1,"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"remember muse"}}}))
+    monkeypatch.setenv("MUSE_HOME",str(muse))
+    r=CliRunner().invoke(cli.app,["capture","muse"],input=json.dumps({"hook_event_name":"Stop","session_id":"deadbeef-1234-5678-9abc-def012345678","cwd":"/repo","permission_mode":"default"}))
+    assert r.exit_code==0 and cli.drain_hooks()==1
+    with cli._core(read_only=True,purpose="test.read") as conn: assert conn.execute("SELECT COUNT(*) FROM conversations WHERE source='muse'").fetchone()[0]==1
+
+def test_muse_stop_hook_rejects_unknown_or_malicious_session(hooks,monkeypatch,tmp_path):
+    monkeypatch.setenv("MUSE_HOME",str(tmp_path/"muse"))
+    for sid in ("00000000-0000-0000-0000-000000000000","../evil","sess;rm"):
+        assert CliRunner().invoke(cli.app,["capture","muse"],input=json.dumps({"hook_event_name":"Stop","session_id":sid})).exit_code==0
+    assert not list(cli.HOOK_DIR.glob("*.json"))
+
+def test_muse_stop_hook_rejects_symlink_escape(hooks,monkeypatch,tmp_path):
+    muse=tmp_path/"muse"; d=muse/"sessions"/"2026"/"09"/"20"/"aaaaaaaa-1111-2222-3333-444444444444"; d.mkdir(parents=True)
+    outside=tmp_path/"outside.jsonl"; outside.write_text(json.dumps({"sequence":1,"recorded_at":1789934104303999,"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"Hi"}}}))
+    (d/"session.jsonl").symlink_to(outside)
+    monkeypatch.setenv("MUSE_HOME",str(muse))
+    assert CliRunner().invoke(cli.app,["capture","muse"],input=json.dumps({"hook_event_name":"Stop","session_id":"aaaaaaaa-1111-2222-3333-444444444444"})).exit_code==0
+    assert not list(cli.HOOK_DIR.glob("*.json"))
+
 def test_unchanged_capture_and_queued_duplicate_do_not_open_archive(hooks,monkeypatch):
     sessions,data=hooks; transcript(path:=sessions/"duplicate.jsonl"); enqueue(path); assert cli.drain_hooks()==1
     launched=[]; monkeypatch.setattr(cli.subprocess,"Popen",lambda *a,**k:launched.append(a)); monkeypatch.setattr(cli,"_core",lambda **k:pytest.fail("unchanged hook opened archive"))

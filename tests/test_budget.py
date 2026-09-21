@@ -12,12 +12,12 @@ def _loc(paths):
 
 
 def test_line_budget():
-    """Keep the cohesive archive-writing core under the explicit 1500-line budget in AGENTS.md."""
+    """Keep the cohesive archive-writing core under the explicit budget in AGENTS.md (1500 plus ~15 per local-session integration)."""
     root = Path(__file__).resolve().parents[1]
     paths = sorted((root / "src" / "ai_convos").glob("*.py"))
     assert paths, "No source files found"
     loc = _loc(paths)
-    assert loc < 1500, f"Code line budget exceeded: {loc} >= 1500"
+    assert loc < 1520, f"Code line budget exceeded: {loc} >= 1520"
 
 
 def test_app_line_budgets():

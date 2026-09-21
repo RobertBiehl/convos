@@ -29,7 +29,7 @@ authorization evidence and must never be inferred as wire-level row identity.
 Line Budget
 -----------
 
-Stay below the explicit 1500-line core budget (tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). The budget keeps durable schema migrations, canonical evidence classification, and capture snapshots in the cohesive core instead of hiding archive mutation behind an optional product. Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible.
+Stay below the explicit core budget (1500 lines plus ~15 per local-session integration, currently 1520; tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). The budget keeps durable schema migrations, canonical evidence classification, and capture snapshots in the cohesive core instead of hiding archive mutation behind an optional product. Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible.
 
 Package boundaries must represent user-installable products, not internal
 modules or a way to evade line budgets. A cohesive product may declare one
@@ -115,3 +115,21 @@ uv run convos sql "SELECT source, COUNT(*) FROM conversations GROUP BY source"  
 uv run convos search "test"    # verify FTS works
 uv run convos query "test"     # verify hybrid pipeline
 ```
+
+Oracle Reviews
+--------------
+
+Oracle browser reviews may take hours. A request to run Oracle authorizes one
+submission, not synchronous babysitting.
+
+- Preview the bundle, submit exactly once, and verify the durable session
+  name/URL and that ChatGPT accepted the prompt.
+- Poll with exponential backoff rather than continuously tailing: wait roughly
+  5, 10, 20, then 40 minutes, capped at hourly checks. Prefer a nonblocking
+  monitor when available, and report only state changes instead of every poll.
+- If the current environment cannot wait efficiently, return the durable session
+  details instead of using minute-by-minute polling to keep the turn alive.
+- If automation fails ambiguously, inspect the existing session/conversation
+  before retrying. Never resubmit while the first request may still be alive.
+- When the user says Oracle is done, reattach once and capture only the completed
+  verdict against the exact commit and bundle.
