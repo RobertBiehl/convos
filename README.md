@@ -6,54 +6,59 @@
 
 **Queryable memory for coding agents, backed by exact conversation evidence.**
 
-Convos captures Claude Code and Codex work automatically, recalls relevant
-decisions across ChatGPT, Claude, Claude Code, and Codex, then gives agents the
-exact turns they need to continue.
+Convos captures Claude Code and Codex work automatically. Agents can query those
+sessions and optional ChatGPT and Claude imports, then open the exact turns they
+need to continue.
 
-## Give this to your agent
+## Start with your agent
+
+Paste this into any agent that can read a repository and run commands:
 
 ```text
-Install Convos from PyPI with `uv tool install convos` (use pipx only if uv is unavailable), run `convos init`, then run `convos doctor` and repair any reported skill or hook issue. Run `convos embed` so semantic retrieval is ready, use `convos query "why did we make this decision?"` to find a relevant past conversation, and verify the strongest result with `convos read CONVERSATION_ID --around MESSAGE_ID`. Do not configure web sync, credentials, or a remote service unless I ask.
+Set up Convos for my current project using https://github.com/RobertBiehl/convos: read its README and skills/convos/SKILL.md, install the current release, run convos init and convos doctor, repair setup issues and guide me through any required hook review, then use convos query and convos read to show me one real prior decision with its exact source (or tell me if no relevant history exists); ask before importing web chats or configuring remote sync.
 ```
+
+The agent handles installation, capture setup, and the first evidence-backed
+answer. Convos keeps the source turns available for later questions.
+
+## Reproducible example
+
+Ask your agent (in a host with slash skills): **`/convos wasn't the duplicate-job bug fixed two agents ago?`**
+
+The agent uses Convos to find the earlier Claude Code decision alongside a later
+Codex follow-up, then reads the source turn before answering:
+
+```text
+convos query "duplicate-job bug after restart" -> codex, claude-code
+convos read d9baf4944df912a2 --around 85d06d3d7d83591f
+Source turn: The first fix only deduped jobs in memory. Restart brought the bug back, so persist idempotency keys in SQLite.
+```
+
+The agent can now answer: **"Only until restart. The first fix forgot its own
+deduplication state; the later decision was to persist the keys in SQLite."**
+
+Run `python3 examples/demo/run.py` after installing Convos to reproduce this
+output. The example creates two synthetic local sessions in a temporary archive
+and uses literal retrieval so it runs without downloading an embedding model.
+See [the demo source](examples/demo/run.py).
 
 The daily agent workflow is **Capture -> Recall -> Continue**: lifecycle hooks
 capture completed local turns, hybrid retrieval finds the right prior work, and
 bounded reads provide exact evidence instead of generated recollections.
 
-## Why this exists
-
-- Resume work across coding agents without reconstructing old sessions
-- Retrieve prior decisions, commands, evidence, and edits without dumping whole transcripts
-- Keep ChatGPT, Claude, Claude Code, and Codex history locally searchable
-- Keep the same encrypted memory available across computers without path allowlists
-- Share project-associated prompts and changes automatically with encrypted team workspaces
-- Use a CLI skill and lifecycle hooks; the self-hosted relay is optional
-
-## Features
-
-- Fast full-text search with direct source, day, role, project, conversation, and thinking filters
-- Hybrid semantic search (BM25 + embeddings + Reciprocal Rank Fusion) via `convos query`
-- Fetch from ChatGPT and Claude using browser cookies
-- Import exports from ChatGPT, Claude, Claude Code, and Codex
-- Capture completed Claude Code + Codex turns just in time with lifecycle hooks
-- Deterministic project resume packets and exact session replay
-- Optional code-change provenance: blame, timeline, time travel, and graph browsing
-- Optional end-to-end encrypted personal multi-device and team synchronization
-- Local secret scanning with mandatory pre-encryption team redaction
-- Export to JSON or CSV
-
 ## Install
 
-Install from PyPI with uv, initialize local capture, and prepare semantic recall:
+Install from PyPI with uv, initialize local capture, and prepare literal recall:
 
 ```bash
 uv tool install convos
 convos init
-convos embed
+convos fts
 convos doctor
 ```
 
-Semantic retrieval is included on macOS through EmbeddingGemma and llama.cpp.
+On macOS, run `convos embed` to prepare semantic retrieval through EmbeddingGemma
+and llama.cpp.
 Linux defaults to capture, literal search, and remote sync without a native
 semantic runtime. To enable semantic retrieval elsewhere, install
 `convos[semantic]`, set `CONVOS_SEMANTIC=llama`, then run `convos embed`.
@@ -83,6 +88,25 @@ through `/hooks`. Refresh only the skill with:
 ```bash
 convos install-skills
 ```
+
+## Why this exists
+
+- Let agents retrieve prior decisions, commands, and edits across sessions
+- Open the exact conversation evidence behind an answer
+- Resume work across coding agents without reconstructing old sessions
+
+## Features
+
+- Fast full-text search with direct source, day, role, project, conversation, and thinking filters
+- Hybrid semantic search (BM25 + embeddings + Reciprocal Rank Fusion) via `convos query`
+- Fetch from ChatGPT and Claude using browser cookies
+- Import exports from ChatGPT, Claude, Claude Code, and Codex
+- Capture completed Claude Code + Codex turns just in time with lifecycle hooks
+- Deterministic project resume packets and exact session replay
+- Optional code-change provenance: blame, timeline, time travel, and graph browsing
+- Optional end-to-end encrypted personal multi-device and team synchronization
+- Local secret scanning with mandatory pre-encryption team redaction
+- Export to JSON or CSV
 
 ## Encrypted Remote
 
@@ -243,31 +267,35 @@ comparison, archive-statistics, and prompt-to-change query recipes.
 ```bash
 convos init
 convos sync                  # optional ChatGPT, Claude web, and export backfill
+convos fts                   # refresh BM25 after imports
 convos doctor
-convos search "prompt" -s claude -n 10
-convos query "conceptual search"
+convos search "one-line fix" -s claude-code -n 10
+convos query "duplicate-job bug after restart"
 ```
 
 If Safari cookies are protected by macOS privacy, `sync` will fall back to Chrome.
+The search phrases above are illustrative; your agent should use terms from your
+actual work.
 
 ## Common commands
 
 Search:
 
 ```bash
-convos search "vector database" -s chatgpt -d 30   # BM25 only
-convos search "decision" --cwd /path/to/repo       # exact project scope
-convos query "why did we choose this?" --conversation f2b9c5a9
-convos search "reasoning" --thinking
+convos search "one-line fix" -s claude-code -d 30   # BM25 only
+convos search "CI was green" --cwd /path/to/repo   # exact project scope
+convos query "why did the third agent reopen this?" --conversation f2b9c5a9
+convos search "this should be safe" --thinking
 convos read f2b9c5a9 -n 20 -f jsonl              # bounded recent context from one result
 convos embed --limit 1000                         # explicitly backfill a bounded batch
-convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings + RRF
+convos query "the quick fix that needed a migration" # hybrid: BM25 + embeddings + RRF
 convos fts                                        # explicitly refresh BM25 after imports
 convos backup                                     # database plus retained attachment bodies
 ```
 
 Both discovery commands return the strongest matching message from each
 conversation, so `-n` controls the number of distinct conversation candidates.
+They retrieve source turns; the agent reads those turns before answering.
 Both accept `--cwd`/`-w` to include one recorded directory and its descendants,
 plus `--conversation` for an exact conversation-ID prefix. These direct options
 replace the deferred custom query language.
@@ -357,7 +385,9 @@ convos export out.json -f json
 convos export out.csv -f csv -s claude
 ```
 
-## Example output
+## Illustrative output
+
+These examples show the output format with synthetic content and counts.
 
 ```bash
 convos sync
@@ -373,19 +403,19 @@ Total: 248 convs, 2908 msgs, 128 tools, 17 attachs, 4 edits
 ```
 
 ```bash
-convos search "vector database" -s chatgpt -d 30
+convos search "one-line fix" -s claude-code -d 30
 ```
 ```text
-f2b9c5a9  ChatGPT  "Indexing embeddings with DuckDB"  2026-01-14T09:22:11Z
-8a1d0c3e  ChatGPT  "Choosing ANN libraries"           2026-01-10T18:03:42Z
+f2b9c5a9  Claude Code  "A one-line fix, allegedly"  2026-01-14T09:22:11Z
+8a1d0c3e  Claude Code  "The rollback plan"           2026-01-10T18:03:42Z
 ```
 
 ```bash
 convos read f2b9c5a9 -f jsonl
 ```
 ```text
-{"id":"01ab...","role":"user","content":"How do I store vectors in DuckDB?","thinking":null,"created_at":"2026-01-14 09:22:11"}
-{"id":"02cd...","role":"assistant","content":"Use a table with a FLOAT[] column and an HNSW index...","thinking":null,"created_at":"2026-01-14 09:22:42"}
+{"id":"01ab...","role":"user","content":"Can the agent make this a one-line fix?","thinking":null,"created_at":"2026-01-14 09:22:11"}
+{"id":"02cd...","role":"assistant","content":"The one-line fix needs a migration and a rollback plan.","thinking":null,"created_at":"2026-01-14 09:22:42"}
 ```
 
 ## Data model

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-label="Convos. Queryable memory for coding agents. Invoke the Convos skill: wasn't this fixed two agents ago?">
+  <rect width="1280" height="720" fill="#f8f7f3"/>
+  <g fill="#171717" text-anchor="middle" font-family="Menlo, 'Lucida Console', monospace">
+    <text x="640" y="329" font-size="114" font-weight="700" letter-spacing="-8">convos</text>
+    <text x="640" y="388" font-size="25" letter-spacing="-0.5">queryable memory for coding agents</text>
+  </g>
+  <line x1="290" y1="456" x2="990" y2="456" stroke="#c9c6bd" stroke-width="2"/>
+  <text x="640" y="513" text-anchor="middle" fill="#282828" font-family="Menlo, 'Lucida Console', monospace" font-size="24">/convos wasn&apos;t this fixed two agents ago?</text>
+</svg>
