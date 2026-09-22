@@ -8,7 +8,7 @@ if "ai_convos.cli" in sys.modules: raise RuntimeError("Convos loaded before the 
 _SUITE=tempfile.TemporaryDirectory(prefix="convos-tests-")
 _SUITE_ROOT=Path(_SUITE.name)
 def _paths(root):
-    return {"CONVOS_PROJECT_ROOT":root/"archive", "CODEX_HOME":root/"codex", "CLAUDE_CONFIG_DIR":root/"claude", "CONVOS_SERVER_DB":root/"relay/server.db"}
+    return {"CONVOS_PROJECT_ROOT":root/"archive", "CODEX_HOME":root/"codex", "CLAUDE_CONFIG_DIR":root/"claude", "MUSE_HOME":root/"muse", "CONVOS_SERVER_DB":root/"relay/server.db"}
 [os.environ.__setitem__(name,str(path)) for name,path in _paths(_SUITE_ROOT).items()]
 os.environ["CONVOS_TEST_ROOT"]=str(_SUITE_ROOT)
 [os.environ.pop(name,None) for name in ("CONVOS_IMPORT_PATHS","CONVOS_CODEX_MEMORY_ROOT","CONVOS_CLAUDE_PROJECTS_ROOT","CONVOS_MEMORY_DB")]

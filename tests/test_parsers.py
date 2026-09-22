@@ -569,6 +569,155 @@ class TestCodexParser:
         assert [m["role"] for m in result.msgs] == ["developer","system","user"]
 
 
+# ---- Muse Session Parser Tests ----
+
+def _muse_run(seq, event, sid="sess-1", run="run-1", ts=1789934104303999):
+    return {"schema_version":1,"id":f"e{seq}","stream":{"kind":"session","id":sid},"sequence":seq,"recorded_at":ts+seq,"record_type":"event","durability":"durable","causation_id":None,"payload_type":"runtime.session","payload_schema_version":1,"payload":{"kind":"run","run_id":run,"event":event}}
+
+def _muse_rec(seq, payload_type, kind, record, sid="sess-1", ts=1789934104303999):
+    return {"schema_version":1,"id":f"e{seq}","stream":{"kind":"session","id":sid},"sequence":seq,"recorded_at":ts+seq,"record_type":"event","durability":"durable","causation_id":None,"payload_type":payload_type,"payload_schema_version":1,"payload":{"kind":kind,"record":record}}
+
+def _muse_session_dir(root, sid="sess-1"):
+    d=root/"2026"/"09"/"20"/sid; d.mkdir(parents=True); return d/"session.jsonl"
+
+class TestMuseParser:
+    """Tests for parsing Muse session JSONL files."""
+
+    def _basic(self, sid="sess-1"):
+        return [
+            _muse_rec(1,"runtime.session.route_facts","route_facts",{"cwd":"/repo","pid":1},sid),
+            _muse_rec(2,"session.workspace_branch.observed","workspace_branch",{"command_id":sid,"workspace_root":"/repo","reference":{"kind":"branch","name":"main"},"vcs":"git","commit":"abc123"},sid),
+            _muse_run(3,{"kind":"started","prompt":"Fix it"},sid),
+            _muse_run(4,{"kind":"model_completed","usage":{},"duration_ms":1,"finish_reason":"tool_calls","model":"muse-spark-1.3"},sid),
+            _muse_run(5,{"kind":"assistant_tool_calls_committed","message_id":"msg-1","response_id":"resp-1","tool_calls":[{"id":"fc-1","call_id":"call-1","name":"bash","args":json.dumps({"command":"ls","description":"list"})}]},sid),
+            _muse_run(6,{"kind":"tool_result_batch_committed","batch_id":"msg-1","results":[{"tool_call_index":0,"tool_call_id":"call-1","text":"out"}]},sid),
+            _muse_run(7,{"kind":"reasoning_summary_committed","message_id":"rsm-1","response_id":"resp-1","text":"Thinking out loud"},sid),
+            _muse_run(8,{"kind":"assistant_message_committed","message_id":"msg-2","response_id":"resp-2","text":"Done!"},sid),
+        ]
+
+    def test_parse_basic_session(self, tmp_path):
+        from ai_convos.cli import parse_muse, ts_from_epoch
+        _muse_session_dir(tmp_path/"muse").write_text("\n".join(map(json.dumps,self._basic())))
+        result=parse_muse(tmp_path/"muse")
+        assert len(result.convs)==1 and len(result.msgs)==4 and len(result.tools)==1
+        conv=result.convs[0]
+        assert (conv["source"],conv["cwd"],conv["git_branch"],conv["model"],conv["title"])==("muse","/repo","main","muse-spark-1.3","Fix it")
+        assert json.loads(conv["metadata"])=={"session_id":"sess-1","session_kind":"main","session_kind_evidence":"inferred","capture_mode":"transcript","git_commit":"abc123"}
+        assert (conv["created_at"],conv["updated_at"])==(ts_from_epoch(1789934104304000/1e6),ts_from_epoch(1789934104304007/1e6))
+        user=[m for m in result.msgs if m["role"]=="user"][0]
+        assert user["content"]=="Fix it" and user["thinking"] is None
+        batch=[m for m in result.msgs if m["role"]=="assistant" and m["content"]=="" and m["thinking"] is None][0]
+        assert batch["model"]=="muse-spark-1.3"
+        assert [m for m in result.msgs if m["content"]=="Done!"][0]["thinking"] is None
+        assert [m for m in result.msgs if m["thinking"]=="Thinking out loud"][0]["content"]==""
+        tool=result.tools[0]
+        assert (tool["tool_name"],tool["status"],tool["message_id"])==("bash","complete",batch["id"])
+        assert json.loads(tool["input"])["command"]=="ls" and json.loads(tool["output"])=="out"
+        assert sorted(json.loads(m["metadata"])["provider_index"] for m in result.msgs)==[2,4,6,7]
+
+    def test_retained_frame_children_are_unpacked(self, tmp_path):
+        from ai_convos.cli import parse_muse
+        inner=_muse_run(2,{"kind":"started","prompt":"Hi"},sid="sess-9")
+        frame={"retained_frame":"session_permission_transaction","frame_schema_version":1,"outer_log_ordinal":1,"transaction_id":"t","children":[{"child_index":0,"record_json":json.dumps(inner)}]}
+        _muse_session_dir(tmp_path/"muse",sid="sess-9").write_text(json.dumps(frame))
+        result=parse_muse(tmp_path/"muse")
+        assert len(result.convs)==1 and result.msgs[0]["content"]=="Hi" and json.loads(result.convs[0]["metadata"])["session_id"]=="sess-9"
+
+    def test_subagent_session_metadata_is_normalized(self, tmp_path):
+        from ai_convos.cli import parse_muse
+        d=tmp_path/"muse"/"2026"/"09"/"20"/"ab12cd34"/"subagent"/"ef567890"; d.mkdir(parents=True)
+        (d/"session.jsonl").write_text(json.dumps(_muse_run(1,{"kind":"started","prompt":"inspect"},sid="ef567890")))
+        conv=parse_muse(tmp_path/"muse").convs[0]
+        assert json.loads(conv["metadata"])=={"session_id":"ef567890","parent_session_id":"ab12cd34","session_kind":"subagent","session_kind_evidence":"exact","capture_mode":"transcript"}
+
+    def test_impostor_subagent_path_stays_main(self, tmp_path):
+        from ai_convos.cli import parse_muse
+        d=tmp_path/"archive"/"subagent"/"muse"/"sessions"/"2026"/"09"/"20"/"ab12cd34"; d.mkdir(parents=True)
+        (d/"session.jsonl").write_text(json.dumps(_muse_run(1,{"kind":"started","prompt":"inspect"},sid="ab12cd34")))
+        conv=parse_muse(tmp_path/"archive").convs[0]
+        assert json.loads(conv["metadata"])=={"session_id":"ab12cd34","session_kind":"main","session_kind_evidence":"inferred","capture_mode":"transcript"}
+
+    def test_missing_stream_id_keeps_capture_identity(self, tmp_path):
+        from ai_convos.cli import parse_muse_session
+        p=_muse_session_dir(tmp_path/"muse",sid="copied"); p.write_text(json.dumps({"sequence":1,"recorded_at":1789934104303999,"payload":{"kind":"run","run_id":"run-1","event":{"kind":"started","prompt":"Hi"}}}))
+        assert json.loads(parse_muse_session(p)["conv"]["metadata"])=={"session_kind":"main","session_kind_evidence":"inferred","capture_mode":"transcript"}
+
+    def test_summary_identity_survives_transcript_growth(self, tmp_path):
+        from ai_convos.cli import parse_muse_session
+        base=[_muse_run(1,{"kind":"started","prompt":"go"},sid="sess-g"),_muse_run(2,{"kind":"reasoning_summary_committed","message_id":"rsm-9","response_id":"resp-9","text":"Thinking"},sid="sess-g")]
+        full=base+[_muse_run(3,{"kind":"assistant_message_committed","message_id":"msg-9","response_id":"resp-9","text":"Done"},sid="sess-g")]
+        p=_muse_session_dir(tmp_path/"muse",sid="sess-g")
+        p.write_text("\n".join(map(json.dumps,base))); early=parse_muse_session(p)
+        p.write_text("\n".join(map(json.dumps,full))); late=parse_muse_session(p)
+        early_ids={m["id"] for m in early["msgs"]}; late_ids={m["id"] for m in late["msgs"]}
+        assert early_ids <= late_ids and len(late["msgs"])==3
+        assert [m for m in late["msgs"] if m["thinking"]=="Thinking"][0]["id"] in early_ids
+
+    def test_malformed_json_fails_the_file(self, tmp_path):
+        from ai_convos.cli import parse_muse
+        p=_muse_session_dir(tmp_path/"muse"); p.write_text(json.dumps(_muse_run(1,{"kind":"started","prompt":"go"}))+"\n{broken")
+        result=parse_muse(tmp_path/"muse")
+        assert not result.convs and result.failed_inputs==[str(p)]
+
+    def test_terminal_failure_marks_tool_failed_and_missing_result_pending(self, tmp_path):
+        from ai_convos.cli import parse_muse
+        events=[_muse_run(1,{"kind":"started","prompt":"go"},sid="sess-f"),
+            _muse_run(2,{"kind":"assistant_tool_calls_committed","message_id":"m1","response_id":"r1","tool_calls":[{"id":"fc-9","call_id":"call-9","name":"bash","args":"{}"}]},sid="sess-f"),
+            _muse_run(3,{"kind":"assistant_tool_calls_committed","message_id":"m2","response_id":"r2","tool_calls":[{"id":"fc-8","call_id":"call-8","name":"bash","args":"{}"}]},sid="sess-f"),
+            {"schema_version":1,"id":"e4","stream":{"kind":"session","id":"sess-f"},"sequence":4,"recorded_at":1789934104304003,"record_type":"event","durability":"durable","causation_id":None,"payload_type":"tool_batch.effect.terminal","payload_schema_version":1,"payload":{"kind":"tool_batch_effect","run_id":"run-1","record":{"kind":"terminal","effect_id":"t1","task_id":"t1","task_stream":{"kind":"task","id":"t1"},"call_id":"call-9","outcome":{"kind":"completed","task_completion":{"kind":"terminal","terminal":{"kind":"failed","reason":"boom"}}}}}}]
+        _muse_session_dir(tmp_path/"muse",sid="sess-f").write_text("\n".join(map(json.dumps,events)))
+        assert sorted(t["status"] for t in parse_muse(tmp_path/"muse").tools)==["failed","pending"]
+
+    def test_empty_session_creates_no_conversation_and_is_not_failed(self, tmp_path):
+        from ai_convos.cli import parse_muse
+        _muse_session_dir(tmp_path/"muse").write_text("")
+        result=parse_muse(tmp_path/"muse")
+        assert not result.convs and result.failed_inputs==[]
+
+    def test_native_binding_survives_transcript_move(self, tmp_path):
+        import duckdb
+        from ai_convos import cli
+        root=tmp_path/"muse"; a=_muse_session_dir(root); a.write_text("\n".join(map(json.dumps,self._basic())))
+        b=a.parent/"moved.jsonl"
+        first=cli.parse_muse(root,files=[a]); db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,first)
+        b.write_text(a.read_text())
+        moved=cli.parse_muse(root,files=[b],bindings=cli.session_bindings(db))
+        assert ([c["id"] for c in moved.convs],[m["id"] for m in moved.msgs])==([c["id"] for c in first.convs],[m["id"] for m in first.msgs])
+        cli.upsert(db,moved)
+        assert db.execute("SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM tool_calls),(SELECT COUNT(*) FROM provider_sessions)").fetchone()==(1,4,1,1)
+
+    def test_file_edits_extract_from_write_and_edit_calls(self, tmp_path):
+        import duckdb
+        from ai_convos import cli
+        def call(mid, resp, cid, name, args):
+            return _muse_run(10+len(cid),{"kind":"assistant_tool_calls_committed","message_id":mid,"response_id":resp,"tool_calls":[{"id":f"fc-{cid}","call_id":cid,"name":name,"args":json.dumps(args)}]})
+        def res(mid, cid, text):
+            return _muse_run(20+len(cid),{"kind":"tool_result_batch_committed","batch_id":mid,"results":[{"tool_call_index":0,"tool_call_id":cid,"text":text}]})
+        def fail_for(cid, seq):
+            return {"schema_version":1,"id":f"e{seq}","stream":{"kind":"session","id":"sess-e"},"sequence":seq,"recorded_at":1789934104304000+seq,"record_type":"event","durability":"durable","causation_id":None,"payload_type":"tool_batch.effect.terminal","payload_schema_version":1,"payload":{"kind":"tool_batch_effect","run_id":"run-1","record":{"kind":"terminal","effect_id":"t","task_id":"t","task_stream":{"kind":"task","id":"t"},"call_id":cid,"outcome":{"kind":"completed","task_completion":{"kind":"terminal","terminal":{"kind":"failed","reason":"denied"}}}}}}
+        events=[_muse_run(1,{"kind":"started","prompt":"edit things"},sid="sess-e"),
+            call("m1","r1","call-w1","write_file",{"path":"/repo/new.py","content":"print(1)"}),res("m1","call-w1","wrote 9 bytes to /repo/new.py"),
+            call("m2","r2","call-e1","edit_file",{"path":"/repo/old.py","find":"a = 1","replace":"a = 2"}),res("m2","call-e1","edited"),
+            call("m3","r3","call-e2","edit_file",{"path":"/repo/old.py","find":"b = 1","replace":"b = 2"}),fail_for("call-e2",30),
+            call("m4","r4","call-wf","write_file",{"path":"/repo/no.py","content":"x"}),res("m4","call-wf","denied"),fail_for("call-wf",31),
+            call("m5","r5","call-u1","edit_file",{"path":"/repo/maybe.py","find":"c = 1","replace":"c = 2"}),
+            call("m6","r6","call-u2","write_file",{"path":"/repo/nope.py","content":"y"}),res("m6","call-u2","permission denied")]
+        _muse_session_dir(tmp_path/"muse",sid="sess-e").write_text("\n".join(map(json.dumps,events)))
+        result=cli.parse_muse(tmp_path/"muse")
+        assert [(e["file_path"],e["edit_type"],e["content"],e["old_content"]) for e in result.edits]==[("/repo/new.py","write","print(1)",None),("/repo/old.py","edit","a = 2","a = 1")]
+        assert sorted(v["status"] for v in result.edit_evidence)==["confirmed","confirmed","invalid","invalid","unknown","unknown"]
+        assert {v["reason"] for v in result.edit_evidence if v["status"]=="unknown"}=={"result_missing","unconfirmed_result"}
+        assert {v["tool_call_id"] for v in result.edit_evidence}=={t["id"] for t in result.tools if t["tool_name"] in ("write_file","edit_file")}
+        db=duckdb.connect(); cli.init_schema(db); cli.upsert(db,result)
+        assert db.execute("SELECT (SELECT COUNT(*) FROM file_edits),(SELECT COUNT(*) FROM provenance.file_edit_evidence WHERE status='confirmed')").fetchone()==(2,2)
+
+    def test_detect_source_and_parse_source(self, tmp_path):
+        from ai_convos import cli
+        d=tmp_path/"sessdir"; d.mkdir(); (d/"session.jsonl").write_text(json.dumps(_muse_run(1,{"kind":"started","prompt":"Hi"})))
+        assert cli.detect_source(d)=="muse"
+        assert len(cli.parse_source(d).convs)==1
+
+
 # ---- ChatGPT Export Parser Tests ----
 
 class TestChatGPTExportParser:
