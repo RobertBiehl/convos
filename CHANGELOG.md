@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.6b17
+
+- Muse harness support: parse local Muse session transcripts, sync them
+  alongside Claude Code and Codex, capture Stop/SubagentStop hooks by
+  session ID, and extract confirmed write_file/edit_file evidence.
+- Core line budget 1650 -> 1665 for the new local-session integration.
+
 ## 0.11.6b16
 
 - Verify every single-column primary-key index and read every VARCHAR/JSON column
