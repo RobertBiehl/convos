@@ -10,6 +10,8 @@ Convos captures Claude Code and Codex work automatically. Agents can query those
 sessions and optional ChatGPT and Claude imports, then open the exact turns they
 need to continue.
 
+<img src=".github/social-preview-v2.png" alt="Convos: queryable memory for coding agents. /convos wasn't this fixed two agents ago?" width="640">
+
 ## Start with your agent
 
 Paste this into any agent that can read a repository and run commands:
