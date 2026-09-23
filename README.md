@@ -12,6 +12,10 @@ need to continue.
 
 <img src=".github/social-preview-v2.png" alt="Convos: queryable memory for coding agents. /convos wasn't this fixed two agents ago?" width="640">
 
+[![Convos film: one engineer and agent, a teammate using /convos, and a team continuing the work](.github/media/convos-team-story.gif)](.github/media/convos-team-story.mp4)
+
+[Watch the 25-second film with sound](.github/media/convos-team-story.mp4). Music: [Happy Beats & Business Moves Vol. 1 by Sascha Ende](https://ende.app/en/song/12866-happy-beats-business-moves-vol-1), CC BY 4.0.
+
 ## Start with your agent
 
 Paste this into any agent that can read a repository and run commands:
