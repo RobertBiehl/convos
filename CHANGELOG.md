@@ -4,12 +4,26 @@
 
 - Fix the default EmbeddingGemma GGUF filename so first-time semantic model
   downloads resolve at the pinned Hugging Face revision.
-- Record a repository's configured remote URLs instead of the output of
-  `git remote -v`, which applies `url.<base>.insteadOf` rewrites. A rewrite
-  to a local authenticating proxy put the proxy's loopback URL and session
-  token into repository evidence and identity, so every session split the
-  repository and a linked or promoted checkout published the token. Push URLs
-  stay part of the evidence, so identities without rewrites are unchanged.
+- Keep a repository's configured remote URL wherever `git remote -v`
+  rewrites it (`url.<base>.insteadOf` / `pushInsteadOf`) to a loopback
+  address. A rewrite to a local authenticating proxy put the proxy's URL and
+  session token into repository evidence and identity, so every session
+  split the repository and a linked or promoted checkout published the
+  token. Every other URL is still taken from `git remote -v`, which resolves
+  aliases such as `gh:` and selects the fetch and push URLs, so identities
+  without a proxy rewrite are unchanged.
+- Schema 18 merges the repository ids those rewrites split. Every
+  repository whose stored remotes include a loopback URL joins its
+  (lineage, configured remotes) group under the id a fresh capture computes.
+  Its files, versions, checkpoints, checkpoint links, scopes and checkouts
+  follow under re-derived ids. The migration reads configured remotes from
+  checkouts still on disk; received rows are matched by URL path. The old
+  to new ids stay in `provenance.rekeyed`, and every received batch runs
+  the same pass, so late or replayed facts land on the merged ids. The
+  signed bodies of re-keyed received facts stay retained. Repositories
+  whose remotes really changed keep their ids.
+- Core line budget 1665 -> 1686 for the repository re-key migration and
+  the proxy-only configured-URL selection.
 
 ## 0.11.6b17
 

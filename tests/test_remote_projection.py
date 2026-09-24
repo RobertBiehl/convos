@@ -91,6 +91,22 @@ def test_author_successor_can_replace_provenance_association(tmp_path):
         assert db.execute("SELECT file_id FROM provenance.file_edit_files").fetchone()==(new,)
         assert db.execute("SELECT count(*) FROM remote.row_conflicts").fetchone()[0]==0
 
+def test_received_proxy_rewritten_repository_facts_merge_into_the_configured_remote_id(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"receiver.db"
+    loop,real=(dict(lineage="l",roots=[],remotes=[url]) for url in ("https://127.0.0.1:9/token/scm/acme/project","https://example.com/scm/acme/project"))
+    old,new=(digest(dict(lineage="l",remotes=r["remotes"])) for r in (loop,real))
+    fact=lambda kind,id,data:dict(row=(row:=dict(v=1,kind=kind,id=id,state="active",data=data)),proof=row_proof(device,user,"w",1,row))
+    file=lambda repo,name:fact("file.observed",digest(dict(repository=repo,path=name)),dict(repository=repo,path=name,kind="tracked"))
+    stale=[fact("repository.observed",old,loop),file(old,"a.py")]
+    ssh=dict(lineage="l",roots=[],remotes=["https://example.com:7999/acme/project"]); sibling=digest(dict(lineage="l",remotes=ssh["remotes"]))
+    apply_row_replicas(path,[*stale,fact("repository.observed",new,real),fact("repository.observed",sibling,ssh),file(new,"b.py")],"w",[control],local_user="other")
+    apply_row_replicas(path,[file(old,"c.py"),*stale],"w",[control],local_user="other")
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert sorted(db.execute("SELECT id,CAST(remotes AS VARCHAR) FROM provenance.repositories").fetchall())==sorted([(new,json.dumps(real["remotes"])),(sibling,json.dumps(ssh["remotes"]))])
+        assert sorted(db.execute("SELECT id,repository,path FROM provenance.files").fetchall())==sorted((digest(dict(repository=new,path=n)),new,n) for n in ("a.py","b.py","c.py"))
+        assert db.execute("SELECT count(*) FROM remote.row_conflicts").fetchone()[0]==3
+    assert audit_rows(path,page=1,local_user="other")["totals"]["unavailable"]==0
+
 def test_audit_detects_missing_body_even_without_surviving_origin(tmp_path):
     root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"lost.db"
     apply_row_replicas(path,bodies,"w",[control],local_user="other")

@@ -83,7 +83,7 @@ def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_pat
     observed=next(r for r in records if r["kind"]=="repository.observed"); head=db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]; project(db,{**observed,"payload":{k:v for k,v in observed["payload"].items() if k!="head"},"observed_at":None}); assert db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]==head
     row=query(db,"conversation_changes","c")[0]; assert row["repositories"]==2 and row["files"]==2 and row["prompt"]=="make the cross-repo change" and row["changeset_id"]=="m"
     assert len(query(db,"changeset_files","m"))==2 and query(db,"current_activity",str(a))[0]["repository"]==repository(a)["id"]
-    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","repository_aliases","conversation_scopes","files","file_versions","file_edit_scopes","file_edit_files","file_edit_evidence","git_checkpoints","checkpoint_edits","local_facts","pending"}
+    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","repository_aliases","rekeyed","conversation_scopes","files","file_versions","file_edit_scopes","file_edit_files","file_edit_evidence","git_checkpoints","checkpoint_edits","local_facts","pending"}
     columns={r[0] for r in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance'").fetchall()}; assert not columns&{"prompt","content","payload","workspace","author"}
 
 
@@ -359,6 +359,34 @@ def test_repository_identity_ignores_insteadof_rewrites_and_keeps_push_urls(tmp_
     root=repo(tmp_path/"checkout"); git(root,"remote","add","origin","https://example.com/acme/project.git"); git(root,"remote","set-url","--push","origin","git@example.com:acme/project-push.git"); plain=repository(root)
     (rewrite:=tmp_path/"gitconfig").write_text('[url "http://127.0.0.1:9/session-token/"]\n\tinsteadOf = https://example.com/\n\tpushInsteadOf = git@example.com:\n'); monkeypatch.setenv("GIT_CONFIG_GLOBAL",str(rewrite)); assert "127.0.0.1" in git(root,"remote","-v")
     assert repository(root)["remotes"]==plain["remotes"]==["https://example.com/acme/project","https://example.com/acme/project-push"] and repository(root)["id"]==plain["id"]
+
+def test_repository_identity_resolves_url_aliases_and_keeps_git_remote_selection(tmp_path):
+    def remotes(name,*config): return (root:=repo(tmp_path/name),[git(root,"config",*c) for c in config],repository(root))[-1]
+    plain,alias,other=remotes("plain",("remote.origin.url","https://github.com/acme/project.git")),remotes("alias",("remote.origin.url","gh:acme/project.git"),("url.https://github.com/.insteadOf","gh:")),remotes("other",("remote.origin.url","gh:acme/project.git"),("url.https://gitlab.com/.insteadOf","gh:"))
+    assert plain["remotes"]==alias["remotes"]==["https://github.com/acme/project"] and other["remotes"]==["https://gitlab.com/acme/project"]
+    many=remotes("many",("remote.origin.url","https://github.com/acme/project.git"),("--add","remote.origin.url","https://github.com/acme/unused.git"),("remote.origin.pushurl","https://github.com/acme/push.git"),("url.http://127.0.0.1:9/token/.insteadOf","https://github.com/"))
+    pushed=remotes("pushed",("remote.origin.url","https://github.com/acme/project.git"),("url.http://127.0.0.1:9/token/.pushInsteadOf","https://github.com/"))
+    assert many["remotes"]==["https://github.com/acme/project","https://github.com/acme/push"] and pushed["remotes"]==plain["remotes"]==["https://github.com/acme/project"]
+
+def test_schema_18_merges_proxy_rewritten_repository_ids_and_keeps_every_link(tmp_path,monkeypatch):
+    main,wt,path=repo(tmp_path/"main"),tmp_path/"wt",tmp_path/"core.db"; git(main,"remote","add","origin","https://example.com/acme/project.git"); git(main,"worktree","add","-q",str(wt))
+    session=lambda token:((rewrite:=tmp_path/token).write_text(f'[url "http://127.0.0.1:9/{token}/"]\n\tinsteadOf = https://example.com/\n'),monkeypatch.setenv("GIT_CONFIG_GLOBAL",str(rewrite)))
+    monkeypatch.setattr(core_module,"_git_remotes",lambda root:sorted({r for line in core_module._git_run(root,"remote","-v").decode().splitlines() if (r:=core_module._remote(line.split("\t",1)[1].rsplit(" ",1)[0]))}))
+    session("token-a"); core(path,main,[(main/"x.py","write","one\n",None)]).close(); capture(path)
+    session("token-b"); (wt/"y.py").write_text("two\n"); db=duckdb.connect(str(path)); db.execute("INSERT INTO provenance.file_edit_evidence VALUES ('e1','confirmed','test_fixture',NULL); INSERT INTO file_edits VALUES ('e1','m',?,'write','two\n','2026-01-01',NULL)",[str(wt/"y.py")]); db.close(); capture(path)
+    db=duckdb.connect(str(path)); assert len(db.execute("SELECT id FROM provenance.repositories").fetchall())==2==query(db,"conversation_changes","c")[0]["repositories"]; files=query(db,"changeset_files","m"); db.execute("UPDATE core_schema SET version=17"); db.close()
+    monkeypatch.undo(); session("token-b"); db=duckdb.connect(str(path)); init_schema(db); git(main,"worktree","add","-q",str(tmp_path/"fresh"))
+    assert db.execute("SELECT CAST(remotes AS VARCHAR) FROM provenance.repositories").fetchall()==[('["https://example.com/acme/project"]',)] and len({repository(p,db)["id"] for p in (main,wt,tmp_path/"fresh")})==1
+    assert query(db,"conversation_changes","c")[0]["repositories"]==1 and len(query(db,"changeset_files","m"))==len(files)==2 and query(db,"file_history","y.py")[0]["prompt"]=="make the cross-repo change"
+    assert not db.execute("""SELECT * FROM provenance.files f WHERE f.repository NOT IN (SELECT id FROM provenance.repositories) OR f.id<>sha256(json_object('path',f.path,'repository',f.repository)) UNION ALL SELECT c.id,c.repository,c.head,c.state_hash FROM provenance.git_checkpoints c WHERE c.repository NOT IN (SELECT id FROM provenance.repositories) OR c.id<>sha256(json_object('head',c.head,'repository',c.repository,'state',c.state_hash))
+        UNION ALL SELECT x.file_edit_id,x.file_id,NULL,NULL FROM provenance.file_edit_files x WHERE x.file_id NOT IN (SELECT id FROM provenance.files) UNION ALL SELECT l.kind,l.entity,NULL,NULL FROM provenance.local_facts l WHERE l.kind='repository.observed' AND l.entity NOT IN (SELECT id FROM provenance.repositories)""").fetchall()
+    assert db.execute("SELECT count(*) FROM provenance.git_checkpoints").fetchone()[0]>0 and core_module.rekey_repositories(db)==0; db.close()
+
+def test_schema_18_keeps_loopback_rows_whose_checkout_now_points_at_another_repository(tmp_path):
+    db,root=graph(tmp_path/"archive.db"),repo(tmp_path/"checkout"); git(root,"remote","add","origin","https://example.com/fork/project.git"); lineage=repository(root)["lineage"]
+    old=digest({"lineage":lineage,"remotes":[loop:="https://127.0.0.1:9/token/acme/project"]})
+    db.execute("INSERT INTO provenance.repositories VALUES (?,?,'[]',?,NULL,NULL)",[old,lineage,json.dumps([loop])]); db.execute("INSERT INTO provenance.repository_checkouts VALUES ('k',?,?,NULL,NULL)",[old,str(root)])
+    assert core_module.rekey_repositories(db,True)==0 and db.execute("SELECT id FROM provenance.repositories").fetchall()==[(old,)]; db.close()
 
 
 def test_ssh_and_https_remote_evidence_normalize_identically(tmp_path):
