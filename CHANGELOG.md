@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.6b18
+
+- Record a repository's configured remote URLs instead of the output of
+  `git remote -v`, which applies `url.<base>.insteadOf` rewrites. A rewrite
+  to a local authenticating proxy put the proxy's loopback URL and session
+  token into repository evidence and identity, so every session split the
+  repository and a linked or promoted checkout published the token. Push URLs
+  stay part of the evidence, so identities without rewrites are unchanged.
+
 ## 0.11.6b17
 
 - Muse harness support: parse local Muse session transcripts, sync them

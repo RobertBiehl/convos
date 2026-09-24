@@ -355,6 +355,12 @@ def test_replaced_checkout_at_same_path_gets_new_identity_and_prunes_stale_metad
     root=repo(tmp_path/"checkout"); git(root,"remote","add","origin","https://example.com/acme/original.git"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); capture(path); db=duckdb.connect(str(path)); stable=repository(root,db)["id"]; db.close(); __import__("shutil").rmtree(root/".git"); capture(path); db=duckdb.connect(str(path)); assert not db.execute("SELECT 1 FROM provenance.repository_checkouts WHERE root=?",[str(root)]).fetchone(); db.close(); git(root,"init","-q"); git(root,"config","user.email","a@b.c"); git(root,"config","user.name","A"); git(root,"add","."); git(root,"commit","-qm","replacement"); git(root,"remote","add","origin","https://example.com/other/replacement.git"); db=duckdb.connect(str(path)); assert repository(root,db)["id"]!=stable
 
 
+def test_repository_identity_ignores_insteadof_rewrites_and_keeps_push_urls(tmp_path,monkeypatch):
+    root=repo(tmp_path/"checkout"); git(root,"remote","add","origin","https://example.com/acme/project.git"); git(root,"remote","set-url","--push","origin","git@example.com:acme/project-push.git"); plain=repository(root)
+    (rewrite:=tmp_path/"gitconfig").write_text('[url "http://127.0.0.1:9/session-token/"]\n\tinsteadOf = https://example.com/\n\tpushInsteadOf = git@example.com:\n'); monkeypatch.setenv("GIT_CONFIG_GLOBAL",str(rewrite)); assert "127.0.0.1" in git(root,"remote","-v")
+    assert repository(root)["remotes"]==plain["remotes"]==["https://example.com/acme/project","https://example.com/acme/project-push"] and repository(root)["id"]==plain["id"]
+
+
 def test_ssh_and_https_remote_evidence_normalize_identically(tmp_path):
     a=repo(tmp_path/"a"); b=tmp_path/"b"; subprocess.run(("git","clone","-q",str(a),str(b)),check=True); git(a,"remote","add","origin","git@github.com:acme/project.git"); git(b,"remote","set-url","origin","https://github.com/acme/project.git")
     assert repository(a)["id"]==repository(b)["id"] and repository(a)["remotes"]==repository(b)["remotes"]==["https://github.com/acme/project"]
