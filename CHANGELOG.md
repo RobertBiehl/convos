@@ -2,6 +2,8 @@
 
 ## 0.11.6b18
 
+- Fix the default EmbeddingGemma GGUF filename so first-time semantic model
+  downloads resolve at the pinned Hugging Face revision.
 - Record a repository's configured remote URLs instead of the output of
   `git remote -v`, which applies `url.<base>.insteadOf` rewrites. A rewrite
   to a local authenticating proxy put the proxy's loopback URL and session

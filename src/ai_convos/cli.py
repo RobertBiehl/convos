@@ -1330,7 +1330,7 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
         if resume or any(attempted.get(p.stem)!=_hook_stamp(p) for p in [*HOOK_DIR.glob("*.json"),*HOOK_DIR.glob("*.work")]): wake_hooks(attempt)
     return len(done)
 
-_MODELS,_MCFG,_LLAMA_LOG,_SEMANTIC_INSTALL={},dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF",filename="embeddinggemma-300m-qat-q8_0.gguf",revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64",artifact_sha256="6fa0c02a9c302be6f977521d399b4de3a46310a4f2621ee0063747881b673f67",embedding=True,n_ctx=16384,n_batch=2048,n_ubatch=2048,n_seq_max=8,n_gpu_layers=-1),None,"Semantic runtime unavailable. macOS includes it; elsewhere install `convos[semantic]`, set CONVOS_SEMANTIC=llama, then run `convos embed`. Literal `convos search` needs no model."
+_MODELS,_MCFG,_LLAMA_LOG,_SEMANTIC_INSTALL={},dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF",filename="embeddinggemma-300m-qat-Q8_0.gguf",revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64",artifact_sha256="6fa0c02a9c302be6f977521d399b4de3a46310a4f2621ee0063747881b673f67",embedding=True,n_ctx=16384,n_batch=2048,n_ubatch=2048,n_seq_max=8,n_gpu_layers=-1),None,"Semantic runtime unavailable. macOS includes it; elsewhere install `convos[semantic]`, set CONVOS_SEMANTIC=llama, then run `convos embed`. Literal `convos search` needs no model."
 def semantic_enabled(): return (mode:=os.environ.get("CONVOS_SEMANTIC","auto").lower()) not in ("0","false","no","off") and (mode!="auto" or sys.platform=="darwin")
 def semantic_backend():
     mode=os.environ.get("CONVOS_SEMANTIC","auto").lower()
