@@ -128,6 +128,17 @@ def test_proxy_merge_retains_a_colliding_signed_destination_body(tmp_path):
     replay=tmp_path/"replay.db"; apply_row_replicas(replay,exported,"w",[control],local_user="third")
     with duckdb.connect(str(replay),read_only=True) as db: assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(new,)]
 
+def test_retained_proxy_body_identifies_a_row_whose_current_remotes_are_canonical(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"receiver.db"
+    lineage="l"; loop="https://127.0.0.1:9/token/acme/project"; real="https://example.com/acme/project"; old=digest(dict(lineage=lineage,remotes=[loop])); new=digest(dict(lineage=lineage,remotes=[real]))
+    row=dict(v=1,kind="repository.observed",id=old,state="active",data=dict(lineage=lineage,roots=[],remotes=[loop])); proof=row_proof(device,user,"w",1,row)
+    apply_row_replicas(path,[dict(row=row,proof=proof)],"w",[control],local_user="other")
+    with duckdb.connect(str(path)) as db:
+        with core_module.preserve_fact_heads(db,[("repository.observed",old)]): db.execute("UPDATE provenance.repositories SET remotes=? WHERE id=?",[json.dumps([real]),old])
+        assert json.loads(db.execute("SELECT body FROM remote.row_conflicts WHERE proof_id=?",[digest(proof)]).fetchone()[0])==row
+        assert core_module.rekey_repositories(db)>0 and core_module.rekey_repositories(db)==0
+        assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(new,)]
+
 def test_audit_detects_missing_body_even_without_surviving_origin(tmp_path):
     root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"lost.db"
     apply_row_replicas(path,bodies,"w",[control],local_user="other")

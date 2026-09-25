@@ -260,11 +260,14 @@ def rekey_repositories(db,observe=False):
     # b17 recorded url.*.insteadOf targets as remotes; merge each (lineage, real remotes) group holding a loopback-proxy remote into the id a fresh capture computes; a loopback URL maps to the unique real URL (stored, or configured in a checkout on disk) with the longest matching path.
     rows=db.execute("SELECT id,lineage,CAST(remotes AS VARCHAR) FROM provenance.repositories WHERE lineage IS NOT NULL").fetchall()
     lineage={rid:value for rid,value,remotes in rows}
+    current={rid:json.loads(remotes) for rid,value,remotes in rows}
+    stale={rid for rid,value,remotes in rows if rid!=provenance_digest({"lineage":value,"remotes":current[rid]}) and not any(map(_LOOPBACK.match,current[rid]))}
+    historic={rid for rid,raw in db.execute("SELECT p.source_row_id,CAST(c.body AS VARCHAR) FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.row_kind='repository.observed' AND p.source_row_id IN (SELECT UNNEST(?))",[list(stale)]).fetchall() for body in [json.loads(raw)] if body["id"]==rid and body["kind"]=="repository.observed" and body["data"]["lineage"]==lineage[rid] and rid==provenance_digest({"lineage":lineage[rid],"remotes":body["data"]["remotes"]}) and any(map(_LOOPBACK.match,body["data"]["remotes"])) and all(sum(proxy.endswith("/"+real.split("/",3)[3]) for real in current[rid])==1 for proxy in body["data"]["remotes"] if _LOOPBACK.match(proxy))} if stale else set()
     live={rid:value["remotes"] for checkout,root,rid in db.execute("SELECT id,root,repository FROM provenance.repository_checkouts").fetchall() if Path(root,".git").exists() and (value:=_repository(root))["checkout"]==checkout and value["lineage"]==lineage.get(rid)} if observe and _refresh_repository() is None else {}
     real={(lineage,url) for rid,lineage,remotes in rows for url in [*live.get(rid,()),*json.loads(remotes)] if not _LOOPBACK.match(url)}
     key={rid:(lineage,tuple(sorted({(m[0][1] if (m:=sorted((-len(r.split("/",3)[3]),r) for l,r in real if l==lineage and url.endswith("/"+r.split("/",3)[3]))) and m[0][0]<[*m,(0,)][1][0] else url) if _LOOPBACK.match(url) else url for url in json.loads(remotes)}))) for rid,lineage,remotes in rows}
-    target={k:provenance_digest({"lineage":k[0],"remotes":list(k[1])}) for rid,lineage,remotes in rows if any(map(_LOOPBACK.match,json.loads(remotes))) and not any(map(_LOOPBACK.match,(k:=key[rid])[1]))}
-    maps=[("repository.observed",rid,target[k]) for rid,lineage,remotes in rows if any(map(_LOOPBACK.match,json.loads(remotes))) and (k:=key[rid]) in target and target[k]!=rid]
+    target={k:provenance_digest({"lineage":k[0],"remotes":list(k[1])}) for rid,lineage,remotes in rows if (rid in historic or any(map(_LOOPBACK.match,current[rid]))) and not any(map(_LOOPBACK.match,(k:=key[rid])[1]))}
+    maps=[("repository.observed",rid,target[k]) for rid,lineage,remotes in rows if (rid in historic or any(map(_LOOPBACK.match,current[rid]))) and (k:=key[rid]) in target and target[k]!=rid]
     existing={(kind,old):new for kind,old,new in db.execute("SELECT kind,old,new FROM provenance.rekeyed").fetchall()}
     required(all(existing.get((kind,old),new)==new for kind,old,new in maps),ValueError("repository rekey conflicts with an earlier identity"))
     _insert_pages(db,"provenance.rekeyed",maps,mode=" OR IGNORE")
