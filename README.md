@@ -422,6 +422,8 @@ convos read f2b9c5a9 -f jsonl
 
 ## Data model
 
+GitHub, Bitbucket, and configured Git proxy remotes use [canonical repository evidence](docs/git-identity.md). Machine-wide custom mappings belong in `~/.convos/config.json`.
+
 Data lives in `<root>/data/convos.db` (DuckDB). Default root is `~/.convos` (override with `CONVOS_PROJECT_ROOT`).
 
 - `conversations`

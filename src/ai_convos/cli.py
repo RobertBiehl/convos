@@ -213,12 +213,35 @@ def _git_root(path):
     if not (probe:=(probe if (probe:=Path(path)).is_dir() else probe.parent)).exists(): return None
     try: return Path(_git_run(probe,"rev-parse","--show-toplevel").decode().strip()).resolve()
     except subprocess.CalledProcessError as e: return None if b"not a git repository" in e.stderr.lower() or not probe.exists() else (_ for _ in ()).throw(e)
-def _remote(url): return (lambda p,port:f"https://{p.hostname.lower()}{f':{port}' if port and port!={'ssh':22,'https':443,'http':80}.get(p.scheme.lower()) else ''}/{p.path.strip('/').removesuffix('.git')}" if p.hostname and p.path else None)(p:=__import__("urllib.parse").parse.urlparse(re.sub(r"^(?:[^/@]+@)?([^:/]+):",r"ssh://\1/",url) if "://" not in url else url),p.port)
+def _git_identity():
+    path=(Path(os.environ["CONVOS_PROJECT_ROOT"]).expanduser() if os.environ.get("CONVOS_PROJECT_ROOT") else PROJECT_ROOT)/"config.json"
+    value=json.loads(path.read_text()) if path.is_file() else {}
+    required(isinstance(value,dict) and isinstance(value.get("git_identity",{}),dict),ValueError("invalid git_identity config"))
+    identity=value.get("git_identity",{})
+    required(all(isinstance(identity.get(key,{}),dict) and all(isinstance(a,str) and isinstance(b,str) for a,b in identity.get(key,{}).items()) for key in ("host_aliases","url_prefixes")) and all(a.startswith("https://") and b.startswith("https://") and a.endswith("/") and b.endswith("/") for a,b in identity.get("url_prefixes",{}).items()),ValueError("invalid git_identity mappings"))
+    return identity
+def _remote(url):
+    p=__import__("urllib.parse").parse.urlparse(re.sub(r"^(?:[^/@]+@)?([^:/]+):",r"ssh://\1/",url) if "://" not in url else url)
+    if not p.hostname or not p.path: return None
+    config=_git_identity()
+    hosts={"ssh.github.com":"github.com","altssh.bitbucket.org":"bitbucket.org",**config.get("host_aliases",{})}
+    if "://" not in url and "@" not in url and "." not in p.hostname and p.hostname not in hosts: return None
+    host,port=p.hostname.lower(),p.port
+    normalized=f"https://{host}{f':{port}' if port and port!={'ssh':22,'https':443,'http':80}.get(p.scheme.lower()) and not (p.scheme=='ssh' and (p.hostname.lower(),port) in (('ssh.github.com',443),('altssh.bitbucket.org',443))) else ''}/{p.path.strip('/').removesuffix('.git')}"
+    prefixes=config.get("url_prefixes",{})
+    match=max((prefix for prefix in prefixes if normalized.startswith(prefix)),key=len,default=None)
+    normalized=prefixes[match]+normalized[len(match):] if match else f"https://{hosts.get(host,host)}/scm/{p.path.strip('/').removesuffix('.git')}" if p.scheme=="ssh" and p.username=="git" and port==7999 and not p.path.strip('/').lower().startswith("scm/") else normalized.replace(f"https://{host}",f"https://{hosts.get(host,host)}",1)
+    result=__import__("urllib.parse").parse.urlparse(normalized)
+    return normalized if result.scheme=="https" and (host:=result.hostname) and not result.username and host.lower() not in ("localhost","::1") and not re.fullmatch(r"127\.[0-9.]+",host.lower()) else None
 def _git_remotes(root):
     # `remote -v` resolves url.*.insteadOf aliases and picks fetch/push URLs; where it lands on a loopback proxy (a session credential), keep the configured URL.
     conf=[(key[7:].rsplit(".",1),url) for key,url in (line.split(" ",1) for line in _git_maybe(root,"config","--get-regexp",r"^remote\..*\.(push)?url$").decode(errors="replace").splitlines() if " " in line)]
+    rewrites=[(key[4:-10],value) for key,value in (line.split(" ",1) for line in _git_maybe(root,"config","--get-regexp",r"^url\..*\.insteadof$").decode(errors="replace").splitlines() if " " in line) if not re.match(r"^https?://(?:127\.[0-9.]+|localhost|\[::1\])(?::[0-9]+)?/",key[4:-10])]
+    def original(url):
+        match=max(((base,prefix) for base,prefix in rewrites if url.startswith(prefix)),key=lambda pair:len(pair[1]),default=None)
+        return _remote(match[0]+url[len(match[1]):] if match else url)
     urls,lines=lambda name,*kinds:next((found for kind in kinds if (found:=[url for key,url in conf if key==[name,kind]])),[]),[(name,*rest.rsplit(" ",1)) for line in _git_maybe(root,"remote","-v").decode(errors="replace").splitlines() for name,rest in [line.split("\t",1)]]
-    return sorted({remote for (name,kind),group in itertools.groupby(lines,key=lambda l:(l[0],l[2])) for url,configured in itertools.zip_longest([l[1] for l in group],urls(name,"pushurl","url") if kind=="(push)" else urls(name,"url")[:1]) if url and not url.startswith(("/","file:")) and (remote:=_remote(configured) if configured and _LOOPBACK.match(_remote(url) or "") else _remote(url))})
+    return sorted({remote for (name,kind),group in itertools.groupby(lines,key=lambda l:(l[0],l[2])) for url,configured in itertools.zip_longest([l[1] for l in group],urls(name,"pushurl","url") if kind=="(push)" else urls(name,"url")[:1]) if url and not url.startswith(("/","file:")) and (remote:=original(configured) if configured and re.match(r"^https?://(?:127\.[0-9.]+|localhost|\[::1\])(?::[0-9]+)?/",url) else _remote(url))})
 def repository_evidence(value): return provenance_digest({"lineage":value["lineage"],"remotes":value["remotes"]}) if value["lineage"] else None
 def _checkout(root): return provenance_digest(f"{stat.st_dev}:{stat.st_ino}" if (stat:=next((p.stat() for p in [Path(root)/'.git'] if p.exists()),None)) else str(root))[:32]
 def _unborn(root): return provenance_digest(f"{stat.st_dev}:{stat.st_ino}:{getattr(stat,'st_birthtime_ns',stat.st_ctime_ns)}" if (stat:=next((p.stat() for p in [Path(root)/'.git/config',Path(root)/'.git'] if p.exists()),None)) else str(root))
@@ -230,26 +253,36 @@ def _refresh_repository(): (_git_root.cache_clear(),_repository.cache_clear())
 def repository(path,known=None,refresh=True): return (lambda value,state,evidence,bound,resolved:{**value,"id":resolved or value["id"],"alias":None if resolved or not evidence else evidence})(value:={**_repository(str(root)),"head":_git_maybe(root,"rev-parse","--verify","HEAD").decode().strip(),"branch":_git_maybe(root,"symbolic-ref","--short","HEAD").decode().strip()},state:=repository_state(known) if known is not None and hasattr(known,"execute") else known or {"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}},evidence:=repository_evidence(value),bound:=state["checkouts"].get(value["checkout"]),bound if value["lineage"] and state["lineages"].get(bound)==value["lineage"] else evidence and state["aliases"].get(evidence)) if (not refresh or _refresh_repository() is None) and Path(path).exists() and (root:=_git_root(Path(path))) and Path(path).exists() else None
 def _cached_repository(cache,root,known): return cache[key] if (key:=str(root)) in cache else cache.setdefault(key,repository(root,known,False))
 def _observe_checkout(db,repo): return (db.execute("DELETE FROM provenance.repository_checkouts WHERE root=? AND id<>?",(repo["root"],repo["checkout"])),db.execute("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET repository=excluded.repository,root=excluded.root,branch=excluded.branch,head=excluded.head",(repo["checkout"],repo["id"],repo["root"],repo["branch"],repo["head"])),repo["alias"] and db.execute("INSERT OR IGNORE INTO provenance.repository_aliases VALUES (?,?)",(repo["id"],repo["alias"])))
-_LOOPBACK=re.compile(r"^https://(127\.[0-9.]+|localhost|::1)(:[0-9]+)?/")
+_LOOPBACK=re.compile(r"^https://(127\.[0-9.]+|localhost|\[?::1\]?)(:[0-9]+)?/")
 _REKEY_DERIVED=[(kind,f"SELECT {old},json_object({recipe}) FROM provenance.{table} x JOIN provenance.rekeyed m ON (m.kind,m.old)=('{parent}',x.{column})") for kind,old,recipe,table,parent,column in (("file.observed","x.id","'repository',m.new,'path',x.path","files","repository.observed","repository"),("git.checkpoint","x.id","'repository',m.new,'head',x.head,'state',x.state_hash","git_checkpoints","repository.observed","repository"),("file.version","x.id","'file',m.new,'content',x.content_hash","file_versions","file.observed","file_id"),("checkpoint.link","sha256(json_object('checkpoint',x.checkpoint_id,'edit',x.file_edit_id))","'checkpoint',m.new,'edit',x.file_edit_id","checkpoint_edits","git.checkpoint","checkpoint_id"))]
 _REKEY_COLUMNS=[(f"provenance.{t}",c,k,move) for t,c,k,move in (("repositories","id","'repository.observed'",1),("files","id","'file.observed'",1),("file_versions","id","'file.version'",1),("git_checkpoints","id","'git.checkpoint'",1),("checkpoint_edits","checkpoint_id","'git.checkpoint'",1),("repository_aliases","repository","'repository.observed'",1),("local_facts","entity","t.kind",1),("files","repository","'repository.observed'",0),("file_versions","file_id","'file.observed'",0),("git_checkpoints","repository","'repository.observed'",0),("file_edit_files","file_id","'file.observed'",0),("conversation_scopes","repository","'repository.observed'",0),("file_edit_scopes","repository","'repository.observed'",0),("repository_checkouts","repository","'repository.observed'",0))]+[("remote.provenance_origins","physical_entity","t.kind",1),("archive_changes","entity","t.kind",1)]
 def rekey_repositories(db,observe=False):
     # b17 recorded url.*.insteadOf targets as remotes; merge each (lineage, real remotes) group holding a loopback-proxy remote into the id a fresh capture computes; a loopback URL maps to the unique real URL (stored, or configured in a checkout on disk) with the longest matching path.
-    rows,live=db.execute("SELECT id,lineage,CAST(remotes AS VARCHAR) FROM provenance.repositories WHERE lineage IS NOT NULL").fetchall(),{rid:remotes for root,rid in db.execute("SELECT root,repository FROM provenance.repository_checkouts").fetchall() if Path(root,".git").exists() and (remotes:=_repository(root)["remotes"])} if observe and _refresh_repository() is None else {}
+    rows=db.execute("SELECT id,lineage,CAST(remotes AS VARCHAR) FROM provenance.repositories WHERE lineage IS NOT NULL").fetchall()
+    lineage={rid:value for rid,value,remotes in rows}
+    live={rid:value["remotes"] for checkout,root,rid in db.execute("SELECT id,root,repository FROM provenance.repository_checkouts").fetchall() if Path(root,".git").exists() and (value:=_repository(root))["checkout"]==checkout and value["lineage"]==lineage.get(rid)} if observe and _refresh_repository() is None else {}
     real={(lineage,url) for rid,lineage,remotes in rows for url in [*live.get(rid,()),*json.loads(remotes)] if not _LOOPBACK.match(url)}
     key={rid:(lineage,tuple(sorted({(m[0][1] if (m:=sorted((-len(r.split("/",3)[3]),r) for l,r in real if l==lineage and url.endswith("/"+r.split("/",3)[3]))) and m[0][0]<[*m,(0,)][1][0] else url) if _LOOPBACK.match(url) else url for url in json.loads(remotes)}))) for rid,lineage,remotes in rows}
     target={k:provenance_digest({"lineage":k[0],"remotes":list(k[1])}) for rid,lineage,remotes in rows if any(map(_LOOPBACK.match,json.loads(remotes))) and not any(map(_LOOPBACK.match,(k:=key[rid])[1]))}
-    _insert_pages(db,"provenance.rekeyed",[("repository.observed",rid,target[k]) for rid,k in key.items() if k in target and target[k]!=rid],mode=" OR REPLACE")
-    [_insert_pages(db,"provenance.rekeyed",[(kind,old,provenance_digest(json.loads(recipe))) for old,recipe in db.execute(sql).fetchall()],mode=" OR IGNORE") for kind,sql in _REKEY_DERIVED]
+    maps=[("repository.observed",rid,target[k]) for rid,lineage,remotes in rows if any(map(_LOOPBACK.match,json.loads(remotes))) and (k:=key[rid]) in target and target[k]!=rid]
+    existing={(kind,old):new for kind,old,new in db.execute("SELECT kind,old,new FROM provenance.rekeyed").fetchall()}
+    required(all(existing.get((kind,old),new)==new for kind,old,new in maps),ValueError("repository rekey conflicts with an earlier identity"))
+    _insert_pages(db,"provenance.rekeyed",maps,mode=" OR IGNORE")
+    db.execute("UPDATE provenance.rekeyed r SET new=m.new FROM provenance.rekeyed m WHERE (r.kind,r.new)=(m.kind,m.old)")
+    [_insert_pages(db,"provenance.rekeyed",candidate,mode=" OR IGNORE") for kind,sql in _REKEY_DERIVED for candidate in [[(kind,old,provenance_digest(json.loads(recipe))) for old,recipe in db.execute(sql).fetchall()]] if required(all(existing.get((kind,old),new)==new for _,old,new in candidate),ValueError("derived rekey conflicts with an earlier identity"))]
     db.execute("UPDATE provenance.rekeyed r SET new=m.new FROM provenance.rekeyed m WHERE (r.kind,r.new)=(m.kind,m.old)")
     db.execute("CREATE OR REPLACE TEMP TABLE rekey AS "+" UNION ".join(f"SELECT m.* FROM provenance.rekeyed m JOIN {t} t ON (m.kind,m.old)=({k},t.{c})" for t,c,k,move in _REKEY_COLUMNS))
     if not (edits:=db.execute("SELECT kind,old,new FROM rekey UNION SELECT 'edit.observed',file_edit_id,file_edit_id FROM provenance.file_edit_files WHERE file_id IN (SELECT old FROM rekey WHERE kind='file.observed')").fetchall()): return 0
-    with preserve_fact_heads(db,[(kind,old) for kind,old,new in edits]):
+    with preserve_fact_heads(db,[(kind,entity) for kind,old,new in edits for entity in (old,new)]):
+        [db.execute(f"DELETE FROM provenance.local_facts l USING rekey m WHERE (l.kind,l.entity)=(m.kind,m.old) AND m.kind='{kind}' AND EXISTS (SELECT 1 FROM provenance.{table} x WHERE x.id=m.new)") for kind,table in (("repository.observed","repositories"),("file.observed","files"),("file.version","file_versions"),("git.checkpoint","git_checkpoints"))]
+        db.execute("DELETE FROM provenance.local_facts l USING rekey m WHERE (l.kind,l.entity)=(m.kind,m.old) AND m.kind='checkpoint.link' AND EXISTS (SELECT 1 FROM provenance.checkpoint_edits x WHERE sha256(json_object('checkpoint',x.checkpoint_id,'edit',x.file_edit_id))=m.new)")
         [db.execute(f"INSERT OR IGNORE INTO {t} SELECT t.* REPLACE (m.new AS {c}) FROM {t} t JOIN rekey m ON (m.kind,m.old)=({k},t.{c}); DELETE FROM {t} t USING rekey m WHERE (m.kind,m.old)=({k},t.{c})" if move else f"UPDATE {t} t SET {c}=m.new FROM rekey m WHERE (m.kind,m.old)=({k},t.{c})") for t,c,k,move in _REKEY_COLUMNS]
         db.executemany("UPDATE provenance.repositories SET remotes=? WHERE id=?",[(json.dumps(list(k[1])),new) for k,new in target.items()])
     return (_archive_touch(db,[(kind,new) for kind,old,new in edits]),len(edits))[-1]
 def capture_repository(path,db_path=None):
-    with _core(db_path,ready=True,purpose="schema.repository") as db: known=repository_state(db)
+    with _core(db_path,ready=True,purpose="schema.repository") as db,_transaction(db):
+        rekey_repositories(db,True)
+        known=repository_state(db)
     repo=repository(path,known)
     if not repo: return None
     record=_provenance_record("repository.observed",repo["id"],{k:repo[k] for k in ("id","lineage","roots","remotes","head")},datetime.now(timezone.utc).isoformat().replace("+00:00","Z"))
@@ -344,6 +377,7 @@ def capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="syn
             if strict: raise
             return log_parse_error('Provenance pending; captured conversations are committed',error) or []
 def _capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="sync",blocked=()):
+    with _core(path,ready=True,purpose="provenance.rekey") as db,_transaction(db): rekey_repositories(db,True)
     targeted,eids,cids=edit_ids is not None or conversation_ids is not None,sorted(set(edit_ids or ())),sorted(set(conversation_ids or ()))
     excluded=lambda value: bool(value) and any(Path(value).is_relative_to(root) for root in blocked)
     def snapshot(core):

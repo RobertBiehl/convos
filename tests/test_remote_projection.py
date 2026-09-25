@@ -106,6 +106,27 @@ def test_received_proxy_rewritten_repository_facts_merge_into_the_configured_rem
         assert sorted(db.execute("SELECT id,repository,path FROM provenance.files").fetchall())==sorted((digest(dict(repository=new,path=n)),new,n) for n in ("a.py","b.py","c.py"))
         assert db.execute("SELECT count(*) FROM remote.row_conflicts").fetchone()[0]==3
     assert audit_rows(path,page=1,local_user="other")["totals"]["unavailable"]==0
+    keys={1:os.urandom(32)}; exported=[open_replica(env,keys[1]) for env in row_replicas(path,dict(user="other",device=device),"w",[],keys)]
+    assert {row["id"] for item in exported for row in [item["row"]] if row["kind"]=="repository.observed"}=={old,new,sibling}
+    replay=tmp_path/"replay.db"; apply_row_replicas(replay,exported,"w",[control],local_user="third")
+    with duckdb.connect(str(replay),read_only=True) as db:
+        assert {r[0] for r in db.execute("SELECT id FROM provenance.repositories").fetchall()}=={new,sibling}
+        assert {r[0] for r in db.execute("SELECT path FROM provenance.files").fetchall()}=={"a.py","b.py","c.py"}
+
+def test_proxy_merge_retains_a_colliding_signed_destination_body(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"receiver.db"
+    lineage="l"; loop="https://127.0.0.1:9/token/acme/project"; real="https://example.com/acme/project"
+    old,new=(digest(dict(lineage=lineage,remotes=[url])) for url in (loop,real))
+    fact=lambda rid,remotes:(lambda row:dict(row=row,proof=row_proof(device,user,"w",1,row)))(dict(v=1,kind="repository.observed",id=rid,state="active",data=dict(lineage=lineage,roots=[],remotes=remotes)))
+    destination= fact(new,[real,"https://example.com/other/repository"]); proxy=fact(old,[loop])
+    apply_row_replicas(path,[destination,proxy],"w",[control],local_user="other")
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT CAST(remotes AS VARCHAR) FROM provenance.repositories WHERE id=?",[new]).fetchone()==(json.dumps([real]),)
+        assert json.loads(db.execute("SELECT body FROM remote.row_conflicts WHERE proof_id=?",[digest(destination["proof"])]).fetchone()[0])==destination["row"]
+    keys={1:os.urandom(32)}; exported=[open_replica(env,keys[1]) for env in row_replicas(path,dict(user="other",device=device),"w",[],keys)]
+    assert destination["row"] in [item["row"] for item in exported] and proxy["row"] in [item["row"] for item in exported]
+    replay=tmp_path/"replay.db"; apply_row_replicas(replay,exported,"w",[control],local_user="third")
+    with duckdb.connect(str(replay),read_only=True) as db: assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(new,)]
 
 def test_audit_detects_missing_body_even_without_surviving_origin(tmp_path):
     root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"lost.db"
