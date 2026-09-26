@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "runId": "20260926T091346-2ac56e",
+  "command": "review",
+  "args": [
+    "review",
+    "--feature",
+    "feat_library_4445d2d730",
+    "--limit",
+    "1",
+    "--jobs",
+    "1",
+    "--include-dirty",
+    "--reasoning-effort",
+    "high",
+    "--prompt-file",
+    "<local-review-prompt>"
+  ],
+  "rootPath": ".",
+  "headSha": "20a56a3b778b9ba41406db713324d88d9113eca6",
+  "startedAt": "2026-09-26T09:13:46.078Z",
+  "finishedAt": "2026-09-26T09:14:08.168Z",
+  "status": "completed",
+  "claimedFeatureIds": [
+    "feat_library_4445d2d730"
+  ],
+  "findingIds": [],
+  "patchAttemptIds": [],
+  "errors": []
+}

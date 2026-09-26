@@ -21,10 +21,11 @@ Compatibility
 
 There is no backward compatibility unless explicitly requested or covered by tests.
 Released signed logical-row encodings are the exception: retained relay replicas
-must remain ingestible for their documented lifetime. Physical-ID recipe changes
-require both a backed-up local migration and receive-path coverage proving old
-logical replicas project to the current physical identity; workspace IDs are
-authorization evidence and must never be inferred as wire-level row identity.
+must remain ingestible for their documented lifetime. Repository canonicalization requires a backed-up migration of this device's
+own observations and signed retirement of its obsolete facts. Receivers apply
+the author's revisions without computing a rekey. Replay tests must prove
+convergence and author isolation. Workspace IDs remain authorization evidence,
+never wire-level row identity.
 
 Line Budget
 -----------

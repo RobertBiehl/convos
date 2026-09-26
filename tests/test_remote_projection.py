@@ -14,8 +14,9 @@ from ai_convos_remote.protocol import b64, certificate, digest, event, identity,
 
 
 def git(path,*args): return subprocess.run(("git","-C",str(path),*args),check=True,capture_output=True).stdout.decode().strip()
-def source(tmp_path):
+def source(tmp_path,remote=None):
     repo=tmp_path/"repo"; repo.mkdir(); git(repo,"init","-q"); git(repo,"config","user.email","a@b.c"); git(repo,"config","user.name","A"); (repo/"a.py").write_text("new\n"); git(repo,"add","."); git(repo,"commit","-qm","init")
+    if remote: git(repo,"remote","add","origin",remote)
     path=tmp_path/"source.db"; db=duckdb.connect(str(path)); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','title','2026-01-01','2026-01-01','m',?,NULL,NULL,'{}')",[str(repo)]); db.execute("INSERT INTO messages VALUES ('u','c','user','change it',NULL,'2026-01-01 00:00:00','m','{}',NULL,NULL),('m','c','assistant','done',NULL,'2026-01-01 00:00:01','m','{}',NULL,NULL)"); db.execute("INSERT INTO file_edits VALUES ('e','m',?,'write','new\n','2026-01-01 00:00:01',NULL)",[str(repo/'a.py')]); db.execute("INSERT INTO provenance.file_edit_evidence VALUES ('e','confirmed','test_fixture',NULL)"); db.close(); capture_provenance(path); return repo,duckdb.connect(str(path))
 
 def signed_edit_graph():
@@ -91,53 +92,25 @@ def test_author_successor_can_replace_provenance_association(tmp_path):
         assert db.execute("SELECT file_id FROM provenance.file_edit_files").fetchone()==(new,)
         assert db.execute("SELECT count(*) FROM remote.row_conflicts").fetchone()[0]==0
 
-def test_received_proxy_rewritten_repository_facts_merge_into_the_configured_remote_id(tmp_path):
-    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"receiver.db"
-    loop,real=(dict(lineage="l",roots=[],remotes=[url]) for url in ("https://127.0.0.1:9/token/scm/acme/project","https://example.com/scm/acme/project"))
-    old,new=(digest(dict(lineage="l",remotes=r["remotes"])) for r in (loop,real))
-    fact=lambda kind,id,data:dict(row=(row:=dict(v=1,kind=kind,id=id,state="active",data=data)),proof=row_proof(device,user,"w",1,row))
-    file=lambda repo,name:fact("file.observed",digest(dict(repository=repo,path=name)),dict(repository=repo,path=name,kind="tracked"))
-    stale=[fact("repository.observed",old,loop),file(old,"a.py")]
-    ssh=dict(lineage="l",roots=[],remotes=["https://example.com:7999/acme/project"]); sibling=digest(dict(lineage="l",remotes=ssh["remotes"]))
-    apply_row_replicas(path,[*stale,fact("repository.observed",new,real),fact("repository.observed",sibling,ssh),file(new,"b.py")],"w",[control],local_user="other")
-    apply_row_replicas(path,[file(old,"c.py"),*stale],"w",[control],local_user="other")
-    with duckdb.connect(str(path),read_only=True) as db:
-        assert sorted(db.execute("SELECT id,CAST(remotes AS VARCHAR) FROM provenance.repositories").fetchall())==sorted([(new,json.dumps(real["remotes"])),(sibling,json.dumps(ssh["remotes"]))])
-        assert sorted(db.execute("SELECT id,repository,path FROM provenance.files").fetchall())==sorted((digest(dict(repository=new,path=n)),new,n) for n in ("a.py","b.py","c.py"))
-        assert db.execute("SELECT count(*) FROM remote.row_conflicts").fetchone()[0]==3
-    assert audit_rows(path,page=1,local_user="other")["totals"]["unavailable"]==0
-    keys={1:os.urandom(32)}; exported=[open_replica(env,keys[1]) for env in row_replicas(path,dict(user="other",device=device),"w",[],keys)]
-    assert {row["id"] for item in exported for row in [item["row"]] if row["kind"]=="repository.observed"}=={old,new,sibling}
-    replay=tmp_path/"replay.db"; apply_row_replicas(replay,exported,"w",[control],local_user="third")
-    with duckdb.connect(str(replay),read_only=True) as db:
-        assert {r[0] for r in db.execute("SELECT id FROM provenance.repositories").fetchall()}=={new,sibling}
-        assert {r[0] for r in db.execute("SELECT path FROM provenance.files").fetchall()}=={"a.py","b.py","c.py"}
-
-def test_proxy_merge_retains_a_colliding_signed_destination_body(tmp_path):
-    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"receiver.db"
-    lineage="l"; loop="https://127.0.0.1:9/token/acme/project"; real="https://example.com/acme/project"
-    old,new=(digest(dict(lineage=lineage,remotes=[url])) for url in (loop,real))
-    fact=lambda rid,remotes:(lambda row:dict(row=row,proof=row_proof(device,user,"w",1,row)))(dict(v=1,kind="repository.observed",id=rid,state="active",data=dict(lineage=lineage,roots=[],remotes=remotes)))
-    destination= fact(new,[real,"https://example.com/other/repository"]); proxy=fact(old,[loop])
-    apply_row_replicas(path,[destination,proxy],"w",[control],local_user="other")
-    with duckdb.connect(str(path),read_only=True) as db:
-        assert db.execute("SELECT CAST(remotes AS VARCHAR) FROM provenance.repositories WHERE id=?",[new]).fetchone()==(json.dumps([real]),)
-        assert json.loads(db.execute("SELECT body FROM remote.row_conflicts WHERE proof_id=?",[digest(destination["proof"])]).fetchone()[0])==destination["row"]
-    keys={1:os.urandom(32)}; exported=[open_replica(env,keys[1]) for env in row_replicas(path,dict(user="other",device=device),"w",[],keys)]
-    assert destination["row"] in [item["row"] for item in exported] and proxy["row"] in [item["row"] for item in exported]
-    replay=tmp_path/"replay.db"; apply_row_replicas(replay,exported,"w",[control],local_user="third")
-    with duckdb.connect(str(replay),read_only=True) as db: assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(new,)]
-
-def test_retained_proxy_body_identifies_a_row_whose_current_remotes_are_canonical(tmp_path):
-    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"receiver.db"
-    lineage="l"; loop="https://127.0.0.1:9/token/acme/project"; real="https://example.com/acme/project"; old=digest(dict(lineage=lineage,remotes=[loop])); new=digest(dict(lineage=lineage,remotes=[real]))
-    row=dict(v=1,kind="repository.observed",id=old,state="active",data=dict(lineage=lineage,roots=[],remotes=[loop])); proof=row_proof(device,user,"w",1,row)
-    apply_row_replicas(path,[dict(row=row,proof=proof)],"w",[control],local_user="other")
+def test_received_proxy_facts_remain_author_owned_even_with_canonical_peer_evidence(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph()
+    path=tmp_path/"receiver.db"
+    remotes=["https://127.0.0.1:9/token/acme/project","https://example.com/acme/project"]
+    old,new=(digest(dict(lineage="l",remotes=[url])) for url in remotes)
+    facts=[dict(row=(row:=dict(v=1,kind="repository.observed",id=rid,state="active",data=dict(lineage="l",roots=[],remotes=[url]))),proof=row_proof(device,user,"w",1,row)) for rid,url in zip((old,new),remotes)]
+    apply_row_replicas(path,facts,"w",[control],local_user="other")
     with duckdb.connect(str(path)) as db:
-        with core_module.preserve_fact_heads(db,[("repository.observed",old)]): db.execute("UPDATE provenance.repositories SET remotes=? WHERE id=?",[json.dumps([real]),old])
-        assert json.loads(db.execute("SELECT body FROM remote.row_conflicts WHERE proof_id=?",[digest(proof)]).fetchone()[0])==row
-        assert core_module.rekey_repositories(db)>0 and core_module.rekey_repositories(db)==0
-        assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(new,)]
+        before=db.execute("SELECT * FROM provenance.repositories ORDER BY id").fetchall()
+        assert core_module.rekey_repositories(db)==0
+        assert db.execute("SELECT * FROM provenance.repositories ORDER BY id").fetchall()==before
+        assert {r[0] for r in before}=={old,new}
+    keys={1:os.urandom(32)}
+    exported=[open_replica(env,keys[1]) for env in row_replicas(path,dict(user="other",device=device),"w",[],keys)]
+    replay=tmp_path/"replay.db"
+    apply_row_replicas(replay,exported,"w",[control],local_user="third")
+    with duckdb.connect(str(replay),read_only=True) as db:
+        assert db.execute("SELECT * FROM provenance.repositories ORDER BY id").fetchall()==before
+    assert audit_rows(replay,local_user="third")["totals"]["unavailable"]==0
 
 def test_audit_detects_missing_body_even_without_surviving_origin(tmp_path):
     root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"lost.db"
@@ -147,6 +120,104 @@ def test_audit_detects_missing_body_even_without_surviving_origin(tmp_path):
     assert audit["tables"]["messages"]["unavailable"]==1
     apply_row_replicas(path,[bodies[1]],"w",[control],local_user="other")
     assert audit_rows(path,page=1,local_user="other")["totals"]["unavailable"]==0
+
+def test_author_can_retire_repository_fact_and_replay_cannot_resurrect_it(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph()
+    path=tmp_path/"deleted.db"
+    row=dict(v=1,kind="repository.observed",id="old",state="active",data=dict(lineage="l",roots=[],remotes=["https://example.com/acme/project"]))
+    first=row_proof(device,user,"w",1,row)
+    deleted={**row,"state":"deleted","data":None}
+    successor=row_proof(device,user,"w",1,deleted,first["revision"])
+    active=dict(row=row,proof=first)
+    apply_row_replicas(path,[active],"w",[control],local_user="other")
+    apply_row_replicas(path,[dict(row=deleted,proof=successor)],"w",[control],local_user="other")
+    apply_row_replicas(path,[active],"w",[control],local_user="other")
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM provenance.repositories").fetchone()==(0,)
+        assert db.execute("SELECT count(*) FROM remote.row_conflicts").fetchone()==(0,)
+
+@pytest.mark.parametrize("kind",["repository.observed","file.observed","file.version","git.checkpoint"])
+def test_fact_deletion_retires_only_the_signing_authors_claim(tmp_path,kind):
+    root,device,user,control,*_=signed_edit_graph()
+    other_root,other_device,other_user,other_control,*_=signed_edit_graph()
+    control["devices"].update(other_control["devices"])
+    rid=digest(dict(lineage="l",remotes=["https://example.com/team/project"]))
+    fid=digest(dict(repository=rid,path="a.py"))
+    records={"repository.observed":(rid,dict(lineage="l",roots=[],remotes=["https://example.com/team/project"])),"file.observed":(fid,dict(repository=rid,path="a.py",kind="tracked")),"file.version":(digest(dict(file=fid,content="h")),dict(file=fid,content_hash="h",observed_at=None)),"git.checkpoint":(digest(dict(repository=rid,head="h",state="s")),dict(repository=rid,head="h",state_hash="s",paths=[],observed_at=None,capture_source="test"))}
+    entity,data=records[kind]
+    row=dict(v=1,kind=kind,id=entity,state="active",data=data)
+    first,other=(row_proof(d,u,"w",1,row) for d,u in ((device,user),(other_device,other_user)))
+    path=tmp_path/"shared.db"
+    apply_row_replicas(path,[dict(row=row,proof=p) for p in (first,other)],"w",[control],local_user="reader")
+    deleted={**row,"state":"deleted","data":None}
+    apply_row_replicas(path,[dict(row=deleted,proof=row_proof(device,user,"w",1,deleted,first["revision"]))],"w",[control],local_user="reader")
+    table,column=core_module._FACT_TABLES[kind]
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute(f"SELECT {column} FROM provenance.{table}").fetchall()==[(entity,)]
+        assert db.execute("SELECT proof_id FROM remote.provenance_origins WHERE author_user_id=?",[other_user]).fetchall()==[(digest(other),)]
+    keys={1:os.urandom(32)}
+    exported=[open_replica(env,keys[1]) for env in row_replicas(path,dict(user="reader",device=device),"w",[],keys)]
+    assert any(item["row"]==row and item["proof"]==other for item in exported)
+    assert not any(item["row"]==row and item["proof"]==first for item in exported)
+    apply_row_replicas(path,[dict(row=deleted,proof=row_proof(other_device,other_user,"w",1,deleted,other["revision"]))],"w",[control],local_user="reader")
+    with duckdb.connect(str(path),read_only=True) as db: assert db.execute(f"SELECT count(*) FROM provenance.{table}").fetchone()==(0,)
+
+def test_recovered_own_facts_are_not_inferred_to_be_deleted(tmp_path):
+    root,device,user,control,*_=signed_edit_graph()
+    row=dict(v=1,kind="repository.observed",id="retained",state="active",data=dict(lineage="l",roots=[],remotes=["https://example.com/team/project"]))
+    path=tmp_path/"recovered.db"
+    apply_row_replicas(path,[dict(row=row,proof=row_proof(device,user,"w",1,row))],"w",[control],local_user=user,local_device=device["id"])
+    with duckdb.connect(str(path)) as db,connect(tmp_path/"state.db") as state:
+        db.execute("INSERT OR REPLACE INTO archive_sync VALUES (TRUE,2,?,?)",[user,device["id"]])
+        assert not [r for r in scan(db,state) if r["payload"].get("state")=="deleted"]
+
+@pytest.mark.parametrize("same_user",[False,True])
+def test_identity_rule_change_retires_owned_graph_and_converges_after_replay(tmp_path,monkeypatch,same_user):
+    checkout,db=source(tmp_path,"ssh://git@code.example.com:7999/team/project.git")
+    path=tmp_path/"source.db"
+    root,device,user,control,*_=signed_edit_graph()
+    cfg=dict(user=user,device=device,workspaces={"w":dict(kind="personal",epoch=1)},controls={"w":control},server_state=dict(workspaces=[dict(id="w",controls=[control])]))
+    db.execute("INSERT INTO archive_sync VALUES (TRUE,2,?,?)",[user,device["id"]])
+    old=db.execute("SELECT id FROM provenance.repositories").fetchone()[0]
+    evidence=db.execute("SELECT id,message_id,file_path,content,old_content FROM file_edits").fetchall()
+    with connect(tmp_path/"state.db") as state: initial=scan(db,state)
+    db.close()
+    keys={1:os.urandom(32)}
+    attest_rows(path,cfg,"w",initial)
+    before=[open_replica(env,keys[1]) for env in row_replicas(path,cfg,"w",initial,keys)]
+    receiver=tmp_path/"receiver.db"
+    receiver_user=user if same_user else "reader"
+    apply_row_replicas(receiver,before,"w",[control],local_user=receiver_user,local_device="another-device")
+    config=tmp_path/"settings"; config.mkdir()
+    (config/"config.json").write_text(json.dumps(dict(git_identity=dict(url_prefixes={"https://code.example.com:7999/":"https://code.example.com/scm/"}))))
+    monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(config))
+    assert core_module.canonicalize_repositories(path)>0
+    canonical=repository(checkout)["id"]
+    assert canonical!=old
+    assert list(tmp_path.glob("source.db.pre-git-identity-*.bak"))
+    with duckdb.connect(str(path)) as db,connect(tmp_path/"state.db") as state:
+        assert db.execute("SELECT id,message_id,file_path,content,old_content FROM file_edits").fetchall()==evidence
+        assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(canonical,)]
+        after=scan(db,state)
+        generation=core_module.archive_state(db)[1]
+    with connect(tmp_path/"rebuilt-state.db") as state:
+        paged=list(projection_module.scan_archive(path,state,generation=generation,page=1))
+    assert {r["entity"] for r in paged if r["payload"].get("state")=="deleted"}=={r["entity"] for r in after if r["payload"].get("state")=="deleted"}
+    assert {r["kind"] for r in after if r["payload"].get("state")=="deleted"}=={"repository.observed","file.observed","file.version","git.checkpoint","checkpoint.link"}
+    attest_rows(path,cfg,"w",after)
+    exported=[open_replica(env,keys[1]) for env in row_replicas(path,cfg,"w",after,keys)]
+    assert not any(item["row"]["kind"]=="repository.observed" and item["row"]["id"]==old and item["row"]["state"]=="active" for item in exported)
+    assert core_module.canonicalize_repositories(path)==0
+    assert core_module.canonicalize_repositories(receiver)==0
+    with duckdb.connect(str(receiver),read_only=True) as db: assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(old,)]
+    monkeypatch.setattr(core_module,"rekey_repositories",lambda *a,**k:pytest.fail("receiver computed a migration"))
+    for target,batches in ((receiver,[exported,before]),(tmp_path/"fresh.db",[[item] for item in reversed([*before,*exported])])):
+        for batch in batches: apply_row_replicas(target,batch,"w",[control],local_user=receiver_user,local_device="another-device")
+        with duckdb.connect(str(target),read_only=True) as db:
+            assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(canonical,)]
+            assert db.execute("SELECT DISTINCT repository FROM provenance.files").fetchall()==[(canonical,)]
+            assert db.execute("SELECT count(*) FROM provenance.file_edit_files x JOIN provenance.files f ON f.id=x.file_id JOIN provenance.checkpoint_edits c ON c.file_edit_id=x.file_edit_id JOIN provenance.git_checkpoints g ON g.id=c.checkpoint_id WHERE f.repository=g.repository AND f.repository=?",[canonical]).fetchone()==(1,)
+        assert audit_rows(target,local_user=receiver_user)["totals"]["unavailable"]==0
 
 @pytest.mark.parametrize("timestamp",["2026-01-01T00:00:00","2026-01-01T00:00:00.000000","2026-01-01T00:00:00.123456"])
 def test_historical_timestamp_reconstructs_exact_proof_without_resigning(tmp_path,timestamp):

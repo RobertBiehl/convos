@@ -83,7 +83,7 @@ def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_pat
     observed=next(r for r in records if r["kind"]=="repository.observed"); head=db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]; project(db,{**observed,"payload":{k:v for k,v in observed["payload"].items() if k!="head"},"observed_at":None}); assert db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]==head
     row=query(db,"conversation_changes","c")[0]; assert row["repositories"]==2 and row["files"]==2 and row["prompt"]=="make the cross-repo change" and row["changeset_id"]=="m"
     assert len(query(db,"changeset_files","m"))==2 and query(db,"current_activity",str(a))[0]["repository"]==repository(a)["id"]
-    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","repository_aliases","rekeyed","conversation_scopes","files","file_versions","file_edit_scopes","file_edit_files","file_edit_evidence","git_checkpoints","checkpoint_edits","local_facts","pending"}
+    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","repository_aliases","conversation_scopes","files","file_versions","file_edit_scopes","file_edit_files","file_edit_evidence","git_checkpoints","checkpoint_edits","local_facts","pending"}
     columns={r[0] for r in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance'").fetchall()}; assert not columns&{"prompt","content","payload","workspace","author"}
 
 
@@ -345,10 +345,10 @@ def test_repository_identity_distinguishes_fork_but_preserves_lineage_and_unborn
     path=tmp_path/"empty-core.db"; db=core(path,empty,[(empty/"new.py","write","new\n",None)]); db.close(); records=capture(path); assert any(r["kind"]=="git.checkpoint" and r["payload"]["head"]=="" for r in records)
 
 
-def test_bound_checkout_survives_remote_changes_and_move_without_binding_fork(tmp_path):
-    root=repo(tmp_path/"source"); git(root,"remote","add","origin","https://example.com/acme/project.git"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); capture(path); db=duckdb.connect(str(path)); stable=repository(root,db)["id"]; git(root,"remote","set-url","origin","git@example.com:other/fork.git"); assert repository(root,db)["id"]==stable
-    moved=tmp_path/"moved"; __import__("shutil").move(root,moved); assert repository(moved,db)["id"]==stable
-    fork=tmp_path/"fork"; subprocess.run(("git","clone","-q",str(moved),str(fork)),check=True); git(fork,"remote","set-url","origin","git@example.com:other/fork.git"); assert repository(fork,db)["id"]!=stable
+def test_remote_change_gets_canonical_identity_and_move_keeps_it(tmp_path):
+    root=repo(tmp_path/"source"); git(root,"remote","add","origin","https://example.com/acme/project.git"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); capture(path); db=duckdb.connect(str(path)); stable=repository(root,db)["id"]; git(root,"remote","set-url","origin","git@example.com:other/fork.git"); changed=repository(root,db)["id"]; assert changed!=stable
+    moved=tmp_path/"moved"; __import__("shutil").move(root,moved); assert repository(moved,db)["id"]==changed
+    fork=tmp_path/"fork"; subprocess.run(("git","clone","-q",str(moved),str(fork)),check=True); git(fork,"remote","set-url","origin","git@example.com:other/fork.git"); assert repository(fork,db)["id"]==changed
 
 
 def test_replaced_checkout_at_same_path_gets_new_identity_and_prunes_stale_metadata(tmp_path):
@@ -368,27 +368,27 @@ def test_repository_identity_resolves_url_aliases_and_keeps_git_remote_selection
     pushed=remotes("pushed",("remote.origin.url","https://github.com/acme/project.git"),("url.http://127.0.0.1:9/token/.pushInsteadOf","https://github.com/"))
     assert many["remotes"]==["https://github.com/acme/project","https://github.com/acme/push"] and pushed["remotes"]==plain["remotes"]==["https://github.com/acme/project"]
 
-def test_schema_18_merges_proxy_rewritten_repository_ids_and_keeps_every_link(tmp_path,monkeypatch):
+def test_rule_migration_merges_proxy_ids_and_keeps_every_link(tmp_path,monkeypatch):
     main,wt,path=repo(tmp_path/"main"),tmp_path/"wt",tmp_path/"core.db"; git(main,"remote","add","origin","https://example.com/acme/project.git"); git(main,"worktree","add","-q",str(wt))
     session=lambda token:((rewrite:=tmp_path/token).write_text(f'[url "http://127.0.0.1:9/{token}/"]\n\tinsteadOf = https://example.com/\n'),monkeypatch.setenv("GIT_CONFIG_GLOBAL",str(rewrite)))
     monkeypatch.setattr(core_module,"_git_remotes",lambda root:sorted({line.split("\t",1)[1].rsplit(" ",1)[0].replace("http://","https://").removesuffix(".git") for line in core_module._git_run(root,"remote","-v").decode().splitlines()}))
     session("token-a"); core(path,main,[(main/"x.py","write","one\n",None)]).close(); capture(path)
     session("token-b"); (wt/"y.py").write_text("two\n"); db=duckdb.connect(str(path)); db.execute("INSERT INTO provenance.file_edit_evidence VALUES ('e1','confirmed','test_fixture',NULL); INSERT INTO file_edits VALUES ('e1','m',?,'write','two\n','2026-01-01',NULL)",[str(wt/"y.py")]); db.close(); capture(path)
-    db=duckdb.connect(str(path)); assert len(db.execute("SELECT id FROM provenance.repositories").fetchall())==2==query(db,"conversation_changes","c")[0]["repositories"]; files=query(db,"changeset_files","m"); db.execute("UPDATE core_schema SET version=17"); db.close()
-    monkeypatch.undo(); session("token-b"); db=duckdb.connect(str(path)); init_schema(db); git(main,"worktree","add","-q",str(tmp_path/"fresh"))
+    db=duckdb.connect(str(path)); assert len(db.execute("SELECT id FROM provenance.repositories").fetchall())==2==query(db,"conversation_changes","c")[0]["repositories"]; files=query(db,"changeset_files","m"); db.execute("DELETE FROM core_migrations WHERE name='git_identity'"); db.close()
+    monkeypatch.undo(); session("token-b"); core_module.canonicalize_repositories(path); db=duckdb.connect(str(path)); git(main,"worktree","add","-q",str(tmp_path/"fresh"))
     assert db.execute("SELECT CAST(remotes AS VARCHAR) FROM provenance.repositories").fetchall()==[('["https://example.com/acme/project"]',)] and len({repository(p,db)["id"] for p in (main,wt,tmp_path/"fresh")})==1
     assert query(db,"conversation_changes","c")[0]["repositories"]==1 and len(query(db,"changeset_files","m"))==len(files)==2 and query(db,"file_history","y.py")[0]["prompt"]=="make the cross-repo change"
     assert not db.execute("""SELECT * FROM provenance.files f WHERE f.repository NOT IN (SELECT id FROM provenance.repositories) OR f.id<>sha256(json_object('path',f.path,'repository',f.repository)) UNION ALL SELECT c.id,c.repository,c.head,c.state_hash FROM provenance.git_checkpoints c WHERE c.repository NOT IN (SELECT id FROM provenance.repositories) OR c.id<>sha256(json_object('head',c.head,'repository',c.repository,'state',c.state_hash))
         UNION ALL SELECT x.file_edit_id,x.file_id,NULL,NULL FROM provenance.file_edit_files x WHERE x.file_id NOT IN (SELECT id FROM provenance.files) UNION ALL SELECT l.kind,l.entity,NULL,NULL FROM provenance.local_facts l WHERE l.kind='repository.observed' AND l.entity NOT IN (SELECT id FROM provenance.repositories)""").fetchall()
     assert db.execute("SELECT count(*) FROM provenance.git_checkpoints").fetchone()[0]>0 and core_module.rekey_repositories(db)==0; db.close()
 
-def test_schema_18_keeps_loopback_rows_whose_checkout_now_points_at_another_repository(tmp_path):
+def test_migration_keeps_loopback_rows_without_matching_local_evidence(tmp_path):
     db,root=graph(tmp_path/"archive.db"),repo(tmp_path/"checkout"); git(root,"remote","add","origin","https://example.com/fork/project.git"); lineage=repository(root)["lineage"]
     old=digest({"lineage":lineage,"remotes":[loop:="https://127.0.0.1:9/token/acme/project"]})
     db.execute("INSERT INTO provenance.repositories VALUES (?,?,'[]',?,NULL,NULL)",[old,lineage,json.dumps([loop])]); db.execute("INSERT INTO provenance.repository_checkouts VALUES ('k',?,?,NULL,NULL)",[old,str(root)])
-    assert core_module.rekey_repositories(db,True)==0 and db.execute("SELECT id FROM provenance.repositories").fetchall()==[(old,)]; db.close()
+    assert core_module.rekey_repositories(db)==0 and db.execute("SELECT id FROM provenance.repositories").fetchall()==[(old,)]; db.close()
 
-def test_rekey_only_moves_proxy_rows_and_never_claims_a_colliding_remote_row_as_local(tmp_path):
+def test_rekey_moves_only_local_observations_to_canonical_destination(tmp_path):
     db=graph(tmp_path/"archive.db"); lineage="history"; loop="https://127.0.0.1:9/token/acme/project"; real="https://example.com/acme/project"
     old,new=(digest(dict(lineage=lineage,remotes=[url])) for url in (loop,real)); sticky="a"*64; old_file,new_file=(digest(dict(repository=rid,path="a.py")) for rid in (old,new))
     db.executemany("INSERT INTO provenance.repositories VALUES (?,?,'[]',?,NULL,NULL)",[(old,lineage,json.dumps([loop])),(new,lineage,json.dumps([real])),(sticky,lineage,json.dumps([real]))])
@@ -396,15 +396,15 @@ def test_rekey_only_moves_proxy_rows_and_never_claims_a_colliding_remote_row_as_
     assert core_module.rekey_repositories(db)>0
     assert {r[0] for r in db.execute("SELECT id FROM provenance.repositories").fetchall()}=={new,sticky}
     assert db.execute("SELECT id,repository FROM provenance.files").fetchall()==[(new_file,new)]
-    assert not db.execute("SELECT 1 FROM provenance.local_facts WHERE kind='repository.observed' AND entity=?",[new]).fetchone()
-    assert not db.execute("SELECT 1 FROM provenance.local_facts WHERE kind='file.observed' AND entity=?",[new_file]).fetchone()
-    assert db.execute("SELECT new FROM provenance.rekeyed WHERE kind='repository.observed' AND old=?",[old]).fetchone()==(new,)
+    assert db.execute("SELECT 1 FROM provenance.local_facts WHERE kind='repository.observed' AND entity=?",[new]).fetchone()
+    assert db.execute("SELECT 1 FROM provenance.local_facts WHERE kind='file.observed' AND entity=?",[new_file]).fetchone()
+    assert not db.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='provenance' AND table_name='rekeyed'").fetchone()
     assert core_module.rekey_repositories(db)==0; db.close()
 
 def test_repository_capture_reconciles_a_bound_proxy_id_before_writing(tmp_path):
     root=repo(tmp_path/"checkout"); git(root,"remote","add","origin","https://example.com/acme/project.git"); current=repository(root)
     loop="https://127.0.0.1:9/token/acme/project"; old=digest(dict(lineage=current["lineage"],remotes=[loop])); path=tmp_path/"archive.db"; db=graph(path)
-    db.execute("INSERT INTO provenance.repositories VALUES (?,?,?, ?,NULL,NULL)",[old,current["lineage"],json.dumps(current["roots"]),json.dumps([loop])]); db.execute("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?)",[current["checkout"],old,str(root),current["branch"],current["head"]]); db.close()
+    db.execute("INSERT INTO provenance.repositories VALUES (?,?,?, ?,NULL,NULL)",[old,current["lineage"],json.dumps(current["roots"]),json.dumps([loop])]); db.execute("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?)",[current["checkout"],old,str(root),current["branch"],current["head"]]); db.execute("INSERT INTO provenance.local_facts VALUES ('repository.observed',?)",[old]); db.close()
     observed=core_module.capture_repository(root,path)
     assert observed["id"]==current["id"] and observed["remotes"]==current["remotes"]
     with duckdb.connect(str(path),read_only=True) as db: assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(current["id"],)]
@@ -414,6 +414,57 @@ def test_direct_proxy_urls_do_not_enter_repository_identity(tmp_path):
     assert repository(root)["remotes"]==[] and "session-secret" not in json.dumps(repository(root))
     git(root,"remote","set-url","origin","gh:acme/project.git"); git(root,"config","url.http://127.0.0.1:9/session-secret/.insteadOf","gh:")
     assert repository(root)["remotes"]==[]
+
+@pytest.mark.parametrize("proxy",["ssh://git@127.0.0.1:9/token/","http://localhost:9/token/"])
+def test_proxy_fallback_uses_configured_url_without_applying_a_losing_rewrite(tmp_path,proxy):
+    root=repo(tmp_path/"checkout")
+    git(root,"remote","add","origin","https://example.com/acme/project.git")
+    git(root,"config","url.https://wrong.example/.insteadOf","https://example.com/")
+    git(root,"config",f"url.{proxy}.insteadOf","https://example.com/acme/")
+    assert repository(root)["remotes"]==["https://example.com/acme/project"]
+
+def test_canonical_remote_overrides_stale_checkout_binding(tmp_path):
+    root=repo(tmp_path/"checkout")
+    git(root,"remote","add","origin","https://example.com/acme/project.git")
+    current=repository(root)
+    known={"roots":{},"checkouts":{current["checkout"]:"old"},"checkout_roots":{},"lineages":{"old":current["lineage"]},"aliases":{current["id"]:"old"}}
+    assert repository(root,known)["id"]==current["id"]
+    git(root,"remote","remove","origin")
+    assert repository(root,known)["id"]=="old"
+
+def test_config_migration_is_backed_up_atomic_and_skips_unchanged_rules(tmp_path,monkeypatch):
+    root=repo(tmp_path/"checkout")
+    git(root,"remote","add","origin","https://old.example/team/project.git")
+    path=tmp_path/"archive.db"
+    core(path,root,[(root/"x.py","write","one\n",None)]).close()
+    capture(path)
+    with duckdb.connect(str(path),read_only=True) as db:
+        old=db.execute("SELECT id FROM provenance.repositories").fetchone()[0]
+        fingerprint=db.execute("SELECT state FROM core_migrations WHERE name='git_identity'").fetchone()[0]
+    config=tmp_path/"settings"; config.mkdir()
+    (config/"config.json").write_text(json.dumps({"git_identity":{"host_aliases":{"old.example":"new.example"}}}))
+    monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(config))
+    backup=core_module._migration_backup
+    def interrupted(*args): raise OSError("backup interrupted")
+    monkeypatch.setattr(core_module,"_migration_backup",interrupted)
+    with pytest.raises(OSError,match="backup interrupted"): core_module.canonicalize_repositories(path)
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(old,)]
+        assert db.execute("SELECT state FROM core_migrations WHERE name='git_identity'").fetchone()==(fingerprint,)
+    monkeypatch.setattr(core_module,"_migration_backup",backup)
+    assert core_module.canonicalize_repositories(path)>0
+    saved=next(tmp_path.glob("archive.db.pre-git-identity-*.bak"))
+    with duckdb.connect(str(saved),read_only=True) as db: assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(old,)]
+    (config/"config.json").write_text(json.dumps({"git_identity":{"host_aliases":{"old.example":"final.example","new.example":"final.example"}}}))
+    assert core_module.canonicalize_repositories(path)>0
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT remotes FROM provenance.repositories").fetchone()==('["https://final.example/team/project"]',)
+        assert db.execute("SELECT version FROM core_schema").fetchone()==(17,)
+    def unexpected(*a,**k): pytest.fail("unchanged rules performed Git inspection or mutation")
+    monkeypatch.setattr(core_module,"_git_run",unexpected)
+    monkeypatch.setattr(core_module,"_migration_backup",unexpected)
+    monkeypatch.setattr(core_module,"rekey_repositories",unexpected)
+    assert core_module.canonicalize_repositories(path)==0
 
 def test_provider_ssh_endpoints_and_global_host_aliases(tmp_path,monkeypatch):
     root=repo(tmp_path/"checkout"); git(root,"remote","add","origin","ssh://git@ssh.github.com:443/acme/project.git")
@@ -429,11 +480,11 @@ def test_provider_ssh_endpoints_and_global_host_aliases(tmp_path,monkeypatch):
     git(root,"remote","set-url","origin","http://127.0.0.1:9/session-secret/acme/project.git")
     assert repository(root)["remotes"]==["https://code.example.com/acme/project"]
 
-def test_bitbucket_server_default_ssh_port_matches_https_scm_path(tmp_path):
+def test_custom_ssh_port_requires_explicit_scm_mapping(tmp_path):
     root=repo(tmp_path/"checkout"); git(root,"remote","add","origin","ssh://git@code.example.com:7999/ACME/project.git")
     ssh=repository(root)["remotes"]
     git(root,"remote","set-url","origin","https://user@code.example.com/scm/ACME/project.git")
-    assert ssh==repository(root)["remotes"]==["https://code.example.com/scm/ACME/project"]
+    assert ssh==["https://code.example.com:7999/ACME/project"] and repository(root)["remotes"]==["https://code.example.com/scm/ACME/project"]
 
 
 def test_ssh_and_https_remote_evidence_normalize_identically(tmp_path):

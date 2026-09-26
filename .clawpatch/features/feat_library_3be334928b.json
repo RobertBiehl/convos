@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "featureId": "feat_library_3be334928b",
+  "title": "Python source apps/remote/src",
+  "summary": "Python source group apps/remote/src with 6 files.",
+  "kind": "library",
+  "source": "python-source-group",
+  "confidence": "medium",
+  "entrypoints": [
+    {
+      "path": "apps/remote/src",
+      "symbol": "apps/remote/src",
+      "route": null,
+      "command": null
+    }
+  ],
+  "ownedFiles": [
+    {
+      "path": "apps/remote/src/ai_convos_remote/__init__.py",
+      "reason": "source group src"
+    },
+    {
+      "path": "apps/remote/src/ai_convos_remote/control.py",
+      "reason": "source group src"
+    },
+    {
+      "path": "apps/remote/src/ai_convos_remote/migrations.py",
+      "reason": "source group src"
+    },
+    {
+      "path": "apps/remote/src/ai_convos_remote/projection.py",
+      "reason": "source group src"
+    },
+    {
+      "path": "apps/remote/src/ai_convos_remote/protocol.py",
+      "reason": "source group src"
+    },
+    {
+      "path": "apps/remote/src/ai_convos_remote/service.py",
+      "reason": "source group src"
+    }
+  ],
+  "contextFiles": [
+    {
+      "path": "apps/remote/pyproject.toml",
+      "reason": "python target runtime metadata"
+    },
+    {
+      "path": "src/ai_convos/cli.py",
+      "reason": "Identity migration, retirement and replay contract"
+    },
+    {
+      "path": "docs/git-identity.md",
+      "reason": "Identity migration, retirement and replay contract"
+    },
+    {
+      "path": "docs/invariants.md",
+      "reason": "Identity migration, retirement and replay contract"
+    },
+    {
+      "path": "tests/test_remote_projection.py",
+      "reason": "Identity migration, retirement and replay contract"
+    },
+    {
+      "path": "tests/test_provenance.py",
+      "reason": "Identity migration, retirement and replay contract"
+    },
+    {
+      "path": "tests/test_attestation_snapshots.py",
+      "reason": "Identity migration, retirement and replay contract"
+    }
+  ],
+  "tests": [],
+  "tags": [
+    "python",
+    "source-group",
+    "workspace",
+    "uv-workspace"
+  ],
+  "trustBoundaries": [],
+  "status": "reviewed",
+  "lock": null,
+  "findingIds": [],
+  "patchAttemptIds": [],
+  "analysisHistory": [
+    {
+      "runId": "20260926T091718-cf3d1a",
+      "kind": "review",
+      "summary": "0 finding(s); prompt=213849 bytes; approxTokens=53463; includedFiles=13; omittedFiles=0",
+      "provider": "codex",
+      "model": null,
+      "reasoningEffort": "high",
+      "createdAt": "2026-09-26T09:17:49.129Z"
+    }
+  ],
+  "createdAt": "2026-09-26T09:13:03.948Z",
+  "updatedAt": "2026-09-26T09:17:49.129Z"
+}
