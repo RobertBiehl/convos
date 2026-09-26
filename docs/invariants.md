@@ -40,7 +40,7 @@ questions do not become invariants by implication.
 
 > A physical archive migration and relay compatibility are two halves of one
 > upgrade. Retained signed logical encodings remain readable at ingestion;
-> physical-ID changes repair already projected rows without changing relay
+> purely physical-ID changes repair already projected rows without changing relay
 > ciphertext, logical row IDs, proofs, or signatures. Workspace identity is
 > authorization evidence, never a serialized physical-ID recipe.
 > Core migrations cap DuckDB at 1.5 GiB without raising a lower user limit and
@@ -353,6 +353,15 @@ they do not depend on relay or `state.db` history.
 > is identified from durable Git evidence; a repository file is identified by
 > repository plus normalized relative path. A checkout is an observation of a
 > repository, never the repository identity itself.
+
+> Canonical remote evidence determines repository identity whenever available;
+> a checkout binding is only a fallback without remote evidence. Explicit local
+> URL rules control deployment-specific equivalence. A rule change triggers a
+> verified backup and atomic canonicalization of locally observed facts, never
+> another device's received claims. Each author publishes canonical facts and
+> signed deletes of its obsolete facts; receivers apply those revisions without
+> calculating a migration. Shared rows survive while another active claim exists.
+> No persistent rekey relation is introduced. See [Git identity](git-identity.md).
 
 > Different worktrees may have different branches and heads while referring to
 > the same repository and file identities. Files outside a resolved repository

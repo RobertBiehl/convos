@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.6b18
+
+- Keep proxy credentials out of repository identity; canonical remotes win over stale bindings, with explicit host/port/path mappings.
+- Back up and canonicalize this device's observations when rules change; signed deletes retire obsolete facts without receiver-side migration.
+- Correct the pinned EmbeddingGemma GGUF filename for first-time semantic downloads.
+
 ## 0.11.6b17
 
 - Muse harness support: parse local Muse session transcripts, sync them

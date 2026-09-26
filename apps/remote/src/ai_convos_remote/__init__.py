@@ -9,7 +9,7 @@ import typer
 from ai_convos_redact import protect_all
 _pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases",default=()),[0,0,""],5
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, provider_session_key, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
+from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, canonicalize_repositories, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, provider_session_key, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .projection import PROJECTION_VERSION, PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_stamps, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, local_repack_envelopes, repack_index, project, project_many, read_state, relocate_attachments, reset_history, retained_proof_pages, retry_edit_replicas, retry_own_replicas, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
@@ -537,6 +537,10 @@ def sharing_routes(state,ws,user,bindings,core):
         binding=bindings.get(policy_binding(ws,p[1],p[2])) if p[0]==user else None
         path=binding_path(binding) if binding else None
         expected=binding["repository"] if isinstance(binding,dict) else known["aliases"].get(repository_evidence(json.loads(p[3])))
+        if isinstance(binding,dict):
+            for location in (path,known["checkout_roots"].get(binding["checkout"])):
+                if location and (repo:=core_repository(location,known,True)) and (repo["checkout"],repo["lineage"])==(binding["checkout"],json.loads(p[3])["lineage"]): return known["checkouts"].get(repo["checkout"],repo["id"])
+            return None
         if path and (repo:=core_repository(path,known,True)) and repo["id"]==expected: return expected
         for checkout,rid in known["checkouts"].items():
             if rid==expected and (repo:=core_repository(known.get("checkout_roots",{}).get(checkout),known,True)) and (repo["id"],repo["checkout"])==(expected,checkout): return expected
@@ -971,6 +975,7 @@ def sync_once(root=None,repair=False,manual=False):
         state=connect(state_path)
         try:
             drain_hooks()
+            canonicalize_repositories(core_path(root))
             server=refresh(cfg,root,True)
             if not repair and _settled(cfg,state,root):
                 state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))

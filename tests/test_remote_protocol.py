@@ -44,7 +44,10 @@ def test_logical_provenance_fact_signs_semantics_not_checkout_observation():
     record={"kind":"repository.observed","entity":"r","payload":{"id":"r","lineage":"l","roots":["portable"],"remotes":[],"head":"local-head"},"observed_at":"2026-01-01T00:00:00Z"}; row=logical_fact(record); assert row["data"]=={"lineage":"l","roots":["portable"],"remotes":[]} and row==logical_fact({**record,"payload":{**record["payload"],"head":"other-head"},"observed_at":"2027-01-01T00:00:00Z"})
     root,device=identity("root"),fixed_identity(); user=public_id(root["sign_public"]); proof=row_proof(device,user,"w",1,row); assert verify_row_proof(proof,row,certificate(root,user,device),root["sign_public"])
     with pytest.raises(ValueError,match="row proof"): verify_row_proof(proof,{**row,"data":{**row["data"],"lineage":"changed"}},certificate(root,user,device),root["sign_public"])
-    with pytest.raises(ValueError,match="row proof"): verify_row_proof(row_proof(device,user,"w",1,{**row,"state":"deleted","data":None}),{**row,"state":"deleted","data":None},certificate(root,user,device),root["sign_public"])
+    deleted=logical_fact({**record,"payload":{"id":"r","state":"deleted"}})
+    retirement=row_proof(device,user,"w",1,deleted,proof['revision'])
+    assert deleted['data'] is None and verify_row_proof(retirement,deleted,certificate(root,user,device),root['sign_public'])
+    with pytest.raises(ValueError,match="row proof"): verify_row_proof(proof,deleted,certificate(root,user,device),root['sign_public'])
 
 
 def test_row_proof_binds_origin_revision_predecessor_and_deletion():

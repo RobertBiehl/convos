@@ -77,7 +77,7 @@ def get_db(read_only:bool=False,wait=30,path=None,deadline=None,*,purpose="direc
 def open_db(path=None,read_only=False,wait=30,deadline=None,*,purpose="direct database access"): return get_db(read_only,wait,path,deadline,purpose=purpose)
 @contextlib.contextmanager
 def _core(path=None,read_only=False,ready=False,wait=30,*,purpose):
-    with contextlib.closing(get_db(read_only,wait,path,purpose=purpose)) as db: (((ready) and (init_schema(db))),(yield db))
+    with contextlib.closing(db) if (db:=get_db(read_only,wait,path,purpose=purpose)) is not None else contextlib.nullcontext() as db: (((ready) and (init_schema(db))),(yield db))
 @contextlib.contextmanager
 def operation_lock(path,purpose,wait=30,identity=None,mandatory=True):
     with (Path(path).parent.mkdir(parents=True,exist_ok=True) or Path(path).open("a+")) as lock:
@@ -212,8 +212,25 @@ def _git_root(path):
     if not (probe:=(probe if (probe:=Path(path)).is_dir() else probe.parent)).exists(): return None
     try: return Path(_git_run(probe,"rev-parse","--show-toplevel").decode().strip()).resolve()
     except subprocess.CalledProcessError as e: return None if b"not a git repository" in e.stderr.lower() or not probe.exists() else (_ for _ in ()).throw(e)
-def _remote(url): return (lambda p,port:f"https://{p.hostname.lower()}{f':{port}' if port and port!={'ssh':22,'https':443,'http':80}.get(p.scheme.lower()) else ''}/{p.path.strip('/').removesuffix('.git')}" if p.hostname and p.path else None)(p:=__import__("urllib.parse").parse.urlparse(re.sub(r"^(?:[^/@]+@)?([^:/]+):",r"ssh://\1/",url) if "://" not in url else url),p.port)
-def _git_remotes(root): return sorted({remote for line in _git_run(root,"remote","-v").decode(errors="replace").splitlines() if "\t" in line and not (url:=line.split("\t",1)[1].rsplit(" ",1)[0]).startswith(("/","file:")) and (remote:=_remote(url))})
+def _git_identity():
+    value=json.loads(path.read_text()) if (path:=(Path(os.environ["CONVOS_PROJECT_ROOT"]).expanduser() if os.environ.get("CONVOS_PROJECT_ROOT") else PROJECT_ROOT)/"config.json").is_file() else {}
+    identity=value.get("git_identity",{}) if required(isinstance(value,dict) and isinstance(value.get("git_identity",{}),dict),ValueError("invalid git_identity config")) else {}
+    return required(all(isinstance(identity.get(key,{}),dict) and all(isinstance(a,str) and isinstance(b,str) for a,b in identity.get(key,{}).items()) for key in ("host_aliases","url_prefixes")) and all(a.startswith("https://") and b.startswith("https://") and a.endswith("/") and b.endswith("/") for a,b in identity.get("url_prefixes",{}).items()),ValueError("invalid git_identity mappings")) and identity
+def _remote(url):
+    p=__import__("urllib.parse").parse.urlparse(re.sub(r"^(?:[^/@]+@)?([^:/]+):",r"ssh://\1/",url) if "://" not in url else url)
+    if not p.hostname or not p.path: return None
+    config,hosts=(config:=_git_identity()),{"ssh.github.com":"github.com","altssh.bitbucket.org":"bitbucket.org",**config.get("host_aliases",{})}
+    if "://" not in url and "@" not in url and "." not in p.hostname and p.hostname not in hosts: return None
+    host,port=p.hostname.lower(),p.port
+    normalized=f"https://{host}{f':{port}' if port and port!={'ssh':22,'https':443,'http':80}.get(p.scheme.lower()) and not (p.scheme=='ssh' and (p.hostname.lower(),port) in (('ssh.github.com',443),('altssh.bitbucket.org',443))) else ''}/{p.path.strip('/').removesuffix('.git')}"
+    prefixes,match=(prefixes:=config.get("url_prefixes",{})),max((prefix for prefix in prefixes if normalized.startswith(prefix)),key=len,default=None)
+    normalized=prefixes[match]+normalized[len(match):] if match else normalized.replace(f"https://{host}",f"https://{hosts.get(host,host)}",1)
+    return normalized if (result:=__import__("urllib.parse").parse.urlparse(normalized)).scheme=="https" and (host:=result.hostname) and not result.username and host.lower() not in ("localhost","::1") and not re.fullmatch(r"127\.[0-9.]+",host.lower()) else None
+def _git_remotes(root):
+    # `remote -v` resolves url.*.insteadOf aliases and picks fetch/push URLs; where it lands on a loopback proxy (a session credential), keep the configured URL.
+    conf=[(key[7:].rsplit(".",1),url) for key,url in (line.split(" ",1) for line in _git_maybe(root,"config","--get-regexp",r"^remote\..*\.(push)?url$").decode(errors="replace").splitlines() if " " in line)]
+    urls,lines=lambda name,*kinds:next((found for kind in kinds if (found:=[url for key,url in conf if key==[name,kind]])),[]),[(name,*rest.rsplit(" ",1)) for line in _git_maybe(root,"remote","-v").decode(errors="replace").splitlines() for name,rest in [line.split("\t",1)]]
+    return sorted({remote for (name,kind),group in itertools.groupby(lines,key=lambda l:(l[0],l[2])) for url,configured in itertools.zip_longest([l[1] for l in group],urls(name,"pushurl","url") if kind=="(push)" else urls(name,"url")[:1]) if url and not url.startswith(("/","file:")) and (remote:=_remote(configured) if configured and _LOOPBACK.match(url) else _remote(url))})
 def repository_evidence(value): return provenance_digest({"lineage":value["lineage"],"remotes":value["remotes"]}) if value["lineage"] else None
 def _checkout(root): return provenance_digest(f"{stat.st_dev}:{stat.st_ino}" if (stat:=next((p.stat() for p in [Path(root)/'.git'] if p.exists()),None)) else str(root))[:32]
 def _unborn(root): return provenance_digest(f"{stat.st_dev}:{stat.st_ino}:{getattr(stat,'st_birthtime_ns',stat.st_ctime_ns)}" if (stat:=next((p.stat() for p in [Path(root)/'.git/config',Path(root)/'.git'] if p.exists()),None)) else str(root))
@@ -222,11 +239,50 @@ def _git_marker(path): return next(((str(root.resolve()),_checkout(root)) for ra
 def _repository(root): return (lambda root,roots,remotes,lineage:dict(id=provenance_digest({"lineage":lineage,"remotes":remotes}) if lineage else _unborn(root),lineage=lineage,root=str(root),roots=roots,remotes=remotes,checkout=_checkout(root)))(root:=Path(root),roots:=sorted(_git_maybe(root,"rev-list","--max-parents=0","HEAD").decode().split()),_git_remotes(root),provenance_digest({"git_roots":roots}) if roots else None)
 def repository_state(db): return {"roots":dict(db.execute("SELECT root,repository FROM provenance.repository_checkouts").fetchall()),"checkouts":dict(db.execute("SELECT id,repository FROM provenance.repository_checkouts").fetchall()),"checkout_roots":dict(db.execute("SELECT id,root FROM provenance.repository_checkouts").fetchall()),"lineages":dict(db.execute("SELECT id,lineage FROM provenance.repositories").fetchall()),"aliases":dict(db.execute("SELECT evidence,CASE WHEN COUNT(DISTINCT repository)=1 THEN MIN(repository) END FROM provenance.repository_aliases GROUP BY evidence").fetchall())}
 def _refresh_repository(): (_git_root.cache_clear(),_repository.cache_clear())
-def repository(path,known=None,refresh=True): return (lambda value,state,evidence,bound,resolved:{**value,"id":resolved or value["id"],"alias":None if resolved or not evidence else evidence})(value:={**_repository(str(root)),"head":_git_maybe(root,"rev-parse","--verify","HEAD").decode().strip(),"branch":_git_maybe(root,"symbolic-ref","--short","HEAD").decode().strip()},state:=repository_state(known) if known is not None and hasattr(known,"execute") else known or {"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}},evidence:=repository_evidence(value),bound:=state["checkouts"].get(value["checkout"]),bound if value["lineage"] and state["lineages"].get(bound)==value["lineage"] else evidence and state["aliases"].get(evidence)) if (not refresh or _refresh_repository() is None) and Path(path).exists() and (root:=_git_root(Path(path))) and Path(path).exists() else None
+def repository(path,known=None,refresh=True): return (lambda value,state,evidence,bound,resolved:{**value,"id":resolved or value["id"],"alias":None if resolved or not evidence else evidence})(value:={**_repository(str(root)),"head":_git_maybe(root,"rev-parse","--verify","HEAD").decode().strip(),"branch":_git_maybe(root,"symbolic-ref","--short","HEAD").decode().strip()},state:=repository_state(known) if known is not None and hasattr(known,"execute") else known or {"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}},evidence:=repository_evidence(value),bound:=state["checkouts"].get(value["checkout"]),None if value["remotes"] else bound if value["lineage"] and state["lineages"].get(bound)==value["lineage"] else evidence and state["aliases"].get(evidence)) if (not refresh or _refresh_repository() is None) and Path(path).exists() and (root:=_git_root(Path(path))) and Path(path).exists() else None
 def _cached_repository(cache,root,known): return cache[key] if (key:=str(root)) in cache else cache.setdefault(key,repository(root,known,False))
 def _observe_checkout(db,repo): return (db.execute("DELETE FROM provenance.repository_checkouts WHERE root=? AND id<>?",(repo["root"],repo["checkout"])),db.execute("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET repository=excluded.repository,root=excluded.root,branch=excluded.branch,head=excluded.head",(repo["checkout"],repo["id"],repo["root"],repo["branch"],repo["head"])),repo["alias"] and db.execute("INSERT OR IGNORE INTO provenance.repository_aliases VALUES (?,?)",(repo["id"],repo["alias"])))
+_LOOPBACK=re.compile(r"^(?:(?:https?|ssh|git)://)?(?:[^/@]+@)?(?:127\.[0-9.]+|localhost|\[::1\])(?::[0-9]+)?[:/]")
+def _repository_rekeys(rows: list, checkouts: list = ()) -> dict[str,list[str]]:
+    current,live=(current:={rid:(lineage,json.loads(remotes)) for rid,lineage,remotes in rows if lineage}),(_refresh_repository(),[value for checkout,root,rid in checkouts if rid in current and root and Path(root,".git").exists() and (value:=_repository(root))["checkout"]==checkout and value["lineage"]==current[rid][0]])[1]
+    real={(lineage,remote) for lineage,urls in [*current.values(),*((v["lineage"],v["remotes"]) for v in live)] for url in urls if (remote:=_remote(url))}
+    def canonical(lineage: str, url: str) -> str | None:
+        if remote:=_remote(url): return remote
+        return matches[0][1] if (matches:=sorted((-len(remote.split("/",3)[3]),remote) for candidate,remote in real if candidate==lineage and url.endswith("/"+remote.split("/",3)[3])) if _LOOPBACK.match(url) else []) and matches[0][0]<[*matches,(0,)][1][0] else None
+    return {rid:sorted(set(mapped)) for rid,(lineage,urls) in current.items() if urls and all(mapped:=[canonical(lineage,url) for url in urls]) and provenance_digest(dict(lineage=lineage,remotes=sorted(set(mapped))))!=rid}
+_FACT_TABLES={"repository.observed":("repositories","id"),"file.observed":("files","id"),"file.version":("file_versions","id"),"git.checkpoint":("git_checkpoints","id"),"edit.observed":("file_edit_files","file_edit_id"),"checkpoint.link":("checkpoint_edits","sha256(json_object('checkpoint',checkpoint_id,'edit',file_edit_id))")}
+_FACT_RECIPES={"repository.observed":(("lineage","lineage"),("remotes","remotes")),"file.observed":(("repository","repository"),("path","path")),"file.version":(("file","file"),("content","content_hash")),"git.checkpoint":(("repository","repository"),("head","head"),("state","state_hash")),"checkpoint.link":(("checkpoint","checkpoint"),("edit","edit"))}
+def _delete_unclaimed_fact(db, kind: str, entity: str) -> None: db.execute(f"DELETE FROM provenance.{_FACT_TABLES[kind][0]} WHERE {_FACT_TABLES[kind][1]}=? AND NOT EXISTS (SELECT 1 FROM provenance.local_facts WHERE kind=? AND entity=?) AND NOT EXISTS (SELECT 1 FROM remote.provenance_origins o JOIN remote.row_proofs p ON p.id=o.proof_id WHERE o.kind=? AND o.physical_entity=? AND p.state='active')",[entity,kind,entity,kind,entity])
+def rekey_repositories(db, remotes: dict[str,list[str]] | None = None) -> int:
+    records,maps,changed=provenance_records(db,set(db.execute("SELECT kind,entity FROM provenance.local_facts").fetchall()),True),{},[]
+    remotes=_repository_rekeys(db.execute("SELECT id,lineage,CAST(remotes AS VARCHAR) FROM provenance.repositories").fetchall()) if remotes is None else remotes
+    for record in records:
+        kind,old,p=(kind:=record["kind"]),(old:=record["entity"]),(p:={**record["payload"],**({"remotes":remotes[old]} if kind=="repository.observed" and old in remotes else {}),**{key:maps.get((parent,record["payload"][key]),record["payload"][key]) for key,parent in (("repository","repository.observed"),("file","file.observed"),("checkpoint","git.checkpoint")) if key in record["payload"]}})
+        new=provenance_digest({key:p[field] for key,field in _FACT_RECIPES[kind]}) if p!=record["payload"] and kind!="edit.observed" else old
+        if new!=old: maps[kind,old]=new
+        if p!=record["payload"]: changed.append((old,{**record,"entity":new,"payload":{**p,**({"id":new} if kind!="checkpoint.link" else {})}}))
+    if not changed: return 0
+    with preserve_fact_heads(db,keys:=[(r["kind"],entity) for old,r in changed for entity in (old,r["entity"])],observed=True):
+        (project_native_provenance(db,[r for old,r in changed],replace_file=True),db.executemany("DELETE FROM provenance.local_facts WHERE kind=? AND entity=?",list(maps)))
+        for (kind,old),new in maps.items():
+            if kind=="repository.observed": ([db.execute(f"UPDATE provenance.{table} SET repository=? WHERE repository=?",[new,old]) for table in ("repository_checkouts","conversation_scopes","file_edit_scopes")],db.execute("INSERT OR IGNORE INTO provenance.repository_aliases SELECT ?,evidence FROM provenance.repository_aliases WHERE repository=?",[new,old]),db.execute("DELETE FROM provenance.repository_aliases WHERE repository=?",[old]))
+            _delete_unclaimed_fact(db,kind,old)
+    return (_archive_touch(db,[*keys,*[("retired."+kind,old) for kind,old in maps]]),len(changed))[-1]
+def canonicalize_repositories(path: Path | None = None) -> int:
+    fingerprint=provenance_digest(dict(version=1,rules=_git_identity()))
+    with _core(path,read_only=True,purpose="provenance.identity.plan") as db:
+        if db is None or db.execute("SELECT state FROM core_migrations WHERE name='git_identity'").fetchone()==(fingerprint,): return 0
+        generation,rows,checkouts,local=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone(),db.execute("SELECT id,lineage,CAST(remotes AS VARCHAR) FROM provenance.repositories").fetchall(),db.execute("SELECT id,root,repository FROM provenance.repository_checkouts UNION SELECT checkout,root,repository FROM provenance.file_edit_scopes WHERE checkout IS NOT NULL AND root IS NOT NULL").fetchall(),{r[0] for r in db.execute("SELECT entity FROM provenance.local_facts WHERE kind='repository.observed'").fetchall()}
+    remotes={rid:urls for rid,urls in _repository_rekeys(rows,checkouts).items() if rid in local}
+    with _core(path,purpose="provenance.identity.write") as db:
+        required(generation==db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone() and fingerprint==provenance_digest(dict(version=1,rules=_git_identity())),ProvenanceChanged("Archive or identity rules changed during canonicalization; retry"))
+        if remotes: _migration_backup(db,"git-identity-"+fingerprint[:12])
+        with _transaction(db): changed=(rekey_repositories(db,remotes),db.execute("INSERT OR REPLACE INTO core_migrations VALUES ('git_identity',?)",[fingerprint]))[0]
+    return changed
 def capture_repository(path,db_path=None):
-    with _core(db_path,ready=True,purpose="schema.repository") as db: known=repository_state(db)
+    with _core(db_path,ready=True,purpose="schema.repository"): pass
+    canonicalize_repositories(db_path)
+    with _core(db_path,read_only=True,purpose="provenance.repository.plan") as db: known=repository_state(db)
     repo=repository(path,known)
     if not repo: return None
     record=_provenance_record("repository.observed",repo["id"],{k:repo[k] for k in ("id","lineage","roots","remotes","head")},datetime.now(timezone.utc).isoformat().replace("+00:00","Z"))
@@ -297,11 +353,11 @@ def project_provenance(db,value,map_id=lambda table,value:value,touch=True,repla
             check,error,sql,args=_PROVENANCE_ROWS[k]
             ((required(check(p,value,map_id,observed),ValueError(error))),(db.execute(sql.replace("OR IGNORE","OR REPLACE") if native else sql,args(p,value,map_id,observed))))
     return bool(_archive_touch(db,[(k,value["entity"])])) if touch else True
-def project_native_provenance(db,records):
+def project_native_provenance(db,records,replace_file=False):
     keys,local=(keys:=[(r["kind"],r["entity"]) for r in records]),set(db.execute("SELECT kind,entity FROM provenance.local_facts WHERE entity IN (SELECT UNNEST(?))",[[entity for kind,entity in keys]]).fetchall()) if keys else set()
     current={(r['kind'],r['entity']):logical_fact(r) for r in provenance_records(db,{key for key in keys if key[0] in ('file.observed','edit.observed','checkpoint.link')})}
     records,keys=(records:=[r for r in records if (key:=(r['kind'],r['entity'])) not in local or current.get(key)!=logical_fact(r)]),[(r['kind'],r['entity']) for r in records]
-    with preserve_fact_heads(db,keys,observed=True): ([project_provenance(db,record,preserve=False,native=key not in local,touch=False) for record,key in zip(records,keys)],keys and _archive_touch(db,keys))
+    with preserve_fact_heads(db,keys,observed=True): ([project_provenance(db,record,preserve=False,native=key not in local,touch=False,replace_file=replace_file) for record,key in zip(records,keys)],keys and _archive_touch(db,keys))
     _insert_pages(db,"provenance.local_facts",keys,mode=" OR IGNORE")
 def repair_legacy_edit_scopes(db,apply=False):
     # Only migration placeholders: preserve the unique historical file, never reinterpret today's checkout.
@@ -321,6 +377,7 @@ def capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="syn
             if strict: raise
             return log_parse_error('Provenance pending; captured conversations are committed',error) or []
 def _capture_provenance(path=None,edit_ids=None,conversation_ids=None,source="sync",blocked=()):
+    canonicalize_repositories(path)
     targeted,eids,cids=edit_ids is not None or conversation_ids is not None,sorted(set(edit_ids or ())),sorted(set(conversation_ids or ()))
     excluded=lambda value: bool(value) and any(Path(value).is_relative_to(root) for root in blocked)
     def snapshot(core):
@@ -374,7 +431,7 @@ def project_archive_rows(db,table,columns,rows,preserve=True):
             for mode,foreign in ((" OR REPLACE",True),(" OR IGNORE",False)): _insert_pages(db,"provenance.file_edit_evidence",[(v[0],"unverified","signed_replica_missing_evidence",None) for v,o in rows if bool(o)==foreign],mode=mode)
         (((origins) and ((_insert_pages(db,"remote.row_origins",origins,mode=" OR REPLACE"),db.execute("DELETE FROM remote.row_references r USING remote.row_origins o WHERE (r.table_name,r.physical_row_id,r.author_user_id,r.source_row_id)=(o.table_name,o.physical_row_id,o.author_user_id,o.source_row_id) AND r.table_name=? AND r.physical_row_id IN (SELECT UNNEST(?))",[table,ids])))),((table in ("file_edits","tool_calls")) and (_apply_signed_edit_evidence(db,[v[0] for v in values] if table=="file_edits" else (),[v[0] for v in values] if table=="tool_calls" else ()))))
 def claim_row_owners(db,records):
-    claims={(kind,entity,p['author_user_id'],p['author_device_id'],(primary:=(kind,entity)==(row['kind'],row['id'])),primary and row['kind'] in ARCHIVE_COLUMNS and not p['previous_revision']) for row,p in records if row['kind'] in ARCHIVE_COLUMNS|{'edit.observed':(),'checkpoint.link':()} for kind,entity in ([(row['kind'],row['id']),*[(parent,row['data'][column]) for column,parent in ARCHIVE_FKS.get(row['kind'],()) if row['state']=='active' and row['data'][column]],*[(kind,entity) for e in (row['data'] or {}).get('edits',[]) for kind,entity in [('file_edits',e['id']),('messages',e['message_id'])]]] if row['kind'] in ARCHIVE_COLUMNS else [('file_edits',row['id']),('messages',row['data']['turn'])] if row['kind']=='edit.observed' else [('file_edits',row['data']['edit'])])}
+    claims={(kind,entity,p['author_user_id'],p['author_device_id'],(primary:=(kind,entity)==(row['kind'],row['id'])),primary and row['kind'] in ARCHIVE_COLUMNS and not p['previous_revision']) for row,p in records if row['kind'] in ARCHIVE_COLUMNS|{'edit.observed':(),'checkpoint.link':()} and (row['kind'] in ARCHIVE_COLUMNS or row['state']=='active') for kind,entity in ([(row['kind'],row['id']),*[(parent,row['data'][column]) for column,parent in ARCHIVE_FKS.get(row['kind'],()) if row['state']=='active' and row['data'][column]],*[(kind,entity) for e in (row['data'] or {}).get('edits',[]) for kind,entity in [('file_edits',e['id']),('messages',e['message_id'])]]] if row['kind'] in ARCHIVE_COLUMNS else [('file_edits',row['id']),('messages',row['data']['turn'])] if row['kind']=='edit.observed' else [('file_edits',row['data']['edit'])])}
     if not claims: return
     db.execute('CREATE OR REPLACE TEMP TABLE owner_claims(kind VARCHAR,source VARCHAR,author VARCHAR,device VARCHAR,primary_row BOOLEAN,base BOOLEAN)')
     _insert_pages(db,'owner_claims',list(claims))
@@ -393,7 +450,7 @@ def project_attested_rows(db,records,root_public,certificate):
     proofs,pending,_=[proof for row,proof in records],set(),required(all((row["kind"],row["id"],row["v"],row["state"],provenance_digest(row))==(proof["row_kind"],proof["row_id"],proof["encoding_v"],proof["state"],proof["content_hash"]) for row,proof in records),ValueError("attestation snapshot/proof mismatch"))
     items=[(row,proof,pid,True) for (row,proof),pid in zip(records,project_row_proofs(db,proofs,root_public,certificate))]
     _retain_lossy_replicas(db,_protect_native_replicas(db,items,pending.add),pending.add)
-    return (_insert_pages(db,"remote.row_conflicts",[(pid,json.dumps(row,sort_keys=True,separators=(",",":"))) for row,proof,pid,native in items if pid in pending],mode=" OR IGNORE"),(prior:=[(p["row_kind"],p["row_id"],p["author_user_id"],p["previous_revision"]) for p in proofs if p["previous_revision"]]) and retire_row_bodies(db,prior),record_local_row_bases(db,proofs),[repair_parent_links(db,author,{(row["kind"],row["id"]) for row,p in records}) for author in {p["author_user_id"] for p in proofs}])[-2]
+    return (_insert_pages(db,"remote.row_conflicts",[(pid,json.dumps(row,sort_keys=True,separators=(",",":"))) for row,proof,pid,native in items if pid in pending],mode=" OR IGNORE"),record_local_row_bases(db,proofs),(prior:=[(p["row_kind"],p["row_id"],p["author_user_id"],p["previous_revision"]) for p in proofs if p["previous_revision"]]) and retire_row_bodies(db,prior),[repair_parent_links(db,author,{(row["kind"],row["id"]) for row,p in records}) for author in {p["author_user_id"] for p in proofs}])[-2]
 def record_local_row_bases(db,proofs,seed=False):
     rows=db.execute("SELECT p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p WHERE p.id IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_conflicts c WHERE c.proof_id=p.id) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision))",[[provenance_digest(p) for p in proofs]]).fetchall() if seed else [(p["row_kind"],p["row_id"],p["author_user_id"],p["revision"]) for p in proofs]
     return _insert_pages(db,"remote.local_row_bases",rows,conflict=" ON CONFLICT(kind,entity,author) DO NOTHING" if seed else " ON CONFLICT(kind,entity,author) DO UPDATE SET revision=excluded.revision WHERE local_row_bases.revision IS DISTINCT FROM excluded.revision")
@@ -404,7 +461,7 @@ PROVENANCE_FIELDS_V1={"repository.observed":("lineage","roots","remotes"),"file.
 ROW_JSON_V1,ROW_TIME_V1={"metadata","input","output"},{"created_at","updated_at"}
 ARCHIVE_FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 def logical_row(table,columns=(),values=(),identity=None,v=1,state="active"):
-    if v!=1 or table not in ROW_FIELDS_V1 or state not in ("active","deleted") or state=="deleted" and (not identity or columns or values) or len(columns)!=len(values) or len(set(columns))!=len(columns): raise ValueError("invalid logical row schema")
+    if v!=1 or table not in ROW_FIELDS_V1 and not (table in PROVENANCE_KINDS and state=="deleted") or state not in ("active","deleted") or state=="deleted" and (not identity or columns or values) or len(columns)!=len(values) or len(set(columns))!=len(columns): raise ValueError("invalid logical row schema")
     if state=="deleted": return {"v":v,"kind":table,"id":identity,"state":state,"data":None}
     row,required=({'edits':[]} if table in ('messages','tool_calls') else {})|dict(zip(columns,values)),{"id",*ROW_FIELDS_V1[table]}
     if not required<=set(row): raise ValueError("incomplete logical row")
@@ -412,6 +469,7 @@ def logical_row(table,columns=(),values=(),identity=None,v=1,state="active"):
     return {"v":v,"kind":table,"id":identity or row["id"],"state":state,"data":{k:norm(k,row[k]) for k in ROW_FIELDS_V1[table]}}
 def logical_fact(record):
     kind,p=record["kind"],record["payload"]
+    if p.get("state")=="deleted": return logical_row(kind,identity=record["entity"],state="deleted")
     if kind not in PROVENANCE_FIELDS_V1 or record["entity"]!=(p.get("id") if kind!="checkpoint.link" else provenance_digest({"checkpoint":p["checkpoint"],"edit":p["edit"]})): raise ValueError("invalid provenance fact")
     return {"v":1,"kind":kind,"id":record["entity"],"state":"active","data":{k:(v.isoformat(timespec="microseconds") if isinstance(v,datetime) else v) for k in PROVENANCE_FIELDS_V1[kind] for v in [record["observed_at"] if k=="observed_at" else p[k]]}}
 def matching_logical_row(row,expected,paths=()):
@@ -549,7 +607,7 @@ def typed_logical_rows(db,claims,references=True,historical=False):
     facts,((mapped, out))=(facts:={(r["kind"],r["entity"]):r for r in provenance_records(db,{(kind,physical) for kind,physical,source,user,state in claims if kind in PROVENANCE_KINDS},historical)}),(logical_references(db,{raw[cols.index(column)] for (kind,physical),(cols,raw) in found.items() for column,parent in ARCHIVE_FKS.get(kind,()) if raw[cols.index(column)]}|{record["payload"][field] for record in facts.values() for field in ("turn","edit") if field in record["payload"]},references),{})
     for claim in claims:
         kind,physical,source,user,state=claim
-        if kind in ARCHIVE_COLUMNS and state=="deleted": row=logical_row(kind,identity=source,state="deleted")
+        if state=="deleted": row=logical_row(kind,identity=source,state="deleted")
         elif kind in ARCHIVE_COLUMNS and (value:=found.get((kind,physical))):
             cols,raw,parents=*value,dict(ARCHIVE_FKS.get(kind,()))
             row=logical_row(kind,cols,[source if column=="id" else mapped.get((parents[column],item,user),item) if column in parents else item for column,item in zip(cols,raw)],source)
@@ -565,10 +623,13 @@ def typed_logical_rows(db,claims,references=True,historical=False):
 def _retain_lossy_replicas(db,items,defer):
     refs,wanted,mapped=(refs:={"conversation_id":"conversations","message_id":"messages","parent_id":"messages","turn":"messages","edit":"file_edits"}),(wanted:={(refs[key],mapped(refs[key],value),p["author_user_id"]):value for row,p,pid,native,*maps in items for table,source,mapped,physical,origin in [_logical_parts(row,p,pid,native,maps[0] if maps else None)] for key,value in (row["data"] or {}).items() if key in refs and value}),logical_references(db,{physical for table,physical,user in wanted})
     if missing:={key:value for key,value in wanted.items() if key not in mapped and key[1]!=value}: _insert_pages(db,"remote.row_references",[(*key,value) for key,value in missing.items()],mode=" OR IGNORE")
-    claims,found=(claims:=[(pid,p,(table,mapped("file_edits",source) if table=="edit.observed" else provenance_digest({"checkpoint":row["data"]["checkpoint"],"edit":mapped("file_edits",row["data"]["edit"])}) if table=="checkpoint.link" else source if table in PROVENANCE_KINDS else physical,source,p["author_user_id"],row["state"])) for row,p,pid,native,*maps in items for table,source,mapped,physical,origin in [_logical_parts(row,p,pid,native,maps[0] if maps else None)]]),typed_logical_rows(db,[claim for pid,p,claim in claims])
+    claims,found=(claims:=[(pid,p,(table,mapped("file_edits",source) if table=="edit.observed" else provenance_digest({"checkpoint":row["data"]["checkpoint"],"edit":mapped("file_edits",row["data"]["edit"])}) if table=="checkpoint.link" and row["state"]=="active" else source if table in PROVENANCE_KINDS else physical,source,p["author_user_id"],row["state"])) for row,p,pid,native,*maps in items for table,source,mapped,physical,origin in [_logical_parts(row,p,pid,native,maps[0] if maps else None)]]),typed_logical_rows(db,[claim for pid,p,claim in claims])
     [defer(pid) for pid,p,claim in claims if matching_logical_row(found[claim],p["content_hash"]) is None]
 def project_logical_row(db,row,proof,proof_id,native=False,touch=True,parent_map=None,defer=False,preserve=True,local=None,record_origin=True):
     table,source,mapped,physical,origin=_logical_parts(row,proof,proof_id,native,parent_map)
+    if table in PROVENANCE_KINDS and row["state"]=="deleted":
+        physical=(db.execute("SELECT physical_entity FROM remote.provenance_origins WHERE kind=? AND source_entity=? AND author_user_id=? LIMIT 1",[table,source,proof["author_user_id"]]).fetchone() or [mapped("file_edits",source) if table=="edit.observed" else source])[0]
+        return (db.execute("INSERT OR REPLACE INTO remote.provenance_origins VALUES (?,?,?,?,?,?)",[table,physical,proof["workspace"],proof["author_user_id"],source,proof_id]),_delete_unclaimed_fact(db,table,physical),_archive_touch(db,[(table,physical)]) if touch else None,physical)[-1]
     if table in PROVENANCE_KINDS:
         data,value=(data:={"id":source,**row["data"]}),{"kind":table,"entity":source,"payload":data,"observed_at":data.pop("observed_at",None)}
         replace_file=table=="edit.observed" and bool(db.execute("WITH RECURSIVE ancestors(revision) AS (SELECT CAST(? AS VARCHAR) UNION SELECT p.previous_revision FROM remote.row_proofs p JOIN ancestors a ON p.revision=a.revision WHERE p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND p.previous_revision IS NOT NULL) SELECT 1 FROM remote.provenance_origins o JOIN remote.row_proofs p ON p.id=o.proof_id JOIN ancestors a ON a.revision=p.revision WHERE o.kind=? AND o.physical_entity=? AND o.author_user_id=? LIMIT 1",(proof["previous_revision"],table,source,proof["author_user_id"],table,mapped("file_edits",source),proof["author_user_id"])).fetchone())
@@ -866,7 +927,7 @@ def load_fts(conn, allow_install: bool = False):
 
 def rebuild_fts_index(conn): conn.execute("PRAGMA create_fts_index('messages', 'id', 'content', 'thinking', overwrite=1); UPDATE retrieval_state SET fts_generation=messages_generation,fts_definition_hash=? WHERE singleton",(_FTS_DEF,))
 
-def ensure_db_ready(conn): return (lambda tables:True if "messages" in tables and "core_schema" in tables and (conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0]==CORE_VERSION and not conn.execute("SELECT 1 FROM core_migrations").fetchone() else typer.echo("Database initialization or migration required. Run `convos sync`.",err=True))({r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()})
+def ensure_db_ready(conn): return (lambda tables:True if "messages" in tables and "core_schema" in tables and (conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0]==CORE_VERSION and not conn.execute("SELECT 1 FROM core_migrations WHERE name<>'git_identity'").fetchone() else typer.echo("Database initialization or migration required. Run `convos sync`.",err=True))({r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()})
 
 def gen_id(source: str, oid: str) -> str: return hashlib.sha256(f"{source}:{oid}".encode()).hexdigest()[:16]
 def ts_from_epoch(t):
@@ -1330,7 +1391,7 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
         if resume or any(attempted.get(p.stem)!=_hook_stamp(p) for p in [*HOOK_DIR.glob("*.json"),*HOOK_DIR.glob("*.work")]): wake_hooks(attempt)
     return len(done)
 
-_MODELS,_MCFG,_LLAMA_LOG,_SEMANTIC_INSTALL={},dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF",filename="embeddinggemma-300m-qat-q8_0.gguf",revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64",artifact_sha256="6fa0c02a9c302be6f977521d399b4de3a46310a4f2621ee0063747881b673f67",embedding=True,n_ctx=16384,n_batch=2048,n_ubatch=2048,n_seq_max=8,n_gpu_layers=-1),None,"Semantic runtime unavailable. macOS includes it; elsewhere install `convos[semantic]`, set CONVOS_SEMANTIC=llama, then run `convos embed`. Literal `convos search` needs no model."
+_MODELS,_MCFG,_LLAMA_LOG,_SEMANTIC_INSTALL={},dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF",filename="embeddinggemma-300m-qat-Q8_0.gguf",revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64",artifact_sha256="6fa0c02a9c302be6f977521d399b4de3a46310a4f2621ee0063747881b673f67",embedding=True,n_ctx=16384,n_batch=2048,n_ubatch=2048,n_seq_max=8,n_gpu_layers=-1),None,"Semantic runtime unavailable. macOS includes it; elsewhere install `convos[semantic]`, set CONVOS_SEMANTIC=llama, then run `convos embed`. Literal `convos search` needs no model."
 def semantic_enabled(): return (mode:=os.environ.get("CONVOS_SEMANTIC","auto").lower()) not in ("0","false","no","off") and (mode!="auto" or sys.platform=="darwin")
 def semantic_backend():
     mode=os.environ.get("CONVOS_SEMANTIC","auto").lower()
