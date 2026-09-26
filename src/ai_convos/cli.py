@@ -271,14 +271,14 @@ def rekey_repositories(db, remotes: dict[str,list[str]] | None = None) -> int:
 def canonicalize_repositories(path: Path | None = None) -> int:
     fingerprint=provenance_digest(dict(version=1,rules=_git_identity()))
     with _core(path,read_only=True,purpose="provenance.identity.plan") as db:
-        if db is None or db.execute("SELECT state FROM core_migrations WHERE name='git_identity'").fetchone()==(fingerprint,): return 0
+        if db is None or (done:=db.execute("SELECT state FROM core_migrations WHERE name='git_identity'").fetchone()==(fingerprint,)) and not (pending:={rid for rid,urls in db.execute("SELECT r.id,CAST(r.remotes AS VARCHAR) FROM provenance.repositories r JOIN provenance.local_facts l ON l.kind='repository.observed' AND l.entity=r.id WHERE r.lineage IS NOT NULL").fetchall() if any(_LOOPBACK.match(url) for url in json.loads(urls))}): return 0
         generation,rows,checkouts,local=db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone(),db.execute("SELECT id,lineage,CAST(remotes AS VARCHAR) FROM provenance.repositories").fetchall(),db.execute("SELECT id,root,repository FROM provenance.repository_checkouts UNION SELECT checkout,root,repository FROM provenance.file_edit_scopes WHERE checkout IS NOT NULL AND root IS NOT NULL").fetchall(),{r[0] for r in db.execute("SELECT entity FROM provenance.local_facts WHERE kind='repository.observed'").fetchall()}
-    remotes={rid:urls for rid,urls in _repository_rekeys(rows,checkouts).items() if rid in local}
+    remotes={rid:urls for rid,urls in _repository_rekeys(rows,[c for c in checkouts if not done or c[2] in pending]).items() if rid in local}
+    if done and not remotes: return 0
     with _core(path,purpose="provenance.identity.write") as db:
         required(generation==db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone() and fingerprint==provenance_digest(dict(version=1,rules=_git_identity())),ProvenanceChanged("Archive or identity rules changed during canonicalization; retry"))
         if remotes: _migration_backup(db,"git-identity-"+fingerprint[:12])
-        with _transaction(db): changed=(rekey_repositories(db,remotes),db.execute("INSERT OR REPLACE INTO core_migrations VALUES ('git_identity',?)",[fingerprint]))[0]
-    return changed
+        with _transaction(db): return (rekey_repositories(db,remotes),db.execute("INSERT OR REPLACE INTO core_migrations VALUES ('git_identity',?)",[fingerprint]))[0]
 def capture_repository(path,db_path=None):
     with _core(db_path,ready=True,purpose="schema.repository"): pass
     canonicalize_repositories(db_path)

@@ -415,6 +415,42 @@ def test_direct_proxy_urls_do_not_enter_repository_identity(tmp_path):
     git(root,"remote","set-url","origin","gh:acme/project.git"); git(root,"config","url.http://127.0.0.1:9/session-secret/.insteadOf","gh:")
     assert repository(root)["remotes"]==[]
 
+@pytest.mark.parametrize("evidence",["checkout","stored"])
+def test_unresolved_proxy_migration_retries_when_evidence_arrives(tmp_path,monkeypatch,evidence):
+    root=repo(tmp_path/"checkout"); git(root,"remote","add","origin","https://example.com/acme/project.git"); current=repository(root)
+    proxy="https://127.0.0.1:9/token/acme/project"; old=digest(dict(lineage=current["lineage"],remotes=[proxy])); path=tmp_path/"archive.db"
+    with graph(path) as db:
+        core_module.project_native_provenance(db,[core_module._repository_record({**current,"id":old,"remotes":[proxy]},None)])
+        core_module._observe_checkout(db,{**current,"id":old})
+        fid=digest(dict(repository=old,path="x.py")); db.execute("INSERT INTO provenance.files VALUES (?,?,'x.py','repository')",[fid,old]); db.execute("INSERT INTO provenance.local_facts VALUES ('file.observed',?)",[fid])
+    offline=tmp_path/"offline"; root.rename(offline)
+    assert core_module.canonicalize_repositories(path)==0
+    with duckdb.connect(str(path),read_only=True) as db: before=archive_state(db)
+    with monkeypatch.context() as patch:
+        get_db=core_module.get_db
+        def read_only_db(read_only,*args,**kwargs):
+            assert read_only, "unresolved retry opened a writer"
+            return get_db(read_only,*args,**kwargs)
+        patch.setattr(core_module,"get_db",read_only_db)
+        assert core_module.canonicalize_repositories(path)==0
+    assert not list(tmp_path.glob("archive.db.pre-git-identity-*.bak"))
+    with duckdb.connect(str(path),read_only=True) as db: assert archive_state(db)==before
+    if evidence=="checkout":
+        offline.rename(root)
+        assert core_module.capture_repository(root,path)["id"]==current["id"]
+    else:
+        with duckdb.connect(str(path)) as db: db.execute("INSERT INTO provenance.repositories VALUES (?,?,'[]',?,NULL,NULL)",[current["id"],current["lineage"],json.dumps(current["remotes"])])
+        assert core_module.canonicalize_repositories(path)>0
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT id FROM provenance.repositories").fetchall()==[(current["id"],)]
+        assert db.execute("SELECT id,repository FROM provenance.files").fetchall()==[(digest(dict(repository=current["id"],path="x.py")),current["id"])]
+        assert db.execute("SELECT entity FROM archive_changes WHERE kind='retired.repository.observed'").fetchall()==[(old,)]
+    saved=next(tmp_path.glob("archive.db.pre-git-identity-*.bak"))
+    with duckdb.connect(str(saved),read_only=True) as db: assert db.execute("SELECT id FROM provenance.repositories WHERE id=?",[old]).fetchone()==(old,)
+    def unexpected(*args,**kwargs): pytest.fail("completed migration retried Git inspection")
+    monkeypatch.setattr(core_module,"_git_run",unexpected)
+    assert core_module.canonicalize_repositories(path)==0
+
 @pytest.mark.parametrize("proxy",["ssh://git@127.0.0.1:9/token/","http://localhost:9/token/"])
 def test_proxy_fallback_uses_configured_url_without_applying_a_losing_rewrite(tmp_path,proxy):
     root=repo(tmp_path/"checkout")

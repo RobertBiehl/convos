@@ -62,7 +62,11 @@ IDs must agree on rules; the config is local and is not silently distributed.
 
 Capture and remote sync compare a fingerprint of the built-in identity recipe
 and configured rules with the last completed fingerprint in `core_migrations`.
-Unchanged rules return before Git inspection, backup, or a write connection.
+Unchanged rules return before Git inspection, backup, or a write connection
+unless local proxy identities remain unresolved. Those identities are retried
+using stored candidates and their own checkouts, so a returning checkout or
+new canonical evidence can complete the migration. An unresolved retry does
+not create a backup or open a write connection.
 Changed rules collect live Git evidence outside the write connection, validate
 that the archive generation and config did not change, create a verified private
 backup, and commit the local rewrite plus fingerprint atomically. Schema remains
@@ -87,8 +91,8 @@ URL. A new rule maps that URL to its HTTPS form:
 A fact here is one signed repository, file, version, edit association, checkpoint,
 or checkpoint-link observation. A delete retires only its author's claim. If
 another author still owns the same old physical row, that row stays until the
-other author retires it. After every author upgrades and synchronizes, obsolete
-active facts disappear; compact deletion proofs remain for replay protection.
+other author retires it. Retirement removes obsolete active facts once no local
+or active origin claims remain; compact deletion proofs remain for replay protection.
 Superseded bodies are no longer re-exported as current facts.
 
 Retirement requires an explicit local change notice in the existing
@@ -101,6 +105,8 @@ after sync state is rebuilt or a crash occurs before signing.
 
 - Old clients must upgrade to consume provenance deletes. A partial rollout can
   temporarily retain old IDs belonging to devices that have not migrated.
+- A superseded active origin in another workspace can still keep an obsolete
+  row alive after retirement. Cross-workspace cleanup is deferred.
 - Proxy recovery requires a unique same-lineage match by the longest remote path,
   using stored canonical candidates or a live checkout whose marker and lineage
   still match. Ambiguous or unavailable evidence stays unresolved.
