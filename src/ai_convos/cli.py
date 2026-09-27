@@ -329,7 +329,6 @@ def provenance_issue(db,value,map_id=lambda table,value:value,replace_file=False
     if not (row:=db.execute("SELECT message_id FROM file_edits WHERE id=?",(edit,)).fetchone()): return f"provenance dependency missing: edit={edit} logical={p['id']} turn={turn}"
     if row[0]!=turn: return f"provenance edit/turn mismatch: edit={edit} stored={row[0]} incoming={turn}"
     if not replace_file and (old:=db.execute("SELECT file_id FROM provenance.file_edit_files WHERE file_edit_id=?",(edit,)).fetchone()) and old[0]!=p["file"]: return f"provenance edit scope conflict: edit={edit} stored={old[0]} incoming={p['file']}"
-    return None
 @contextlib.contextmanager
 def preserve_fact_heads(db,keys,observed=()):
     # Fresh source writers may establish bases; receiving own replicas is not a source observation.
@@ -629,6 +628,7 @@ def project_logical_row(db,row,proof,proof_id,native=False,touch=True,parent_map
     table,source,mapped,physical,origin=_logical_parts(row,proof,proof_id,native,parent_map)
     if table in PROVENANCE_KINDS and row["state"]=="deleted":
         physical=(db.execute("SELECT physical_entity FROM remote.provenance_origins WHERE kind=? AND source_entity=? AND author_user_id=? LIMIT 1",[table,source,proof["author_user_id"]]).fetchone() or [mapped("file_edits",source) if table=="edit.observed" else source])[0]
+        db.execute("WITH RECURSIVE ancestors(revision) AS (SELECT CAST(? AS VARCHAR) UNION SELECT p.previous_revision FROM remote.row_proofs p JOIN ancestors a ON p.revision=a.revision WHERE p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND p.previous_revision IS NOT NULL) DELETE FROM remote.provenance_origins o USING remote.row_proofs p,ancestors a WHERE o.proof_id=p.id AND p.revision=a.revision AND (o.kind,o.physical_entity,o.source_entity,o.author_user_id)=(?,?,?,?)",[proof["previous_revision"],table,source,proof["author_user_id"],table,physical,source,proof["author_user_id"]])
         return (db.execute("INSERT OR REPLACE INTO remote.provenance_origins VALUES (?,?,?,?,?,?)",[table,physical,proof["workspace"],proof["author_user_id"],source,proof_id]),_delete_unclaimed_fact(db,table,physical),_archive_touch(db,[(table,physical)]) if touch else None,physical)[-1]
     if table in PROVENANCE_KINDS:
         data,value=(data:={"id":source,**row["data"]}),{"kind":table,"entity":source,"payload":data,"observed_at":data.pop("observed_at",None)}

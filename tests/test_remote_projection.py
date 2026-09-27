@@ -136,6 +136,39 @@ def test_author_can_retire_repository_fact_and_replay_cannot_resurrect_it(tmp_pa
         assert db.execute("SELECT count(*) FROM provenance.repositories").fetchone()==(0,)
         assert db.execute("SELECT count(*) FROM remote.row_conflicts").fetchone()==(0,)
 
+@pytest.mark.parametrize("order",[("personal","team"),("team","personal")])
+def test_cross_workspace_retirement_removes_superseded_same_author_claims(tmp_path,order):
+    root,device,user,base,*_=signed_edit_graph()
+    control=lambda ws:{"workspace":ws,"revision":1,"epoch":1,"devices":base["devices"]}
+    fid=digest(dict(repository=None,path="a.py")); file=dict(v=1,kind="file.observed",id=fid,state="active",data=dict(repository=None,path="a.py",kind="external"))
+    row=dict(v=1,kind="file.version",id=digest(dict(file=fid,content="h")),state="active",data=dict(file=fid,content_hash="h",observed_at="2026-01-01T00:00:00"))
+    updated={**row,"data":{**row["data"],"observed_at":"2026-01-02T00:00:00"}}
+    deleted={**row,"state":"deleted","data":None}
+    originals={ws:row_proof(device,user,ws,1,row) for ws in order}
+    revisions={ws:row_proof(device,user,ws,1,updated,originals[ws]["revision"]) for ws in order}
+    tombstones={ws:row_proof(device,user,ws,1,deleted,revisions[ws]["revision"]) for ws in order}
+    path=tmp_path/"receiver.db"
+    apply_row_replicas(path,[dict(row=file,proof=row_proof(device,user,order[0],1,file)),dict(row=row,proof=originals[order[0]])],order[0],[control(order[0])],local_user="reader")
+    apply_row_replicas(path,[dict(row=updated,proof=revisions[order[1]],lineage=[originals[order[1]]])],order[1],[control(order[1])],local_user="reader")
+    with duckdb.connect(str(path),read_only=True) as db: assert db.execute("SELECT count(*) FROM remote.provenance_origins WHERE kind='file.version'").fetchone()==(2,)
+    for ws in order[::-1]:
+        lineage=[revisions[ws],originals[ws]] if ws==order[0] else None
+        apply_row_replicas(path,[dict(row=deleted,proof=tombstones[ws],**({"lineage":lineage} if lineage else {}))],ws,[control(ws)],local_user="reader")
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM provenance.file_versions").fetchone()==(0,)
+        assert not db.execute("SELECT 1 FROM remote.provenance_origins o JOIN remote.row_proofs p ON p.id=o.proof_id WHERE o.kind='file.version' AND p.state='active'").fetchone()
+    apply_row_replicas(path,[dict(row=row,proof=originals[order[0]])],order[0],[control(order[0])],local_user="reader")
+    with duckdb.connect(str(path),read_only=True) as db: assert db.execute("SELECT count(*) FROM provenance.file_versions").fetchone()==(0,)
+    keys={1:os.urandom(32)}
+    replay=tmp_path/"replay.db"
+    for ws in order:
+        replicas=[open_replica(env,keys[1]) for env in row_replicas(path,dict(user="reader",device=device),ws,[],keys)]
+        assert any(item["row"]==deleted for item in replicas)
+        assert not any(item["row"]==row or item["row"]==updated for item in replicas)
+        apply_row_replicas(replay,replicas,ws,[control(ws)],local_user="another-reader")
+    with duckdb.connect(str(replay),read_only=True) as db: assert db.execute("SELECT count(*) FROM provenance.file_versions").fetchone()==(0,)
+    assert audit_rows(replay,local_user="another-reader")["totals"]["unavailable"]==0
+
 @pytest.mark.parametrize("kind",["repository.observed","file.observed","file.version","git.checkpoint"])
 def test_fact_deletion_retires_only_the_signing_authors_claim(tmp_path,kind):
     root,device,user,control,*_=signed_edit_graph()
