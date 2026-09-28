@@ -625,6 +625,44 @@ def test_noop_fast_path_tracks_external_bridge_state(tmp_path,monkeypatch):
     memory_module.remember_data("new remote memory","global"); calls.clear(); sync_once(root); assert len(calls)>1 and server.execute("SELECT COUNT(*) FROM semantic_replicas").fetchone()[0]>0
     calls.clear(); sync_once(root); assert calls==["state"]
 
+def test_identity_rule_change_wakes_settled_sync_and_survives_repull(tmp_path,monkeypatch):
+    from tests.test_remote_projection import source
+    server=server_connect(tmp_path/'server.db')
+    monkeypatch.setattr(remote_client,'request',transport(server))
+    monkeypatch.setattr(remote_client,'drain_hooks',lambda:None)
+    a,b=tmp_path/'a',tmp_path/'b'
+    _,recovery=setup_client('http://server','alice','laptop',root=a)
+    setup_client('http://server','alice','desktop',recovery,root=b)
+    seed=tmp_path/'seed'; seed.mkdir()
+    _,db=source(seed,'ssh://git@code.example.com:7999/team/project.git')
+    old,lineage=db.execute('SELECT id,lineage FROM provenance.repositories').fetchone()
+    evidence={table:db.execute(f'SELECT * FROM {table} ORDER BY id').fetchall() for table in ('conversations','messages','file_edits')}
+    db.close()
+    path=a/'data/convos.db'; path.parent.mkdir(parents=True,exist_ok=True)
+    shutil.copy(seed/'source.db',path)
+    def sync(root,repull=False):
+        monkeypatch.setenv('CONVOS_PROJECT_ROOT',str(root))
+        (repull_once if repull else sync_once)(root)
+    for root in (a,b,a): sync(root)
+    with duckdb.connect(str(b/'data/convos.db'),read_only=True) as db:
+        assert db.execute('SELECT id FROM provenance.repositories').fetchall()==[(old,)]
+        received={table:db.execute(f'SELECT * FROM {table} ORDER BY id').fetchall() for table in evidence}
+    (a/'config.json').write_text(json.dumps({'git_identity':{'url_prefixes':{'https://code.example.com:7999/':'https://code.example.com/scm/'}}}))
+    new=core_module.provenance_digest(dict(lineage=lineage,remotes=['https://code.example.com/scm/team/project']))
+    for root in (a,b,a,b): sync(root)
+    for root in (a,b):
+        with duckdb.connect(str(root/'data/convos.db'),read_only=True) as db:
+            assert db.execute('SELECT id FROM provenance.repositories').fetchall()==[(new,)]
+            assert db.execute('SELECT DISTINCT repository FROM provenance.files').fetchall()==[(new,)]
+            assert db.execute("SELECT count(*) FROM remote.row_proofs WHERE row_kind='repository.observed' AND source_row_id=? AND state='deleted'",[old]).fetchone()[0]>0
+            assert {table:db.execute(f'SELECT * FROM {table} ORDER BY id').fetchall() for table in evidence}==(evidence if root==a else received)
+    sync(b,repull=True)
+    with duckdb.connect(str(b/'data/convos.db'),read_only=True) as db:
+        assert db.execute('SELECT id FROM provenance.repositories').fetchall()==[(new,)]
+        assert {table:db.execute(f'SELECT * FROM {table} ORDER BY id').fetchall() for table in evidence}==received
+        assert not core_module.archive_relationships(db)
+    server.close()
+
 @pytest.mark.parametrize('change',['delete','revise','create'])
 def test_memory_change_after_publication_cannot_be_marked_settled(tmp_path,monkeypatch,change):
     server=server_connect(tmp_path/'server.db')

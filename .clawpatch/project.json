@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "projectId": "prj_github-com-RobertBiehl-convos",
+  "name": "convos",
+  "rootPath": ".",
+  "git": {
+    "remoteUrl": "https://github.com/RobertBiehl/convos.git",
+    "defaultBranch": "master",
+    "currentBranch": "fix/configured-remote-urls",
+    "headSha": "20a56a3b778b9ba41406db713324d88d9113eca6"
+  },
+  "detected": {
+    "languages": [
+      "python"
+    ],
+    "frameworks": [
+      "pytest"
+    ],
+    "packageManagers": [
+      "uv"
+    ],
+    "commands": {
+      "typecheck": null,
+      "lint": null,
+      "format": null,
+      "test": "uv run pytest"
+    }
+  },
+  "createdAt": "2026-09-26T09:11:56.381Z",
+  "updatedAt": "2026-09-26T09:11:56.381Z"
+}

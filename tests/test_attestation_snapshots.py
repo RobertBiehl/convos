@@ -14,8 +14,10 @@ from tests.test_remote_projection import git, source
 
 def change_source(path,checkout,kind):
     if kind=='repository.observed':
-        git(checkout,'remote','add','origin','https://example.test/newer/repo.git')
-        core.capture_repository(checkout,path)
+        # Exercise a newer body for the same logical row; a Git remote change now gets a new ID.
+        with core.open_db(path,purpose='test.native.capture') as db,core._transaction(db):
+            record=next(r for r in core.provenance_records(db) if r['kind']==kind)
+            core.project_native_provenance(db,[record|{'payload':record['payload']|{'remotes':['https://example.test/newer/repo']}}])
     else:
         with core.open_db(path,purpose='test.native.capture') as db,core._transaction(db):
             columns=core.ARCHIVE_COLUMNS['messages']; row=dict(zip(columns,db.execute('SELECT * EXCLUDE (embedding) FROM messages WHERE id=\'m\'').fetchone()))

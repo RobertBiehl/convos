@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-library-fdfbcb4ae4-9dba_0e54dccc4d",
+  "featureId": "feat_library_fdfbcb4ae4",
+  "title": "Pre-existing: proxy URL rewrites split Memory repository scopes",
+  "category": "bug",
+  "severity": "medium",
+  "confidence": "high",
+  "triage": "confirmed-bug",
+  "evidence": [
+    {
+      "path": "apps/memory/src/ai_convos_memory/__init__.py",
+      "startLine": 50,
+      "endLine": 59,
+      "symbol": "_repository",
+      "quote": null
+    },
+    {
+      "path": "apps/memory/src/ai_convos_memory/__init__.py",
+      "startLine": 66,
+      "endLine": 93,
+      "symbol": "_scope / _bind_scope",
+      "quote": null
+    },
+    {
+      "path": "apps/memory/src/ai_convos_memory/__init__.py",
+      "startLine": 239,
+      "endLine": 257,
+      "symbol": "remember_data",
+      "quote": null
+    }
+  ],
+  "reasoning": "Memory hashes `git remote get-url origin`, which includes insteadOf transport rewriting. The proxy port therefore becomes repository identity despite an unchanged configured origin. After a port change, _scope rejects the existing checkout binding; _bind_scope finds no matching repository and replaces that binding with a suffixed scope. Existing canonicals remain in the old scope, while subsequent scoped reads and writes use the new scope. Previously saved memories disappear from that checkout's current scope, and remembering identical content creates another canonical because its ID includes scope. This is pre-existing in optional Memory's separate identity recipe, not a regression introduced by the core archive identity fix.",
+  "reproduction": "Synthetic regression procedure, not executed here: create an isolated temporary Git checkout and temporary Memory ledger, with global/system Git configuration disabled. Configure origin as https://code.example.com/team/project.git and local url.http://127.0.0.1:41001/session/.insteadOf=https://code.example.com/. Point CONVOS_MEMORY_DB at the temporary ledger. Clear _repository's cache, record its repository ID, and call remember_data('synthetic memory', scope=str(checkout)). Replace the rewrite with url.http://127.0.0.1:41002/session/.insteadOf=https://code.example.com/, then clear the cache again. The repository ID changes although remote.origin.url is unchanged. Repeat remember_data with identical content: its scope gains a repository suffix and its canonical ID changes. Verify _scope(checkout) now returns the new scope while the original canonical still belongs to the old scope. No network access or live archive is needed.",
+  "recommendation": "Handle this as a separate scoped Memory migration decision. Derive repository identity from configured canonical origin evidence before transport rewriting, and define a backed-up migration for existing bindings and affected scope references. Do not merely replace the hash input: that would itself change persisted repository identities and trigger the same scope split.",
+  "whyTestsDoNotAlreadyCoverThis": "No Memory tests were included in the review context. Coverage of transport rewrite changes and persisted scope continuity cannot be established from the supplied excerpts.",
+  "suggestedRegressionTest": "Use the isolated checkout and ledger above; assert repository identity, bound scope, and canonical ID remain stable across proxy-port changes and cache clears. Add migration coverage proving existing memories and their links remain accessible, while genuinely different configured origins remain isolated.",
+  "minimumFixScope": "Separate optional Memory identity and ledger-migration change covering _repository, repository_scopes, affected scope references, and synthetic continuity/isolation tests.",
+  "status": "open",
+  "history": [
+    {
+      "runId": null,
+      "kind": "triage",
+      "status": "open",
+      "note": "Pre-existing optional Memory scope issue, reproduced with synthetic Git proxy sessions. Outside PR #140 archive-provenance changes. Raised in the PR and user review for a separate scope-binding migration decision; deliberately left open.",
+      "reasoning": null,
+      "commands": [],
+      "createdAt": "2026-09-26T09:29:03.672Z"
+    }
+  ],
+  "signature": "sig_feat-library-fdfbcb4ae4_9dba5399ee",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20260926T092736-807b9c",
+  "createdAt": "2026-09-26T09:28:12.741Z",
+  "updatedAt": "2026-09-26T09:29:03.671Z"
+}

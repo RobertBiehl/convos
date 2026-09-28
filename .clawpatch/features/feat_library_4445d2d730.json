@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "featureId": "feat_library_4445d2d730",
+  "title": "Python source src",
+  "summary": "Python source group src with 4 files.",
+  "kind": "library",
+  "source": "python-source-group",
+  "confidence": "medium",
+  "entrypoints": [
+    {
+      "path": "src",
+      "symbol": "src",
+      "route": null,
+      "command": null
+    }
+  ],
+  "ownedFiles": [
+    {
+      "path": "src/ai_convos/__init__.py",
+      "reason": "source group src"
+    },
+    {
+      "path": "src/ai_convos/__main__.py",
+      "reason": "source group src"
+    },
+    {
+      "path": "src/ai_convos/cli.py",
+      "reason": "source group src"
+    },
+    {
+      "path": "src/ai_convos/migrations.py",
+      "reason": "source group src"
+    }
+  ],
+  "contextFiles": [
+    {
+      "path": "pyproject.toml",
+      "reason": "python target runtime metadata"
+    },
+    {
+      "path": "docs/git-identity.md",
+      "reason": "Repository identity contract and cross-product boundary"
+    },
+    {
+      "path": "docs/invariants.md",
+      "reason": "Repository identity contract and cross-product boundary"
+    },
+    {
+      "path": "tests/test_provenance.py",
+      "reason": "Repository identity contract and cross-product boundary"
+    },
+    {
+      "path": "tests/test_remote_projection.py",
+      "reason": "Repository identity contract and cross-product boundary"
+    },
+    {
+      "path": "apps/remote/src/ai_convos_remote/projection.py",
+      "reason": "Repository identity contract and cross-product boundary"
+    },
+    {
+      "path": "apps/remote/src/ai_convos_remote/protocol.py",
+      "reason": "Repository identity contract and cross-product boundary"
+    },
+    {
+      "path": "apps/remote/src/ai_convos_remote/__init__.py",
+      "reason": "Repository identity contract and cross-product boundary"
+    }
+  ],
+  "tests": [],
+  "tags": [
+    "python",
+    "source-group"
+  ],
+  "trustBoundaries": [],
+  "status": "reviewed",
+  "lock": null,
+  "findingIds": [],
+  "patchAttemptIds": [],
+  "analysisHistory": [
+    {
+      "runId": "20260926T091346-2ac56e",
+      "kind": "review",
+      "summary": "0 finding(s); prompt=210102 bytes; approxTokens=52526; includedFiles=12; omittedFiles=0",
+      "provider": "codex",
+      "model": null,
+      "reasoningEffort": "high",
+      "createdAt": "2026-09-26T09:14:08.167Z"
+    },
+    {
+      "runId": "20260926T092455-b879a4",
+      "kind": "review",
+      "summary": "0 finding(s); prompt=210862 bytes; approxTokens=52716; includedFiles=12; omittedFiles=0",
+      "provider": "codex",
+      "model": null,
+      "reasoningEffort": "high",
+      "createdAt": "2026-09-26T09:25:29.607Z"
+    }
+  ],
+  "createdAt": "2026-09-26T09:13:03.948Z",
+  "updatedAt": "2026-09-26T09:25:29.607Z"
+}

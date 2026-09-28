@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "featureId": "feat_library_fdfbcb4ae4",
+  "title": "Python source apps/memory/src",
+  "summary": "Python source file apps/memory/src/ai_convos_memory/__init__.py.",
+  "kind": "library",
+  "source": "python-source-group",
+  "confidence": "medium",
+  "entrypoints": [
+    {
+      "path": "apps/memory/src",
+      "symbol": "apps/memory/src",
+      "route": null,
+      "command": null
+    }
+  ],
+  "ownedFiles": [
+    {
+      "path": "apps/memory/src/ai_convos_memory/__init__.py",
+      "reason": "source group src"
+    }
+  ],
+  "contextFiles": [
+    {
+      "path": "apps/memory/pyproject.toml",
+      "reason": "python target runtime metadata"
+    }
+  ],
+  "tests": [],
+  "tags": [
+    "python",
+    "source-group",
+    "workspace",
+    "uv-workspace"
+  ],
+  "trustBoundaries": [],
+  "status": "needs-fix",
+  "lock": null,
+  "findingIds": [
+    "fnd_sig-feat-library-fdfbcb4ae4-9dba_0e54dccc4d"
+  ],
+  "patchAttemptIds": [],
+  "analysisHistory": [
+    {
+      "runId": "20260926T092736-807b9c",
+      "kind": "review",
+      "summary": "1 finding(s); prompt=32921 bytes; approxTokens=8231; includedFiles=2; omittedFiles=0",
+      "provider": "codex",
+      "model": null,
+      "reasoningEffort": "high",
+      "createdAt": "2026-09-26T09:28:12.742Z"
+    }
+  ],
+  "createdAt": "2026-09-26T09:13:03.948Z",
+  "updatedAt": "2026-09-26T09:28:12.742Z"
+}
