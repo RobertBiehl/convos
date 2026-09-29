@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Stop the git identity migration from writing an archive backup on every hook when a proxy remote stays unresolved: plan a rekey only when a repository's remotes change, as the rekey itself does.
+
 ## 0.11.6b18
 
 - Keep proxy credentials out of repository identity; canonical remotes win over stale bindings, with explicit host/port/path mappings.

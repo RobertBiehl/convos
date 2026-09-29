@@ -451,6 +451,15 @@ def test_unresolved_proxy_migration_retries_when_evidence_arrives(tmp_path,monke
     monkeypatch.setattr(core_module,"_git_run",unexpected)
     assert core_module.canonicalize_repositories(path)==0
 
+def test_pending_proxy_with_legacy_ids_takes_no_backup_per_retry(tmp_path):
+    root=repo(tmp_path/"checkout"); git(root,"remote","add","origin","https://example.com/acme/project.git"); current=repository(root)
+    old=digest(dict(lineage=current["lineage"],remotes=["https://127.0.0.1:9/token/acme/project"])); legacy="b"*64; path=tmp_path/"archive.db"
+    with graph(path) as db:
+        core_module.project_native_provenance(db,[core_module._repository_record({**current,"id":old,"remotes":["https://127.0.0.1:9/token/acme/project"]},None)]); core_module._observe_checkout(db,{**current,"id":old})
+        db.execute("INSERT INTO provenance.repositories VALUES (?,'other','[]','[\"https://example.com/acme/other\"]',NULL,NULL)",[legacy]); db.execute("INSERT INTO provenance.local_facts VALUES ('repository.observed',?)",[legacy])
+    root.rename(tmp_path/"offline")
+    assert [core_module.canonicalize_repositories(path) for _ in range(2)]==[0,0] and not list(tmp_path.glob("archive.db.pre-git-identity-*.bak"))
+
 @pytest.mark.parametrize("proxy",["ssh://git@127.0.0.1:9/token/","http://localhost:9/token/"])
 def test_proxy_fallback_uses_configured_url_without_applying_a_losing_rewrite(tmp_path,proxy):
     root=repo(tmp_path/"checkout")
