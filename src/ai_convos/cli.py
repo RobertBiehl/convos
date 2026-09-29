@@ -664,9 +664,10 @@ def project_attachment_body(db_path,data,body_hash):
         if rows and path and (ids:=[row_id for row_id,old in rows if old!=str(path)]):
             with _transaction(db): db.executemany("UPDATE attachments SET path=? WHERE id=?",[(str(path),row_id) for row_id in ids])
         return len(rows)
-def _backup_copy(source,target): return command and not subprocess.run(command,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode or shutil.copyfile(source,target) if (command:=("cp","-c",str(source),str(target)) if sys.platform=="darwin" else ("cp","--reflink=auto",str(source),str(target)) if sys.platform.startswith("linux") else None) else shutil.copyfile(source,target)
-def _file_sha256(path):
-    with Path(path).open("rb") as source: return hashlib.file_digest(source,"sha256").hexdigest()
+# Read the live archive only in a child: closing any descriptor of it drops this process's DuckDB (fcntl) lock.
+def _isolated(op,*paths): return subprocess.run([sys.executable,"-I","-c","import hashlib,shutil,sys\nop,*p=sys.argv[1:]\nprint(shutil.copyfile(*p) if op=='copy' else hashlib.file_digest(open(p[0],'rb'),'sha256').hexdigest())",op,*map(str,paths)],capture_output=True,text=True,check=True).stdout.strip()
+def _backup_copy(source,target): return command and not subprocess.run(command,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode or _isolated("copy",source,target) if (command:=("cp","-c",str(source),str(target)) if sys.platform=="darwin" else ("cp","--reflink=auto",str(source),str(target)) if sys.platform.startswith("linux") else None) else _isolated("copy",source,target)
+def _file_sha256(path): return (source:=Path(path).open("rb")) and (hashlib.file_digest(source,"sha256").hexdigest(),source.close())[0]
 def _check_archive(path):
     with contextlib.closing(duckdb.connect(str(path),read_only=True)) as db: return db.execute("SELECT COUNT(*) FROM conversations").fetchone()
 def _archive_index_check(db,schema,table,key): return (typer.echo(f"index {schema}.{table}.{key}",err=True),(keys:=[r[0] for r in db.execute(f'SELECT "{key.replace(chr(34),chr(34)*2)}" FROM "{schema.replace(chr(34),chr(34)*2)}"."{table.replace(chr(34),chr(34)*2)}"').fetchall()]),required((found:=sum(db.execute(f'SELECT count(*) FROM "{schema.replace(chr(34),chr(34)*2)}"."{table.replace(chr(34),chr(34)*2)}" WHERE "{key.replace(chr(34),chr(34)*2)}" IN (SELECT UNNEST(?))',[keys[at:at+20000]]).fetchone()[0] for at in range(0,len(keys),20000)))==len(keys),ValueError(f'{schema}.{table} primary-key index misses {len(keys)-found} of {len(keys)} rows')),len(keys))[-1]
@@ -699,7 +700,7 @@ def _migration_backup(conn,version=1):
     path,label,backup=(path:=Path(next((r[2] for r in conn.execute("PRAGMA database_list").fetchall() if r[2]),""))),(label:=f"v{version}" if isinstance(version,int) else version),path.with_name(f"{path.name}.pre-{label}.bak") if path.name else None
     required(isinstance(label,str) and label and all(c.isalnum() or c in "-_" for c in label),ValueError("invalid backup label"))
     if not backup: return None
-    source=(conn.execute("CHECKPOINT"),_file_sha256(path))[1]
+    source=(conn.execute("CHECKPOINT"),_isolated("sha256",path))[1]
     if backup.exists() and (backup.is_symlink() or not backup.is_file()): raise ValueError("core migration backup path is unsafe")
     if backup.exists() and source==_file_sha256(backup) and _bundle_valid(backup.with_name(backup.name+".attachments"),backup.name,source,_backup_rows(conn)): return backup
     if not backup.exists() and _bundle_valid(backup.with_name(backup.name+".attachments"),backup.name,source,_backup_rows(conn)): return (atomic_publish(backup,lambda tmp:(_backup_copy(path,tmp),required(_file_sha256(tmp)==source,ValueError("archive backup verification failed")),_check_archive(tmp))),backup)[1]
