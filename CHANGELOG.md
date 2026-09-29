@@ -2,6 +2,7 @@
 
 ## 0.11.6b19
 
+- Keep the archive locked while a migration or `convos backup` copies it: hashing the live file in-process released DuckDB's lock, and a concurrent hook could write beside the migration and corrupt the archive (`field id mismatch`).
 - Stop the git identity migration from writing an archive backup on every hook when a proxy remote stays unresolved: plan a rekey only when a repository's remotes change, as the rekey itself does.
 
 ## 0.11.6b18
