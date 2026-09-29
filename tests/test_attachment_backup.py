@@ -1,5 +1,7 @@
 """Metadata-only attachment history requires no invented file; claimed bytes stay mandatory."""
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -90,3 +92,12 @@ def test_backup_resolves_shared_claimed_bytes_through_any_indexed_path(tmp_path,
     assert (bundle / body_hash).read_bytes() == data
     assert manifest['references']['conflict:' + proof[0]] == [body_hash, len(data)]
     assert len(manifest['attachments']) == 1
+
+
+def test_backup_keeps_the_archive_locked_against_a_second_writer(tmp_path):
+    """Closing any descriptor of the archive drops this process's fcntl lock; a hook then writes beside the migration."""
+    path, _, _ = attachment_archive(tmp_path)
+    with core.open_db(path, purpose='fixture.backup') as db:
+        core._migration_backup(db, 'lock')
+        other = subprocess.run([sys.executable, '-c', 'import duckdb, sys\nduckdb.connect(sys.argv[1]).execute("CHECKPOINT")', str(path)], capture_output=True, text=True)
+    assert other.returncode and 'lock' in other.stderr, other.stderr
