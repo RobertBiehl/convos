@@ -106,6 +106,12 @@ def test_stale_fixed_migration_backup_is_preserved_not_reused(tmp_path):
     path=tmp_path/"legacy.db"; stale=path.with_name("legacy.db.pre-v1.bak"); db=duckdb.connect(str(stale)); db.execute("CREATE TABLE conversations(id VARCHAR,title VARCHAR)"); db.execute("INSERT INTO conversations VALUES ('old','stale')"); db.close(); db=duckdb.connect(str(path)); db.execute("CREATE TABLE conversations(id VARCHAR,title VARCHAR)"); db.execute("INSERT INTO conversations VALUES ('new','current')"); db.close(); db=duckdb.connect(str(path)); init_schema(db); db.close(); backups=[p for p in tmp_path.glob("legacy.db.pre-v1.bak.*") if p.is_file()]; assert len(backups)==1 and duckdb.connect(str(stale),read_only=True).execute("SELECT id FROM conversations").fetchone()[0]=="old" and duckdb.connect(str(backups[0]),read_only=True).execute("SELECT id FROM conversations").fetchone()[0]=="new"
 
 
+def test_retried_migration_reuses_its_hashed_backup_instead_of_copying_again(tmp_path):
+    path=tmp_path/"legacy.db"; [(db:=duckdb.connect(str(p))).execute(f"CREATE TABLE conversations(id VARCHAR); INSERT INTO conversations VALUES ('{id}')") and db.close() for p,id in ((path.with_name("legacy.db.pre-v1.bak"),"old"),(path,"new"))]
+    db=duckdb.connect(str(path)); first,second=core_module._migration_backup(db,1),core_module._migration_backup(db,1); db.close()
+    assert first==second and [p for p in tmp_path.glob("legacy.db.pre-v1.bak.*") if p.is_file()]==[first]
+
+
 def test_v4_indexes_native_sessions_classifies_recovery_and_preserves_startup_candidates(tmp_path,monkeypatch):
     path=tmp_path/"v3.db"; db=graph(path); meta=lambda sid,kind="main":json.dumps({"session_id":sid,"session_kind":kind}); recovered=json.dumps({"recovered":"history.jsonl"}); repair=json.dumps({"recovered":"id-inversion"})
     wrapper="# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>"; db.executemany("INSERT INTO conversations VALUES (?,?,'x',NULL,NULL,NULL,NULL,NULL,NULL,?)",[("keep","codex",meta("native")),("stub","codex",meta("stub")),("prompt","codex",meta("prompt")),("sub","codex",meta("child","subagent")),("history","claude-code",recovered),("foreign","codex",meta("native"))]); db.executemany("INSERT INTO messages VALUES (?,?,?, ?,NULL,NULL,NULL,?,NULL,NULL)",[("keep-m","keep","user","real prompt","{}"),("stub-m","stub","user",wrapper,"{}"),("prompt-m","prompt","user",wrapper+"\nactual request","{}"),("sub-u","sub","user","<environment_context>\nx\n</environment_context>","{}"),("sub-a","sub","assistant","work","{}"),("history-m","history","user","old prompt",recovered),("repair-m","keep","unknown","",repair)]); db.execute("INSERT INTO remote.row_origins VALUES ('conversations','foreign','w','author','device','foreign','event','conversations:foreign',NULL,NULL)"); rebuild_fts_index(db); before=archive_state(db)[1]; db.execute("DROP TABLE provider_sessions; UPDATE core_schema SET version=3"); db.close(); monkeypatch.setattr(core_module,"rebuild_fts_index",lambda *_:(_ for _ in ()).throw(AssertionError("v4 must not rebuild FTS")))
@@ -545,6 +551,23 @@ def test_same_remote_does_not_collapse_unrelated_histories_and_ports_are_distinc
 
 def test_v3_migration_quarantines_detected_legacy_remote_identity_collision(tmp_path):
     a,b=repo(tmp_path/"a","a",content="a\n"),repo(tmp_path/"b","b",content="b\n"); git(a,"remote","add","origin","https://example.com/acme/project.git"); git(b,"remote","add","origin","https://example.com/acme/project.git"); path=tmp_path/"legacy.db"; db=graph(path); old=digest({"remotes":["https://example.com/acme/project"]}); first=repository(a); db.execute("INSERT INTO provenance.repositories VALUES (?,?,?,?,?,?)",(old,first["lineage"],json.dumps(first["roots"]),json.dumps(first["remotes"]),first["head"],None)); db.executemany("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?)",[(repository(a)["checkout"],old,str(a),"",first["head"]),(repository(b)["checkout"],old,str(b),"",repository(b)["head"])]); db.execute("UPDATE core_schema SET version=2"); db.close(); db=duckdb.connect(str(path)); init_schema(db); assert not db.execute("SELECT 1 FROM provenance.repository_checkouts WHERE repository=?",(old,)).fetchone() and not db.execute("SELECT 1 FROM provenance.repository_aliases WHERE repository=?",(old,)).fetchone() and repository(a,db)["id"]!=repository(b,db)["id"]; db.close()
+
+
+def legacy_checkouts(tmp_path,*extra):
+    a=repo(tmp_path/"a"); git(a,"remote","add","origin","https://example.com/acme/project.git"); path=tmp_path/"legacy.db"; db=graph(path); old=digest({"remotes":["https://example.com/acme/project"]}); first=repository(a)
+    db.execute("INSERT INTO provenance.repositories VALUES (?,?,?,?,?,?)",(old,first["lineage"],json.dumps(first["roots"]),json.dumps(first["remotes"]),first["head"],None)); db.executemany("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?)",[(first["checkout"],old,str(a),"",first["head"]),*((f"gone{i}",old,str(root),"",first["head"]) for i,root in enumerate(extra))]); db.execute("UPDATE core_schema SET version=2"); db.close()
+    return path,old
+
+def test_v3_migration_does_not_attribute_a_deleted_checkout_to_its_enclosing_repository(tmp_path):
+    b=repo(tmp_path/"b","b",content="b\n"); git(b,"remote","add","origin","https://example.com/acme/project.git"); path,old=legacy_checkouts(tmp_path,b/"deleted-worktree"); db=duckdb.connect(str(path)); init_schema(db)
+    assert db.execute("SELECT 1 FROM provenance.repository_aliases WHERE repository=?",(old,)).fetchone(); db.close()
+
+@pytest.mark.skipif(sys.platform!="darwin",reason="macOS ACLs")
+def test_v3_migration_survives_a_deleted_checkout_under_a_traverse_only_directory(tmp_path):
+    home=tmp_path/"home"; (repos:=home/"repos").mkdir(parents=True); path,old=legacy_checkouts(tmp_path,repos/"deleted-worktree"); me=subprocess.run(("id","-un"),capture_output=True,text=True,check=True).stdout.strip()
+    subprocess.run(("chmod","+a",f"user:{me} allow search",str(home)),check=True); [subprocess.run(("chmod","+a",f"user:{me} deny list",str(d)),check=True) for d in (home,repos)]
+    try: db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT 1 FROM provenance.repository_aliases WHERE repository=?",(old,)).fetchone(); db.close()
+    finally: subprocess.run(("chmod","-N",str(home),str(repos)),check=True)
 
 
 def test_conversation_scope_is_captured_once_across_git_init_and_removal(tmp_path):
