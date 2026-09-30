@@ -111,6 +111,12 @@ def test_retried_migration_reuses_its_hashed_backup_instead_of_copying_again(tmp
     db=duckdb.connect(str(path)); first,second=core_module._migration_backup(db,1),core_module._migration_backup(db,1); db.close()
     assert first==second and [p for p in tmp_path.glob("legacy.db.pre-v1.bak.*") if p.is_file()]==[first]
 
+def test_retried_migration_reuses_a_timestamped_backup_left_by_an_earlier_release(tmp_path):
+    path=tmp_path/"legacy.db"; (db:=duckdb.connect(str(path))).execute("CREATE TABLE conversations(id VARCHAR); INSERT INTO conversations VALUES ('new')"); source=(db.execute("CHECKPOINT"),core_module._file_sha256(path))[1]
+    [p.write_text("stale") for p in (path.with_name("legacy.db.pre-v1.bak"),path.with_name(f"legacy.db.pre-v1.bak.{source[:12]}"))]
+    first,second=core_module._migration_backup(db,1),core_module._migration_backup(db,1); db.close()
+    assert first==second and first.name.startswith(f"legacy.db.pre-v1.bak.{source[:12]}.")
+
 
 def test_v4_indexes_native_sessions_classifies_recovery_and_preserves_startup_candidates(tmp_path,monkeypatch):
     path=tmp_path/"v3.db"; db=graph(path); meta=lambda sid,kind="main":json.dumps({"session_id":sid,"session_kind":kind}); recovered=json.dumps({"recovered":"history.jsonl"}); repair=json.dumps({"recovered":"id-inversion"})
@@ -558,15 +564,20 @@ def legacy_checkouts(tmp_path,*extra):
     db.execute("INSERT INTO provenance.repositories VALUES (?,?,?,?,?,?)",(old,first["lineage"],json.dumps(first["roots"]),json.dumps(first["remotes"]),first["head"],None)); db.executemany("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?)",[(first["checkout"],old,str(a),"",first["head"]),*((f"gone{i}",old,str(root),"",first["head"]) for i,root in enumerate(extra))]); db.execute("UPDATE core_schema SET version=2"); db.close()
     return path,old
 
-def test_v3_migration_does_not_attribute_a_deleted_checkout_to_its_enclosing_repository(tmp_path):
-    b=repo(tmp_path/"b","b",content="b\n"); git(b,"remote","add","origin","https://example.com/acme/project.git"); path,old=legacy_checkouts(tmp_path,b/"deleted-worktree"); db=duckdb.connect(str(path)); init_schema(db)
-    assert db.execute("SELECT 1 FROM provenance.repository_aliases WHERE repository=?",(old,)).fetchone(); db.close()
+@pytest.mark.parametrize("state",["deleted","emptied","unsearchable"])
+def test_v3_migration_counts_only_roots_that_are_still_checkouts(tmp_path,state):
+    b=repo(tmp_path/"b","b",content="b\n"); git(b,"remote","add","origin","https://example.com/acme/project.git"); root=b/".koder/worktrees/gone"
+    root.parent.mkdir(parents=True); (state!="deleted") and root.mkdir(); path,old=legacy_checkouts(tmp_path,root); (state=="unsearchable") and root.parent.chmod(0)
+    try:
+        with duckdb.connect(str(path)) as db: init_schema(db); assert db.execute("SELECT 1 FROM provenance.repository_aliases WHERE repository=?",(old,)).fetchone()
+    finally: root.parent.chmod(0o755)
 
 @pytest.mark.skipif(sys.platform!="darwin",reason="macOS ACLs")
 def test_v3_migration_survives_a_deleted_checkout_under_a_traverse_only_directory(tmp_path):
     home=tmp_path/"home"; (repos:=home/"repos").mkdir(parents=True); path,old=legacy_checkouts(tmp_path,repos/"deleted-worktree"); me=subprocess.run(("id","-un"),capture_output=True,text=True,check=True).stdout.strip()
-    subprocess.run(("chmod","+a",f"user:{me} allow search",str(home)),check=True); [subprocess.run(("chmod","+a",f"user:{me} deny list",str(d)),check=True) for d in (home,repos)]
-    try: db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT 1 FROM provenance.repository_aliases WHERE repository=?",(old,)).fetchone(); db.close()
+    try:
+        subprocess.run(("chmod","+a",f"user:{me} allow search",str(home)),check=True); [subprocess.run(("chmod","+a",f"user:{me} deny list",str(d)),check=True) for d in (home,repos)]
+        with duckdb.connect(str(path)) as db: init_schema(db); assert db.execute("SELECT 1 FROM provenance.repository_aliases WHERE repository=?",(old,)).fetchone()
     finally: subprocess.run(("chmod","-N",str(home),str(repos)),check=True)
 
 

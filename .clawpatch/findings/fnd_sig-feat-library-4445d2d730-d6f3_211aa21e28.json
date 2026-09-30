@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-library-4445d2d730-d6f3_211aa21e28",
+  "featureId": "feat_library_4445d2d730",
+  "title": "Physical-ID migration strands file-edit evidence and scopes",
+  "category": "data-loss",
+  "severity": "high",
+  "confidence": "high",
+  "triage": "confirmed-bug",
+  "evidence": [
+    {
+      "path": "src/ai_convos/cli.py",
+      "startLine": 138,
+      "endLine": 140,
+      "symbol": "_PROVENANCE_SCHEMA",
+      "quote": null
+    },
+    {
+      "path": "src/ai_convos/migrations.py",
+      "startLine": 65,
+      "endLine": 65,
+      "symbol": "migrate_remote_ids",
+      "quote": null
+    },
+    {
+      "path": "src/ai_convos/migrations.py",
+      "startLine": 79,
+      "endLine": 91,
+      "symbol": "migrate_remote_data",
+      "quote": null
+    }
+  ],
+  "reasoning": "The migration changes received file_edits and tool_calls IDs, but leaves provenance.file_edit_evidence and provenance.file_edit_scopes unchanged. Both tables are keyed by file_edit_id, and evidence also references tool_call_id. Only file_edit_files and checkpoint_edits receive relation remapping. Existing evidence and scope records consequently remain attached to obsolete IDs after their archive rows move, losing their association with the retained edits.",
+  "reproduction": "Create a legacy received file edit and tool call with noncanonical physical IDs, attach a file_edit_evidence record referencing both IDs and a file_edit_scopes record, then run migrate_remote_ids. The archive rows acquire canonical IDs while the evidence and scope records retain the old IDs; joins to the migrated edits no longer return those records.",
+  "recommendation": "Include file_edit_evidence and file_edit_scopes in the durable, resumable migration. Remap evidence.tool_call_id as well as both tables' file_edit_id, preserving evidence values and resolving duplicate records explicitly.",
+  "whyTestsDoNotAlreadyCoverThis": "The supplied tests exercise evidence retention, schema upgrades, and signed replay, but contain no physical-ID migration case with evidence and scopes attached to the migrated rows.",
+  "suggestedRegressionTest": "Migrate legacy received edits and tools with populated evidence and scopes. Assert both records join to the canonical edit, evidence references the canonical tool, and all evidence fields remain unchanged. Repeat after an injected interruption to verify resume preserves the associations.",
+  "minimumFixScope": "src/ai_convos/migrations.py relation staging and replay, plus a migration regression test.",
+  "status": "open",
+  "history": [],
+  "signature": "sig_feat-library-4445d2d730_d6f3201b8b",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20260930T225430-61364a",
+  "createdAt": "2026-09-30T22:56:27.770Z",
+  "updatedAt": "2026-09-30T22:56:27.770Z"
+}
