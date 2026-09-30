@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.6b20
+
+- Stop the v3 migration from probing the parent of a deleted checkout: under a traverse-only directory git exited 128 and `init_schema` aborted on every run; elsewhere the parent's repository was counted as this repository's evidence.
+- Reuse a verified content-addressed migration backup on retry instead of writing another archive-sized copy each time.
+
 ## 0.11.6b19
 
 - Keep the archive locked while a migration or `convos backup` copies it: hashing the live file in-process released DuckDB's lock, and a concurrent hook could write beside the migration and corrupt the archive (`field id mismatch`).
