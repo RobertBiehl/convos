@@ -2,8 +2,8 @@
 
 ## 0.11.6b20
 
-- Stop the v3 migration from probing the parent of a deleted checkout: under a traverse-only directory git exited 128 and `init_schema` aborted on every run; elsewhere the parent's repository was counted as this repository's evidence.
-- Reuse a verified content-addressed migration backup on retry instead of writing another archive-sized copy each time.
+- Count a recorded checkout in the v3 migration only while it is still a checkout. A deleted worktree under a traverse-only directory made git exit 128 and `init_schema` abort on every run; a deleted or emptied worktree inside another checkout counted that checkout's repository as evidence; on Python 3.12/3.13 an unsearchable parent raised `PermissionError`.
+- Reuse a verified content-addressed migration backup on retry, including the `.<sha12>.<ns>` copies earlier retries left, instead of writing another archive-sized copy each time.
 
 ## 0.11.6b19
 

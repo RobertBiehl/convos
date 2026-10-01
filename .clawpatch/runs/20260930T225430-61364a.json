@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "runId": "20260930T225430-61364a",
+  "command": "review",
+  "args": [
+    "--root",
+    "/Users/Shared/Developer/Workspace/ai-convos-db/.koder/worktrees/wt-unlistable-checkout-probe",
+    "review",
+    "--feature",
+    "feat_library_4445d2d730",
+    "--since",
+    "e1a0bd7",
+    "--reasoning-effort",
+    "high"
+  ],
+  "rootPath": "/Users/Shared/Developer/Workspace/ai-convos-db/.koder/worktrees/wt-unlistable-checkout-probe",
+  "headSha": "aa4eb90eb0f590af4bf1600420aa865f8b002db7",
+  "startedAt": "2026-09-30T22:54:30.097Z",
+  "finishedAt": "2026-09-30T22:56:27.775Z",
+  "status": "completed",
+  "claimedFeatureIds": [
+    "feat_library_4445d2d730"
+  ],
+  "findingIds": [
+    "fnd_sig-feat-library-4445d2d730-d6f3_211aa21e28"
+  ],
+  "patchAttemptIds": [],
+  "errors": []
+}
