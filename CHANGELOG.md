@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Take a repository-relative edit path from git's spelling. On a case-insensitive filesystem, one edit written as `.../Zim/...` inside the checkout `.../zim` made `relative_to` raise `ValueError` and aborted `convos sync`. Directory names now take the on-disk spelling; the file name keeps the case it was written with.
+
 ## 0.11.6b20
 
 - Count a recorded checkout in the v3 migration only while it is still a checkout. A deleted worktree under a traverse-only directory made git exit 128 and `init_schema` abort on every run; a deleted or emptied worktree inside another checkout counted that checkout's repository as evidence; on Python 3.12/3.13 an unsearchable parent raised `PermissionError`.

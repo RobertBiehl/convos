@@ -726,6 +726,13 @@ def test_file_edit_scope_is_unique_frozen_and_revisits_parent_conversation(tmp_p
     with pytest.raises(ValueError,match="scope conflict"): project(db,conflict)
 
 
+def test_miscased_edit_paths_take_git_spelling_on_case_insensitive_filesystems(tmp_path):
+    root=repo(tmp_path/"Repo"); (root/"Sub").mkdir(); (root/"Sub"/"x.py").write_text("one\n"); typed=tmp_path/"REPO"/"sub"/"x.py"
+    if not typed.exists(): pytest.skip("case-sensitive filesystem")
+    path=tmp_path/"core.db"; db=core(path,tmp_path/"REPO",[(typed,"write","one\n",None)]); scope=core_module.snapshot_edit_scopes([{"id":"e0","path":str(typed),"cwd":None}],core_module.repository_state(db)); db.close()
+    assert scope[0][1:4]==("Sub/x.py",repository(root)["id"],str(root)) and next(r["payload"]["id"] for r in capture(path) if r["kind"]=="file.observed")==digest({"repository":repository(root)["id"],"path":"Sub/x.py"})
+
+
 def test_provenance_git_observation_does_not_hold_duckdb_lock(tmp_path,monkeypatch):
     root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); run=core_module._git_run
     def unlocked(repo,*args): subprocess.run((sys.executable,"-c","import duckdb,sys; duckdb.connect(sys.argv[1]).close()",str(path)),check=True); return run(repo,*args)

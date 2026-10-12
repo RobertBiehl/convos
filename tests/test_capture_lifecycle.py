@@ -117,8 +117,8 @@ def test_worktree_disappearing_during_lookup_cannot_inherit_parent(tmp_path,monk
     root,path=worktree(tmp_path)
     def disappears(probe):
         remove(root,path)
-        return root
-    monkeypatch.setattr(cli,'_git_root',disappears)
+        return root,''
+    monkeypatch.setattr(cli,'_git_where',disappears)
     assert cli.repository(path,refresh=False) is None
 
 
