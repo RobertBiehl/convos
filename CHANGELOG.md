@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.6b21
 
 - Take a repository-relative edit path from git's spelling. On a case-insensitive filesystem, one edit written as `.../Zim/...` inside the checkout `.../zim` made `relative_to` raise `ValueError` and aborted `convos sync`. Directory names now take the on-disk spelling; the file name keeps the case it was written with.
 
