@@ -977,7 +977,7 @@ def chatgpt_profiles(browser: str) -> list[str | None]: return [None] if browser
 
 def chatgpt_cookie_base(browser: str, hosts: list[tuple[str, list[str]]], profile: str | None): return required(next(((cookies,url) for url,domains in hosts if (cookies:=get_cookies_any(domains,browser,profile=profile))),None),ValueError(f"No ChatGPT cookies found in {browser}"+(f" profile {profile}" if profile else "")))
 def claude_listing(browser):
-    cookies,org=(cookies:=required(get_cookies("claude.ai",browser),ValueError(f"No Claude cookies found in {browser}"))),required(fetch_json("https://claude.ai/api/organizations",cookies,_CLAUDE_HEADERS),ValueError("Could not get Claude org ID"))[0]["uuid"]
+    cookies,orgs,org=(cookies:=required(get_cookies("claude.ai",browser),ValueError(f"No Claude cookies found in {browser}"))),(orgs:=required(fetch_json("https://claude.ai/api/organizations",cookies,_CLAUDE_HEADERS),ValueError("Could not get Claude org ID"))),max(orgs,key=lambda o:("chat" in o.get("capabilities",["chat"]),o["uuid"]==cookies.get("lastActiveOrg")))["uuid"]
     return cookies,org,fetch_json(f"https://claude.ai/api/organizations/{org}/chat_conversations",cookies,_CLAUDE_HEADERS)
 
 def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):

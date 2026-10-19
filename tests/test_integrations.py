@@ -293,6 +293,23 @@ class TestChatGPTAPI:
 class TestClaudeAPI:
     """Tests for Claude.ai API structure."""
 
+    @pytest.mark.parametrize("active,expected", [("work","work"), ("personal","personal"), (None,"personal"), ("stale","personal"), ("api","personal")])
+    def test_listing_selects_active_chat_organization(self, monkeypatch, active, expected):
+        from ai_convos import cli
+        cookies = {"sessionKey":"session", **({"lastActiveOrg":active} if active else {})}
+        orgs = [{"uuid":"api","capabilities":["api"]}, {"uuid":"personal","capabilities":["chat"]}, {"uuid":"work","capabilities":["chat","raven"]}]
+        calls = []
+        monkeypatch.setattr(cli, "get_cookies", lambda *_: cookies)
+        def fake(url, actual_cookies, headers):
+            assert actual_cookies == cookies
+            calls.append(url)
+            if url.endswith("/api/organizations"): return orgs
+            assert url == f"https://claude.ai/api/organizations/{expected}/chat_conversations"
+            return [{"uuid":"conversation"}]
+        monkeypatch.setattr(cli, "fetch_json", fake)
+        assert cli.claude_listing("safari") == (cookies, expected, [{"uuid":"conversation"}])
+        assert len(calls) == 2
+
     def test_fetch_claude_rejects_partial_detail_failure(self, monkeypatch):
         from ai_convos import cli
         monkeypatch.setattr(cli, "get_cookies", lambda *_: {"session":"x"})

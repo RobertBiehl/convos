@@ -15,6 +15,12 @@ Supports both web API fetching and export file parsing.
 
 Uses browser cookies to authenticate with Claude.ai's API.
 
+Sync selects the browser's active chat organization (`lastActiveOrg`), falling
+back to the first chat-capable organization. API-only organizations can appear
+first in the organization list and return `403 Permission denied` for chat
+endpoints even with a valid session. Older organization responses without a
+`capabilities` field are treated as chat-capable.
+
 ### Endpoints
 
 **Get organizations:**
@@ -184,6 +190,8 @@ CONVOS_IMPORT_PATHS="~/Downloads/claude-export.json" uv run convos sync
 
 **403 Forbidden:**
 - Cookies expired - log into claude.ai in browser
+- `account_session_invalid` - open claude.ai and sign in again in that browser
+- `Permission denied` with a valid session - verify the selected organization has chat access
 - Headers may need updating if API changes
 - `sync` will try Safari and Chrome
 
