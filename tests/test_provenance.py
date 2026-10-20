@@ -516,7 +516,7 @@ def test_config_migration_is_backed_up_atomic_and_skips_unchanged_rules(tmp_path
     assert core_module.canonicalize_repositories(path)>0
     with duckdb.connect(str(path),read_only=True) as db:
         assert db.execute("SELECT remotes FROM provenance.repositories").fetchone()==('["https://final.example/team/project"]',)
-        assert db.execute("SELECT version FROM core_schema").fetchone()==(17,)
+        assert db.execute("SELECT version FROM core_schema").fetchone()==(core_module.CORE_VERSION,)
     def unexpected(*a,**k): pytest.fail("unchanged rules performed Git inspection or mutation")
     monkeypatch.setattr(core_module,"_git_run",unexpected)
     monkeypatch.setattr(core_module,"_migration_backup",unexpected)
