@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.6b22
+
+- Stop parsing Claude Code `api-request-blob` transcript events as conversation turns. These request-history copies carry the same tool-use and edit ids as the real assistant turn, so each ingest moved those rows between the two messages and signed a new revision every time. On the relay this churn was about two thirds of all stored replicas.
+- Schema 18 backs up the archive, re-points the affected tool calls and edits to their real turns, deletes the blob messages and the history copies the switching left behind, and signs deletions so receivers drop them too.
+- Core line budget 1725 -> 1735 for the one-time cleanup migration.
+
 ## 0.11.6b21
 
 - Take a repository-relative edit path from git's spelling. On a case-insensitive filesystem, one edit written as `.../Zim/...` inside the checkout `.../zim` made `relative_to` raise `ValueError` and aborted `convos sync`. Directory names now take the on-disk spelling; the file name keeps the case it was written with.
