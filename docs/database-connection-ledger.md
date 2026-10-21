@@ -100,6 +100,7 @@ The AST ledger has 79 archive acquisition sites and 22 SQLite constructor sites.
 | A105 | `src/ai_convos/cli.py::_verify_worker` | `archive.verify` | Shared | Full single-column primary-key and variable-width storage scan before a sync cutover or explicit verification | Delays writers for the archive scan | Runs in an isolated process so a storage SIGBUS cannot kill the migration process; reports the active table and column |
 
 | A99 | `src/ai_convos/cli.py::reset_archive_sync` | `sync.cutover` | Exclusive | One-time backed-up archive reset and identity migration | Temporarily blocks archive access during upgrade | Idempotent marker and atomic rollback; local conversations and attachment backup preserved |
+| A109 | `src/ai_convos/cli.py::retire_sync_identity` | `sync.identity.retire` | Exclusive | Backed-up removal of a retired sync identity's local proof metadata when `remote setup` creates a new identity | Temporarily blocks archive access during setup | Runs after the backup in one transaction; refuses, unchanged, when the archive holds rows received from the old identity's other devices |
 
 ## Direct DuckDB constructors
 

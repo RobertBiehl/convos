@@ -11,7 +11,7 @@ from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remot
 
 # Newer Typer vendors Click; command errors must use the active runtime.
 click=getattr(typer,"_click",click)
-app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, Codex, and Muse")
+app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, Codex, and Muse", pretty_exceptions_show_locals=False)
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT,DATA_DIR,DB_PATH,STATE_PATH=(root:=find_root()),(data:=root/"data"),data/"convos.db",data/"sync_state.json"
 HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,12,18,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest()  # conservative web pacing stays below the observed ~200-detail failure point
@@ -799,6 +799,15 @@ def reset_archive_sync_db(db,user,device):
         required(not (introduced:=missing()-before),ValueError(f'Archive relationship validation failed during sync reset: {sorted(introduced,key=str)}'))
         _archive_touch(db,changed)
     return ((issues:=archive_relationships(db)) and typer.echo(f'Sync upgrade preserved pre-existing unresolved relationships: {issues}',err=True),dict(removed=removed,backup=str(backup) if backup else None,unresolved=issues))[-1]
+def retire_sync_identity(path,user,device):
+    # A new identity cannot extend a retired identity's signatures: drop its local proof metadata and re-pin the archive.
+    if not Path(path).is_file(): return None
+    with contextlib.closing(get_db(path=path,purpose='sync.identity.retire')) as db:
+        if not (old:=(init_schema(db,cutover=False),db.execute('SELECT user_id FROM archive_sync WHERE singleton').fetchone())[-1]) or (old:=old[0])==user: return None
+        required(not (received:={table:n for table,column in (('row_origins','author_user_id'),('provenance_origins','author_user_id'),('row_references','author_user_id'),('derived_edits','user_id')) for n, in [db.execute(f'SELECT count(*) FROM remote.{table} WHERE {column}=?',[old]).fetchone()] if n}),ValueError(f'Archive holds rows received from other devices of sync identity {old}: {received}; recover that identity instead; archive unchanged'))
+        backup=_migration_backup(db,f'identity-{old}')
+        with _transaction(db): ([db.execute(f'DELETE FROM remote.{table} WHERE {column} IN (SELECT id FROM remote.row_proofs WHERE author_user_id=?)',[old]) for table,column in (('row_conflicts','proof_id'),('edit_dependencies','proof_id'),('edit_ready','after_proof_id'))],[db.execute(f'DELETE FROM remote.{table} WHERE {column}=?',[old]) for table,column in (('local_row_bases','author'),('row_owners','author'),('row_signers','author_user_id'),('provider_session_aliases','author_user_id'),('file_edit_evidence_proofs','author_user_id'),('semantic_ancestors','author_user_id'),('row_proofs','author_user_id'))],db.execute('UPDATE archive_sync SET user_id=?,device_id=? WHERE singleton',[user,device]))
+        return str(backup) if backup else None
 
 def merge_archive_backup(path,backup,page=500):
     def restore(db,table,rows,columns=None): return (((bodies:=dict(rows)),(proofs:=db.execute("SELECT * FROM remote.row_proofs WHERE id IN (SELECT UNNEST(?))",[list(bodies)]).fetchall()),required(len(proofs)==len(bodies),ValueError("Recovery bodies require stored proofs")),restore_signed_bodies(db,[dict(proof_id=p[0],proof_row=p,body=json.loads(bodies[p[0]])) for p in proofs]))[-1] if table=="remote.row_conflicts" and rows else _insert_pages(db,table,rows,columns,mode=" OR IGNORE"),project_edit_dependencies(db,advanced=[('', '')]))[0]

@@ -9,7 +9,7 @@ import typer
 from ai_convos_redact import protect_all
 _pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases",default=()),[0,0,""],5
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, canonicalize_repositories, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, provider_session_key, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
+from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, canonicalize_repositories, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, provider_session_key, retire_sync_identity, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .projection import PROJECTION_VERSION, PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_stamps, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, local_repack_envelopes, repack_index, project, project_many, read_state, relocate_attachments, reset_history, retained_proof_pages, retry_edit_replicas, retry_own_replicas, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
@@ -376,7 +376,7 @@ def setup_client(url,user,device="computer",recovery=None,root=None):
         controls,sharing=recovered.get("controls",{}),recovered.get("sharing",{})
     else: root_id,keys,workspaces,controls,sharing=identity(user+" root"),{},{},{},{}
     dev,uid=identity(device),root_id["id"]
-    if not recovery: recovery,bundle=recovery_bundle({"root":root_id,"keys":keys,"workspaces":workspaces})
+    if not recovery: recovery,bundle=(retire_sync_identity(core_path(root),uid,dev["id"]),recovery_bundle({"root":root_id,"keys":keys,"workspaces":workspaces}))[1]
     registered=enroll(url,user,root_id,dev,bundle if not workspaces else None)
     cfg={"url":url,"name":user,"user":uid,"token":registered["token"],"root":root_id,"device":dev,"recovery":recovery,"keys":keys,"workspaces":workspaces,"controls":controls,"bindings":{},"sharing":sharing,"server_state":{},"sync_version":2,"relay_generation":registered['generation']}
     save(cfg,root)

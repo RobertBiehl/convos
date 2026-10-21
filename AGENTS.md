@@ -30,7 +30,7 @@ never wire-level row identity.
 Line Budget
 -----------
 
-Stay below the explicit 1735-line core budget (tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). The budget keeps durable schema migrations, canonical evidence classification, and capture snapshots in the cohesive core instead of hiding archive mutation behind an optional product. Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible.
+Stay below the explicit 1745-line core budget (tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). The budget keeps durable schema migrations, canonical evidence classification, and capture snapshots in the cohesive core instead of hiding archive mutation behind an optional product. Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible.
 
 Package boundaries must represent user-installable products, not internal
 modules or a way to evade line budgets. A cohesive product may declare one

@@ -562,6 +562,18 @@ device and recovery key also prevents recovery of the old personal authority,
 although intact rows and original proofs held by teammates remain repairable
 into an explicitly re-founded workspace.
 
+If a device's private keys leak, `rehome` is not enough because it keeps the
+user root. Replace the identity instead. Stop the remote worker, wipe or
+replace the relay, move `~/.convos/remote/` aside (it holds the leaked keys),
+and run `convos remote setup URL NAME` followed by `convos remote sync`. When
+the archive was synchronized under an earlier identity, `setup` first backs it
+up as `convos.db.pre-identity-<old user>.bak`. It then deletes that identity's
+local proof metadata (signatures, ownership claims, retained variants) and pins
+the archive to the new identity, which signs every native row afresh. It
+refuses, leaving the archive unchanged, when the archive holds rows received
+from the old identity's other devices; enroll such a device with `recover`.
+Teammates' rows and proofs are kept.
+
 `state.db` is disposable synchronization metadata. Device `config.json` pins
 the last successfully synchronized DuckDB identity and generation, so deleting
 only `state.db` cannot erase archive rollback detection. If `convos.db` is
