@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.6b24
+
+- `convos remote setup` on an archive synchronized under an earlier identity now retires that identity's local sync metadata. It backs up the archive, deletes the old signatures, ownership claims and retained variants, and pins the archive to the new identity. Before this, the stale signatures made `convos remote audit` report hundreds of thousands of unavailable rows and `convos remote repull` fail. It refuses when the archive holds rows received from the old identity's other devices. `docs/remote.md` describes rotating a leaked identity.
+- CLI tracebacks no longer print local variables. A crashing `convos remote` command printed the loaded config, including private keys and the relay token.
+- Core line budget 1735 -> 1745 for the identity retirement.
+
 ## 0.11.6b23
 
 - Upload an attachment's file before the row that references it, and commit the upload queue before rows go out. A sync interrupted in between (e.g. right after its first row upload) left other devices with attachment rows whose file never arrived, and b22's schema 18 backup then refused to migrate them.
