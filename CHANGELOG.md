@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.6b23
+
+- Upload an attachment's file before the row that references it, and commit the upload queue before rows go out. A sync interrupted in between (e.g. right after its first row upload) left other devices with attachment rows whose file never arrived, and b22's schema 18 backup then refused to migrate them.
+- Migration and `convos backup` list bodies this device does not hold (never arrived, wrong size or hash) under the manifest's new `absent` map instead of refusing; symlinked bodies still refuse. `remote doctor` reports them as `missing_files`, repaired by `convos remote sync --repair` on the capturing device.
+
 ## 0.11.6b22
 
 - Stop parsing Claude Code `api-request-blob` transcript events as conversation turns. These request-history copies carry the same tool-use and edit ids as the real assistant turn, so each ingest moved those rows between the two messages and signed a new revision every time. On the relay this churn was about two thirds of all stored replicas.

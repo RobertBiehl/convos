@@ -1,4 +1,4 @@
-"""Metadata-only attachment history requires no invented file; claimed bytes stay mandatory."""
+"""Metadata-only attachment history requires no invented file; claimed bytes this device lacks are recorded as absent."""
 import json
 import subprocess
 import sys
@@ -53,8 +53,7 @@ def test_repair_restores_metadata_only_history_and_can_back_up_the_result(tmp_pa
     repair.snapshot(Path(result['target']), tmp_path / 'after')
 
 
-@pytest.mark.parametrize('damage', ['missing', 'wrong-hash', 'wrong-size', 'symlink'])
-def test_backup_refuses_unavailable_claimed_bytes_with_actionable_reference(tmp_path, damage):
+def damaged_archive(tmp_path, damage):
     data = b'original bytes'
     body_hash = core.provenance_digest(data)
     path, row, proof = attachment_archive(tmp_path, body_hash, len(data))
@@ -66,10 +65,28 @@ def test_backup_refuses_unavailable_claimed_bytes_with_actionable_reference(tmp_
         target = tmp_path / 'bytes'
         target.write_bytes(data)
         blob.symlink_to(target)
+    return path, proof, blob, body_hash, len(data)
+
+
+@pytest.mark.parametrize('damage', ['missing', 'wrong-hash', 'wrong-size'])
+def test_backup_records_claimed_bytes_this_device_does_not_hold(tmp_path, damage):
+    """A row whose file never arrived (or arrived damaged) is recoverable from its author; the backup must not block migrations on it."""
+    path, proof, blob, body_hash, size = damaged_archive(tmp_path, damage)
+    before = blob.read_bytes() if blob.exists() else None
+    with core.open_db(path, purpose='fixture.absent') as db:
+        backup = core._migration_backup(db, 'absent-blob')
+        assert core._migration_backup(db, 'absent-blob') == backup
+    manifest = json.loads((backup.with_name(backup.name + '.attachments') / 'manifest.json').read_text())
+    assert manifest['absent'] == {'conflict:' + proof[0]: [body_hash, size]} and manifest['references'] == manifest['attachments'] == {}
+    assert (blob.read_bytes() if blob.exists() else None) == before
+
+
+def test_backup_refuses_a_symlinked_body(tmp_path):
+    path, proof, blob, body_hash, size = damaged_archive(tmp_path, 'symlink')
     with core.open_db(path, purpose='fixture.refuse') as db:
         before = db.execute('SELECT * FROM remote.row_conflicts').fetchall()
-        with pytest.raises(ValueError, match='attachment body unavailable for backup') as failure:
-            core._migration_backup(db, 'missing-blob')
+        with pytest.raises(ValueError, match='attachment body is a symlink') as failure:
+            core._migration_backup(db, 'symlink-blob')
         assert proof[0] in str(failure.value) and body_hash in str(failure.value)
         assert db.execute('SELECT * FROM remote.row_conflicts').fetchall() == before
     assert not list(path.parent.glob('*.bak'))

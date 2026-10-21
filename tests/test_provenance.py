@@ -50,10 +50,10 @@ def test_manual_archive_backup_is_checkpointed_validated_and_private(tmp_path,mo
     path,body=tmp_path/"core.db",tmp_path/"body"; body.write_bytes(b"retained"); db=graph(path); db.execute("INSERT INTO conversations(id,source,metadata) VALUES ('kept','codex','{}'); INSERT INTO messages(id,conversation_id,role,metadata) VALUES ('m','kept','user','{}'); INSERT INTO attachments(id,message_id,path,size) VALUES ('a','m',?,8)",[str(body)]); core_module.index_attachment_body(db,"a",body,8); db.close(); monkeypatch.setattr(core_module,"DB_PATH",path); core_module.backup(); saved=next(tmp_path.glob("core.db.pre-manual-*.bak")); bundle=saved.with_name(saved.name+".attachments"); check=duckdb.connect(str(saved),read_only=True)
     assert check.execute("SELECT id FROM conversations").fetchone()[0]=="kept" and saved.stat().st_mode&0o777==0o600 and (bundle/digest(b"retained")).read_bytes()==b"retained" and json.loads((bundle/"manifest.json").read_text())["database_sha256"]==core_module._file_sha256(saved) and str(saved) in capsys.readouterr().out; check.close()
 
-def test_manual_backup_refuses_missing_body_before_publishing_database(tmp_path,monkeypatch):
+def test_manual_backup_records_a_lost_body_as_absent(tmp_path,monkeypatch):
     path,body=tmp_path/"core.db",tmp_path/"body"; body.write_bytes(b"retained"); db=graph(path); db.execute("INSERT INTO conversations(id,source) VALUES ('c','test'); INSERT INTO messages(id,conversation_id,role) VALUES ('m','c','user'); INSERT INTO attachments(id,message_id,path,size) VALUES ('a','m',?,8)",[str(body)]); core_module.index_attachment_body(db,"a",body,8); db.close(); body.unlink(); monkeypatch.setattr(core_module,"DB_PATH",path)
-    with pytest.raises(ValueError,match="attachment body unavailable"): core_module.backup()
-    assert not list(tmp_path.glob("core.db.pre-manual-*.bak"))
+    core_module.backup(); saved=next(p for p in tmp_path.glob("core.db.pre-manual-*.bak") if p.is_file())
+    assert json.loads((saved.with_name(saved.name+".attachments")/"manifest.json").read_text())["absent"]=={"attachment:a":[digest(b"retained"),8]}
 
 def test_manual_backup_does_not_silently_migrate_archive(tmp_path,monkeypatch):
     path=tmp_path/"core.db"; db=graph(path); db.execute("INSERT INTO conversations(id,source) VALUES ('c','test'); UPDATE core_schema SET version=8"); db.close(); monkeypatch.setattr(core_module,"DB_PATH",path); core_module.backup()

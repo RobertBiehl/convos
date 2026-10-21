@@ -237,7 +237,10 @@ Existing core archives migrate automatically. Before schema N first mutates an
 archive, Convos checkpoints and validates a mode-0600
 `<database>.pre-vN.bak`; retained bodies are included by hash under the sibling
 `<database>.pre-vN.bak.attachments/` bundle, and the database filename is
-published only after every required body is verified. Manual `convos backup`
+published only after every held body is verified. A body this device does not
+hold (a received row whose file never arrived, or a file with the wrong size or
+hash) is listed under the manifest's `absent` map instead of blocking the
+migration; a symlinked body still refuses. Manual `convos backup`
 uses the same complete format without silently migrating the live archive. Relay and
 `state.db` remain rebuildable and are not migrated during this clean cutover.
 
