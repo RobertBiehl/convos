@@ -392,7 +392,11 @@ bodies and exact legacy signed-body donors. The donor is never deleted: it can
 still contain a divergent original version or attachments unavailable elsewhere.
 Repull success establishes preservation of the inventoried signed heads, not
 that every conflict has a resolved searchable projection. `retained_bodies` and
-`remote audit` expose that distinction. Existing ambiguous duplicate identities
+`remote audit` expose that distinction. `remote doctor` reports `missing_files`
+for received attachment rows whose file never arrived; the device that captured
+them re-uploads the files with `convos remote sync --repair`. A sync uploads an
+attachment's file before the row that references it, so an interrupted sender
+leaves files without rows, never rows without files. Existing ambiguous duplicate identities
 are not automatically deleted or merged.
 
 Same-user receive identity no longer depends on temporary recovery flags.

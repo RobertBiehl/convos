@@ -612,6 +612,7 @@ def _upload_batches(rows,limit=8*1024*1024,measure=lambda row:row["size"],maximu
     if batch: yield batch
 def upload(cfg,state,root=None,workspaces=None,concurrent=False,server=None):
     active={w["id"] for w in (server or refresh(cfg,root,concurrent))["workspaces"] if workspaces is None or w["id"] in workspaces}
+    upload_blobs(cfg,state,root,active)
     rows=[r for r in state.execute("SELECT * FROM outbox ORDER BY workspace,seq").fetchall() if r["workspace"] in active]
     for batch in _upload_batches(rows):
         prepared,acknowledged=[],[]
@@ -643,7 +644,6 @@ def upload(cfg,state,root=None,workspaces=None,concurrent=False,server=None):
         state.commit()
         for row,env,path,ack in delivered: path.unlink(missing_ok=True)
     upload_replicas(cfg,state,root,active)
-    upload_blobs(cfg,state,root,active)
 def reconcile_replicas(cfg,state,root,ws,envelopes,semantic=False):
     stage_replicas(root,envelopes,semantic)
     upload_replicas(cfg,state,root,{ws})
@@ -1036,6 +1036,7 @@ def sync_once(root=None,repair=False,manual=False):
                     keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}
                     upload_blocked=[]
                     inventory=lambda ids:replica_inventory(cfg,state,ws,ids) if verify else {rid for rid,epoch in local_receipts(state,"replica",ws,ids)}
+                    (reconcile_blobs(cfg,state,root,ws,blob_replicas(path,cfg,ws,records,keys,(),origins,bindings,repair)),state.commit(),upload_blobs(cfg,state,root,{ws}))
                     prepared=[pair for i in range(0,max(len(records),1),REPLICA_DB_PAGE) for envelopes in [(row_replicas(path,cfg,ws,records[i:i+REPLICA_DB_PAGE],keys,(),origins,bindings,inventory,False,upload_blocked),_progress(f"preparing rows {min(i+REPLICA_DB_PAGE,len(records))}/{len(records)}"))[0]] for pair in prepare_replicas(root,envelopes)]+[pair for page in (retained_proof_pages(path,ws,origins,cfg["user"],REPLICA_DB_PAGE) if retained else ()) for envelopes in [(row_replicas(path,cfg,ws,[],keys,(),origins,bindings,inventory,page,upload_blocked),_progress("preparing retained rows"))[0]] for pair in prepare_replicas(root,envelopes)]
                     try:
                         with local_lock(root,"mutation",True):
@@ -1055,7 +1056,6 @@ def sync_once(root=None,repair=False,manual=False):
                     upload_replicas(cfg,state,root,{ws},{final for tmp,final in prepared} if full else ())
                     state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_upload_blocked:{ws}",json.dumps(sorted(set(upload_blocked))))) if upload_blocked else state.execute("DELETE FROM meta WHERE key=?",(f"replica_upload_blocked:{ws}",))
                     if upload_blocked: typer.echo(f"Remote upload skipped {len(set(upload_blocked))} received row(s) whose local projection does not match the author's proof; run `convos remote repull` to restore them.",err=True)
-                    reconcile_blobs(cfg,state,root,ws,blob_replicas(path,cfg,ws,records,keys,(),origins,bindings,repair))
             for ws,meta in cfg["workspaces"].items():
                 if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]:
                     repair=bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone())
@@ -1399,8 +1399,8 @@ def watch(interval:int=typer.Option(2,"--interval")):
 def enable_cmd(remove:bool=typer.Option(False,"--remove")): typer.echo((remove or install_hooks(False,False),enable(paths()[0],remove))[-1])
 def recovery_notice(root=None):
     if not core_path(root).is_file(): return ""
-    with _core(root,True,purpose="remote.status.retained") as db: count=db.execute("SELECT count(*) FROM remote.row_conflicts").fetchone()[0]
-    return f"; retained_bodies={count} (run `convos remote audit` for unresolved projections)" if count else ""
+    with _core(root,True,purpose="remote.status.retained") as db: retained,missing=db.execute("SELECT (SELECT count(*) FROM remote.row_conflicts),(SELECT count(*) FROM attachment_bodies b JOIN attachments a ON a.id=b.attachment_id WHERE a.path IS NULL)").fetchone()
+    return (f"; retained_bodies={retained} (run `convos remote audit` for unresolved projections)" if retained else "")+(f"; missing_files={missing} (rows whose file never arrived; run `convos remote sync --repair` on the device that captured them)" if missing else "")
 def doctor_status():
     try:
         cfg=load()

@@ -38,6 +38,11 @@ questions do not become invariants by implication.
 > validates a private `<database>.pre-vN.bak`. A failed upgrade must leave a
 > usable original or recovery copy.
 
+> A sync interrupted at any point leaves every archive usable and upgradable.
+> Senders publish an attachment's file before its row; a received row may lack
+> its file only until its author repairs, and that absence never blocks a
+> migration.
+
 > A physical archive migration and relay compatibility are two halves of one
 > upgrade. Retained signed logical encodings remain readable at ingestion;
 > purely physical-ID changes repair already projected rows without changing relay

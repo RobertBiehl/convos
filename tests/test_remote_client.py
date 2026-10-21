@@ -1357,6 +1357,37 @@ def test_replication_boundary_crash_matrix_converges_after_restart(tmp_path,monk
     assert fired[0] and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==(1 if kind=="row" else 3) and server.execute("SELECT COUNT(*) FROM blob_replicas").fetchone()[0]==(kind=="blob")
 
 
+@pytest.mark.parametrize("repair",[False,True])
+def test_sender_aborted_at_any_relay_request_never_leaves_rows_without_files(tmp_path,monkeypatch,repair):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); setup_client("http://server","alice","desktop",recovery,root=b)
+    db=duckdb.connect(str((a/"data").mkdir() or a/"data/convos.db")); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','abort sweep','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); db.execute("INSERT INTO messages VALUES ('m','c','user','attached',NULL,'2026-01-01',NULL,'{}',NULL,NULL)")
+    (source:=tmp_path/"attachment.bin").write_bytes(b"file before row"); db.execute("INSERT INTO attachments VALUES ('a','m','attachment.bin','application/octet-stream',?,?,NULL,'2026-01-01')",(source.stat().st_size,str(source))); index_attachment_body(db,"a",source,source.stat().st_size); db.close()
+    def after(limit,calls=[0]):
+        def call(cfg,body,auth=True):
+            result=direct(cfg,body,auth)
+            if cfg["device"]["id"]==alice["device"]["id"] and (calls.__setitem__(0,calls[0]+1) or calls[0]>=limit): raise ConnectionError("sender aborted")
+            return result
+        calls[0]=0; return call
+    for limit in range(1,200):
+        monkeypatch.setattr("ai_convos_remote.request",after(limit))
+        try: sync_once(a,repair); done=True
+        except ConnectionError: done=False
+        monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(b,True)
+        with duckdb.connect(str(b/"data/convos.db"),read_only=True) as got: assert got.execute("SELECT COUNT(*) FROM attachment_bodies x JOIN attachments y ON y.id=x.attachment_id WHERE y.path IS NULL").fetchone()[0]==0,f"abort after relay request {limit}"
+        if done: break
+    with duckdb.connect(str(b/"data/convos.db"),read_only=True) as got: assert done and Path(got.execute("SELECT path FROM attachments").fetchone()[0]).read_bytes()==b"file before row"
+def test_sender_without_its_own_file_publishes_no_row_for_it(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice",root=a); setup_client("http://server","alice","desktop",recovery,root=b)
+    db=duckdb.connect(str((a/"data").mkdir() or a/"data/convos.db")); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','lost file','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); db.execute("INSERT INTO messages VALUES ('m','c','user','attached',NULL,'2026-01-01',NULL,'{}',NULL,NULL)")
+    (source:=tmp_path/"attachment.bin").write_bytes(b"deleted after capture"); db.execute("INSERT INTO attachments VALUES ('a','m','attachment.bin','application/octet-stream',?,?,NULL,'2026-01-01')",(source.stat().st_size,str(source))); index_attachment_body(db,"a",source,source.stat().st_size); db.close(); source.unlink()
+    with pytest.raises(ValueError,match="attachment body"): sync_once(a,True)
+    sync_once(b,True)
+    with duckdb.connect(str(b/"data/convos.db"),read_only=True) as got: assert got.execute("SELECT COUNT(*) FROM attachments").fetchone()[0]==0
+def test_doctor_counts_received_rows_whose_file_never_arrived(tmp_path,monkeypatch):
+    monkeypatch.setattr("ai_convos_remote.request",transport(server_connect(tmp_path/"server.db"))); monkeypatch.setattr(remote_client,"health",lambda cfg:{"ok":True}); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(root:=tmp_path/"client")); setup_client("http://server","alice",root=root)
+    db=duckdb.connect(str((root/"data").mkdir() or root/"data/convos.db")); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','holes','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}'); INSERT INTO messages VALUES ('m','c','user','attached',NULL,'2026-01-01',NULL,'{}',NULL,NULL)")
+    db.executemany("INSERT INTO attachments(id,message_id,size) VALUES (?,'m',4)",[["x"],["y"]]); db.executemany("INSERT INTO attachment_bodies VALUES (?,?,4)",[["x","0"*64],["y","1"*64]]); db.close()
+    assert "missing_files=2" in (status:=doctor_status()) and "convos remote sync --repair" in status
 def test_keyboard_interrupt_releases_sync_lease_and_retry_converges(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db")
     direct=transport(server)
