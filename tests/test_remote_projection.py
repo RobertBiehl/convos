@@ -686,3 +686,27 @@ def test_completed_remote_attachment_is_rescued_into_archive_storage(tmp_path):
     db_path=tmp_path/"data/convos.db"; db_path.parent.mkdir(); db=duckdb.connect(str(db_path)); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','attachment','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); db.execute("INSERT INTO messages VALUES ('m','c','user','file',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); old=tmp_path/"remote/attachments/w/blob"; old.parent.mkdir(parents=True); old.write_bytes(b"canonical"); db.execute("INSERT INTO attachments (id,message_id,filename,size,path) VALUES ('a','m','a.bin',?,?)",(old.stat().st_size,str(old))); db.close()
     assert relocate_attachments(db_path,tmp_path/"remote/attachments")==1 and not old.exists() and relocate_attachments(db_path,tmp_path/"remote/attachments")==0
     db=duckdb.connect(str(db_path),read_only=True); path=Path(db.execute("SELECT path FROM attachments WHERE id='a'").fetchone()[0]); db.close(); assert path.parent==tmp_path/"data/attachments" and path.read_bytes()==b"canonical" and os.stat(path).st_mode&0o777==0o600
+
+
+def test_team_root_survives_personal_revert(tmp_path):
+    repo,core=source(tmp_path)
+    core.close()
+    root,device=identity("root"),identity("device")
+    user=public_id(root["sign_public"])
+    entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":certificate(root,user,device),"history":True}
+    control=lambda ws:{"workspace":ws,"revision":1,"epoch":1,"devices":{device["id"]:entry}}
+    cfg=lambda ws:{"user":user,"device":device,"workspaces":{ws:{"kind":"team","epoch":1}},"controls":{ws:control(ws)},"server_state":{"workspaces":[{"id":ws,"controls":[control(ws)]}]}}
+    def records(title,n):
+        with duckdb.connect(str(tmp_path/"source.db")) as db: db.execute("UPDATE conversations SET title=?",[title])
+        with duckdb.connect(str(tmp_path/"source.db"),read_only=True) as core,connect(tmp_path/f"state{n}.db") as state: return scan(core,state)
+    first=records("A",0)
+    assert attest_rows(tmp_path/"source.db",cfg("personal"),"personal",first)==attest_rows(tmp_path/"source.db",cfg("team"),"team",first)==len(first)
+    for n,title in enumerate("BA",1): assert attest_rows(tmp_path/"source.db",cfg("personal"),"personal",records(title,n))==1
+    current=records("A",3)
+    bodies=[open_replica(env,bytes(32)) for env in row_replicas(tmp_path/"source.db",cfg("team"),"team",current,{1:bytes(32)})]
+    assert attest_rows(tmp_path/"source.db",cfg("team"),"team",current)==0
+    assert [b["proof"]["previous_revision"] for b in bodies if b["row"]["kind"]=="conversations"]==[None]
+    personal=[open_replica(env,bytes(32)) for env in row_replicas(tmp_path/"source.db",cfg("personal"),"personal",current,{1:bytes(32)})]
+    apply_row_replicas(tmp_path/"target.db",personal,"personal",[control("personal")],local_user=user)
+    apply_row_replicas(tmp_path/"target.db",bodies,"team",[control("team")],local_user=user)
+    with duckdb.connect(str(tmp_path/"target.db"),read_only=True) as db: assert db.execute("SELECT title FROM conversations").fetchall()==[("A",)] and db.execute("SELECT COUNT(*) FROM remote.row_proofs WHERE workspace_id='team' AND row_kind='conversations'").fetchone()==(1,)
