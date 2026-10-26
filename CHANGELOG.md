@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.6b25
+
+- Decide a row's current proof within one workspace. A revision id does not include its workspace, so a root revision held by both Personal and a team workspace counted as superseded in the team as soon as Personal moved past it. A row whose content returned to that root (A, B, A) then had no team proof, and every team sync failed with `current row proof unavailable`; `attest_rows`, `row_replicas`, `blob_replicas` and the retained-proof pages now only count a newer proof from the same workspace. No data repair: the existing team proof becomes current again.
+
 ## 0.11.6b24
 
 - `convos remote setup` on an archive synchronized under an earlier identity now retires that identity's local sync metadata. It backs up the archive, deletes the old signatures, ownership claims and retained variants, and pins the archive to the new identity. Before this, the stale signatures made `convos remote audit` report hundreds of thousands of unavailable rows and `convos remote repull` fail. It refuses when the archive holds rows received from the old identity's other devices. `docs/remote.md` describes rotating a leaked identity.

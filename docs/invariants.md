@@ -112,7 +112,9 @@ they do not depend on relay or `state.db` history.
 > A row lineage keeps one immutable origin workspace. Every revision separately
 > names the workspace and epoch that authorized its signer; after explicit
 > re-founding, a valid successor may retain the old origin and predecessor while
-> using the fresh workspace as its authorization context.
+> using the fresh workspace as its authorization context. A revision id does
+> not name its workspace, so one revision can exist in several workspaces; a
+> proof is superseded only by a descendant in its own workspace.
 
 > A retained current-row replica carries the exact signed proof-header chain
 > back to its root, but no superseded row bodies. Receivers verify every
