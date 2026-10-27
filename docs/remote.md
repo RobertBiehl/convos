@@ -400,18 +400,21 @@ leaves files without rows, never rows without files. Existing ambiguous duplicat
 are not automatically deleted or merged.
 
 A received row the receiver cannot reconcile is parked, not refused with the
-whole batch: the row is not projected, `remote.parked_rows` records its proof
-id and reason, and the cursor moves on. `remote doctor` reports `parked_rows`
-with a count per reason. Two kinds: a same-author inconsistency (`Derived edit
-claimed twice`) keeps the author's signed proof and body, and the author's next
-revision of that row supersedes it; an ownership refusal (`Derived edit
-ownership conflict`, `Source device ownership conflict`, `archive ownership
-conflict`) stores nothing of that row and makes `convos remote sync` exit
-non-zero until it is resolved. A parked row authored by the local user is
-retried on every sync; `remote repull` retries every parked row. A received message revision
-that lists an edit as `unknown/unclassified_input` while the same author's tool
-call already holds it classified is projected without that claim; `remote
-audit` shows it as a projection mismatch until the author's next revision.
+whole batch: nothing of the row is stored, `remote.parked_rows` records its
+proof id, kind, source id, author and reason, and the cursor moves on. The
+reasons are ownership refusals (`Derived edit ownership conflict`, `Source
+device ownership conflict`, `archive ownership conflict`). While one exists,
+`remote doctor` reports `parked_rows` with a count per reason and exits
+non-zero, `remote sync` exits non-zero after syncing, and `remote watch`
+records the failure in `last_error`. `remote repull` clears the parked rows,
+re-receives them and parks again whatever still conflicts; the archive-side
+cause (a native row or edit with the same identity) is the operator's to
+resolve. A received message revision that lists an edit as
+`unknown/unclassified_input` while the same author's tool call already holds
+it classified is projected without that claim, and two parents of one author
+that classify the same edit in one batch bind it to the current holder, else
+to the greatest proof id; `remote audit` shows the other parent as a
+projection mismatch with its body retained until the author's next revision.
 
 Same-user receive identity no longer depends on temporary recovery flags.
 Existing native rows and received bindings are reused. Native differences are
