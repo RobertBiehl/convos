@@ -629,8 +629,8 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
         while True:
             try:
                 with _transaction(db):
-                    items=[values[i] for i in indexes if (pid:=digest(values[i][1])) not in parked or parked[pid][1]]
-                    claim_row_owners(db,[(row,p) for row,p,signer_,lineage in items if digest(p) not in parked])
+                    items=[values[i] for i in indexes if digest(values[i][1]) not in parked]
+                    claim_row_owners(db,[(row,p) for row,p,signer_,lineage in items])
                     work,advanced=(retry,[]) if isinstance(retry,list) else _edit_retry_work(db) if retry else ([],[])
                     columns=("workspace","kind","row_id","author","revision")
                     temp_rows(db,"incoming",columns,[tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id","revision")) for row,p,signer_,lineage in items])
@@ -682,17 +682,15 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
                                 retired.append((*scope,revision))
                                 revision=chains[scope][revision][2]["previous_revision"]
                         retire_row_bodies(db,retired)
-                        temp_rows(db,"resolved",("kind","row_id","author"),resolved)
-                        db.execute("DELETE FROM remote.parked_rows x USING resolved r WHERE (x.row_kind,x.source_row_id,x.author_user_id)=(r.kind,r.row_id,r.author)")
-                    _insert_pages(db,"remote.parked_rows",[(pid,p["row_kind"],p["row_id"],p["author_user_id"],parked[pid][0]) for pid,p in [(digest(p),p) for row,p,*rest in [values[i] for i in indexes]]+[(pid,p) for nodes in chains.values() for pid,row,p in nodes.values()] if pid in parked],mode=" OR REPLACE")
+                    _insert_pages(db,"remote.parked_rows",[(pid,p["row_kind"],p["row_id"],p["author_user_id"],parked[pid]) for pid,p in [(digest(p),p) for row,p,*rest in [values[i] for i in indexes]]+[(pid,p) for nodes in chains.values() for pid,row,p in nodes.values()] if pid in parked],mode=" OR REPLACE")
                     dependency=lambda kind,entity,author:digest([kind,author if kind=='file_edits' else None,entity])
                     waiting=[(dependency(kind,entity,p['author_user_id']),pid) for row,p,pid,native in projected if pid in pending and row['kind']=='edit.observed' for kind,entity in (('file_edits',row['id']),('file.observed',row['data']['file']))]
                     again=project_edit_dependencies(db,waiting,[dependency(kind,entity,p['author_user_id']) for row,p,pid,native in projected if pid not in pending for kind,entity in ([(row['kind'],row['id'])] if row['kind'] in ('file_edits','file.observed') else [('file_edits',e['id']) for e in (row['data'] or {}).get('edits',[])])],[pid for pid,key in work]+[digest(p) for row,p,signer_,lineage in items if row['kind']=='edit.observed'],advanced)
                 break
             except ValueError as e:
-                if not (hit:=getattr(e,"parked",None)) or set(hit[0])<=set(parked): raise
-                parked.update({pid:(reason,hit[1]) for pid,reason in hit[0].items()})
-        results=[(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("row_kind","row_id","author_user_id")))==p["revision"] for row,p,signer_,lineage in [values[i] for i in indexes]]
+                if not (hit:=getattr(e,"parked",None)) or set(hit)<=set(parked): raise
+                parked.update(hit)
+        results=[(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("row_kind","row_id","author_user_id")))==p["revision"] and digest(p) not in parked for row,p,signer_,lineage in [values[i] for i in indexes]]
         accepted=semantic|dict(zip(indexes,results))
         result=len(work) if retry else [accepted[i] for i in range(len(values))]
     finally:
