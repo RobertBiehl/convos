@@ -54,14 +54,16 @@ def test_turn_major_parts_keep_a_turn_and_its_evidence_together():
     tool=lambda tid,mid:dict(id=tid,message_id=mid,tool_name="apply_patch",input="{}",output="{}",status="complete",duration_ms=None,created_at=None)
     edit=lambda eid,mid:dict(id=eid,message_id=mid,file_path=f"{eid}.py",edit_type="write",content="x",created_at=None,old_content=None)
     evidence=lambda eid,tid:dict(file_edit_id=eid,status="confirmed",reason="tool_success",tool_call_id=tid)
-    small,big=[(f"t{i}",f"m{i}",f"e{i}") for i in range(40)],[(f"b{j}","m39",f"x{j}") for j in range(30)]
-    r=cli.ParseResult(convs=[dict(id="c",source="codex",title="t",created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")],msgs=[msg(i) for i in reversed(range(40))],tools=[tool(t,m) for t,m,e in small+big],attachs=[dict(id=f"a{i}",message_id=f"m{i}",filename="f",mime_type="text/plain",size=1,path=None,url=None,created_at=None) for i in range(40)],artifacts=[dict(id="art",conversation_id="c",artifact_type="code",title="t",content="x",language=None,created_at=None,version=1)],edits=[edit(e,m) for t,m,e in small+big],edit_evidence=[evidence(e,t) for t,m,e in small+big])
-    parts=cli.ingest_parts(copy.deepcopy(r),size=20)
-    at={(k,v.get("id",v.get("file_edit_id"))):i for i,p in enumerate(parts) for k in KINDS for v in getattr(p,k)}
-    assert sum(len(getattr(p,k)) for p in parts for k in KINDS)==len(at)==1+40+70+40+1+70+70 and len(parts)>=13
-    assert all(sum(len(getattr(p,k)) for k in KINDS)<=20 for p in parts) and at[("convs","c")]==at[("artifacts","art")]==0
-    assert all(at[("tools",t)]==at[("edits",e)]==at[("edit_evidence",e)]>=at[("msgs",m)] for t,m,e in small+big) and all(at[("attachs",f"a{i}")]>=at[("msgs",f"m{i}")] for i in range(40))
-    assert all(at[("tools",t)]==at[("attachs",f"a{i}")]==at[("msgs",m)] for i,(t,m,e) in enumerate(small[:39])) and len({at[("tools",t)] for t,m,e in big})>1
+    small,big=[(f"t{i}",f"m{i}",f"e{i}",f"m{i}") for i in range(40)],[(f"b{j}","m39",f"x{j}","m39") for j in range(30)]
+    late,giant=[("tl","m3","el","m30")],[("tg","m10",f"g{j}","m10") for j in range(25)]  # an edit attributed to a later message than its tool call; one tool call larger than a part
+    units=small+big+late+giant
+    r=cli.ParseResult(convs=[dict(id="c",source="codex",title="t",created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")],msgs=[msg(i) for i in reversed(range(40))],tools=[tool(t,m) for t,m,e,em in small+big+late+giant[:1]],attachs=[dict(id=f"a{i}",message_id=f"m{i}",filename="f",mime_type="text/plain",size=1,path=None,url=None,created_at=None) for i in range(40)],artifacts=[dict(id="art",conversation_id="c",artifact_type="code",title="t",content="x",language=None,created_at=None,version=1)],edits=[edit(e,em) for t,m,e,em in units],edit_evidence=[evidence(e,t) for t,m,e,em in units])
+    total,parts=sum(len(getattr(r,k)) for k in KINDS),cli.ingest_parts(copy.deepcopy(r),size=20)
+    at,sizes={(k,v.get("id",v.get("file_edit_id"))):i for i,p in enumerate(parts) for k in KINDS for v in getattr(p,k)},[sum(len(getattr(p,k)) for k in KINDS) for p in parts]
+    assert sum(sizes)==len(at)==total and len(parts)>=16 and at[("convs","c")]==at[("artifacts","art")]==0
+    assert sorted(sizes)[-1]==1+25+25 and all(s<=20 for s in sizes if s!=51)  # the giant unit commits whole in a part of its own; every other part respects the size
+    assert all(at[("tools",t)]==at[("edits",e)]==at[("edit_evidence",e)]>=max(at[("msgs",m)],at[("msgs",em)]) for t,m,e,em in units) and all(at[("attachs",f"a{i}")]>=at[("msgs",f"m{i}")] for i in range(40))
+    assert all(at[("tools",t)]==at[("attachs",f"a{i}")]==at[("msgs",m)] for i,(t,m,e,em) in enumerate(small[:39]) if i!=10) and len({at[("tools",t)] for t,m,e,em in big})>1
     assert all(at[("msgs",f"m{i}")]<=at[("msgs",f"m{i+1}")] for i in range(39)) and all(p.scopes is not None and p.edit_scopes is not None for p in parts)
 
 def test_signer_between_parts_mints_nothing_until_the_last_part_commits(tmp_path,monkeypatch):
@@ -121,6 +123,29 @@ def test_crash_at_any_part_boundary_restarts_to_the_uninterrupted_result(tmp_pat
             with cli._core(purpose="test.alive") as db: db.execute("UPDATE open_ingests SET pid=?",[os.getpid()])
         monkeypatch.setattr(cli,"archive_yield",real); cli.commit_result(copy.deepcopy(second),"test.restart"); sign()
         assert markers()==0 and (tables(),proofs())==reference
+
+def test_sync_scans_with_the_generation_it_records(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db")
+    monkeypatch.setattr(remote_client,"request",lambda cfg,body,auth=True:action(server,body,cfg.get("token") if auth else None)); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
+    root=tmp_path/"laptop"; a,_=setup_client("http://server","alice",device="laptop",root=root)
+    try:
+        path=root/"data/convos.db"; fresh_archive(monkeypatch,path)
+        cli.commit_result(parsed(session(tmp_path/"projects/-tmp-x/first.jsonl",3)),"test.first"); sync_once(root,manual=True)
+        ws=next(iter(remote_client.load(root)["workspaces"])); watermark=lambda:int(P.connect(root/"remote/state.db").execute("SELECT value FROM meta WHERE key=?",(f"core_generation:{ws}",)).fetchone()[0])
+        second=parsed(session(tmp_path/"projects/-tmp-x/second.jsonl",50)); monkeypatch.setattr(cli,"ingest_parts",functools.partial(cli.ingest_parts,size=100))
+        real=cli.archive_yield; monkeypatch.setattr(cli,"archive_yield",lambda path=None:(_ for _ in ()).throw(RuntimeError("crash")))
+        rows=lambda:set(query("SELECT 'messages',id FROM messages UNION ALL SELECT 'tool_calls',id FROM tool_calls")); start,before=generation(),rows()
+        with pytest.raises(RuntimeError,match="crash"): cli.commit_result(copy.deepcopy(second),"test.again")
+        monkeypatch.setattr(cli,"archive_yield",real); part1=[e for k,e in rows()-before]
+        signed=lambda:query("SELECT count(DISTINCT source_row_id) FROM remote.row_proofs WHERE source_row_id IN (SELECT UNNEST(?))",[part1])[0][0]
+        assert query("SELECT pid,generation FROM open_ingests")==[(os.getpid(),start)] and 0<len(part1)<len(second.msgs)+len(second.tools) and signed()==0
+        # The marker's process looks dead to the first liveness check of this sync and alive to every later one: the one clamp decides, and the scan and the recorded watermark agree with it.
+        calls=[0]; monkeypatch.setattr(P,"_alive",lambda pid:(calls.__setitem__(0,calls[0]+1),calls[0]>1)[1])
+        sync_once(root,manual=True)
+        assert calls[0]>=1 and watermark()==generation() and signed()==len(part1)
+        monkeypatch.setattr(P,"_alive",lambda pid:True); cli.commit_result(copy.deepcopy(second),"test.restart"); sync_once(root,manual=True)
+        assert markers()==0 and watermark()==generation() and signed()==len(part1) and set(mismatches(path,a["user"]).values())=={0}
+    finally: server.close()
 
 def test_legacy_torn_head_converges_on_producer_and_receiver(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db")

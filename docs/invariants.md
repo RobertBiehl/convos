@@ -270,9 +270,10 @@ they do not depend on relay or `state.db` history.
 
 > The signer never reads inside an open multi-part write. The writer keeps an
 > open-ingest marker (start generation, process, heartbeat) that commits with
-> the first part and clears with the last; a scan attests nothing changed after
-> the oldest live marker's start generation. A marker without a live process or
-> a fresh heartbeat counts as closed, so the worst case is today's behaviour.
+> the first part and clears with the last; a sync clamps its watermark once to
+> the oldest live marker's start generation, scans with exactly that generation
+> and records exactly that generation. A marker without a live process or a
+> fresh heartbeat counts as closed, so the worst case is today's behaviour.
 
 > The owning device re-signs its own rows whose current content differs from
 > its latest proof: a write that moves a row away from its signed head marks it
