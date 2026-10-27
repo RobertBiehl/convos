@@ -114,8 +114,13 @@ def test_two_devices_with_same_native_session_choose_one_exact_owner(tmp_path,mo
     try:
         sync_once(roots[0],manual=True)
         if conflict:
-            with pytest.raises(ValueError,match='ownership conflict'): sync_once(roots[1],manual=True)
-            with duckdb.connect(str(roots[1]/'data/convos.db'),read_only=True) as db: assert db.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==('second',)
+            sync_once(roots[1],manual=True)
+            with duckdb.connect(str(roots[1]/'data/convos.db'),read_only=True) as db:
+                assert db.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==('second',)
+                assert db.execute("SELECT reason FROM remote.parked_rows").fetchall()==[('archive ownership conflict: conversations:c',)]
+                assert db.execute("SELECT author_device_id FROM remote.row_proofs WHERE source_row_id='c'").fetchall()==[(second['device']['id'],)]
+            sync_once(roots[0],manual=True)
+            with duckdb.connect(str(roots[0]/'data/convos.db'),read_only=True) as db: assert db.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==('first',) and not db.execute("SELECT 1 FROM remote.parked_rows").fetchone()
         else:
             sync_once(roots[1],manual=True)
             sync_once(roots[0],manual=True)

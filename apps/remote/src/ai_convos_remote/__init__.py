@@ -1360,6 +1360,7 @@ def sync_cmd(repair:bool=False):
     except ConnectionError as e: cli_error(f"{e}. Local sync progress was preserved; retry `convos remote sync`.")
     except (ValueError,RuntimeError,duckdb.InterruptException) as e: cli_error(e)
     typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else "")+recovery_notice())
+    if blocked:={reason:n for reason,n in parked_rows().items() if "ownership" in reason}: cli_error(f"{sum(blocked.values())} received row(s) parked for an ownership conflict were not applied: "+", ".join(f"{reason}: {n}" for reason,n in blocked.items()))
 @remote.command("repull")
 def repull_cmd(from_backup:Path|None=None):
     try: removed,audit=repull_once(from_backup=from_backup)
@@ -1397,10 +1398,13 @@ def watch(interval:int=typer.Option(2,"--interval")):
         time.sleep(delay)
 @remote.command("enable")
 def enable_cmd(remove:bool=typer.Option(False,"--remove")): typer.echo((remove or install_hooks(False,False),enable(paths()[0],remove))[-1])
+def parked_rows(root=None):
+    if not core_path(root).is_file(): return {}
+    with _core(root,True,purpose="remote.status.parked") as db: return dict(db.execute("SELECT reason,count(*) FROM remote.parked_rows GROUP BY reason ORDER BY reason").fetchall()) if db.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='remote' AND table_name='parked_rows'").fetchone() else {}
 def recovery_notice(root=None):
     if not core_path(root).is_file(): return ""
     with _core(root,True,purpose="remote.status.retained") as db: retained,missing=db.execute("SELECT (SELECT count(*) FROM remote.row_conflicts),(SELECT count(*) FROM attachment_bodies b JOIN attachments a ON a.id=b.attachment_id WHERE a.path IS NULL)").fetchone()
-    return (f"; retained_bodies={retained} (run `convos remote audit` for unresolved projections)" if retained else "")+(f"; missing_files={missing} (rows whose file never arrived; run `convos remote sync --repair` on the device that captured them)" if missing else "")
+    return (f"; retained_bodies={retained} (run `convos remote audit` for unresolved projections)" if retained else "")+(f"; missing_files={missing} (rows whose file never arrived; run `convos remote sync --repair` on the device that captured them)" if missing else "")+(f"; parked_rows={sum(parked.values())} ({', '.join(f'{reason}: {n}' for reason,n in parked.items())}), received rows not projected, see docs/remote.md" if (parked:=parked_rows(root)) else "")
 def doctor_status():
     try:
         cfg=load()
