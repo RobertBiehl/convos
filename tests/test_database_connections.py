@@ -208,23 +208,40 @@ def test_remote_signing_and_attachment_io_run_without_archive_lock(tmp_path,monk
     monkeypatch.setattr(projection,"file_hash",hashed)
     assert projection.relocate_attachments(path,legacy)==1
 
-def test_remote_full_scan_releases_the_archive_between_bounded_pages(tmp_path):
+def waiting_writer(path,code="pass"):
+    child=subprocess.Popen([sys.executable,"-c",f"import sys; from ai_convos import cli\nwith cli.open_db(sys.argv[1],purpose='waiting writer') as db: {code}",str(path)],stdout=subprocess.PIPE,text=True); directory=path.with_name(".convos.db.waiters")
+    for _ in range(500):
+        if list(directory.glob("*.lock")): return child
+        time.sleep(.01)
+    raise AssertionError("writer never registered a waiter notice")
+
+def test_remote_full_scan_keeps_one_connection_until_a_writer_waits(tmp_path,monkeypatch):
     from ai_convos_remote import projection
-    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[(str(i),) for i in range(3)]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); stages=[]
+    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[(str(i),) for i in range(3)]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); opened,stages,children=[],[],[]
+    monkeypatch.setattr(projection,"open_db",lambda *args,**kwargs:opened.append(kwargs["purpose"]) or cli.open_db(*args,**kwargs))
+    records=projection.scan_archive(path,state,generation=generation,progress=stages.append,page=1)
+    assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages[0]=="scanning archive 1" and stages[-1]=="scanning archive 3" and opened==["remote.scan.page"]
     def progress(stage):
-        with cli.open_db(path,wait=0,purpose="concurrent page probe"): pass
-        stages.append(stage)
-    records=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); state.close()
-    assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages[0]=="scanning archive 1" and stages[-1]=="scanning archive 3" and len(stages)>=2
+        if not children: children.append(waiting_writer(path))
+        else: assert children[0].wait(5)==0,"the waiting writer did not get the archive at the next page boundary"
+    assert len(projection.scan_archive(path,state,generation=generation,progress=progress,page=1))==3 and opened==["remote.scan.page"]*3 and children[0].wait(5)==0; state.close()
 
 def test_remote_scan_defers_changes_after_its_watermark(tmp_path):
     from ai_convos_remote import projection
-    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[("c",),("d",)]); cli._archive_touch(db,[("conversations","c"),("conversations","d")]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); changed=[]
+    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[("c",),("d",)]); cli._archive_touch(db,[("conversations","c"),("conversations","d")]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); children=[]
     def progress(stage):
-        if not changed:
-            with cli.open_db(path,purpose="concurrent archive change") as db: db.execute("UPDATE conversations SET title='later' WHERE id='d'"); cli._archive_touch(db,[("conversations","d")]); changed.append(cli.archive_state(db)[1])
-    first=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); second=projection.scan_archive(path,state,generation=changed[0],page=1,since=generation); state.close()
+        if not children: children.append(waiting_writer(path,"db.execute(\"UPDATE conversations SET title='later' WHERE id='d'\"); cli._archive_touch(db,[('conversations','d')]); print(cli.archive_state(db)[1])"))
+    first=projection.scan_archive(path,state,generation=generation,progress=progress,page=1); changed=int(children[0].communicate(timeout=5)[0]); second=projection.scan_archive(path,state,generation=changed,page=1,since=generation); state.close()
     assert [r["payload"]["row"][0] for r in first]==["c"] and [(r["payload"]["row"][0],r["payload"]["row"][2]) for r in second]==[("d","later")]
+
+def test_remote_scan_pages_do_not_shrink_under_a_fixed_page_cost(tmp_path,monkeypatch):
+    import itertools, types
+    from ai_convos_remote import projection
+    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[(f"{i:05}",) for i in range(6000)]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); stages=[]
+    monkeypatch.setattr(projection,"time",types.SimpleNamespace(monotonic=itertools.count(step=1.).__next__,time=time.time))
+    assert len(projection.scan_archive(path,state,generation=generation,progress=stages.append))==6000; state.close()
+    done=[int(stage.split()[-1]) for stage in stages if stage.startswith("scanning archive ")]
+    assert [b-a for a,b in zip([0,*done],done)]==[1000]*6
 
 def test_redaction_and_export_processing_run_without_archive_lock(monkeypatch):
     from ai_convos_redact import scan_data

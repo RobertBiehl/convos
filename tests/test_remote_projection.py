@@ -1,4 +1,4 @@
-import json, os, subprocess
+import json, os, subprocess, sys, time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -637,12 +637,14 @@ def test_team_admission_expands_in_bounded_reopenable_pages(tmp_path,monkeypatch
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); rid=next(r["payload"]["id"] for r in scan(core,state) if r["kind"]=="repository.observed"); expected=scan(core,state,"team",[rid],[]); generation=core.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]; core.close(); scope,pages,probes=set(),[],[]; real_page=projection_module._team_page
     def page(*args): rows=real_page(*args); pages.append(len(rows)); return rows
     def progress(stage):
-        if stage.startswith("scanning admitted"):
-            with core_module.open_db(tmp_path/"source.db",wait=0,purpose="team page probe"): pass
-            probes.append(1)
+        if not stage.startswith("scanning admitted"): return
+        if probes: assert probes[0].wait(5)==0,"the waiting writer did not get the archive at the next team page boundary"
+        else:
+            probes.append(subprocess.Popen([sys.executable,"-c","import sys; from ai_convos.cli import open_db; open_db(sys.argv[1],purpose='team page probe').close()",str(tmp_path/"source.db")]))
+            while probes[0].poll() is None and not list(tmp_path.glob(".source.db.waiters/*.lock")): time.sleep(.01)
     monkeypatch.setattr(projection_module,"_team_page",page)
     actual=projection_module.scan_archive(tmp_path/"source.db",state,"team",[rid],[],"w",scope,("cwd","edit"),None,generation,progress,page=1)
-    assert {(r["kind"],r["entity"]):r for r in actual}=={(r["kind"],r["entity"]):r for r in expected} and scope=={"c"} and probes and max(pages)<=1
+    assert {(r["kind"],r["entity"]):r for r in actual}=={(r["kind"],r["entity"]):r for r in expected} and scope=={"c"} and probes and probes[0].wait(5)==0 and max(pages)<=1
 
 
 def test_repository_policy_does_not_reclassify_uncaptured_live_worktree(tmp_path):

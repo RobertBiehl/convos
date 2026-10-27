@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_yield, edit_parents, claim_row_owners, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_waiting, archive_yield, edit_parents, claim_row_owners, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
@@ -372,32 +372,34 @@ def _team_page(core,conversations,after,page):
     convs=packed(conversations)
     query="""WITH scoped AS (SELECT json_extract_string(value,'$') id FROM json_each(?)), edits AS (SELECT fe.id,x.file_id,f.repository FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN scoped s ON s.id=m.conversation_id JOIN provenance.file_edit_evidence v ON v.file_edit_id=fe.id AND v.status='confirmed' LEFT JOIN provenance.file_edit_files x ON x.file_edit_id=fe.id LEFT JOIN provenance.files f ON f.id=x.file_id), selected AS (SELECT 'conversations' kind,c.id entity FROM conversations c JOIN scoped s ON s.id=c.id UNION SELECT 'messages',m.id FROM messages m JOIN scoped s ON s.id=m.conversation_id UNION SELECT 'tool_calls',x.id FROM tool_calls x JOIN messages m ON m.id=x.message_id JOIN scoped s ON s.id=m.conversation_id UNION SELECT 'attachments',x.id FROM attachments x JOIN messages m ON m.id=x.message_id JOIN scoped s ON s.id=m.conversation_id UNION SELECT 'file_edits',e.id FROM edits e UNION SELECT 'artifacts',x.id FROM artifacts x JOIN scoped s ON s.id=x.conversation_id UNION SELECT 'edit.observed',l.entity FROM provenance.local_facts l JOIN edits e ON l.kind='edit.observed' AND l.entity=e.id UNION SELECT 'file.observed',l.entity FROM provenance.local_facts l JOIN edits e ON l.kind='file.observed' AND l.entity=e.file_id UNION SELECT 'file.version',l.entity FROM provenance.local_facts l JOIN provenance.file_versions v ON l.kind='file.version' AND l.entity=v.id JOIN edits e ON e.file_id=v.file_id UNION SELECT 'repository.observed',l.entity FROM provenance.local_facts l JOIN edits e ON l.kind='repository.observed' AND l.entity=e.repository UNION SELECT 'git.checkpoint',l.entity FROM provenance.local_facts l JOIN provenance.git_checkpoints c ON l.kind='git.checkpoint' AND l.entity=c.id JOIN edits e ON e.repository=c.repository UNION SELECT 'checkpoint.link',l.entity FROM provenance.local_facts l JOIN provenance.checkpoint_edits c ON l.kind='checkpoint.link' AND l.entity=sha256(json_object('checkpoint',c.checkpoint_id,'edit',c.file_edit_id)) JOIN edits e ON e.id=c.file_edit_id) SELECT kind,entity FROM selected WHERE entity IS NOT NULL AND (kind>? OR kind=? AND entity>?) ORDER BY kind,entity LIMIT ?"""
     return core.execute(query,(convs,after[0],after[0],after[1],page)).fetchall()
-def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspace=None,new_scope=None,match=("cwd","edit"),user=None,generation=None,progress=None,page=2500,since=None):
+def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspace=None,new_scope=None,match=("cwd","edit"),user=None,generation=None,progress=None,page=1000,since=None):
     sources=required(generation is not None,ValueError("archive scan requires a generation watermark")) and ([*((f"SELECT '{table}' kind,id entity FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='{table}' AND o.physical_row_id=x.id) AND NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=('{table}',x.id) AND c.generation>?)",(generation,)) for table in TABLES.values()),("SELECT kind,entity FROM provenance.local_facts x WHERE NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=(x.kind,x.entity) AND c.generation>?)",(generation,))] if since is None else [("SELECT kind,entity FROM archive_changes WHERE generation>? AND generation<=?",(since,generation))])
     if since is None: sources.append(("SELECT a.kind,a.entity FROM archive_changes a WHERE starts_with(a.kind,'retired.') AND a.generation<=? AND NOT EXISTS (SELECT 1 FROM provenance.local_facts l WHERE (l.kind,l.entity)=(substr(a.kind,9),a.entity))",(generation,)))
     out,done,scope=[],0,new_scope if new_scope is not None else set()
-    for query,args in sources:
-        after,limit=("",""),page
-        while True:
-            started=time.monotonic()
-            with contextlib.closing(open_db(db_path,True,purpose="remote.scan.page")) as core:
-                changes=core.execute(f"SELECT kind,entity FROM ({query}) WHERE kind>? OR kind=? AND entity>? ORDER BY kind,entity LIMIT ?",(*args,after[0],after[0],after[1],limit)).fetchall()
-                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,scope,match,user) if changes else []
-            out+=batch
-            if not changes: break
-            after,done,limit,_=changes[-1],done+len(changes),max(100,min(5000,int(limit*.5/max(time.monotonic()-started,.001)))),(progress and progress(f"scanning archive {done+len(changes)}"),archive_yield(db_path))
-    if scope:
+    with contextlib.closing(_scan_pages(db_path)) as pages:
+        for query,args in sources:
+            after=("","")
+            while True:
+                core=next(pages)
+                changes=core.execute(f"SELECT kind,entity FROM ({query}) WHERE kind>? OR kind=? AND entity>? ORDER BY kind,entity LIMIT ?",(*args,after[0],after[0],after[1],page)).fetchall()
+                out+=scan(core,graph,kind,repositories,roots,set(changes),workspace,scope,match,user) if changes else []
+                if not changes: break
+                after,done,_=changes[-1],done+len(changes),progress and progress(f"scanning archive {done+len(changes)}")
         after=("","")
-        while True:
-            with contextlib.closing(open_db(db_path,True,purpose="remote.scan.team-page")) as core:
-                changes=_team_page(core,scope,after,page)
-                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,None,match,user,scope) if changes else []
-            out+=batch
+        while scope:
+            core=next(pages)
+            changes=_team_page(core,scope,after,page)
+            out+=scan(core,graph,kind,repositories,roots,set(changes),workspace,None,match,user,scope) if changes else []
             if not changes: break
-            after=changes[-1]
-            progress and progress(f"scanning admitted conversations {after[0]}")
-            archive_yield(db_path)
+            after,_=changes[-1],progress and progress(f"scanning admitted conversations {changes[-1][0]}")
     return list({(r["kind"],r["entity"]):r for r in out}.values())
+def _scan_pages(db_path):
+    core=None
+    try:
+        while True:
+            core=core if core is not None and not archive_waiting(db_path) else (core is not None and (core.close(),archive_yield(db_path)),open_db(db_path,True,purpose="remote.scan.page"))[-1]
+            yield core
+    finally: core is not None and core.close()
 def _store_proofs(db_path,records,signer,controls):
     with contextlib.closing(open_db(db_path,purpose="remote.attest.write")) as db,_transaction(db):
         project_workspace_controls(db,controls)

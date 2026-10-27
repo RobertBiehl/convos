@@ -319,6 +319,12 @@ they do not depend on relay or `state.db` history.
 > stays content-free except for bounded encrypted pending uploads. Flat
 > reconciliation remains the design until measurement proves it inadequate.
 
+> An archive scan costs per row, not per page. The scanner keeps one shared
+> connection while no writer waits, hands the archive over at the next page
+> boundary once a waiter notice exists, and pages a fixed 1,000 rows; measured
+> page time never shrinks the page, so a fixed per-page cost cannot collapse
+> its throughput.
+
 > Acceptance tests destroy and rebuild `state.db` and the relay; repair one
 > user's row from another user's intact proof; reject forgery and stale
 > resurrection; preserve conflicts; restore retained attachments; retain origin
