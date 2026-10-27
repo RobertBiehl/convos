@@ -406,10 +406,12 @@ reasons are ownership refusals (`Derived edit ownership conflict`, `Source
 device ownership conflict`, `archive ownership conflict`). While one exists,
 `remote doctor` reports `parked_rows` with a count per reason and exits
 non-zero, `remote sync` exits non-zero after syncing, and `remote watch`
-records the failure in `last_error`. `remote repull` clears the parked rows,
-re-receives them and parks again whatever still conflicts; the archive-side
-cause (a native row or edit with the same identity) is the operator's to
-resolve. A received message revision that lists an edit as
+records the failure in `last_error`. `remote repull` clears the parked rows
+and re-receives them: a row that still conflicts parks again; a competing claim
+for a row this device has published its own claim for meanwhile arrives
+together with that claim and is retained as a variant instead (the same
+handling as on the other device). The archive-side cause (a native row or edit
+with the same identity) is the operator's to resolve. A received message revision that lists an edit as
 `unknown/unclassified_input` while the same author's tool call already holds
 it classified is projected without that claim, and two parents of one author
 that classify the same edit in one batch bind it to the current holder, else

@@ -123,7 +123,7 @@ def test_two_devices_with_same_native_session_choose_one_exact_owner(tmp_path,mo
             with duckdb.connect(str(roots[0]/'data/convos.db'),read_only=True) as db: assert db.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==('first',) and not db.execute("SELECT 1 FROM remote.parked_rows").fetchone()
             with duckdb.connect(str(roots[1]/'data/convos.db')) as db: db.execute("INSERT INTO remote.parked_rows VALUES ('gone','messages','x',?,'archive ownership conflict: messages:x')",[first['user']])
             repull_once(roots[1])
-            with duckdb.connect(str(roots[1]/'data/convos.db'),read_only=True) as db: assert db.execute("SELECT reason FROM remote.parked_rows").fetchall()==[('archive ownership conflict: conversations:c',)] and db.execute("SELECT title FROM conversations WHERE id='c'").fetchone()==('second',)
+            with duckdb.connect(str(roots[1]/'data/convos.db'),read_only=True) as db: assert (db.execute("SELECT reason FROM remote.parked_rows").fetchall(),db.execute("SELECT title FROM conversations WHERE id='c'").fetchone(),db.execute("SELECT count(*) FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.source_row_id='c' AND p.author_device_id=?",[first['device']['id']]).fetchone())==([],('second',),(1,))  # both claims now arrive together: the competing one is retained as a variant, as b25 does
         else:
             sync_once(roots[1],manual=True)
             sync_once(roots[0],manual=True)

@@ -262,9 +262,11 @@ they do not depend on relay or `state.db` history.
 > next revision still chains. Parked rows are never hidden: `convos remote
 > doctor` lists them, and while a park with an ownership reason exists `sync`
 > and `doctor` exit non-zero and `watch` records a failure. A park is cleared
-> only by `convos remote repull`, which re-receives the row and parks it again
-> if it still conflicts. Signature, lineage and authorization failures still
-> refuse the whole batch.
+> only by `convos remote repull`, which re-receives the row: it parks again if
+> it still conflicts, or, when the local device's own claim for that row has
+> been published meanwhile and both arrive together, it is retained as a
+> variant like any competing same-user claim. Signature, lineage and
+> authorization failures still refuse the whole batch.
 
 > Repair inventories the relay before encrypting or uploading received rows. A
 > received projection is re-published only when it still hashes to its author
