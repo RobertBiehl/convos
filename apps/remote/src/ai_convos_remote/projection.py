@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_waiting, archive_yield, edit_parents, claim_row_owners, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_waiting, archive_yield, edit_parents, claim_row_owners, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, migration_memory, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
@@ -394,12 +394,12 @@ def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspac
             after,_=changes[-1],progress and progress(f"scanning admitted conversations {changes[-1][0]}")
     return list({(r["kind"],r["entity"]):r for r in out}.values())
 def _scan_pages(db_path):
-    core=None
-    try:
+    with contextlib.ExitStack() as stack:
+        core=None
         while True:
-            core=core if core is not None and not archive_waiting(db_path) else (core is not None and (core.close(),archive_yield(db_path)),open_db(db_path,True,purpose="remote.scan.page"))[-1]
+            if core is not None and archive_waiting(db_path): core=(stack.close(),archive_yield(db_path),None)[-1]
+            if core is None: stack.enter_context(migration_memory(core:=stack.enter_context(open_db(db_path,True,purpose="remote.scan.page"))))
             yield core
-    finally: core is not None and core.close()
 def _store_proofs(db_path,records,signer,controls):
     with contextlib.closing(open_db(db_path,purpose="remote.attest.write")) as db,_transaction(db):
         project_workspace_controls(db,controls)

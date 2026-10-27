@@ -217,10 +217,11 @@ def waiting_writer(path,code="pass"):
 
 def test_remote_full_scan_keeps_one_connection_until_a_writer_waits(tmp_path,monkeypatch):
     from ai_convos_remote import projection
-    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[(str(i),) for i in range(3)]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); opened,stages,children=[],[],[]
-    monkeypatch.setattr(projection,"open_db",lambda *args,**kwargs:opened.append(kwargs["purpose"]) or cli.open_db(*args,**kwargs))
-    records=projection.scan_archive(path,state,generation=generation,progress=stages.append,page=1)
-    assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages[0]=="scanning archive 1" and stages[-1]=="scanning archive 3" and opened==["remote.scan.page"]
+    from ai_convos import migrations
+    path=tmp_path/"data/convos.db"; db=cli.open_db(path,purpose="fixture"); cli.init_schema(db); db.executemany("INSERT INTO conversations(id,source,metadata) VALUES (?,'codex','{}')",[(str(i),) for i in range(3)]); generation=cli.archive_state(db)[1]; db.close(); state=projection.connect(tmp_path/"state.db"); opened,conns,limits,stages,children=[],[],[],[],[]
+    monkeypatch.setattr(projection,"open_db",lambda *args,**kwargs:(opened.append(kwargs["purpose"]),conns.append(cli.open_db(*args,**kwargs)),conns[-1])[-1])
+    records=projection.scan_archive(path,state,generation=generation,progress=lambda stage:(stages.append(stage),limits.append(conns[-1].execute("SELECT current_setting('memory_limit')").fetchone()[0])),page=1)
+    assert {r["payload"]["row"][0] for r in records}=={"0","1","2"} and stages[0]=="scanning archive 1" and stages[-1]=="scanning archive 3" and opened==["remote.scan.page"] and limits and all(migrations._bytes(limit)<=migrations._MEMORY for limit in limits),limits
     def progress(stage):
         if not children: children.append(waiting_writer(path))
         else: assert children[0].wait(5)==0,"the waiting writer did not get the archive at the next page boundary"
