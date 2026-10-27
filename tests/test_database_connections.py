@@ -261,18 +261,19 @@ def test_ingest_chunks_are_ordered_restart_safe_and_preserve_evidence(tmp_path,m
     result=cli.ParseResult(convs=[conv],msgs=msgs,tools=tools,edits=edits,edit_evidence=evidence); real,calls=cli.upsert,[]
     def interrupted(conn,part):
         calls.append((len(part.convs),len(part.msgs),len(part.tools),len(part.edits),len(part.edit_evidence)))
-        if len(calls)==5: raise RuntimeError("interrupt")
+        if len(calls)==3: raise RuntimeError("interrupt")
         return real(conn,part)
     monkeypatch.setattr(cli,"upsert",interrupted)
     with pytest.raises(RuntimeError,match="interrupt"): cli.commit_result(result,purpose="test.ingest")
-    db=cli.open_db(path,read_only=True,purpose="fixture.read"); assert db.execute("SELECT (SELECT count(*) FROM conversations),(SELECT count(*) FROM messages),(SELECT count(*) FROM tool_calls),(SELECT count(*) FROM file_edits)").fetchone()==(1,501,500,0); db.close()
+    # Turn-major parts: the committed prefix holds every edit with its evidence and tool call, and the open-ingest marker stays until the last part commits.
+    db=cli.open_db(path,read_only=True,purpose="fixture.read"); assert db.execute("SELECT (SELECT count(*) FROM conversations),(SELECT count(*) FROM messages),(SELECT count(*) FROM tool_calls),(SELECT count(*) FROM file_edits),(SELECT count(*) FROM provenance.file_edit_evidence WHERE status='confirmed' AND tool_call_id IS NOT NULL),(SELECT count(*) FROM open_ingests WHERE pid=?)",[os.getpid()]).fetchone()==(1,501,166,166,166,1); db.close()
     calls.clear()
     def recorded(conn,part):
         calls.append((len(part.convs),len(part.msgs),len(part.tools),len(part.edits),len(part.edit_evidence)))
         return real(conn,part)
     monkeypatch.setattr(cli,"upsert",recorded); cli.commit_result(result,purpose="test.ingest")
-    db=cli.open_db(path,read_only=True,purpose="fixture.read"); assert db.execute("SELECT (SELECT count(*) FROM tool_calls),(SELECT count(*) FROM file_edits),(SELECT count(*) FROM provenance.file_edit_evidence WHERE status='confirmed')").fetchone()==(501,501,501); db.close()
-    assert calls==[(1,0,0,0,0),(0,500,0,0,0),(0,1,0,0,0),(0,0,500,0,0),(0,0,1,0,0),(0,0,0,500,0),(0,0,0,1,0),(0,0,0,0,500),(0,0,0,0,1)] and result.provenance_edits=={f"e{i}" for i in range(501)}
+    db=cli.open_db(path,read_only=True,purpose="fixture.read"); assert db.execute("SELECT (SELECT count(*) FROM tool_calls),(SELECT count(*) FROM file_edits),(SELECT count(*) FROM provenance.file_edit_evidence WHERE status='confirmed'),(SELECT count(*) FROM open_ingests)").fetchone()==(501,501,501,0); db.close()
+    assert calls==[(1,499,0,0,0),(0,2,166,166,166),(0,0,166,166,166),(0,0,166,166,166),(0,0,3,3,3)] and result.provenance_edits=={f"e{i}" for i in range(501)}
 
 def test_small_capture_is_atomic_across_related_rows(tmp_path,monkeypatch):
     path=tmp_path/"archive.db"; monkeypatch.setattr(cli,"DB_PATH",path)

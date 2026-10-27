@@ -31,7 +31,7 @@ def test_unchanged_ingest_reports_committed_progress_without_dirtying_archive():
     result=cli.commit_result(cli.ParseResult(convs=[conv],msgs=msgs),purpose='test.noop.ingest',progress=pulse)
     with cli._core(read_only=True,purpose='test.noop.after') as db: assert cli.archive_state(db)==before
     assert result[:7]==(0,0,0,0,0,0,0)
-    assert len(progress)==3 and len(set(progress))==3
+    assert len(progress)==2 and len(set(progress))==2
 
 def test_doctor_reports_native_conversations_without_recorded_local_sources(tmp_path,capsys):
     present,missing=tmp_path/'present.jsonl',tmp_path/'missing.jsonl'
