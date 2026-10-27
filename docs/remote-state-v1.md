@@ -431,11 +431,13 @@ old workers are stopped.
 ## Product behavior
 
 `convos remote sync` exits successfully only when every authorized workspace is
-at its advertised tail with no required deferred event. It emits exact counts,
-not guessed percentages or time estimates.
+at its advertised tail with no required deferred event and no received row is
+parked for an ownership conflict. It emits exact counts, not guessed percentages
+or time estimates.
 
 `convos remote doctor` reports lifecycle, pending, lazy, deferred, and required
-deferred counts, last successful sync, and any retained cutover backup. For an
+deferred counts, last successful sync, parked received rows with their reasons,
+and any retained cutover backup. For an
 old state it reports the pending backup/rebaseline without opening it for writes.
 A normal user never runs SQL, manually reseeds imported rows, fetches lazy
 events, or vacuums SQLite.

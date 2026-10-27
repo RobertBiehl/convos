@@ -245,6 +245,22 @@ they do not depend on relay or `state.db` history.
 > and physical relationship health are separate audit results; passing the first
 > two does not establish the third.
 
+> A received unclassified claim (`unknown/unclassified_input`) never displaces a
+> same-author classified one: the edit keeps its tool-call parent and the
+> claiming parent row is still projected, so that revision may mismatch its
+> proof until the author's next revision arrives. A same-author revision that
+> moves an edit between parents updates the binding; an edit still listed by
+> another current same-author parent, in the batch or in the archive, is never
+> deleted as stale.
+
+> A receiver parks a row it cannot reconcile instead of blocking the batch: the
+> row is not projected, its reason is recorded, and the cursor advances. A
+> same-author inconsistency keeps the signed proof and body so the author's next
+> revision supersedes it; an ownership refusal stores nothing of that row. Parked
+> rows are never hidden: `convos remote doctor` lists them, and an ownership
+> refusal makes `convos remote sync` exit non-zero while it is parked. Signature,
+> lineage and authorization failures still refuse the whole batch.
+
 > Repair inventories the relay before encrypting or uploading received rows. A
 > received projection is re-published only when it still hashes to its author
 > proof; otherwise that row is upload-blocked without suppressing healthy rows

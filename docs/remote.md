@@ -399,6 +399,20 @@ attachment's file before the row that references it, so an interrupted sender
 leaves files without rows, never rows without files. Existing ambiguous duplicate identities
 are not automatically deleted or merged.
 
+A received row the receiver cannot reconcile is parked, not refused with the
+whole batch: the row is not projected, `remote.parked_rows` records its proof
+id and reason, and the cursor moves on. `remote doctor` reports `parked_rows`
+with a count per reason. Two kinds: a same-author inconsistency (`Derived edit
+claimed twice`) keeps the author's signed proof and body, and the author's next
+revision of that row supersedes it; an ownership refusal (`Derived edit
+ownership conflict`, `Source device ownership conflict`, `archive ownership
+conflict`) stores nothing of that row and makes `convos remote sync` exit
+non-zero until it is resolved. A parked row authored by the local user is
+retried on every sync; `remote repull` retries every parked row. A received message revision
+that lists an edit as `unknown/unclassified_input` while the same author's tool
+call already holds it classified is projected without that claim; `remote
+audit` shows it as a projection mismatch until the author's next revision.
+
 Same-user receive identity no longer depends on temporary recovery flags.
 Existing native rows and received bindings are reused. Native differences are
 retained rather than overwritten, and compact local publication bases distinguish
