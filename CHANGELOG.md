@@ -7,6 +7,7 @@
 ## 0.11.6b26
 
 - Stop blocking a whole relay batch on a same-author inconsistency. A received `unclassified_input` claim no longer displaces the same author's classified edit, an edit moving between that author's parents updates its binding instead of failing with `Derived edit ownership conflict`, and a row that still cannot be projected is parked in `remote.parked_rows` while the rest of the batch applies; `remote sync` exits non-zero only for cross-author parks
+- `remote audit` and `repull` count a proof head per workspace, as b25 does elsewhere: a successor in another workspace no longer hides a missing body, so a repull no longer reports complete while one is missing
 
 ## 0.11.6b25
 
