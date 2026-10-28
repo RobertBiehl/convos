@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.6b27
+
+- Commit ingest parts turn by turn, so the signer never sees a message without the edits and evidence of its turn. A part holds whole turns (a message with its tool calls, attachments, edits and their evidence), stored evidence is no longer overwritten with the `unclassified_input` default, a changed edit link re-signs both the old and the new parent, and the signer reads only up to the generation where no multi-part ingest is open (`open_ingests`). Each device re-signs its own rows whose content differs from their latest proof, so torn A, B, A heads converge
+
 ## 0.11.6b26
 
 - Stop blocking a whole relay batch on a same-author inconsistency. A received `unclassified_input` claim no longer displaces the same author's classified edit, an edit moving between that author's parents updates its binding instead of failing with `Derived edit ownership conflict`, and a row that still cannot be projected is parked in `remote.parked_rows` while the rest of the batch applies; `remote sync` exits non-zero only for cross-author parks
