@@ -121,6 +121,17 @@ def test_audit_detects_missing_body_even_without_surviving_origin(tmp_path):
     apply_row_replicas(path,[bodies[1]],"w",[control],local_user="other")
     assert audit_rows(path,page=1,local_user="other")["totals"]["unavailable"]==0
 
+def test_audit_requires_a_head_superseded_only_in_another_workspace(tmp_path):
+    root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph(); path=tmp_path/"lost.db"
+    apply_row_replicas(path,bodies,"w",[control],local_user="other")
+    with duckdb.connect(str(path)) as db:
+        cols=[c[0] for c in db.execute("DESCRIBE remote.row_proofs").fetchall()]
+        head=dict(zip(cols,db.execute("SELECT * FROM remote.row_proofs WHERE row_kind='messages'").fetchone()))
+        db.execute(f"INSERT INTO remote.row_proofs({','.join(cols)}) VALUES ({','.join('?'*len(cols))})",[{**head,"id":"z"+head["id"],"workspace_id":"team","revision":"r2","previous_revision":head["revision"]}[c] for c in cols])
+        db.execute("DELETE FROM messages; DELETE FROM remote.row_origins WHERE table_name='messages'")
+    missing=[]; audit_rows(path,page=1,local_user="other",on_unavailable=missing.append)
+    assert head["id"] in {m["proof"] for m in missing}
+
 def test_author_can_retire_repository_fact_and_replay_cannot_resurrect_it(tmp_path):
     root,device,user,control,rows,proofs,bodies,evidence=signed_edit_graph()
     path=tmp_path/"deleted.db"

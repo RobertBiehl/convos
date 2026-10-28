@@ -182,7 +182,7 @@ def _audit_rows(db_path,page=5000,progress=None,local_user=None,on_unavailable=N
     if local_user is not None:
         cursor,seen="",{r[4] for r in origins}
         while True:
-            with contextlib.closing(open_db(db_path,True,purpose="remote.audit.requirements")) as db: heads=db.execute("SELECT p.row_kind,p.source_row_id,p.author_user_id,p.id,p.content_hash,p.state FROM remote.row_proofs p WHERE p.id>? AND NOT EXISTS(SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision) ORDER BY p.id LIMIT ?",[cursor,page]).fetchall()
+            with contextlib.closing(open_db(db_path,True,purpose="remote.audit.requirements")) as db: heads=db.execute("SELECT p.row_kind,p.source_row_id,p.author_user_id,p.id,p.content_hash,p.state FROM remote.row_proofs p WHERE p.id>? AND NOT EXISTS(SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.workspace_id=p.workspace_id AND c.previous_revision=p.revision) ORDER BY p.id LIMIT ?",[cursor,page]).fetchall()
             if not heads: break
             origins += [(kind,source if user==local_user or kind in PROVENANCE-{'edit.observed','checkpoint.link'} else foreign_id(user,"file_edits" if kind=="edit.observed" else kind,source),source,user,pid,expected,state) for kind,source,user,pid,expected,state in heads if pid not in seen]
             cursor=heads[-1][3]
@@ -624,65 +624,73 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
     own=db is None
     db=db or open_db(db_path,purpose="remote.rows.project")
     if own and ready and not semantic_ids: init_schema(db)
+    parked={}
     try:
-        with _transaction(db):
-            items=[values[i] for i in indexes]
-            claim_row_owners(db,[(row,p) for row,p,signer_,lineage in items])
-            work,advanced=(retry,[]) if isinstance(retry,list) else _edit_retry_work(db) if retry else ([],[])
-            columns=("workspace","kind","row_id","author","revision")
-            temp_rows(db,"incoming",columns,[tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id","revision")) for row,p,signer_,lineage in items])
-            if work: db.execute("INSERT INTO incoming SELECT workspace_id,row_kind,source_row_id,author_user_id,revision FROM remote.row_proofs WHERE id IN (SELECT UNNEST(?))",[[pid for pid,key in work]])
-            old={tuple(r) for r in db.execute("SELECT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p JOIN incoming i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(i.workspace,i.kind,i.row_id,i.author,i.revision)").fetchall()}
-            record_local_row_bases(db,[p for row,p,signer_,lineage in items if p["author_user_id"]==local_user and p["author_device_id"]==local_device],True)
-            project_workspace_controls(db,controls)
-            groups={}
-            for row,head,head_signer,lineage in items:
-                for p,signer_ in [*lineage,(head,head_signer)]: groups.setdefault((p["author_user_id"],p["author_device_id"]),(signer_,[]))[1].append(p)
-            [project_row_proofs(db,proofs,signer_["root_public"],signer_["certificate"]) for signer_,proofs in groups.values()]
-            _insert_pages(db,"remote.row_conflicts",[(digest(p),json.dumps(row,sort_keys=True,separators=(",",":"))) for row,p,signer_,lineage in items],("proof_id","body"),mode=" OR IGNORE")
-            projected,chosen=[],{}
-            fields="p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature"
-            chains={}
-            for r in db.execute(f"SELECT p.id,CAST(c.body AS VARCHAR),{fields} FROM remote.row_proofs p JOIN (SELECT DISTINCT kind,row_id,author FROM incoming) i ON (p.row_kind,p.source_row_id,p.author_user_id)=(i.kind,i.row_id,i.author) LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id").fetchall(): chains.setdefault((r[4],r[5],r[11]),{})[r[8]]=(r[0],json.loads(r[1]) if r[1] else None,proof(r[2:]))
-            bases={(kind,entity,author):revision for kind,entity,author,revision in db.execute("SELECT b.* FROM remote.local_row_bases b JOIN (SELECT DISTINCT kind,row_id,author FROM incoming) i ON (b.kind,b.entity,b.author)=(i.kind,i.row_id,i.author)").fetchall()}
-            for scope,nodes in chains.items():
-                leaves=set(nodes)-{v[2]["previous_revision"] for v in nodes.values() if v[2]["previous_revision"]}
-                if leaves and len({nodes[r][2]['content_hash'] for r in leaves})==1:
-                    def follows(revision):
-                        seen=set()
-                        while revision in nodes and revision not in seen:
-                            if revision==bases.get(scope): return True
-                            seen.add(revision)
-                            revision=nodes[revision][2]['previous_revision']
-                        return False
-                    revision=min(leaves,key=lambda r:(not follows(r),nodes[r][1] is None,r))
-                    pid,row,p=nodes[revision]
-                    chosen[scope]=revision
-                    if row is not None: projected.append((row,p,pid,p["author_user_id"]==local_user and (local_device is None or p["author_device_id"]==local_device)))
-            pending=set()
-            own_ids={(kind,entity):entity for row,p,pid,native in projected if p['author_user_id']==local_user for kind,entity in [(row['kind'],row['id']),*[(parent,row['data'][column]) for column,parent in FKS.get(row['kind'],()) if row['state']=='active' and row['data'][column]],*[(kind,entity) for e in (row['data'] or {}).get('edits',[]) for kind,entity in [('file_edits',e['id']),('messages',e['message_id'])]],*([('file_edits',row['id']),('messages',row['data']['turn'])] if row['kind']=='edit.observed' and row['state']=='active' else [('file_edits',row['data']['edit'])] if row['kind']=='checkpoint.link' and row['state']=='active' else [])]}
-            own_ids.update({(kind,source):physical for kind,source,physical in db.execute('SELECT table_name,source_row_id,physical_row_id FROM remote.row_origins WHERE author_user_id=? AND source_row_id IN (SELECT UNNEST(?))',[local_user,[entity for kind,entity in own_ids]]).fetchall()})
-            project_logical_rows(db,[(row,p,pid,native,own_ids if p['author_user_id']==local_user else {}) for row,p,pid,native in projected],defer=pending.add)
-            if pending and not retry: print(f"Remote facts retained pending dependencies: {len(pending)}",file=sys.stderr)
-            [set_attachment_path(db,row['id'] if p['author_user_id']==local_user else foreign_id(p['author_user_id'],'attachments',row['id']),attachment_paths[key],key) for row,p,*_ in values if row['kind']=='attachments' and row['state']=='active' and (key:=(row['data']['body_hash'],row['data']['size'])) in attachment_paths]
-            resolved=[(row["kind"],row["id"],p["author_user_id"]) for row,p,pid,native in projected if pid not in pending]
-            missing={scope:chains[scope][revision] for scope,revision in chosen.items() if chains[scope][revision][1] is None}
-            physical=dict(db.execute("SELECT proof_id,physical_row_id FROM remote.row_origins WHERE proof_id IN (SELECT UNNEST(?)) UNION ALL SELECT proof_id,physical_entity FROM remote.provenance_origins WHERE proof_id IN (SELECT UNNEST(?))",[[pid for pid,row,p in missing.values()]]*2).fetchall()) if missing else {}
-            claims={scope:(kind,physical.get(pid,source if user==local_user or kind in PROVENANCE-{'edit.observed','checkpoint.link'} else foreign_id(user,'file_edits' if kind=='edit.observed' else kind,source)),source,user,p['state']) for scope,(pid,row,p) in missing.items() for kind,source,user in [scope]}
-            found=typed_logical_rows(db,claims.values()) if claims else {}
-            resolved += [scope for scope,claim in claims.items() if matching_logical_row(found[claim],missing[scope][2]['content_hash']) is not None]
-            if resolved:
-                retired=[]
-                for scope in resolved:
-                    revision=chosen[scope]
-                    while revision in chains[scope]:
-                        retired.append((*scope,revision))
-                        revision=chains[scope][revision][2]["previous_revision"]
-                retire_row_bodies(db,retired)
-            dependency=lambda kind,entity,author:digest([kind,author if kind=='file_edits' else None,entity])
-            waiting=[(dependency(kind,entity,p['author_user_id']),pid) for row,p,pid,native in projected if pid in pending and row['kind']=='edit.observed' for kind,entity in (('file_edits',row['id']),('file.observed',row['data']['file']))]
-            again=project_edit_dependencies(db,waiting,[dependency(kind,entity,p['author_user_id']) for row,p,pid,native in projected if pid not in pending for kind,entity in ([(row['kind'],row['id'])] if row['kind'] in ('file_edits','file.observed') else [('file_edits',e['id']) for e in (row['data'] or {}).get('edits',[])])],[pid for pid,key in work]+[digest(p) for row,p,signer_,lineage in items if row['kind']=='edit.observed'],advanced)
-        results=[(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("row_kind","row_id","author_user_id")))==p["revision"] for row,p,signer_,lineage in items]
+        while True:
+            try:
+                with _transaction(db):
+                    items=[values[i] for i in indexes if digest(values[i][1]) not in parked]
+                    claim_row_owners(db,[(row,p) for row,p,signer_,lineage in items])
+                    work,advanced=(retry,[]) if isinstance(retry,list) else _edit_retry_work(db) if retry else ([],[])
+                    columns=("workspace","kind","row_id","author","revision")
+                    temp_rows(db,"incoming",columns,[tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id","revision")) for row,p,signer_,lineage in items])
+                    if work: db.execute("INSERT INTO incoming SELECT workspace_id,row_kind,source_row_id,author_user_id,revision FROM remote.row_proofs WHERE id IN (SELECT UNNEST(?))",[[pid for pid,key in work]])
+                    old={tuple(r) for r in db.execute("SELECT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p JOIN incoming i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(i.workspace,i.kind,i.row_id,i.author,i.revision)").fetchall()}
+                    record_local_row_bases(db,[p for row,p,signer_,lineage in items if p["author_user_id"]==local_user and p["author_device_id"]==local_device],True)
+                    project_workspace_controls(db,controls)
+                    groups={}
+                    for row,head,head_signer,lineage in items:
+                        for p,signer_ in [*lineage,(head,head_signer)]: groups.setdefault((p["author_user_id"],p["author_device_id"]),(signer_,[]))[1].append(p)
+                    [project_row_proofs(db,proofs,signer_["root_public"],signer_["certificate"]) for signer_,proofs in groups.values()]
+                    _insert_pages(db,"remote.row_conflicts",[(digest(p),json.dumps(row,sort_keys=True,separators=(",",":"))) for row,p,signer_,lineage in items],("proof_id","body"),mode=" OR IGNORE")
+                    projected,chosen=[],{}
+                    fields="p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature"
+                    chains={}
+                    for r in db.execute(f"SELECT p.id,CAST(c.body AS VARCHAR),{fields} FROM remote.row_proofs p JOIN (SELECT DISTINCT kind,row_id,author FROM incoming) i ON (p.row_kind,p.source_row_id,p.author_user_id)=(i.kind,i.row_id,i.author) LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id").fetchall(): chains.setdefault((r[4],r[5],r[11]),{})[r[8]]=(r[0],json.loads(r[1]) if r[1] else None,proof(r[2:]))
+                    bases={(kind,entity,author):revision for kind,entity,author,revision in db.execute("SELECT b.* FROM remote.local_row_bases b JOIN (SELECT DISTINCT kind,row_id,author FROM incoming) i ON (b.kind,b.entity,b.author)=(i.kind,i.row_id,i.author)").fetchall()}
+                    for scope,nodes in chains.items():
+                        leaves=set(nodes)-{v[2]["previous_revision"] for v in nodes.values() if v[2]["previous_revision"]}
+                        if leaves and len({nodes[r][2]['content_hash'] for r in leaves})==1:
+                            def follows(revision):
+                                seen=set()
+                                while revision in nodes and revision not in seen:
+                                    if revision==bases.get(scope): return True
+                                    seen.add(revision)
+                                    revision=nodes[revision][2]['previous_revision']
+                                return False
+                            revision=min(leaves,key=lambda r:(not follows(r),nodes[r][1] is None,r))
+                            pid,row,p=nodes[revision]
+                            chosen[scope]=revision
+                            if row is not None and pid not in parked: projected.append((row,p,pid,p["author_user_id"]==local_user and (local_device is None or p["author_device_id"]==local_device)))
+                    pending=set()
+                    own_ids={(kind,entity):entity for row,p,pid,native in projected if p['author_user_id']==local_user for kind,entity in [(row['kind'],row['id']),*[(parent,row['data'][column]) for column,parent in FKS.get(row['kind'],()) if row['state']=='active' and row['data'][column]],*[(kind,entity) for e in (row['data'] or {}).get('edits',[]) for kind,entity in [('file_edits',e['id']),('messages',e['message_id'])]],*([('file_edits',row['id']),('messages',row['data']['turn'])] if row['kind']=='edit.observed' and row['state']=='active' else [('file_edits',row['data']['edit'])] if row['kind']=='checkpoint.link' and row['state']=='active' else [])]}
+                    own_ids.update({(kind,source):physical for kind,source,physical in db.execute('SELECT table_name,source_row_id,physical_row_id FROM remote.row_origins WHERE author_user_id=? AND source_row_id IN (SELECT UNNEST(?))',[local_user,[entity for kind,entity in own_ids]]).fetchall()})
+                    project_logical_rows(db,[(row,p,pid,native,own_ids if p['author_user_id']==local_user else {}) for row,p,pid,native in projected],defer=pending.add)
+                    if pending and not retry: print(f"Remote facts retained pending dependencies: {len(pending)}",file=sys.stderr)
+                    [set_attachment_path(db,row['id'] if p['author_user_id']==local_user else foreign_id(p['author_user_id'],'attachments',row['id']),attachment_paths[key],key) for row,p,*_ in values if row['kind']=='attachments' and row['state']=='active' and (key:=(row['data']['body_hash'],row['data']['size'])) in attachment_paths]
+                    resolved=[(row["kind"],row["id"],p["author_user_id"]) for row,p,pid,native in projected if pid not in pending]
+                    missing={scope:chains[scope][revision] for scope,revision in chosen.items() if chains[scope][revision][1] is None}
+                    physical=dict(db.execute("SELECT proof_id,physical_row_id FROM remote.row_origins WHERE proof_id IN (SELECT UNNEST(?)) UNION ALL SELECT proof_id,physical_entity FROM remote.provenance_origins WHERE proof_id IN (SELECT UNNEST(?))",[[pid for pid,row,p in missing.values()]]*2).fetchall()) if missing else {}
+                    claims={scope:(kind,physical.get(pid,source if user==local_user or kind in PROVENANCE-{'edit.observed','checkpoint.link'} else foreign_id(user,'file_edits' if kind=='edit.observed' else kind,source)),source,user,p['state']) for scope,(pid,row,p) in missing.items() for kind,source,user in [scope]}
+                    found=typed_logical_rows(db,claims.values()) if claims else {}
+                    resolved += [scope for scope,claim in claims.items() if matching_logical_row(found[claim],missing[scope][2]['content_hash']) is not None]
+                    if resolved:
+                        retired=[]
+                        for scope in resolved:
+                            revision=chosen[scope]
+                            while revision in chains[scope]:
+                                retired.append((*scope,revision))
+                                revision=chains[scope][revision][2]["previous_revision"]
+                        retire_row_bodies(db,retired)
+                    _insert_pages(db,"remote.parked_rows",[(pid,p["row_kind"],p["row_id"],p["author_user_id"],parked[pid]) for pid,p in [(digest(p),p) for row,p,*rest in [values[i] for i in indexes]]+[(pid,p) for nodes in chains.values() for pid,row,p in nodes.values()] if pid in parked],mode=" OR REPLACE")
+                    dependency=lambda kind,entity,author:digest([kind,author if kind=='file_edits' else None,entity])
+                    waiting=[(dependency(kind,entity,p['author_user_id']),pid) for row,p,pid,native in projected if pid in pending and row['kind']=='edit.observed' for kind,entity in (('file_edits',row['id']),('file.observed',row['data']['file']))]
+                    again=project_edit_dependencies(db,waiting,[dependency(kind,entity,p['author_user_id']) for row,p,pid,native in projected if pid not in pending for kind,entity in ([(row['kind'],row['id'])] if row['kind'] in ('file_edits','file.observed') else [('file_edits',e['id']) for e in (row['data'] or {}).get('edits',[])])],[pid for pid,key in work]+[digest(p) for row,p,signer_,lineage in items if row['kind']=='edit.observed'],advanced)
+                break
+            except ValueError as e:
+                if not (hit:=getattr(e,"parked",None)) or set(hit)<=set(parked): raise
+                parked.update(hit)
+        results=[(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("row_kind","row_id","author_user_id")))==p["revision"] and digest(p) not in parked for row,p,signer_,lineage in [values[i] for i in indexes]]
         accepted=semantic|dict(zip(indexes,results))
         result=len(work) if retry else [accepted[i] for i in range(len(values))]
     finally:
