@@ -245,6 +245,29 @@ they do not depend on relay or `state.db` history.
 > and physical relationship health are separate audit results; passing the first
 > two does not establish the third.
 
+> A received unclassified claim (`unknown/unclassified_input`) never displaces a
+> same-author classified one: the edit keeps its tool-call parent and the
+> claiming parent row is still projected, so that revision may mismatch its
+> proof until the author's next revision arrives. A same-author revision that
+> moves an edit between parents updates the binding; an edit still listed by
+> another current same-author parent, in the batch or in the archive, is never
+> deleted as stale. Two same-author parents in one batch that both classify the
+> same edit bind it to the parent that already holds it, else to the greatest
+> proof id; the other parent's body is retained as a variant.
+
+> A receiver parks a row it cannot reconcile instead of blocking the batch:
+> nothing of that row is stored except its proof id, kind, source id, author
+> and reason in `remote.parked_rows`, the rest of the batch applies, and the
+> cursor advances; every replica carries its revision lineage, so the author's
+> next revision still chains. Parked rows are never hidden: `convos remote
+> doctor` lists them, and while a park with an ownership reason exists `sync`
+> and `doctor` exit non-zero and `watch` records a failure. A park is cleared
+> only by `convos remote repull`, which re-receives the row: it parks again if
+> it still conflicts, or, when the local device's own claim for that row has
+> been published meanwhile and both arrive together, it is retained as a
+> variant like any competing same-user claim. Signature, lineage and
+> authorization failures still refuse the whole batch.
+
 > Repair inventories the relay before encrypting or uploading received rows. A
 > received projection is re-published only when it still hashes to its author
 > proof; otherwise that row is upload-blocked without suppressing healthy rows
@@ -257,6 +280,29 @@ they do not depend on relay or `state.db` history.
 > rows do not duplicate its bytes. The signed attachment row includes the
 > expected body hash. Body ingestion is bounded by a 32 MiB per-body limit
 > unless policy deliberately changes it.
+
+## Producer closure
+
+> A multi-part archive write commits whole turns: a message with its tool
+> calls, attachments, edits and exactly their evidence never straddles a
+> transaction boundary, and conversations commit before their messages. A turn
+> larger than one part splits only between a message and its children or
+> between tool calls, never between an edit, its evidence and its tool call.
+> An evidence default never overwrites an existing evidence row, and a changed
+> evidence link marks both the old and the new parent changed.
+
+> The signer never reads inside an open multi-part write. The writer keeps an
+> open-ingest marker (start generation, process, heartbeat) that commits with
+> the first part and clears with the last; a sync clamps its watermark once to
+> the oldest live marker's start generation, scans with exactly that generation
+> and records exactly that generation. A marker without a live process or a
+> fresh heartbeat counts as closed, so the worst case is today's behaviour.
+
+> The owning device re-signs its own rows whose current content differs from
+> its latest proof: a write that moves a row away from its signed head marks it
+> changed, and retained head bodies are checked once per sync state. Equal
+> content never gets a new revision, so convergence cannot loop; torn revisions
+> already on the relay are superseded, never rewritten.
 
 ## Signed replication units
 

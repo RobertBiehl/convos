@@ -84,7 +84,10 @@ def test_peer_receives_tool_owned_edits_and_cannot_revise_or_append(tmp_path):
     assert audit_rows(path,local_user=user)['totals']['projection_mismatch']==0
     for row,previous in [(bodies[-1]['row'],bodies[-1]['proof']['revision']),({**bodies[1]['row'],'id':'unauthorized-child'},None)]:
         proof=row_proof(peer,user,'w',1,row,previous)
-        with pytest.raises(ValueError,match='ownership conflict'): apply_row_replicas(path,[dict(row=row,proof=proof)],'w',[control],local_user=user,local_device=peer['id'])
+        assert apply_row_replicas(path,[dict(row=row,proof=proof)],'w',[control],local_user=user,local_device=peer['id'])==[False]
+    with duckdb.connect(str(path)) as db:
+        assert db.execute('SELECT content FROM file_edits').fetchall()==[('one',)] and db.execute('SELECT count(*) FROM remote.row_proofs').fetchone()==(3,)
+        assert [('ownership conflict' in reason) for reason, in db.execute('SELECT reason FROM remote.parked_rows ORDER BY source_row_id').fetchall()]==[True,True]
     updated={**bodies[-1]['row'],'data':{**bodies[-1]['row']['data'],'edits':[{**bodies[-1]['row']['data']['edits'][0],'content':'two'}]}}
     proof=row_proof(device,user,'w',1,updated,bodies[-1]['proof']['revision'])
     apply_row_replicas(path,[dict(row=updated,proof=proof)],'w',[control],local_user=user,local_device=peer['id'])
