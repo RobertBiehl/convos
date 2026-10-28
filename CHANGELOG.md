@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.6b28
+
+- Scan the archive on one read connection with fixed 1,000-row pages. `scan_archive` reopened the archive for every page and shrank the next page from the last page's time, so the agent's full scan ran at 100-row pages, 11 to 14 rows/s, 14.6 h; it now reopens only when a writer is waiting (`archive_waiting`), runs at about 1,500 rows/s on a copy of that archive with the same writer wait, and holds its read connection to the migration memory limit
+
 ## 0.11.6b27
 
 - Commit ingest parts turn by turn, so the signer never sees a message without the edits and evidence of its turn. A part holds whole turns (a message with its tool calls, attachments, edits and their evidence), stored evidence is no longer overwritten with the `unclassified_input` default, a changed edit link re-signs both the old and the new parent, and the signer reads only up to the generation where no multi-part ingest is open (`open_ingests`). Each device re-signs its own rows whose content differs from their latest proof, so torn A, B, A heads converge

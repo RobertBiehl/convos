@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, OPEN_INGEST_STALE, PROVENANCE_KINDS as PROVENANCE, _archive_touch, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_yield, edit_parents, claim_row_owners, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, OPEN_INGEST_STALE, PROVENANCE_KINDS as PROVENANCE, _archive_touch, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_waiting, archive_yield, edit_parents, claim_row_owners, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, migration_memory, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
@@ -378,33 +378,34 @@ def _alive(pid):
 def closed_generation(db_path):
     # The generation up to which no multi-part ingest is open; a marker without a live process or a fresh heartbeat counts as closed.
     with contextlib.closing(open_db(db_path,True,purpose="remote.closed-generation")) as db: return min(generation for pid,generation in db.execute("SELECT NULL,generation FROM archive_state WHERE singleton UNION ALL SELECT pid,generation FROM open_ingests WHERE heartbeat_at>?",[time.time()-OPEN_INGEST_STALE]).fetchall() if pid is None or _alive(pid)) if db.execute("SELECT 1 FROM information_schema.tables WHERE table_name='open_ingests'").fetchone() else db.execute("SELECT generation FROM archive_state WHERE singleton").fetchone()[0]
-def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspace=None,new_scope=None,match=("cwd","edit"),user=None,generation=None,progress=None,page=2500,since=None):
-    required(generation is not None,ValueError("archive scan requires a generation watermark"))  # the caller clamps once (closed_generation) and records exactly this generation
-    sources=[*((f"SELECT '{table}' kind,id entity FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='{table}' AND o.physical_row_id=x.id) AND NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=('{table}',x.id) AND c.generation>?)",(generation,)) for table in TABLES.values()),("SELECT kind,entity FROM provenance.local_facts x WHERE NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=(x.kind,x.entity) AND c.generation>?)",(generation,))] if since is None else [("SELECT kind,entity FROM archive_changes WHERE generation>? AND generation<=?",(since,generation))]
+def scan_archive(db_path,graph,kind="personal",repositories=(),roots=(),workspace=None,new_scope=None,match=("cwd","edit"),user=None,generation=None,progress=None,page=1000,since=None):
+    sources=required(generation is not None,ValueError("archive scan requires a generation watermark")) and ([*((f"SELECT '{table}' kind,id entity FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='{table}' AND o.physical_row_id=x.id) AND NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=('{table}',x.id) AND c.generation>?)",(generation,)) for table in TABLES.values()),("SELECT kind,entity FROM provenance.local_facts x WHERE NOT EXISTS (SELECT 1 FROM archive_changes c WHERE (c.kind,c.entity)=(x.kind,x.entity) AND c.generation>?)",(generation,))] if since is None else [("SELECT kind,entity FROM archive_changes WHERE generation>? AND generation<=?",(since,generation))])
     if since is None: sources.append(("SELECT a.kind,a.entity FROM archive_changes a WHERE starts_with(a.kind,'retired.') AND a.generation<=? AND NOT EXISTS (SELECT 1 FROM provenance.local_facts l WHERE (l.kind,l.entity)=(substr(a.kind,9),a.entity))",(generation,)))
     out,done,scope=[],0,new_scope if new_scope is not None else set()
-    for query,args in sources:
-        after,limit=("",""),page
-        while True:
-            started=time.monotonic()
-            with contextlib.closing(open_db(db_path,True,purpose="remote.scan.page")) as core:
-                changes=core.execute(f"SELECT kind,entity FROM ({query}) WHERE kind>? OR kind=? AND entity>? ORDER BY kind,entity LIMIT ?",(*args,after[0],after[0],after[1],limit)).fetchall()
-                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,scope,match,user,until=generation) if changes else []
-            out+=batch
-            if not changes: break
-            after,done,limit,_=changes[-1],done+len(changes),max(100,min(5000,int(limit*.5/max(time.monotonic()-started,.001)))),(progress and progress(f"scanning archive {done+len(changes)}"),archive_yield(db_path))
-    if scope:
+    with contextlib.closing(_scan_pages(db_path)) as pages:
+        for query,args in sources:
+            after=("","")
+            while True:
+                core=next(pages)
+                changes=core.execute(f"SELECT kind,entity FROM ({query}) WHERE kind>? OR kind=? AND entity>? ORDER BY kind,entity LIMIT ?",(*args,after[0],after[0],after[1],page)).fetchall()
+                out+=scan(core,graph,kind,repositories,roots,set(changes),workspace,scope,match,user,until=generation) if changes else []
+                if not changes: break
+                after,done,_=changes[-1],done+len(changes),progress and progress(f"scanning archive {done+len(changes)}")
         after=("","")
-        while True:
-            with contextlib.closing(open_db(db_path,True,purpose="remote.scan.team-page")) as core:
-                changes=_team_page(core,scope,after,page,generation)
-                batch=scan(core,graph,kind,repositories,roots,set(changes),workspace,None,match,user,scope,generation) if changes else []
-            out+=batch
+        while scope:
+            core=next(pages)
+            changes=_team_page(core,scope,after,page,generation)
+            out+=scan(core,graph,kind,repositories,roots,set(changes),workspace,None,match,user,scope,generation) if changes else []
             if not changes: break
-            after=changes[-1]
-            progress and progress(f"scanning admitted conversations {after[0]}")
-            archive_yield(db_path)
+            after,_=changes[-1],progress and progress(f"scanning admitted conversations {changes[-1][0]}")
     return list({(r["kind"],r["entity"]):r for r in out}.values())
+def _scan_pages(db_path):
+    with contextlib.ExitStack() as stack:
+        core=None
+        while True:
+            if core is not None and archive_waiting(db_path): core=(stack.close(),archive_yield(db_path),None)[-1]
+            if core is None: stack.enter_context(migration_memory(core:=stack.enter_context(open_db(db_path,True,purpose="remote.scan.page"))))
+            yield core
 def _store_proofs(db_path,records,signer,controls):
     with contextlib.closing(open_db(db_path,purpose="remote.attest.write")) as db,_transaction(db):
         project_workspace_controls(db,controls)

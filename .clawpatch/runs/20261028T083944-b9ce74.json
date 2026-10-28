@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "runId": "20261028T083944-b9ce74",
+  "command": "review",
+  "args": [
+    "--root",
+    "/Users/Shared/Developer/Workspace/ai-convos-db/.koder/worktrees/wt-scan-cost",
+    "review",
+    "--feature",
+    "feat_library_3be334928b",
+    "--reasoning-effort",
+    "medium"
+  ],
+  "rootPath": "/Users/Shared/Developer/Workspace/ai-convos-db/.koder/worktrees/wt-scan-cost",
+  "headSha": "7633e3375909c63a4a32ee50cb7c36a086562e24",
+  "startedAt": "2026-10-28T08:39:44.356Z",
+  "finishedAt": "2026-10-28T08:41:25.004Z",
+  "status": "completed",
+  "claimedFeatureIds": [
+    "feat_library_3be334928b"
+  ],
+  "findingIds": [
+    "fnd_sig-feat-library-3be334928b-4263_2e5049dd6f"
+  ],
+  "patchAttemptIds": [],
+  "errors": []
+}

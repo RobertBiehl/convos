@@ -54,9 +54,9 @@ def _waiting(marker):
     try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError: return lock.close() or True
     return (marker.unlink(missing_ok=True),lock.close(),False)[-1]
-def archive_yield(path=None):
-    directory,end=(path:=Path(path or DB_PATH).expanduser().resolve()).with_name(f".{path.name}.waiters"),time.monotonic()+1.1
-    while time.monotonic()<end and any(map(_waiting,directory.glob("*.lock") if directory.is_dir() else ())): time.sleep(random.uniform(.01,.05))
+def archive_waiting(path=None): return any(map(_waiting,directory.glob("*.lock") if (directory:=(path:=Path(path or DB_PATH).expanduser().resolve()).with_name(f".{path.name}.waiters")).is_dir() else ()))
+def archive_yield(path=None,*,end=None):
+    while time.monotonic()<(end:=end or time.monotonic()+1.1) and archive_waiting(path): time.sleep(random.uniform(.01,.05))
 def get_db(read_only:bool=False,wait=30,path=None,deadline=None,*,purpose="direct database access"):
     path,deadline=(path:=Path(path or DB_PATH).expanduser().resolve()),deadline if deadline is not None else time.monotonic()+wait
     if read_only and not path.exists(): return None
