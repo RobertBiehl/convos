@@ -54,11 +54,11 @@ def test_installable_product_versions_are_aligned():
     files = [root/"pyproject.toml", *sorted((root/"apps").glob("*/pyproject.toml"))]
     projects = {f.parent.name:tomllib.loads(f.read_text())["project"] for f in files}
     assert {p["name"] for p in projects.values()} == {"convos","convos-changegraph","convos-explore","convos-memory","convos-redact","convos-remote","convos-remote-server","convos-resume"}, projects
-    assert {p["version"] for p in projects.values()} == {"0.11.6b28"}, projects
+    assert {p["version"] for p in projects.values()} == {"0.11.6b29"}, projects
     major,minor=map(int,next(iter({p["version"] for p in projects.values()})).split(".")[:2])
     constrained=[d for p in projects.values() for d in [*p["dependencies"],*(d for ds in p.get("optional-dependencies",{}).values() for d in ds)] if d.startswith("convos") and ">=" in d]
     assert constrained and {d[d.index(">="):] for d in constrained} == {f">={next(iter(projects.values()))['version']},<{major}.{minor+1}"}, constrained
-    assert {d for p in projects.values() for d in p["dependencies"] if d.startswith("duckdb")} == {"duckdb>=1.4.5"}
+    assert {d for p in projects.values() for d in p["dependencies"] if d.startswith("duckdb")} == {"duckdb==1.5.6"}
     assert not any(d.startswith("convos-changegraph") for d in projects["remote"]["dependencies"])
 
 

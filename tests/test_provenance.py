@@ -737,3 +737,12 @@ def test_provenance_git_observation_does_not_hold_duckdb_lock(tmp_path,monkeypat
     root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); run=core_module._git_run
     def unlocked(repo,*args): subprocess.run((sys.executable,"-c","import duckdb,sys; duckdb.connect(sys.argv[1]).close()",str(path)),check=True); return run(repo,*args)
     monkeypatch.setattr(core_module,"_git_run",unlocked); capture(path)
+
+def test_v19_rebuilds_each_indexed_table_from_its_rows(tmp_path):
+    # DuckDB can persist an index that misses rows of its table (seen in real archives); v19 recreates every indexed table and its indexes from the rows
+    path=tmp_path/"v18.db"; db=graph(path); shape="SELECT t.table_oid,t.sql,list(i.sql ORDER BY i.index_name) FROM duckdb_tables() t JOIN duckdb_indexes() i USING (schema_name,table_name) WHERE t.table_name='edit_dependencies' GROUP BY ALL"
+    db.execute("INSERT INTO remote.edit_dependencies VALUES ('k','p1'),('k','p2'),('j','p1'); UPDATE core_schema SET version=18"); (oid,ddl,indexes),rows=db.execute(shape).fetchone(),db.execute("SELECT * FROM remote.edit_dependencies ORDER BY ALL").fetchall(); db.close()
+    db=duckdb.connect(str(path)); init_schema(db); new_oid,*same=db.execute(shape).fetchone()
+    assert db.execute("SELECT version FROM core_schema").fetchone()[0]==core_module.CORE_VERSION==19 and new_oid!=oid and same==[ddl,indexes] and db.execute("SELECT * FROM remote.edit_dependencies ORDER BY ALL").fetchall()==rows
+    db.execute("BEGIN; DELETE FROM remote.edit_dependencies; COMMIT"); db.close()
+    assert duckdb.connect(str(path.with_name("v18.db.pre-v19.bak")),read_only=True).execute("SELECT version FROM core_schema").fetchone()[0]==18
