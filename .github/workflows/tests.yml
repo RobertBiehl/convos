@@ -53,6 +53,7 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
+          python-version: "3.14"  # DuckDB has no cp315 wheels; a source build overruns the timeout
       - run: uv sync --extra dev --locked
       - run: uv build --all-packages --wheel
       - name: Install customer packages
