@@ -924,6 +924,7 @@ def repull_once(root=None,from_backup=None):
         if fresh:
             atomic_json(job,dict(archive=archive,workspaces=sorted(workspaces),phase="resetting"))
             reset_repull_state(state,workspaces)
+            with _core(root,purpose="remote.repull.reset") as core: core.execute("DELETE FROM remote.parked_rows")
             atomic_json(job,dict(archive=archive,workspaces=sorted(workspaces),phase="receiving"))
         elif saved["phase"]=="resetting": (reset_repull_state(state,workspaces),atomic_json(job,dict(archive=archive,workspaces=sorted(workspaces),phase="receiving")))
         try:
@@ -1361,6 +1362,7 @@ def sync_cmd(repair:bool=False):
     except ConnectionError as e: cli_error(f"{e}. Local sync progress was preserved; retry `convos remote sync`.")
     except (ValueError,RuntimeError,duckdb.InterruptException) as e: cli_error(e)
     typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else "")+recovery_notice())
+    if e:=parked_error(): cli_error(e)
 @remote.command("repull")
 def repull_cmd(from_backup:Path|None=None):
     try: removed,audit=repull_once(from_backup=from_backup)
@@ -1375,7 +1377,9 @@ def fetch_cmd(event_id:Optional[str]=None):
 def watch(interval:int=typer.Option(2,"--interval")):
     failures=0
     while True:
-        try: sync_once()
+        try:
+            sync_once()
+            if e:=parked_error(): raise e
         except duckdb.InterruptException: raise KeyboardInterrupt from None
         except Exception as e:
             failures+=1
@@ -1398,10 +1402,14 @@ def watch(interval:int=typer.Option(2,"--interval")):
         time.sleep(delay)
 @remote.command("enable")
 def enable_cmd(remove:bool=typer.Option(False,"--remove")): typer.echo((remove or install_hooks(False,False),enable(paths()[0],remove))[-1])
+def parked_rows(root=None):
+    if not core_path(root).is_file(): return {}
+    with _core(root,True,purpose="remote.status.parked") as db: return dict(db.execute("SELECT reason,count(*) FROM remote.parked_rows GROUP BY reason ORDER BY reason").fetchall()) if db.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='remote' AND table_name='parked_rows'").fetchone() else {}
+def parked_error(root=None): return ValueError(f"{sum(b.values())} received row(s) parked for an ownership conflict were not applied: "+", ".join(f"{r}: {n}" for r,n in b.items())+"; `convos remote doctor` lists them, `convos remote repull` clears what no longer conflicts") if (b:={r:n for r,n in parked_rows(root).items() if "ownership" in r}) else None
 def recovery_notice(root=None):
     if not core_path(root).is_file(): return ""
     with _core(root,True,purpose="remote.status.retained") as db: retained,missing=db.execute("SELECT (SELECT count(*) FROM remote.row_conflicts),(SELECT count(*) FROM attachment_bodies b JOIN attachments a ON a.id=b.attachment_id WHERE a.path IS NULL)").fetchone()
-    return (f"; retained_bodies={retained} (run `convos remote audit` for unresolved projections)" if retained else "")+(f"; missing_files={missing} (rows whose file never arrived; run `convos remote sync --repair` on the device that captured them)" if missing else "")
+    return (f"; retained_bodies={retained} (run `convos remote audit` for unresolved projections)" if retained else "")+(f"; missing_files={missing} (rows whose file never arrived; run `convos remote sync --repair` on the device that captured them)" if missing else "")+(f"; parked_rows={sum(parked.values())} ({', '.join(f'{reason}: {n}' for reason,n in parked.items())}), received rows not projected, see docs/remote.md" if (parked:=parked_rows(root)) else "")
 def doctor_status():
     try:
         cfg=load()
@@ -1426,7 +1434,7 @@ def doctor_status():
         return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, upload_blocked={upload_blocked}, watch_failures={watch['failures']}{retry}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")+recovery_notice()
     except Exception as e: return f"remote: unavailable ({e})"
 @remote.command("doctor")
-def doctor_cmd(): typer.echo(doctor_status())
+def doctor_cmd(): (typer.echo(doctor_status()),(e:=parked_error()) and cli_error(e))
 @remote.command("audit")
 def audit_cmd(format:str=typer.Option("text","-f","--format")):
     result=audit_rows(core_path(),progress=_progress,local_user=load()["user"])
