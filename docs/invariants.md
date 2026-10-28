@@ -281,6 +281,29 @@ they do not depend on relay or `state.db` history.
 > expected body hash. Body ingestion is bounded by a 32 MiB per-body limit
 > unless policy deliberately changes it.
 
+## Producer closure
+
+> A multi-part archive write commits whole turns: a message with its tool
+> calls, attachments, edits and exactly their evidence never straddles a
+> transaction boundary, and conversations commit before their messages. A turn
+> larger than one part splits only between a message and its children or
+> between tool calls, never between an edit, its evidence and its tool call.
+> An evidence default never overwrites an existing evidence row, and a changed
+> evidence link marks both the old and the new parent changed.
+
+> The signer never reads inside an open multi-part write. The writer keeps an
+> open-ingest marker (start generation, process, heartbeat) that commits with
+> the first part and clears with the last; a sync clamps its watermark once to
+> the oldest live marker's start generation, scans with exactly that generation
+> and records exactly that generation. A marker without a live process or a
+> fresh heartbeat counts as closed, so the worst case is today's behaviour.
+
+> The owning device re-signs its own rows whose current content differs from
+> its latest proof: a write that moves a row away from its signed head marks it
+> changed, and retained head bodies are checked once per sync state. Equal
+> content never gets a new revision, so convergence cannot loop; torn revisions
+> already on the relay are superseded, never rewritten.
+
 ## Signed replication units
 
 > The independently signed content unit is a canonical logical row revision,

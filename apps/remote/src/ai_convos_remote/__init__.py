@@ -11,7 +11,7 @@ _pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases"
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, canonicalize_repositories, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, provider_session_key, retire_sync_identity, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import PROJECTION_VERSION, PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_stamps, bridge_state, connect, control_chain, cutover_state, event_support, inspect_state, local_repack_envelopes, repack_index, project, project_many, read_state, relocate_attachments, reset_history, retained_proof_pages, retry_edit_replicas, retry_own_replicas, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
+from .projection import PROJECTION_VERSION, PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_stamps, bridge_state, closed_generation, connect, control_chain, converge_own_rows, cutover_state, event_support, inspect_state, local_repack_envelopes, repack_index, project, project_many, read_state, relocate_attachments, reset_history, retained_proof_pages, retry_edit_replicas, retry_own_replicas, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
                        recovery_bundle, registration_proof, repack_replica, replica_compression, replica_plain_size, seal_event, seal_key, seal_origin, seal_replica, semantic_proof, sign_control, signer, unb64, verify_certificate, verify_semantic_proof)
 from .service import edit_hooks, enable
@@ -41,7 +41,7 @@ def _local_tails(state,ws): return {"events":(state.execute("SELECT cursor FROM 
 def _settled(cfg,state,root):
     if cfg["server_state"].get("capabilities",{}).get("sync_tails")!=1 or not (archive:=_archive_marker(root)) or archive[2]!=CORE_VERSION or archive[3]: return False
     active={w["id"]:w for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
-    dirty=not active or any(state.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() for table in ("outbox","blob_outbox","lazy_events","sequence_gaps")) or any(path.exists() and any(path.iterdir()) for path in (paths(root)[0]/"outbox",paths(root)[0]/"attachments")) or state.execute("SELECT 1 FROM meta WHERE key LIKE 'replica_repair:%' OR key LIKE 'archive_mode:%' OR key LIKE 'replica_upload_blocked:%' LIMIT 1").fetchone() or any(event_support(row)!=("required" if row[2] else "optional") for row in state.execute("SELECT kind,payload_v,required FROM deferred_events"))
+    dirty=not active or _meta(state,"retained_rows_checked",None)!="done" or any(state.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() for table in ("outbox","blob_outbox","lazy_events","sequence_gaps")) or any(path.exists() and any(path.iterdir()) for path in (paths(root)[0]/"outbox",paths(root)[0]/"attachments")) or state.execute("SELECT 1 FROM meta WHERE key LIKE 'replica_repair:%' OR key LIKE 'archive_mode:%' OR key LIKE 'replica_upload_blocked:%' LIMIT 1").fetchone() or any(event_support(row)!=("required" if row[2] else "optional") for row in state.execute("SELECT kind,payload_v,required FROM deferred_events"))
     ready=all((lifecycle:=state.execute("SELECT lifecycle,error FROM sync_states WHERE workspace=?",(ws,)).fetchone()) and lifecycle[0]=="ready" and not lifecycle[1] and remote.get("sync")==_local_tails(state,ws) and int(_meta(state,f"core_generation:{ws}"))==archive[1] and _meta(state,f"replica_projection:{ws}",None)==bridge_stamp(root) for ws,remote in active.items())
     return not dirty and ready and (marker:=_sync_marker(cfg,root,archive)) is not None and _meta(state,"sync_settled",None)==marker
 def load(root=None):
@@ -995,11 +995,12 @@ def sync_once(root=None,repair=False,manual=False):
             failures={ws:value["error"] for ws,value in pull(cfg,state,root,True,True,server=server).items() if "error" in value}
             retry_own_replicas(core_path(root),cfg['user'],cfg['device']['id'],_progress)
             retry_edit_replicas(core_path(root),cfg['user'],cfg['device']['id'],root,_progress)
+            converge_own_rows(core_path(root),state,cfg['user'],cfg['device']['id'],_progress)
             ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
             authorized={w["id"] for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
             reconciled=_archive_marker(root)
             path,active=core_path(root),authorized
-            generation=archive_info(root)[1] if path.is_file() else 0
+            generation=closed_generation(path) if path.is_file() else 0
             if path.is_file():
                 with closing(open_db(path,True,purpose="remote.routes")) as core: known=core_repository_state(core)
             else: known={"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}}
