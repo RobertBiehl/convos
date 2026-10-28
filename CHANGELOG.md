@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.6b29
+
+- Pin DuckDB 1.5.6 (the version the devices ran; installs had picked up 2.0.0) and rebuild every indexed table once (schema 19): a stored DuckDB index that missed rows of `remote.edit_dependencies` made every sync touching them fail at COMMIT.
+
 ## 0.11.6b28
 
 - Scan the archive on one read connection with fixed 1,000-row pages. `scan_archive` reopened the archive for every page and shrank the next page from the last page's time, so the agent's full scan ran at 100-row pages, 11 to 14 rows/s, 14.6 h; it now reopens only when a writer is waiting (`archive_waiting`), runs at about 1,500 rows/s on a copy of that archive with the same writer wait, and holds its read connection to the migration memory limit

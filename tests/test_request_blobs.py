@@ -78,7 +78,7 @@ def test_schema_18_retires_request_blob_rows_with_signed_deletes(tmp_path,monkey
     with core._core(path,purpose="test.schema") as db:
         db.execute("UPDATE core_schema SET version=17")
         core.init_schema(db)
-        assert db.execute("SELECT version FROM core_schema").fetchone()==(18,)==(core.CORE_VERSION,)
+        assert db.execute("SELECT version FROM core_schema").fetchone()==(core.CORE_VERSION,)
         assert not db.execute("SELECT 1 FROM messages WHERE role='api-request-blob' OR id IN (SELECT UNNEST(?))",[blobs]).fetchall()
         assistant=gen_id("claude-code","message:"+cid+":a1")
         assert db.execute("SELECT DISTINCT message_id FROM tool_calls UNION SELECT DISTINCT message_id FROM file_edits").fetchall()==[(assistant,)]
