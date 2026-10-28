@@ -182,7 +182,7 @@ def _audit_rows(db_path,page=5000,progress=None,local_user=None,on_unavailable=N
     if local_user is not None:
         cursor,seen="",{r[4] for r in origins}
         while True:
-            with contextlib.closing(open_db(db_path,True,purpose="remote.audit.requirements")) as db: heads=db.execute("SELECT p.row_kind,p.source_row_id,p.author_user_id,p.id,p.content_hash,p.state FROM remote.row_proofs p WHERE p.id>? AND NOT EXISTS(SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision) ORDER BY p.id LIMIT ?",[cursor,page]).fetchall()
+            with contextlib.closing(open_db(db_path,True,purpose="remote.audit.requirements")) as db: heads=db.execute("SELECT p.row_kind,p.source_row_id,p.author_user_id,p.id,p.content_hash,p.state FROM remote.row_proofs p WHERE p.id>? AND NOT EXISTS(SELECT 1 FROM remote.row_proofs c WHERE c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.workspace_id=p.workspace_id AND c.previous_revision=p.revision) ORDER BY p.id LIMIT ?",[cursor,page]).fetchall()
             if not heads: break
             origins += [(kind,source if user==local_user or kind in PROVENANCE-{'edit.observed','checkpoint.link'} else foreign_id(user,"file_edits" if kind=="edit.observed" else kind,source),source,user,pid,expected,state) for kind,source,user,pid,expected,state in heads if pid not in seen]
             cursor=heads[-1][3]
