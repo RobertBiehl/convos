@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-library-3be334928b-4263_2e5049dd6f",
+  "featureId": "feat_library_3be334928b",
+  "title": "Audit suppresses required proof heads across workspaces",
+  "category": "bug",
+  "severity": "medium",
+  "confidence": "high",
+  "triage": "confirmed-bug",
+  "evidence": [
+    {
+      "path": "apps/remote/src/ai_convos_remote/projection.py",
+      "startLine": 182,
+      "endLine": 187,
+      "symbol": "_audit_rows",
+      "quote": null
+    },
+    {
+      "path": "docs/invariants.md",
+      "startLine": 112,
+      "endLine": 117,
+      "symbol": null,
+      "quote": null
+    },
+    {
+      "path": "tests/test_remote_projection.py",
+      "startLine": 115,
+      "endLine": 122,
+      "symbol": "test_audit_detects_missing_body_even_without_surviving_origin",
+      "quote": null
+    }
+  ],
+  "reasoning": "The fallback inventory identifies surviving proof heads using a NOT EXISTS successor query scoped by kind, source row and author, but not workspace. Revision IDs deliberately exclude workspace, and the documented contract says a proof is superseded only within its own workspace. A successor in workspace A therefore suppresses an independently current proof in workspace B. If B's origin and retained body are missing, this fallback skips the proof and the audit can incorrectly report zero unavailable bodies.",
+  "reproduction": "Publish identical initial revisions for one author and row in workspaces A and B. Publish a changed successor only in A. Remove B's origin and old retained body while preserving its proof and A's current projection. Run audit_rows with local_user supplied; B's missing current body is omitted.",
+  "recommendation": "Include the proof's origin workspace in the successor correlation used to discover audit requirements.",
+  "whyTestsDoNotAlreadyCoverThis": "The included missing-origin regression uses one workspace. The included cross-workspace retirement tests publish deletion successors in both workspaces and do not exercise an independently current proof whose origin is missing.",
+  "suggestedRegressionTest": "Extend missing-origin audit coverage with identical initial revisions in two workspaces and a successor in only one. Assert that losing the other workspace's current body produces an unavailable result.",
+  "minimumFixScope": "The head-selection query in _audit_rows and one cross-workspace audit regression.",
+  "status": "open",
+  "history": [],
+  "signature": "sig_feat-library-3be334928b_42639d675f",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20261028T083944-b9ce74",
+  "createdAt": "2026-10-28T08:41:24.997Z",
+  "updatedAt": "2026-10-28T08:41:24.997Z"
+}

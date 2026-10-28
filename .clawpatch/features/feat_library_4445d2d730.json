@@ -75,7 +75,8 @@
   "status": "needs-fix",
   "lock": null,
   "findingIds": [
-    "fnd_sig-feat-library-4445d2d730-d6f3_211aa21e28"
+    "fnd_sig-feat-library-4445d2d730-d6f3_211aa21e28",
+    "fnd_sig-feat-library-4445d2d730-68a3_2d09a8f91a"
   ],
   "patchAttemptIds": [],
   "analysisHistory": [
@@ -105,8 +106,17 @@
       "model": null,
       "reasoningEffort": "high",
       "createdAt": "2026-09-30T22:56:27.773Z"
+    },
+    {
+      "runId": "20261028T083828-f137cb",
+      "kind": "review",
+      "summary": "1 finding(s); prompt=210183 bytes; approxTokens=52546; includedFiles=12; omittedFiles=0",
+      "provider": "codex",
+      "model": null,
+      "reasoningEffort": "medium",
+      "createdAt": "2026-10-28T08:39:32.256Z"
     }
   ],
   "createdAt": "2026-09-26T09:13:03.948Z",
-  "updatedAt": "2026-09-30T22:56:27.773Z"
+  "updatedAt": "2026-10-28T08:39:32.256Z"
 }

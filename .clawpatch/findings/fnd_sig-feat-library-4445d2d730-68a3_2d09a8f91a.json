@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-library-4445d2d730-68a3_2d09a8f91a",
+  "featureId": "feat_library_4445d2d730",
+  "title": "Resuming remote ID migration can delete the migrated winner",
+  "category": "data-loss",
+  "severity": "high",
+  "confidence": "high",
+  "triage": "confirmed-bug",
+  "evidence": [
+    {
+      "path": "src/ai_convos/migrations.py",
+      "startLine": 61,
+      "endLine": 61,
+      "symbol": "migrate_remote_ids",
+      "quote": null
+    },
+    {
+      "path": "src/ai_convos/migrations.py",
+      "startLine": 70,
+      "endLine": 83,
+      "symbol": "migrate_remote_data",
+      "quote": null
+    },
+    {
+      "path": "src/ai_convos/migrations.py",
+      "startLine": 91,
+      "endLine": 91,
+      "symbol": "migrate_remote_data",
+      "quote": null
+    }
+  ],
+  "reasoning": "Winner selection prioritizes the current proof over an already canonical physical ID. Consequently, a legacy-ID row can win while an older row at its destination ID loses. The data phase deletes the destination loser, renames the winner to that destination, and commits. Until line 91, the durable migration stage remains 'data' or 'data_direct'. Replaying that phase after interruption executes the same loser deletion against the destination ID, which now contains the winner. The subsequent UPDATE finds no row at the winner's old ID, permanently removing the current body from the active archive. The direct FTS updates have the same replay hazard.",
+  "reproduction": "Create two received representations of one logical message: an older revision already at the canonical ID and the current revision at a legacy ID. Run migration until the message rewrite at line 83 commits, then interrupt before line 91. Resume migrate_remote_data using the retained staging tables. The canonical message is deleted and cannot be recreated from those tables.",
+  "recommendation": "Make each committed rewrite resumable by atomically recording batch completion and skipping completed batches, or retain staged winner bodies and restore destinations idempotently. Apply the same protection to direct FTS rewrites.",
+  "whyTestsDoNotAlreadyCoverThis": "The supplied test excerpts cover backups, schema upgrades, and replay convergence, but do not exercise interruption after a committed ID rewrite where the losing row originally occupied the winner's destination ID.",
+  "suggestedRegressionTest": "Build the canonical-loser/legacy-winner fixture, interrupt immediately after the message rewrite commits, and resume. Assert that the latest message body, origin, child references, and FTS entry survive; repeat resume to prove idempotence.",
+  "minimumFixScope": "src/ai_convos/migrations.py data-phase checkpointing and an interruption regression test.",
+  "status": "open",
+  "history": [],
+  "signature": "sig_feat-library-4445d2d730_68a3dd1b48",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20261028T083828-f137cb",
+  "createdAt": "2026-10-28T08:39:32.250Z",
+  "updatedAt": "2026-10-28T08:39:32.250Z"
+}
