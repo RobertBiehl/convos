@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.6b32
+
+- Handle the relay's HTTP 400 missing-event response during guarded recovery while preserving other errors.
+
 ## 0.11.6b31
 
 - Repair the local sequence left by a parked abandoned membership event while retaining its signed envelope and verified relay history.

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-library-3be334928b-3d79_bace1e7b62",
+  "featureId": "feat_library_3be334928b",
+  "title": "State cutover can discard committed WAL transactions on interruption",
+  "category": "data-loss",
+  "severity": "high",
+  "confidence": "high",
+  "triage": "confirmed-bug",
+  "evidence": [
+    {
+      "path": "apps/remote/src/ai_convos_remote/projection.py",
+      "startLine": 124,
+      "endLine": 138,
+      "symbol": "cutover_state",
+      "quote": null
+    },
+    {
+      "path": "apps/remote/src/ai_convos_remote/projection.py",
+      "startLine": 103,
+      "endLine": 108,
+      "symbol": "cutover_state",
+      "quote": null
+    }
+  ],
+  "reasoning": "The cutover deletes the original SQLite WAL before replacing the original database. If the process or machine stops between those operations, the original database remains without committed transactions that existed only in the WAL. A backup has been created, but it is not automatically restored; the next run can operate on stale state and lose pending sync records.",
+  "reproduction": "Create an incompatible state database with committed changes in its WAL, then interrupt cutover after the WAL is unlinked and before the fresh database replaces the original.",
+  "recommendation": "Make the transition crash-recoverable: preserve the original database and WAL until the replacement is durable, or implement an explicit cutover journal that restores or completes the transition after interruption.",
+  "whyTestsDoNotAlreadyCoverThis": "No tests were included in the review excerpts, so interruption coverage cannot be established.",
+  "suggestedRegressionTest": "Inject a failure after WAL removal and reopen the state; verify that committed pending records remain recoverable and the next cutover completes safely.",
+  "minimumFixScope": "State cutover and its crash-recovery tests.",
+  "status": "uncertain",
+  "history": [
+    {
+      "runId": null,
+      "kind": "triage",
+      "status": "uncertain",
+      "note": "Duplicate unreproduced data-integrity hypothesis outside this change; already raised separately.",
+      "reasoning": null,
+      "commands": [],
+      "createdAt": "2026-10-29T20:14:53.245Z"
+    }
+  ],
+  "signature": "sig_feat-library-3be334928b_3d793bd229",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20261029T201313-e345b5",
+  "createdAt": "2026-10-29T20:13:35.129Z",
+  "updatedAt": "2026-10-29T20:14:53.230Z"
+}
