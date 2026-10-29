@@ -611,6 +611,40 @@ def _upload_batches(rows,limit=8*1024*1024,measure=lambda row:row["size"],maximu
         batch.append(row)
         size+=amount
     if batch: yield batch
+def repair_parked_memberships(cfg,state,root,server):
+    workspaces={w["id"]:w for w in server["workspaces"]}
+    devices={w["id"]:{d:r for control in w["controls"] for d,r in control["devices"].items()} for w in server["workspaces"]}
+    for name,raw in state.execute("SELECT key,value FROM meta WHERE key LIKE 'parked_event:%'").fetchall():
+        _,ws,eid=name.split(":")
+        item=json.loads(raw)
+        if item["kind"]!="workspace.membership" or item["author"]==cfg["device"]["id"] or item["author"] not in devices.get(ws,{}): continue
+        if devices[ws][item["author"]]["user"]!=cfg["user"] or item["author"] not in cfg["controls"][ws]["removed"]: continue
+        if state.execute("SELECT 1 FROM receipts WHERE workspace=? AND event=?",(ws,eid)).fetchone(): continue
+        if not state.execute("SELECT 1 FROM event_sequences WHERE workspace=? AND author=? AND seq=? AND event=?",(ws,item["author"],item["seq"],eid)).fetchone(): continue
+        if state.execute("SELECT 1 FROM event_sequences WHERE workspace=? AND author=? AND seq>?",(ws,item["author"],item["seq"])).fetchone() or state.execute("SELECT 1 FROM outbox WHERE workspace=?",(ws,)).fetchone(): continue
+        if (state.execute("SELECT value FROM meta WHERE key=?",(f"prev:{ws}",)).fetchone() or [None])[0]!=eid: continue
+        path=paths(root)[0]/"outbox"/f"{eid}.json"
+        if path.is_symlink() or not path.is_file(): continue
+        env=json.loads(path.read_text())
+        if not workspaces[ws]["device_authorized"] or env["epoch"]<workspaces[ws]["history_from"] or env["epoch"] not in {k["epoch"] for k in workspaces[ws]["keys"]}: continue
+        value=open_event(env,key(cfg,ws,env["epoch"]),signer({d:r["device"] for d,r in devices[ws].items()},item["author"]))
+        if env["workspace"]!=ws or (value["id"],value["author"],value["seq"],value["kind"],value["entity"])!=(eid,item["author"],item["seq"],item["kind"],item["entity"]): continue
+        own=state.execute("SELECT seq,event FROM receipts WHERE workspace=? AND author=? ORDER BY seq DESC LIMIT 1",(ws,cfg["device"]["id"])).fetchone()
+        head=state.execute("SELECT seq,event FROM event_sequences WHERE workspace=? AND author=? ORDER BY seq DESC LIMIT 1",(ws,cfg["device"]["id"])).fetchone()
+        if (tuple(own) if own else None)!=(tuple(head) if head else None): continue
+        if value["seq"]!=(own["seq"]+1 if own else 1) or value["parents"]!=([own["event"]] if own else []): continue
+        try: found=request(cfg,{"op":"fetch","workspace":ws,"event":eid})
+        except ValueError as e:
+            if str(e)!="event not found": raise
+        else:
+            if found["envelope"]!=env or not isinstance(found["cursor"],int) or isinstance(found["cursor"],bool) or found["cursor"]<1: raise ValueError("relay event acknowledgement mismatch")
+            continue
+        state.execute("DELETE FROM event_sequences WHERE workspace=? AND author=? AND seq=? AND event=?",(ws,item["author"],item["seq"],eid))
+        state.execute("DELETE FROM sequence_gaps WHERE workspace=? AND author=? AND seq=?",(ws,item["author"],item["seq"]))
+        state.execute("DELETE FROM publication_heads WHERE workspace=? AND event=?",(ws,eid))
+        state.execute("DELETE FROM meta WHERE key IN (?,?)",(f"seq:{ws}",f"prev:{ws}"))
+        if own: state.executemany("INSERT INTO meta VALUES (?,?)",[(f"seq:{ws}",str(own["seq"])),(f"prev:{ws}",own["event"])])
+    state.commit()
 def upload(cfg,state,root=None,workspaces=None,concurrent=False,server=None):
     active={w["id"] for w in (server or refresh(cfg,root,concurrent))["workspaces"] if workspaces is None or w["id"] in workspaces}
     upload_blobs(cfg,state,root,active)
@@ -620,6 +654,7 @@ def upload(cfg,state,root=None,workspaces=None,concurrent=False,server=None):
     state.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)",[(f"parked_event:{r['workspace']}:{r['event']}",json.dumps({k:r[k] for k in ("author","seq","kind","entity")})) for r in foreign])
     state.executemany("DELETE FROM outbox WHERE workspace=? AND event=?",[(r["workspace"],r["event"]) for r in foreign])
     state.commit()
+    repair_parked_memberships(cfg,state,root,server or refresh(cfg,root,concurrent))
     parked={r["workspace"]:ValueError(f"outbox event {r['event'][:12]} ({r['kind']}) parked: its author {r['author'][:8]} is not this device") for r in foreign}
     def send(batch):
         prepared,acknowledged=[],[]
@@ -998,6 +1033,7 @@ def sync_once(root=None,repair=False,manual=False):
             drain_hooks()
             canonicalize_repositories(core_path(root))
             server=refresh(cfg,root,True)
+            repair_parked_memberships(cfg,state,root,server)
             if not repair and _settled(cfg,state,root):
                 state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))
                 state.commit()

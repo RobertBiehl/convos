@@ -975,20 +975,69 @@ def test_pull_can_block_bad_workspace_and_continue_healthy_workspaces(tmp_path,m
     assert set(attempted)=={personal,team} and str(summary[personal]["error"])=="row replica proof mismatch" and "error" not in summary[team]
     assert dict(state.execute("SELECT workspace,lifecycle FROM sync_states").fetchall())=={personal:"blocked",team:"ready"} and state.execute("SELECT error FROM sync_states WHERE workspace=?",(personal,)).fetchone()[0]=="row replica proof mismatch"; state.close()
 
-def test_sync_parks_an_outbox_event_another_device_authored_and_still_pulls(tmp_path,monkeypatch):
+@pytest.mark.parametrize("already_parked",[False,True])
+def test_sync_parks_an_outbox_event_another_device_authored_and_still_pulls(tmp_path,monkeypatch,already_parked):
     # An aborted re-enrollment can leave an event of the abandoned device queued; the relay takes it only from that device
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr(remote_client,"request",transport(server)); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
     aroot,broot=tmp_path/"laptop",tmp_path/"desktop"; a,recovery=setup_client("http://server","alice",root=aroot); setup_client("http://server","alice",recovery=recovery,root=broot)
     write_archive(aroot/"data/convos.db","before"); sync_once(aroot); sync_once(broot); ws=workspace(a,"Personal")
     abandoned,_=setup_client("http://server","alice",recovery=recovery,root=tmp_path/"abandoned")
-    other=connect(tmp_path/"abandoned/remote/state.db"); foreign=publish(abandoned,other,ws,ledger_event("abandoned"),tmp_path/"abandoned"); row=other.execute("SELECT * FROM outbox WHERE event=?",(foreign,)).fetchone(); other.close()
-    shutil.copy(row["path"],path:=broot/"remote/outbox"/f"{foreign}.json"); state=connect(broot/"remote/state.db"); state.execute("INSERT INTO outbox VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",(*tuple(row)[:10],str(path),row["size"])); state.commit(); state.close()
+    # The abandoned enrollment used the existing state, including the previous device's sequence.
+    state=connect(broot/"remote/state.db"); foreign=publish(abandoned,state,ws,ledger_event("abandoned"),broot)
+    assert state.execute("SELECT 1 FROM sequence_gaps WHERE workspace=? AND author=?",(ws,abandoned["device"]["id"])).fetchone(); state.close()
+    remote_client.remove_device(load(aroot),ws,abandoned["device"]["id"],aroot)
     with duckdb.connect(str(aroot/"data/convos.db")) as db: project_archive_row(db,"conversations",ARCHIVE_COLUMNS["conversations"],["later","codex","after","2026-01-02","2026-01-02",None,None,None,None,"{}"])
     sync_once(aroot)
-    with pytest.raises(ValueError,match=f"outbox event {foreign[:12]} \\(workspace.membership\\) parked: its author {abandoned['device']['id'][:8]} is not this device"): sync_once(broot)
+    if already_parked:
+        with monkeypatch.context() as m:
+            m.setattr(remote_client,"repair_parked_memberships",lambda *args:None)
+            with pytest.raises(ValueError,match="device event chain mismatch"): sync_once(broot)
+        sync_once(broot)
+    else:
+        with pytest.raises(ValueError,match=f"outbox event {foreign[:12]} \\(workspace.membership\\) parked: its author {abandoned['device']['id'][:8]} is not this device"): sync_once(broot)
     with duckdb.connect(str(broot/"data/convos.db"),read_only=True) as db: assert db.execute("SELECT title FROM conversations WHERE id='later'").fetchone()==("after",)
     state=connect(broot/"remote/state.db"); assert not state.execute("SELECT 1 FROM outbox").fetchone() and json.loads(state.execute("SELECT value FROM meta WHERE key=?",(f"parked_event:{ws}:{foreign}",)).fetchone()[0])["author"]==abandoned["device"]["id"]; state.close()
-    sync_once(broot); state=connect(broot/"remote/state.db"); assert state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone(); state.close()
+    sync_once(broot); state=connect(broot/"remote/state.db"); assert state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone()
+    assert (broot/"remote/outbox"/f"{foreign}.json").is_file() and not state.execute("SELECT 1 FROM event_sequences WHERE workspace=? AND event=?",(ws,foreign)).fetchone()
+    own=load(broot); current=publish(own,state,ws,ledger_event("after-repair"),broot)
+    assert state.execute("SELECT author FROM event_sequences WHERE workspace=? AND event=?",(ws,current)).fetchone()[0]==own["device"]["id"]; state.close(); sync_once(broot)
+
+@pytest.mark.parametrize("case",["pending","accepted","inaccessible","unretired","transport"])
+def test_parked_membership_repair_preserves_ambiguous_history(tmp_path,monkeypatch,case):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr(remote_client,"request",transport(server)); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
+    root=tmp_path/"client"; cfg,recovery=setup_client("http://server","alice",root=root); sync_once(root); ws=workspace(cfg,"Personal")
+    other=tmp_path/"other"; setup_client("http://server","alice",recovery=recovery,root=other); sync_once(other)
+    abandoned,_=setup_client("http://server","alice",recovery=recovery,root=tmp_path/"abandoned")
+    state=connect(root/"remote/state.db"); foreign=publish(abandoned,state,ws,ledger_event("abandoned"),root)
+    row=state.execute("SELECT * FROM outbox WHERE event=?",(foreign,)).fetchone()
+    state.execute("INSERT INTO meta VALUES (?,?)",(f"parked_event:{ws}:{foreign}",json.dumps({k:row[k] for k in ("author","seq","kind","entity")})))
+    state.execute("DELETE FROM outbox WHERE event=?",(foreign,)); state.commit()
+    if case in ("accepted","inaccessible"):
+        env=json.loads((root/"remote/outbox"/f"{foreign}.json").read_text())
+        remote_client.request(abandoned,{"op":"upload_many","envelopes":[env]})
+    if case=="pending": successor=publish(load(root),state,ws,ledger_event("successor"),root)
+    if case in ("accepted","inaccessible"):
+        # The synthetic accepted event has a broken chain, so the normal boundary preflight cannot pull it.
+        with monkeypatch.context() as m:
+            m.setattr(remote_client,"next_boundary",lambda cfg,ws,root:{"epoch":cfg["controls"][ws]["epoch"]+1,**remote_client.request(cfg,{"op":"ledger","workspace":ws})})
+            remote_client.remove_device(load(other),ws,abandoned["device"]["id"],other)
+    elif case!="unretired": remote_client.remove_device(load(other),ws,abandoned["device"]["id"],other)
+    cfg=load(root); server_state=remote_client.refresh(cfg,root)
+    if case=="inaccessible": next(w for w in server_state["workspaces"] if w["id"]==ws)["keys"]=[]
+    requests=[]
+    relay=remote_client.request
+    def observed(cfg,body,*args):
+        requests.append(body["op"])
+        if case=="transport" and body["op"]=="fetch": raise ConnectionError("relay unavailable")
+        return relay(cfg,body,*args)
+    monkeypatch.setattr(remote_client,"request",observed)
+    if case=="transport":
+        with pytest.raises(ConnectionError,match="relay unavailable"): remote_client.repair_parked_memberships(cfg,state,root,server_state)
+    else: remote_client.repair_parked_memberships(cfg,state,root,server_state)
+    assert ("fetch" in requests)==(case in ("accepted","transport"))
+    assert state.execute("SELECT event FROM event_sequences WHERE workspace=? AND author=? AND seq=?",(ws,row["author"],row["seq"])).fetchone()[0]==foreign
+    if case=="pending": assert state.execute("SELECT event FROM outbox WHERE workspace=? AND event=?",(ws,successor)).fetchone()[0]==successor
+    assert (root/"remote/outbox"/f"{foreign}.json").is_file(); state.close()
 
 def test_upload_holds_a_rejected_event_and_its_successors_but_sends_other_workspaces(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); root=tmp_path/"client"; rejected=[]
