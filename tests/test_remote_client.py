@@ -7,6 +7,7 @@ import ai_convos.cli as core_module
 import ai_convos_memory as memory_module
 import ai_convos_remote as remote_client
 import ai_convos_remote.projection as projection_module
+import ai_convos_remote_server as remote_server_module
 from ai_convos.cli import ARCHIVE_COLUMNS, archive_state, capture_provenance, index_attachment_body, init_schema, project_archive_row, project_logical_row
 from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, archive_info, bind_origin, configure_sharing, connect, control_body, create, doctor_status, fetch_lazy, grant_all, key, load, pull, pull_origins, publish, refresh, rehome_client, remove_device,
                               repull_once, request_device, request_history, rescue_bindings, setup_client, sync_once, upload, workspace)
@@ -973,6 +974,37 @@ def test_pull_can_block_bad_workspace_and_continue_healthy_workspaces(tmp_path,m
     monkeypatch.setattr(remote_client,"pull_row_replicas",replicas); state=connect(root/"remote/state.db"); summary=pull(cfg,state,root,keep_going=True)
     assert set(attempted)=={personal,team} and str(summary[personal]["error"])=="row replica proof mismatch" and "error" not in summary[team]
     assert dict(state.execute("SELECT workspace,lifecycle FROM sync_states").fetchall())=={personal:"blocked",team:"ready"} and state.execute("SELECT error FROM sync_states WHERE workspace=?",(personal,)).fetchone()[0]=="row replica proof mismatch"; state.close()
+
+def test_sync_parks_an_outbox_event_another_device_authored_and_still_pulls(tmp_path,monkeypatch):
+    # An aborted re-enrollment can leave an event of the abandoned device queued; the relay takes it only from that device
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr(remote_client,"request",transport(server)); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
+    aroot,broot=tmp_path/"laptop",tmp_path/"desktop"; a,recovery=setup_client("http://server","alice",root=aroot); setup_client("http://server","alice",recovery=recovery,root=broot)
+    write_archive(aroot/"data/convos.db","before"); sync_once(aroot); sync_once(broot); ws=workspace(a,"Personal")
+    abandoned,_=setup_client("http://server","alice",recovery=recovery,root=tmp_path/"abandoned")
+    other=connect(tmp_path/"abandoned/remote/state.db"); foreign=publish(abandoned,other,ws,ledger_event("abandoned"),tmp_path/"abandoned"); row=other.execute("SELECT * FROM outbox WHERE event=?",(foreign,)).fetchone(); other.close()
+    shutil.copy(row["path"],path:=broot/"remote/outbox"/f"{foreign}.json"); state=connect(broot/"remote/state.db"); state.execute("INSERT INTO outbox VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",(*tuple(row)[:10],str(path),row["size"])); state.commit(); state.close()
+    with duckdb.connect(str(aroot/"data/convos.db")) as db: project_archive_row(db,"conversations",ARCHIVE_COLUMNS["conversations"],["later","codex","after","2026-01-02","2026-01-02",None,None,None,None,"{}"])
+    sync_once(aroot)
+    with pytest.raises(ValueError,match=f"outbox event {foreign[:12]} \\(workspace.membership\\) parked: its author {abandoned['device']['id'][:8]} is not this device"): sync_once(broot)
+    with duckdb.connect(str(broot/"data/convos.db"),read_only=True) as db: assert db.execute("SELECT title FROM conversations WHERE id='later'").fetchone()==("after",)
+    state=connect(broot/"remote/state.db"); assert not state.execute("SELECT 1 FROM outbox").fetchone() and json.loads(state.execute("SELECT value FROM meta WHERE key=?",(f"parked_event:{ws}:{foreign}",)).fetchone()[0])["author"]==abandoned["device"]["id"]; state.close()
+    sync_once(broot); state=connect(broot/"remote/state.db"); assert state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone(); state.close()
+
+def test_upload_holds_a_rejected_event_and_its_successors_but_sends_other_workspaces(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); root=tmp_path/"client"; rejected=[]
+    def relay(cfg,body,auth=True):
+        try: return action(server,body,cfg.get("token") if auth else None)
+        except PermissionError as e: raise remote_client.RelayRejected(f"Remote {body['op']} HTTP 403: {e}") from e
+    monkeypatch.setattr(remote_client,"request",relay); cfg,_=setup_client("http://server","alice",root=root); team=create(cfg,"Team","team",root); personal=workspace(cfg,"Personal")
+    state=connect(root/"remote/state.db"); events={ws:[publish(cfg,state,ws,policy(str(i),f"{ws[:4]}{i}"),root) for i in range(3)] for ws in (personal,team)}
+    store=remote_server_module.store_event
+    def store_event(db,actor,env):
+        if env["event"]==events[personal][1]: rejected.append(env["event"]); raise PermissionError("event epoch rejected")
+        return store(db,actor,env)
+    monkeypatch.setattr(remote_server_module,"store_event",store_event)
+    with pytest.raises(ValueError,match="event epoch rejected") as caught: upload(cfg,state,root)
+    assert set(caught.value.workspaces)=={personal} and rejected==[events[personal][1]]*2
+    assert {r[0] for r in state.execute("SELECT event FROM outbox")}==set(events[personal][1:]) and {r[0] for r in state.execute("SELECT event FROM receipts")}>={events[personal][0],*events[team]}; state.close()
 
 def test_pull_never_treats_query_cancellation_as_a_workspace_failure(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); root=tmp_path/"client"; cfg,_=setup_client("http://server","alice",root=root); create(cfg,"Team","team",root); attempted=[]

@@ -399,6 +399,18 @@ attachment's file before the row that references it, so an interrupted sender
 leaves files without rows, never rows without files. Existing ambiguous duplicate identities
 are not automatically deleted or merged.
 
+Uploads go as far as they can. The relay takes a ledger event only from the
+device that authored it, so an event this device queued under an earlier identity
+(an enrollment that was abandoned and rolled back) can never upload: `remote
+sync` parks it before sending (`parked_event:<workspace>:<event>` in the state
+database, its file left in the outbox) and `remote doctor` counts it as
+`parked_events`. When the relay rejects an upload batch (HTTP 403), each event is
+retried alone: the rejected one and the later events of its workspace stay
+queued, since they build on it, and every other workspace's events are sent.
+Either way the replica upload and the pull still run, and the sync then exits
+non-zero naming the event; a parked event is reported once, a held one on every
+sync until the relay accepts it.
+
 A received row the receiver cannot reconcile is parked, not refused with the
 whole batch: nothing of the row is stored, `remote.parked_rows` records its
 proof id, kind, source id, author and reason, and the cursor moves on. The

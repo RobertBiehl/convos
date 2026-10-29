@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.6b30
+
+- Sync goes as far as it can: an outbox event authored by another identity of this device (e.g. an abandoned enrollment) is parked instead of failing every sync with `event author rejected` before the pull, and a batch the relay rejects is retried event by event, holding only the rejected event's workspace; the sync exits non-zero naming them at the end.
+
 ## 0.11.6b29
 
 - Pin DuckDB 1.5.6 (the version the devices ran; installs had picked up 2.0.0) and rebuild every indexed table once (schema 19): a stored DuckDB index that missed rows of `remote.edit_dependencies` made every sync touching them fail at COMMIT.
