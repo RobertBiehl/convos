@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-library-3be334928b-5cce_d7c85adcb0",
+  "featureId": "feat_library_3be334928b",
+  "title": "State cutover can discard committed WAL transactions after a crash",
+  "category": "data-loss",
+  "severity": "high",
+  "confidence": "high",
+  "triage": "confirmed-bug",
+  "evidence": [
+    {
+      "path": "apps/remote/src/ai_convos_remote/projection.py",
+      "startLine": 132,
+      "endLine": 135,
+      "symbol": "cutover_state",
+      "quote": null
+    }
+  ],
+  "reasoning": "Cutover deletes the original database's WAL before replacing the database file. If the process or machine stops between those operations, the original database remains in place without its WAL, so committed transactions that had not been checkpointed disappear. The backup is available for manual recovery, but the live state can lose pending sync work.",
+  "reproduction": "Use a WAL-mode state database with committed, uncheckpointed changes and interrupt cutover after the WAL unlink but before replacement of the database file.",
+  "recommendation": "Install the replacement without first removing the WAL needed by the original database, using a crash-safe cutover protocol that preserves a recoverable database and WAL pair at every step.",
+  "whyTestsDoNotAlreadyCoverThis": "No linked tests were included in the review input; crash interruption at this cutover boundary is therefore not evidenced.",
+  "suggestedRegressionTest": "Interrupt cutover at each filesystem mutation with committed data in the WAL, then reopen or recover the state and verify the committed pending work remains available.",
+  "minimumFixScope": "The filesystem replacement sequence in cutover_state and a crash-recovery regression test.",
+  "status": "uncertain",
+  "history": [
+    {
+      "runId": null,
+      "kind": "triage",
+      "status": "uncertain",
+      "note": "Duplicate unreproduced data-integrity hypothesis outside this change; raised for separate assessment.",
+      "reasoning": null,
+      "commands": [],
+      "createdAt": "2026-10-29T19:26:31.418Z"
+    }
+  ],
+  "signature": "sig_feat-library-3be334928b_5cce51648b",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20261029T192540-1636e9",
+  "createdAt": "2026-10-29T19:26:00.924Z",
+  "updatedAt": "2026-10-29T19:26:31.407Z"
+}

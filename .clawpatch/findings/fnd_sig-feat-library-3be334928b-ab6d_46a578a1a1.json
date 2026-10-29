@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-library-3be334928b-ab6d_46a578a1a1",
+  "featureId": "feat_library_3be334928b",
+  "title": "State cutover removes the live WAL before replacing the database",
+  "category": "data-loss",
+  "severity": "high",
+  "confidence": "high",
+  "triage": "confirmed-bug",
+  "evidence": [
+    {
+      "path": "apps/remote/src/ai_convos_remote/projection.py",
+      "startLine": 103,
+      "endLine": 108,
+      "symbol": "cutover_state",
+      "quote": null
+    },
+    {
+      "path": "apps/remote/src/ai_convos_remote/projection.py",
+      "startLine": 132,
+      "endLine": 138,
+      "symbol": "cutover_state",
+      "quote": null
+    }
+  ],
+  "reasoning": "Cutover unlinks the original SQLite WAL and shared-memory files before replacing the original database. If the process crashes or os.replace fails between those operations, the original database remains without committed transactions that were present only in its WAL. Although the backup contains a consistent copy, the live state can reopen stale and silently lose pending synchronization state.",
+  "reproduction": "Create an incompatible WAL-mode state database with committed data still in its WAL, then interrupt cutover after WAL removal and before replacement. Reopening the original database omits the WAL-only transactions.",
+  "recommendation": "Make replacement crash-safe without deleting the live WAL before the new database is installed; coordinate SQLite connections and preserve recoverability across every cutover step.",
+  "whyTestsDoNotAlreadyCoverThis": "No tests were included in the review context.",
+  "suggestedRegressionTest": "Inject a failure at each cutover filesystem step with committed WAL-only state and verify that reopening or recovery retains all committed records.",
+  "minimumFixScope": "Change the cutover replacement sequence and its failure recovery.",
+  "status": "uncertain",
+  "history": [
+    {
+      "runId": null,
+      "kind": "triage",
+      "status": "uncertain",
+      "note": "Duplicate unreproduced data-integrity hypothesis outside this change; raised for separate assessment.",
+      "reasoning": null,
+      "commands": [],
+      "createdAt": "2026-10-29T19:25:28.401Z"
+    }
+  ],
+  "signature": "sig_feat-library-3be334928b_ab6d1178c9",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20261029T191807-9d34ff",
+  "createdAt": "2026-10-29T19:18:35.532Z",
+  "updatedAt": "2026-10-29T19:25:28.398Z"
+}

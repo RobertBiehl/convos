@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-library-3be334928b-eb45_63c62bdd6c",
+  "featureId": "feat_library_3be334928b",
+  "title": "State cutover can discard committed WAL transactions if interrupted",
+  "category": "data-loss",
+  "severity": "high",
+  "confidence": "high",
+  "triage": "confirmed-bug",
+  "evidence": [
+    {
+      "path": "apps/remote/src/ai_convos_remote/projection.py",
+      "startLine": 124,
+      "endLine": 135,
+      "symbol": "cutover_state",
+      "quote": null
+    }
+  ],
+  "reasoning": "The cutover deletes the original SQLite WAL and shared-memory files before replacing the original database with the fresh database. If the process or machine stops between those operations, the original database remains in place without its WAL. Committed state that existed only in the WAL is then absent on restart. A backup was created, but recovery is not automatic in this path.",
+  "reproduction": "Create an incompatible state database with committed records still in its WAL, interrupt cutover after the WAL is unlinked and before the fresh database is installed, then reopen the original database.",
+  "recommendation": "Make the transition recoverable across interruption: preserve the original database and WAL together until the replacement is durable, and add restart recovery for any intermediate state.",
+  "whyTestsDoNotAlreadyCoverThis": "No tests were included in the review context, so interruption recovery coverage could not be verified.",
+  "suggestedRegressionTest": "Inject a failure between removal of the original WAL and installation of the fresh database; restart and verify that all committed preserved records remain recoverable without manual intervention.",
+  "minimumFixScope": "Revise cutover ordering and recovery in projection.py; add an interruption regression test.",
+  "status": "uncertain",
+  "history": [
+    {
+      "runId": null,
+      "kind": "triage",
+      "status": "uncertain",
+      "note": "Duplicate unreproduced data-integrity hypothesis outside this change; raised for separate assessment.",
+      "reasoning": null,
+      "commands": [],
+      "createdAt": "2026-10-29T19:25:32.727Z"
+    }
+  ],
+  "signature": "sig_feat-library-3be334928b_eb45206800",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20261029T192412-6a6ec7",
+  "createdAt": "2026-10-29T19:24:34.384Z",
+  "updatedAt": "2026-10-29T19:25:32.723Z"
+}
