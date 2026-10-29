@@ -174,6 +174,7 @@ def _response_json(response,limit=64*1024**2):
     try: value=json.loads(raw)
     except (ValueError,UnicodeError) as e: raise ValueError("Relay returned invalid JSON") from e
     return required(isinstance(value,dict),ValueError("Relay response must be a JSON object")) and value
+class RelayRejected(ValueError): pass
 def request(cfg,body,auth=True):
     _heartbeat(f"request {body['op']}")
     safe_url(cfg["url"])
@@ -184,7 +185,7 @@ def request(cfg,body,auth=True):
     except urllib.error.HTTPError as e:
         try: message=_response_json(e,64*1024).get("error",e.reason)
         except ValueError: message=e.reason
-        raise (ConnectionError if e.code in (408,429) or e.code>=500 else ValueError)(f"Remote {body['op']} HTTP {e.code}: {str(message)[:1000]}") from e
+        raise (ConnectionError if e.code in (408,429) or e.code>=500 else RelayRejected if e.code==403 else ValueError)(f"Remote {body['op']} HTTP {e.code}: {str(message)[:1000]}") from e
     except (urllib.error.URLError,TimeoutError,ConnectionError,http.client.HTTPException) as e: raise ConnectionError(f"Remote {body['op']} failed (socket timeout {timeout}s): {e}") from e
 def health(cfg): return (safe_url(cfg["url"]),(lambda result:(required(result.get("version")==2,ValueError("relay protocol v2 required")),result)[-1])(_response_json(_HTTP.open(cfg["url"].rstrip("/")+"/v2/health",timeout=3))))[-1]
 def _manual_waiting(root):
@@ -614,7 +615,13 @@ def upload(cfg,state,root=None,workspaces=None,concurrent=False,server=None):
     active={w["id"] for w in (server or refresh(cfg,root,concurrent))["workspaces"] if workspaces is None or w["id"] in workspaces}
     upload_blobs(cfg,state,root,active)
     rows=[r for r in state.execute("SELECT * FROM outbox ORDER BY workspace,seq").fetchall() if r["workspace"] in active]
-    for batch in _upload_batches(rows):
+    # The relay takes an event only from its author: one queued by an earlier identity of this device can never upload, so it is set aside
+    foreign,held=[r for r in rows if r["author"]!=cfg["device"]["id"]],{}
+    state.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)",[(f"parked_event:{r['workspace']}:{r['event']}",json.dumps({k:r[k] for k in ("author","seq","kind","entity")})) for r in foreign])
+    state.executemany("DELETE FROM outbox WHERE workspace=? AND event=?",[(r["workspace"],r["event"]) for r in foreign])
+    state.commit()
+    parked={r["workspace"]:ValueError(f"outbox event {r['event'][:12]} ({r['kind']}) parked: its author {r['author'][:8]} is not this device") for r in foreign}
+    def send(batch):
         prepared,acknowledged=[],[]
         for row in batch:
             expected=paths(root)[0]/"outbox"/f"{row['event']}.json"
@@ -643,7 +650,20 @@ def upload(cfg,state,root=None,workspaces=None,concurrent=False,server=None):
             state.execute("DELETE FROM outbox WHERE workspace=? AND event=?",(row["workspace"],row["event"]))
         state.commit()
         for row,env,path,ack in delivered: path.unlink(missing_ok=True)
+    for batch in _upload_batches([r for r in rows if r not in foreign]):
+        try: send([r for r in batch if r["workspace"] not in held])
+        except RelayRejected:
+            # The relay applies a batch whole; find the rejected event, and hold its workspace's later events, which build on it
+            for row in batch:
+                try: row["workspace"] in held or send([row])
+                except RelayRejected as e: held[row["workspace"]]=e
     upload_replicas(cfg,state,root,active)
+    if failed:={**parked,**held}: raise (e:=ValueError("; ".join(f"{ws[:8]}: {error}" for ws,error in failed.items())),setattr(e,"workspaces",failed))[0]
+def upload_isolated(failures,*args):
+    try: upload(*args)
+    except ValueError as e:
+        if not hasattr(e,"workspaces"): raise
+        failures.update(e.workspaces)
 def reconcile_replicas(cfg,state,root,ws,envelopes,semantic=False):
     stage_replicas(root,envelopes,semantic)
     upload_replicas(cfg,state,root,{ws})
@@ -988,11 +1008,11 @@ def sync_once(root=None,repair=False,manual=False):
             if repair:
                 for ws in ready: state.execute("INSERT OR REPLACE INTO meta VALUES (?,'1')",(f"replica_repair:{ws}",))
             state.commit()
-            upload(cfg,state,root,ready,True,server)
+            upload_isolated(failures:={},cfg,state,root,ready,True,server)
             prepare_archive(cfg,state,root)
             baseline=archive_info(root)
             bound={r[0] for r in state.execute("SELECT DISTINCT workspace FROM origin_bindings").fetchall()}
-            failures={ws:value["error"] for ws,value in pull(cfg,state,root,True,True,server=server).items() if "error" in value}
+            failures.update({ws:value["error"] for ws,value in pull(cfg,state,root,True,True,server=server).items() if "error" in value})
             retry_own_replicas(core_path(root),cfg['user'],cfg['device']['id'],_progress)
             retry_edit_replicas(core_path(root),cfg['user'],cfg['device']['id'],root,_progress)
             converge_own_rows(core_path(root),state,cfg['user'],cfg['device']['id'],_progress)
@@ -1066,7 +1086,7 @@ def sync_once(root=None,repair=False,manual=False):
             for ws in ready&active: state.execute("DELETE FROM meta WHERE key=?",(f"replica_repair:{ws}",))
             state.commit()
             server=refresh(cfg,root,True)
-            upload(cfg,state,root,ready,True,server)
+            upload_isolated(failures,cfg,state,root,ready,True,server)
             failures.update({ws:value["error"] for ws,value in pull(cfg,state,root,True,True,ready=False,server=server).items() if "error" in value})
             state.commit()
             if failures: raise next(iter(failures.values())) if len(authorized)==1 else (ConnectionError if all(isinstance(error,ConnectionError) for error in failures.values()) else RuntimeError)(f"Remote sync completed partially: {len(failures)} workspace error(s); workspaces were isolated and failed data was not accepted or acknowledged. "+"; ".join(f"{cfg['workspaces'].get(ws,{}).get('name',ws[:8])}: {error}" for ws,error in failures.items()))
@@ -1419,7 +1439,7 @@ def doctor_status():
         if info["status"]!="current": return f"remote: {online}, state={info['status']}, schema={info['version'] or 'unknown'}, next_sync={'backup+rebaseline' if info['status'] in ('incompatible','invalid') else 'initialize'}"
         state=read_state(paths()[2])
         try:
-            pending=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+            pending,parked=state.execute("SELECT (SELECT COUNT(*) FROM outbox),(SELECT COUNT(*) FROM meta WHERE key LIKE 'parked_event:%')").fetchone()
             lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]
             deferred,required=state.execute("SELECT COUNT(*),COALESCE(SUM(required),0) FROM deferred_events").fetchone()
             lifecycle=",".join(f"{r[0][:8]}:{r[1]}" for r in state.execute("SELECT workspace,lifecycle FROM sync_states ORDER BY workspace").fetchall()) or "uninitialized"
@@ -1431,7 +1451,7 @@ def doctor_status():
         watch_path=paths()[0]/"watch.json"
         watch=json.loads(watch_path.read_text()) if watch_path.exists() else {"failures":0}
         retry=f", next_retry={watch['next_retry']}" if watch["failures"] else ""
-        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, upload_blocked={upload_blocked}, watch_failures={watch['failures']}{retry}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")+recovery_notice()
+        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, parked_events={parked}, lazy={lazy}, deferred={deferred}, required={required}, upload_blocked={upload_blocked}, watch_failures={watch['failures']}{retry}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")+recovery_notice()
     except Exception as e: return f"remote: unavailable ({e})"
 @remote.command("doctor")
 def doctor_cmd(): (typer.echo(doctor_status()),(e:=parked_error()) and cli_error(e))
