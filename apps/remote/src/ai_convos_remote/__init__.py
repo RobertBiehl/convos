@@ -175,6 +175,7 @@ def _response_json(response,limit=64*1024**2):
     except (ValueError,UnicodeError) as e: raise ValueError("Relay returned invalid JSON") from e
     return required(isinstance(value,dict),ValueError("Relay response must be a JSON object")) and value
 class RelayRejected(ValueError): pass
+class RelayEventMissing(ValueError): pass
 def request(cfg,body,auth=True):
     _heartbeat(f"request {body['op']}")
     safe_url(cfg["url"])
@@ -183,9 +184,10 @@ def request(cfg,body,auth=True):
     req=urllib.request.Request(cfg["url"].rstrip("/")+"/v2",data=json.dumps(body,separators=(",",":")).encode(),headers=headers,method="POST")
     try: return _response_json(_HTTP.open(req,timeout=(timeout:=120 if body["op"] in {"upload_many","replica_upload_many","replica_replace_many","blob_upload","origin_upload"} else 30)),None if body["op"]=="origin_pull" else 64*1024**2)
     except urllib.error.HTTPError as e:
-        try: message=_response_json(e,64*1024).get("error",e.reason)
-        except ValueError: message=e.reason
-        raise (ConnectionError if e.code in (408,429) or e.code>=500 else RelayRejected if e.code==403 else ValueError)(f"Remote {body['op']} HTTP {e.code}: {str(message)[:1000]}") from e
+        try: parsed=_response_json(e,64*1024)
+        except ValueError: parsed={}
+        message=parsed.get("error",e.reason)
+        raise (ConnectionError if e.code in (408,429) or e.code>=500 else RelayRejected if e.code==403 else RelayEventMissing if body["op"]=="fetch" and e.code==400 and parsed.get("error")=="event not found" else ValueError)(f"Remote {body['op']} HTTP {e.code}: {str(message)[:1000]}") from e
     except (urllib.error.URLError,TimeoutError,ConnectionError,http.client.HTTPException) as e: raise ConnectionError(f"Remote {body['op']} failed (socket timeout {timeout}s): {e}") from e
 def health(cfg): return (safe_url(cfg["url"]),(lambda result:(required(result.get("version")==2,ValueError("relay protocol v2 required")),result)[-1])(_response_json(_HTTP.open(cfg["url"].rstrip("/")+"/v2/health",timeout=3))))[-1]
 def _manual_waiting(root):
@@ -634,8 +636,7 @@ def repair_parked_memberships(cfg,state,root,server):
         if (tuple(own) if own else None)!=(tuple(head) if head else None): continue
         if value["seq"]!=(own["seq"]+1 if own else 1) or value["parents"]!=([own["event"]] if own else []): continue
         try: found=request(cfg,{"op":"fetch","workspace":ws,"event":eid})
-        except ValueError as e:
-            if str(e)!="event not found": raise
+        except RelayEventMissing: pass
         else:
             if found["envelope"]!=env or not isinstance(found["cursor"],int) or isinstance(found["cursor"],bool) or found["cursor"]<1: raise ValueError("relay event acknowledgement mismatch")
             continue
@@ -665,8 +666,7 @@ def upload(cfg,state,root=None,workspaces=None,concurrent=False,server=None):
             current=cfg["workspaces"][row["workspace"]]["epoch"]
             if env["epoch"]!=current:
                 try: found=request(cfg,{"op":"fetch","workspace":row["workspace"],"event":row["event"]})
-                except ValueError as e:
-                    if str(e)!="event not found": raise
+                except RelayEventMissing:
                     value=open_event(env,key(cfg,row["workspace"],env["epoch"]),cfg["device"]["sign_public"])
                     env=seal_event(value,row["workspace"],current,key(cfg,row["workspace"],current))
                     path,size=encrypted_file(root,row["event"],env)

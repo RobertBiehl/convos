@@ -8,14 +8,14 @@ import ai_convos_remote as remote
 
 
 @contextmanager
-def endpoint(status,body,headers=None):
+def endpoint(status,body,headers=None,reason=None):
     calls=[]
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,*args): pass
         def do_POST(self):
             calls.append((self.path,self.headers.get("Authorization")))
             self.rfile.read(int(self.headers.get("Content-Length",0)))
-            self.send_response(status)
+            self.send_response(status,reason)
             for key,value in (headers or {}).items(): self.send_header(key,value)
             self.send_header("Content-Length",str(len(body)))
             self.end_headers()
@@ -45,6 +45,25 @@ def test_http_errors_preserve_status_and_retryability(status,error,body):
         with pytest.raises(error,match=f"Remote state HTTP {status}"):
             remote.request({"url":url,"token":"synthetic-secret"},{"op":"state"})
         assert len(calls)==1
+
+
+@pytest.mark.parametrize("op,status,body,missing",[
+    ("fetch",400,b'{"error":"event not found"}',True),
+    ("fetch",400,b'{"error":"different error"}',False),
+    ("fetch",403,b'{"error":"event not found"}',False),
+    ("fetch",400,b'not json',False),
+    ("state",400,b'{"error":"event not found"}',False),
+])
+def test_only_exact_fetch_400_means_missing_event(op,status,body,missing):
+    with endpoint(status,body) as (url,calls):
+        with pytest.raises(ValueError) as caught: remote.request({"url":url,"token":"synthetic-secret"},{"op":op})
+        assert (type(caught.value).__name__=="RelayEventMissing")==missing and len(calls)==1
+
+
+def test_malformed_fetch_error_never_uses_reason_as_missing_event():
+    with endpoint(400,b'not json',reason="event not found") as (url,calls):
+        with pytest.raises(ValueError) as caught: remote.request({"url":url,"token":"synthetic-secret"},{"op":"fetch"})
+        assert type(caught.value).__name__!="RelayEventMissing" and len(calls)==1
 
 
 @pytest.mark.parametrize("raw,limit,match",[(b'x'*17,16,"byte limit"),(b'not json',16,"invalid JSON"),(b'[]',16,"JSON object")])

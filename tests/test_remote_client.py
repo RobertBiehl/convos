@@ -15,10 +15,15 @@ from ai_convos_remote.control import sign as control_sign, vote as device_vote
 from ai_convos_remote.projection import inspect_state, scan, sharing
 from ai_convos_remote.protocol import certificate, event, identity, logical_row, open_blob, open_origin, open_replica, seal_blob, seal_event, seal_key, seal_origin, seal_replica, sign_control, unb64
 from ai_convos_remote_server import action, connect as server_connect, stored_envelope
+from tests.test_remote_transport import endpoint
 
 
 def transport(db):
-    def call(cfg,body,auth=True): return action(db,body,cfg.get("token") if auth else None)
+    def call(cfg,body,auth=True):
+        try: return action(db,body,cfg.get("token") if auth else None)
+        except ValueError as e:
+            if body["op"]=="fetch" and str(e)=="event not found": raise remote_client.RelayEventMissing(str(e)) from e
+            raise
     return call
 @pytest.fixture(autouse=True)
 def no_approval_delay(monkeypatch): monkeypatch.setattr("ai_convos_remote_server.APPROVAL_DELAY",0)
@@ -1038,6 +1043,22 @@ def test_parked_membership_repair_preserves_ambiguous_history(tmp_path,monkeypat
     assert state.execute("SELECT event FROM event_sequences WHERE workspace=? AND author=? AND seq=?",(ws,row["author"],row["seq"])).fetchone()[0]==foreign
     if case=="pending": assert state.execute("SELECT event FROM outbox WHERE workspace=? AND event=?",(ws,successor)).fetchone()[0]==successor
     assert (root/"remote/outbox"/f"{foreign}.json").is_file(); state.close()
+
+def test_parked_membership_sync_accepts_real_http_missing_event(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); relay=transport(server); http=remote_client.request
+    monkeypatch.setattr(remote_client,"request",relay); monkeypatch.setattr(remote_client,"drain_hooks",lambda:None)
+    aroot,broot=tmp_path/"laptop",tmp_path/"desktop"; a,recovery=setup_client("http://server","alice",root=aroot); setup_client("http://server","alice",recovery=recovery,root=broot)
+    write_archive(aroot/"data/convos.db","before"); sync_once(aroot); sync_once(broot); ws=workspace(a,"Personal")
+    abandoned,_=setup_client("http://server","alice",recovery=recovery,root=tmp_path/"abandoned")
+    state=connect(broot/"remote/state.db"); foreign=publish(abandoned,state,ws,ledger_event("abandoned"),broot); state.close()
+    remote_client.remove_device(load(aroot),ws,abandoned["device"]["id"],aroot); sync_once(aroot)
+    with endpoint(400,b'{"error":"event not found"}') as (url,calls):
+        def request(cfg,body,auth=True): return http({**cfg,"url":url},body,auth) if body["op"]=="fetch" else relay(cfg,body,auth)
+        monkeypatch.setattr(remote_client,"request",request)
+        with pytest.raises(ValueError,match="outbox event .* parked"): sync_once(broot)
+        sync_once(broot)
+        assert calls and (broot/"remote/outbox"/f"{foreign}.json").is_file()
+    state=connect(broot/"remote/state.db"); assert state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone(); state.close()
 
 def test_upload_holds_a_rejected_event_and_its_successors_but_sends_other_workspaces(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); root=tmp_path/"client"; rejected=[]
