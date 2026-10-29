@@ -44,30 +44,6 @@
     {
       "path": "apps/remote/pyproject.toml",
       "reason": "python target runtime metadata"
-    },
-    {
-      "path": "src/ai_convos/cli.py",
-      "reason": "Identity migration, retirement and replay contract"
-    },
-    {
-      "path": "docs/git-identity.md",
-      "reason": "Identity migration, retirement and replay contract"
-    },
-    {
-      "path": "docs/invariants.md",
-      "reason": "Identity migration, retirement and replay contract"
-    },
-    {
-      "path": "tests/test_remote_projection.py",
-      "reason": "Identity migration, retirement and replay contract"
-    },
-    {
-      "path": "tests/test_provenance.py",
-      "reason": "Identity migration, retirement and replay contract"
-    },
-    {
-      "path": "tests/test_attestation_snapshots.py",
-      "reason": "Identity migration, retirement and replay contract"
     }
   ],
   "tests": [],
@@ -81,7 +57,13 @@
   "status": "needs-fix",
   "lock": null,
   "findingIds": [
-    "fnd_sig-feat-library-3be334928b-4263_2e5049dd6f"
+    "fnd_sig-feat-library-3be334928b-4263_2e5049dd6f",
+    "fnd_sig-feat-library-3be334928b-8c7e_7cdefde09c",
+    "fnd_sig-feat-library-3be334928b-fd39_7851b148fe",
+    "fnd_sig-feat-library-3be334928b-6bbd_3a35dfaca9",
+    "fnd_sig-feat-library-3be334928b-ab6d_46a578a1a1",
+    "fnd_sig-feat-library-3be334928b-eb45_63c62bdd6c",
+    "fnd_sig-feat-library-3be334928b-5cce_d7c85adcb0"
   ],
   "patchAttemptIds": [],
   "analysisHistory": [
@@ -102,8 +84,44 @@
       "model": null,
       "reasoningEffort": "medium",
       "createdAt": "2026-10-28T08:41:25.002Z"
+    },
+    {
+      "runId": "20261029T191312-fd7a21",
+      "kind": "review",
+      "summary": "2 finding(s); prompt=94506 bytes; approxTokens=23627; includedFiles=7; omittedFiles=0",
+      "provider": "codex",
+      "model": "gpt-6.1-terra",
+      "reasoningEffort": "high",
+      "createdAt": "2026-10-29T19:13:37.944Z"
+    },
+    {
+      "runId": "20261029T191807-9d34ff",
+      "kind": "review",
+      "summary": "2 finding(s); prompt=94506 bytes; approxTokens=23627; includedFiles=7; omittedFiles=0",
+      "provider": "codex",
+      "model": "gpt-6.1-terra",
+      "reasoningEffort": "high",
+      "createdAt": "2026-10-29T19:18:35.535Z"
+    },
+    {
+      "runId": "20261029T192412-6a6ec7",
+      "kind": "review",
+      "summary": "1 finding(s); prompt=94506 bytes; approxTokens=23627; includedFiles=7; omittedFiles=0",
+      "provider": "codex",
+      "model": "gpt-6.1-terra",
+      "reasoningEffort": "high",
+      "createdAt": "2026-10-29T19:24:34.387Z"
+    },
+    {
+      "runId": "20261029T192540-1636e9",
+      "kind": "review",
+      "summary": "1 finding(s); prompt=94506 bytes; approxTokens=23627; includedFiles=7; omittedFiles=0",
+      "provider": "codex",
+      "model": "gpt-6.1-terra",
+      "reasoningEffort": "high",
+      "createdAt": "2026-10-29T19:26:00.926Z"
     }
   ],
   "createdAt": "2026-09-26T09:13:03.948Z",
-  "updatedAt": "2026-10-28T08:41:25.002Z"
+  "updatedAt": "2026-10-29T19:26:00.926Z"
 }

@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "runId": "20261029T192412-6a6ec7",
+  "command": "review",
+  "args": [
+    "review",
+    "--feature",
+    "feat_library_3be334928b",
+    "--include-dirty",
+    "--provider",
+    "codex",
+    "--model",
+    "gpt-6.1-terra",
+    "--reasoning-effort",
+    "high",
+    "--limit",
+    "1"
+  ],
+  "rootPath": "/Users/Shared/Developer/Workspace/ai-convos-db/.koder/worktrees/wt-parked-sequence",
+  "headSha": "3a20c05dc1ae9ad1f6d52e2628dda87c21ee299c",
+  "startedAt": "2026-10-29T19:24:12.240Z",
+  "finishedAt": "2026-10-29T19:24:34.391Z",
+  "status": "completed",
+  "claimedFeatureIds": [
+    "feat_library_3be334928b"
+  ],
+  "findingIds": [
+    "fnd_sig-feat-library-3be334928b-eb45_63c62bdd6c"
+  ],
+  "patchAttemptIds": [],
+  "errors": []
+}

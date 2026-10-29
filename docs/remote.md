@@ -411,6 +411,11 @@ Either way the replica upload and the pull still run, and the sync then exits
 non-zero naming the event; a parked event is reported once, a held one on every
 sync until the relay accepts it.
 
+For an abandoned membership event, sync repairs the local sequence only after
+the author is removed, the device has access to the event's epoch, and the
+relay confirms the event is absent. The signed envelope and local history must
+also match; sync keeps the envelope and leaves ambiguous history untouched.
+
 A received row the receiver cannot reconcile is parked, not refused with the
 whole batch: nothing of the row is stored, `remote.parked_rows` records its
 proof id, kind, source id, author and reason, and the cursor moves on. The

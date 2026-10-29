@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-library-3be334928b-8c7e_7cdefde09c",
+  "featureId": "feat_library_3be334928b",
+  "title": "History transition bypasses quorum approval",
+  "category": "security",
+  "severity": "high",
+  "confidence": "high",
+  "triage": "confirmed-bug",
+  "evidence": [
+    {
+      "path": "apps/remote/src/ai_convos_remote/control.py",
+      "startLine": 68,
+      "endLine": 73,
+      "symbol": "verify_state",
+      "quote": null
+    }
+  ],
+  "reasoning": "The history action permits an admin to change a device's history flag from false to true without a proposal or votes. The history_activate action requires quorum approval for that same change, so an admin can bypass the intended approval requirement for a future-only device.",
+  "reproduction": "Sign a history transition as an admin, preserving all other device fields while changing a future-only device's history flag to true. verify_state accepts it without votes.",
+  "recommendation": "Prevent history transitions from activating future-only devices; require the history_activate approval path for that change.",
+  "whyTestsDoNotAlreadyCoverThis": "No tests were included in the review context.",
+  "suggestedRegressionTest": "Verify that a signed history transition changing false to true is rejected, while a valid quorum-approved history_activate transition succeeds.",
+  "minimumFixScope": "Tighten the history transition validation in control.py.",
+  "status": "uncertain",
+  "history": [
+    {
+      "runId": null,
+      "kind": "triage",
+      "status": "open",
+      "note": "Outside parked-membership repair; raised for separate security assessment.",
+      "reasoning": null,
+      "commands": [],
+      "createdAt": "2026-10-29T19:13:57.060Z"
+    },
+    {
+      "runId": null,
+      "kind": "triage",
+      "status": "uncertain",
+      "note": "Unreproduced review hypothesis outside parked-membership repair; raised for separate security assessment.",
+      "reasoning": null,
+      "commands": [],
+      "createdAt": "2026-10-29T19:17:19.250Z"
+    }
+  ],
+  "signature": "sig_feat-library-3be334928b_8c7ed79200",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20261029T191312-fd7a21",
+  "createdAt": "2026-10-29T19:13:37.937Z",
+  "updatedAt": "2026-10-29T19:17:19.242Z"
+}

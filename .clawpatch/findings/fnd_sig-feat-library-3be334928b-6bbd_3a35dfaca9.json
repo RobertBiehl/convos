@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "findingId": "fnd_sig-feat-library-3be334928b-6bbd_3a35dfaca9",
+  "featureId": "feat_library_3be334928b",
+  "title": "History transition bypasses device history approval",
+  "category": "security",
+  "severity": "high",
+  "confidence": "high",
+  "triage": "confirmed-bug",
+  "evidence": [
+    {
+      "path": "apps/remote/src/ai_convos_remote/control.py",
+      "startLine": 68,
+      "endLine": 73,
+      "symbol": "verify_state",
+      "quote": null
+    }
+  ],
+  "reasoning": "The history transition permits an admin to change an existing device's history flag from false to true without a proposal or votes. The separate history_activate transition requires quorum approval for that same change. An admin can therefore sign a history transition that grants a future-only device access to historical data without the required approval.",
+  "reproduction": "Given a valid team workspace state with a future-only device, sign a history transition as an admin with that device's history flag changed to true and otherwise unchanged policy. verify_state accepts it without votes.",
+  "recommendation": "Prevent history transitions from activating device history; require the history_activate transition and its approval checks for false-to-true changes.",
+  "whyTestsDoNotAlreadyCoverThis": "No tests were included in the review context.",
+  "suggestedRegressionTest": "Assert that an admin-signed history transition enabling a future-only device is rejected, while an equivalent history_activate transition succeeds only with the required votes.",
+  "minimumFixScope": "Restrict device history changes in verify_state's history branch.",
+  "status": "uncertain",
+  "history": [
+    {
+      "runId": null,
+      "kind": "triage",
+      "status": "uncertain",
+      "note": "Duplicate unreproduced security hypothesis outside this change; raised for separate assessment.",
+      "reasoning": null,
+      "commands": [],
+      "createdAt": "2026-10-29T19:25:22.127Z"
+    }
+  ],
+  "signature": "sig_feat-library-3be334928b_6bbdf330f5",
+  "linkedPatchAttemptIds": [],
+  "createdByRunId": "20261029T191807-9d34ff",
+  "createdAt": "2026-10-29T19:18:35.532Z",
+  "updatedAt": "2026-10-29T19:25:22.122Z"
+}

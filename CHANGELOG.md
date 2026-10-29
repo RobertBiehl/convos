@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.6b31
+
+- Repair the local sequence left by a parked abandoned membership event while retaining its signed envelope and verified relay history.
+
 ## 0.11.6b30
 
 - Sync goes as far as it can: an outbox event authored by another identity of this device (e.g. an abandoned enrollment) is parked instead of failing every sync with `event author rejected` before the pull, and a batch the relay rejects is retried event by event, holding only the rejected event's workspace; the sync exits non-zero naming them at the end.
