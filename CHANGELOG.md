@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Read Firefox cookies on Linux and macOS (native, Snap and Flatpak profiles) and try Firefox in the sync browser order and `doctor`. Web requests go through `curl-cffi` impersonating the browser the cookies came from, since Cloudflare challenges Python's own TLS handshake: on Linux even valid claude.ai cookies got `403 cf-mitigated: challenge`. New dependency `curl-cffi`. Core line budget 1760 -> 1773.
+- Read Chrome and Chromium cookies on Linux: profiles under `~/.config`, keyring-encrypted `v11` cookies via `secret-tool`, and `v10` via Chromium's built-in key. Cookie reading moves to `src/ai_convos/cookies.py`, a browser per `READERS` entry and OS differences as table rows. Core line budget 1745 -> 1760.
+
 ## 0.11.6b32
 
 - Handle the relay's HTTP 400 missing-event response during guarded recovery while preserving other errors.

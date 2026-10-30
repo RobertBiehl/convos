@@ -121,7 +121,9 @@ IDs are SHA256 hashes of `source:original_id`. This ensures:
 
 ### Cookie-Based Auth
 
-Web fetchers extract cookies from Safari or Chrome to authenticate with APIs. No passwords stored, no OAuth flows. Cookies expire naturally.
+Web fetchers extract cookies from Safari, Chrome or Firefox to authenticate with APIs, and send their requests through `curl-cffi` impersonating that same browser (TLS fingerprint and User-Agent): Cloudflare answers Python's own TLS handshake with a challenge even when the cookies are valid. No passwords stored, no OAuth flows. Cookies expire naturally.
+
+`cookies.py` reads them. Each browser is one `READERS` entry; per-OS differences (profile roots, keyring command, PBKDF2 rounds, built-in keys) are rows in its tables rather than branches. Chrome works on macOS (Keychain, `v10`) and Linux (`google-chrome`/`chromium`; `v11` via `secret-tool` from libsecret, `v10` via Chromium's built-in key). Firefox stores cookies unencrypted in `cookies.sqlite` (native, Snap and Flatpak profiles on Linux); the reader copies the file and its WAL, because Firefox locks the live file and keeps recent writes in the WAL, and uses the profile written last unless `CONVOS_FIREFOX_PROFILE` names one.
 
 ### FTS via DuckDB
 

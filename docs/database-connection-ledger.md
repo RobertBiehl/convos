@@ -120,8 +120,8 @@ SQLite connections never take the DuckDB archive lock. They can contend only wit
 
 | ID | Site | Database and mode | Lifetime and cardinality | Possible impact | Mitigation |
 |---|---|---|---|---|---|
-| S01 | `src/ai_convos/cli.py::read_chrome_cookies` | Browser cookie store, read-only URI | Matching cookie rows for one host | Browser copy/write contention only | URI read-only connection; immediate materialization and close |
-| S02 | `src/ai_convos/cli.py::chrome_cookie_domains` | Browser cookie store, read-only URI | Distinct host keys across cookie store | Browser copy/write contention only | URI read-only connection; immediate materialization and close |
+| S01 | `src/ai_convos/cookies.py::read_chrome_cookies` | Browser cookie store, read-only URI | Matching cookie rows for one host | Browser copy/write contention only | URI read-only connection; immediate materialization and close |
+| S02 | `src/ai_convos/cookies.py::chrome_cookie_domains` | Browser cookie store, read-only URI | Distinct host keys across cookie store | Browser copy/write contention only | URI read-only connection; immediate materialization and close |
 | S03 | `apps/memory/src/ai_convos_memory/__init__.py::_scope` | Memory ledger, read/write | Repository-scope lookup and at most one binding write | Can briefly serialize Memory operations | Explicit commit and close; Git evidence collected before open |
 | S04 | `apps/memory/src/ai_convos_memory/__init__.py::connect` | Memory ledger, read/write | Schema check/migration plus caller-owned operation | Caller can hold the Memory writer | Transactions are explicit; all callers close; separate product ledger |
 | S05 | `apps/memory/src/ai_convos_memory/__init__.py::backup_data` | New backup target, read/write | Whole Memory ledger backup and validation | Holds source Memory connection during copy | Foreground explicit backup to a new private file |
@@ -142,3 +142,4 @@ SQLite connections never take the DuckDB archive lock. They can contend only wit
 | S20 | `apps/remote/src/ai_convos_remote/projection.py::cutover_state` | Existing Remote state, read-only URI | Whole supported state copy | Delays Remote state writer during explicit cutover | Sync/mutation lease, staged migration, source unchanged on failure |
 | S21 | `apps/remote/src/ai_convos_remote/projection.py::cutover_state` | New Remote state, read/write | Whole migrated destination | No live-state contention until replacement | Staged file is validated and atomically replaced |
 | S22 | `apps/remote/src/ai_convos_remote/projection.py::reset_sync_state` | Remote state, read-only URI | One-time state reset backup | Brief state reader | Consistent backup before replacing derived state |
+| S23 | `src/ai_convos/cookies.py::_firefox_rows` | Private copy of a Firefox cookie store and its WAL, read/write | One query over the copy | None on the browser: the live file is only copied | Temporary directory removed after immediate materialization and close |

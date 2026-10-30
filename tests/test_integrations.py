@@ -379,21 +379,23 @@ class TestCookieExtraction:
 
     def test_safari_cookies_not_found(self):
         """Safari cookie function handles missing file gracefully."""
-        from ai_convos.cli import read_safari_cookies
+        from ai_convos.cookies import read_safari_cookies
         with patch("pathlib.Path.exists", return_value=False):
             cookies = read_safari_cookies("example.com")
             assert cookies == {}
 
     def test_chrome_cookies_not_found(self):
         """Chrome cookie function handles missing file gracefully."""
-        from ai_convos.cli import read_chrome_cookies
+        from ai_convos.cookies import read_chrome_cookies
         with patch("pathlib.Path.exists", return_value=False):
             cookies = read_chrome_cookies("example.com")
             assert cookies == {}
 
-    def test_chrome_keychain_failure(self):
+    def test_chrome_keychain_failure(self, monkeypatch):
         """Chrome cookies handles keychain access failure."""
-        from ai_convos.cli import read_chrome_cookies
+        from ai_convos import cookies
+        from ai_convos.cookies import read_chrome_cookies
+        monkeypatch.setattr(cookies, "PLATFORM", "darwin")
         with patch("pathlib.Path.exists", return_value=True):
             with patch("subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=1)
@@ -405,7 +407,8 @@ class TestCookieExtraction:
         import sqlite3, hashlib
         from hashlib import pbkdf2_hmac
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        from ai_convos import cli
+        from ai_convos import cli, cookies
+        monkeypatch.setattr(cookies, "PLATFORM", "darwin")
         key = pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1003, 16)
         def enc_v10(value, prefix=b""):
             plain = prefix + value
@@ -420,7 +423,45 @@ class TestCookieExtraction:
         con.commit(); con.close()
         monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
         monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "peanuts"})())
-        assert cli.read_chrome_cookies("claude.ai") == {"sessionKey": "sk-ant-sid02-REAL", "legacy": "plain-token-123"}
+        assert cookies.read_chrome_cookies("claude.ai") == {"sessionKey": "sk-ant-sid02-REAL", "legacy": "plain-token-123"}
+
+    @pytest.mark.parametrize("keyring", [b"from-keyring", None])
+    def test_chrome_cookies_linux_keyring_and_builtin_key(self, tmp_path, monkeypatch, keyring):
+        """Linux Chrome writes v11 with the keyring secret (1 PBKDF2 round) and v10 with the built-in 'peanuts'; without a keyring only v10 decrypts."""
+        import sqlite3
+        from hashlib import pbkdf2_hmac
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from ai_convos import cli, cookies
+        def enc(tag, secret, value):
+            plain = value + bytes([16 - len(value) % 16]) * (16 - len(value) % 16)
+            e = Cipher(algorithms.AES(pbkdf2_hmac("sha1", secret, b"saltysalt", 1, 16)), modes.CBC(b" " * 16)).encryptor()
+            return tag + e.update(plain) + e.finalize()
+        cdir = tmp_path / ".config/chromium/Default"; cdir.mkdir(parents=True)
+        con = sqlite3.connect(str(cdir / "Cookies"))
+        con.execute("CREATE TABLE cookies (name TEXT, encrypted_value BLOB, host_key TEXT)")
+        con.executemany("INSERT INTO cookies VALUES (?,?,?)", [["new", enc(b"v11", b"from-keyring", b"keyring-token"), ".claude.ai"], ["old", enc(b"v10", b"peanuts", b"builtin-token"), ".claude.ai"]])
+        con.commit(); con.close()
+        calls = []
+        monkeypatch.setattr(cookies, "PLATFORM", "linux")
+        monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(cookies, "_keyring", lambda command: calls.append(command) or keyring)
+        assert cookies.read_chrome_cookies("claude.ai") == ({"new": "keyring-token"} if keyring else {}) | {"old": "builtin-token"}
+        assert calls == [["secret-tool", "lookup", "application", "chromium"]] and cli.chrome_profiles() == ["Default"]
+
+    def test_firefox_cookies_read_a_copy_of_the_newest_profile_with_its_wal(self, tmp_path, monkeypatch):
+        """Firefox keeps recent cookies in the WAL of a locked live file: read a copy of both, from the profile written last unless one is named."""
+        import sqlite3, os
+        from ai_convos import cli, cookies
+        root = tmp_path / ".mozilla/firefox"
+        def profile(name, value, mtime):
+            (d := root / name).mkdir(parents=True); con = sqlite3.connect(str(d / "cookies.sqlite")); con.execute("PRAGMA journal_mode=WAL"); con.execute("PRAGMA wal_autocheckpoint=0")
+            con.execute("CREATE TABLE moz_cookies (name TEXT, value TEXT, host TEXT, lastAccessed INTEGER)"); con.execute("INSERT INTO moz_cookies VALUES ('session', ?, '.perplexity.ai', 1)", [value]); con.commit()
+            assert (d / "cookies.sqlite-wal").stat().st_size; os.utime(d / "cookies.sqlite", (mtime, mtime)); return con
+        open_ = [profile("old.default", "stale", 1), profile("new.default-release", "fresh", 2)]
+        monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+        assert cli.get_cookies("perplexity.ai", "firefox") == {"session": "fresh"} and cli.get_cookies("perplexity.ai", "firefox", "old.default") == {"session": "stale"}
+        assert cli.firefox_cookie_domains() == {".perplexity.ai"} and list(cookies.READERS) == ["safari", "chrome", "firefox"]
+        [con.close() for con in open_]
 
 
 # ---- Deduplication Tests ----
@@ -550,6 +591,20 @@ class TestHTTPErrors:
             with pytest.raises(urllib.error.HTTPError) as exc_info:
                 fetch_json("https://api.example.com", {"session": "test"})
             assert exc_info.value.code == 401
+
+    def test_browser_requests_impersonate_that_browser(self, monkeypatch):
+        """With a browser, requests go through curl-cffi as that browser (its User-Agent, not ours) and HTTP errors keep urllib's shape for the retry logic."""
+        from ai_convos.cli import fetch_json
+        import urllib.error, curl_cffi.requests
+        sent, replies = [], [MagicMock(status_code=429, reason="Too Many Requests", headers={"Retry-After": "7"}), MagicMock(status_code=200, json=lambda: {"ok": 1})]
+        monkeypatch.setattr(curl_cffi.requests, "get", lambda url, **k: sent.append(k) or replies.pop(0))
+        with patch("time.sleep") as sleep, patch("urllib.request.urlopen", side_effect=AssertionError("urllib used")):
+            assert fetch_json("https://claude.ai/api", {"sessionKey": "s"}, {"Origin": "https://claude.ai"}, browser="firefox") == {"ok": 1}
+        assert sleep.call_args.args[0] == 30 and [k["impersonate"] for k in sent] == ["firefox", "firefox"]
+        assert sent[0]["headers"] == {"Cookie": "sessionKey=s", "Accept": "application/json", "Origin": "https://claude.ai"}
+        monkeypatch.setattr(curl_cffi.requests, "get", lambda url, **k: MagicMock(status_code=403, reason="Forbidden", headers={}))
+        with pytest.raises(urllib.error.HTTPError) as error: fetch_json("https://claude.ai/api", {}, retries=0, browser="chrome")
+        assert error.value.code == 403
 
     @pytest.mark.parametrize("headers,delay", [({},300),({"Retry-After":"420"},420)])
     def test_429_uses_visible_long_backoff(self, headers, delay):
