@@ -1,4 +1,4 @@
-import contextlib, hashlib, itertools, os, sqlite3, struct, subprocess, sys
+import contextlib, hashlib, itertools, os, shutil, sqlite3, struct, subprocess, sys, tempfile
 from pathlib import Path
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -7,6 +7,7 @@ PLATFORM=sys.platform
 _CHROME_ROOTS={"darwin":{"Library/Application Support/Google/Chrome":"Chrome"},"linux":{".config/google-chrome":"chrome",".config/chromium":"chromium"}}
 _CHROME_KEYRING={"darwin":(lambda app:["security","find-generic-password","-w","-a",app,"-s",f"{app} Safe Storage"],1003,b"v10"),"linux":(lambda app:["secret-tool","lookup","application",app],1,b"v11")}
 _CHROME_FIXED={"linux":{b"v10":b"peanuts"}}  # Chromium's built-in password for cookies written without a keyring
+_FIREFOX_ROOTS={"darwin":("Library/Application Support/Firefox/Profiles",),"linux":(".mozilla/firefox","snap/firefox/common/.mozilla/firefox",".var/app/org.mozilla.firefox/.mozilla/firefox")}
 
 def _safari_records():
     if not (path:=next((p for p in (Path.home()/"Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",Path.home()/"Library/Cookies/Cookies.binarycookies") if p.exists()),None)): return
@@ -37,6 +38,15 @@ def chrome_cookie_domains(profile: str | None = None):
     with contextlib.closing(sqlite3.connect(f"file:{found[0]}?mode=ro&nolock=1",uri=True)) as db: return {r[0] for r in db.execute("SELECT DISTINCT host_key FROM cookies")}
 def chrome_profiles() -> list[str]: return list(dict.fromkeys(p.name for root,_ in _chrome_roots() if root.exists() for p in root.iterdir() if p.is_dir() and ((p/"Cookies").exists() or (p/"Network/Cookies").exists())))
 
-READERS={"safari":read_safari_cookies,"chrome":read_chrome_cookies}
+def _firefox_paths(profile=None): return (lambda name:[path for root in _FIREFOX_ROOTS.get(PLATFORM,()) if (base:=Path.home()/root).is_dir() for folder in ([base/name] if name else base.iterdir()) if (path:=folder/"cookies.sqlite").exists()])(profile or os.environ.get("CONVOS_FIREFOX_PROFILE"))
+def _firefox_rows(sql, args=(), profile=None):
+    if not (path:=max(_firefox_paths(profile),key=lambda p:p.stat().st_mtime,default=None)): return []  # without a named profile, the one Firefox wrote last
+    with tempfile.TemporaryDirectory() as tmp:  # Firefox locks the live file and keeps recent writes in the WAL, so read a copy of both
+        [shutil.copy2(src,Path(tmp)/src.name) for src in (path,path.with_name(f"{path.name}-wal")) if src.exists()]
+        with contextlib.closing(sqlite3.connect(Path(tmp)/path.name)) as db: return db.execute(sql,args).fetchall()
+def read_firefox_cookies(domain: str, profile: str | None = None) -> dict[str, str]: return dict(_firefox_rows("SELECT name,value FROM moz_cookies WHERE host LIKE ? ORDER BY lastAccessed",(f"%{domain}%",),profile))
+def firefox_cookie_domains(profile: str | None = None): return {host for host, in _firefox_rows("SELECT DISTINCT host FROM moz_cookies",(),profile)}
+
+READERS={"safari":read_safari_cookies,"chrome":read_chrome_cookies,"firefox":read_firefox_cookies}
 def get_cookies(domain: str, browser: str = "safari", profile: str | None = None) -> dict[str, str]: return READERS[browser](domain, profile)
 def get_cookies_any(domains: list[str], browser: str = "safari", profile: str | None = None) -> dict[str, str]: return {name:value for domain in domains for name,value in get_cookies(domain,browser,profile=profile).items()}
