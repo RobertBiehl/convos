@@ -372,6 +372,67 @@ class TestClaudeAPI:
         assert_live_import(fetch_claude("safari", limit=1), "claude", tmp_path)
 
 
+# ---- Perplexity Tests ----
+
+class TestPerplexity:
+    """Perplexity threads via the web API, with fake responses."""
+
+    @staticmethod
+    def entry(uuid, query, answer, us):
+        return {"uuid": uuid, "query_str": query, "created_us": us, "display_model": "pplx_pro", "text": json.dumps([{"step_type": "INITIAL_QUERY", "content": {}}, {"step_type": "FINAL", "content": {"answer": answer}}])}
+
+    def fake(self, monkeypatch, threads, details, session={"user": {"id": "u"}}):
+        from ai_convos import cli
+        calls = []
+        def fetch(url, cookies, *a, body=None, **k):
+            calls.append((url.removeprefix("https://www.perplexity.ai"), body))
+            if url.endswith("/list_ask_threads"): return threads[body["offset"]:body["offset"] + 2]
+            if url.endswith("/api/auth/session"): return session
+            return details[url.split("/rest/thread/")[1]]
+        monkeypatch.setattr(cli, "get_cookies", lambda *a, **k: {"session": "s"}); monkeypatch.setattr(cli, "fetch_json", fetch)
+        return calls
+
+    def test_threads_follow_ups_pages_and_answers(self, monkeypatch):
+        """Every thread is read in full (follow-ups, cursor pages); list pages advance by offset; FINAL answers are unwrapped."""
+        from ai_convos import cli
+        thread = lambda u, t, more: {"uuid": u, "title": u.upper(), "last_query_datetime": t, "query_count": 1, "has_next_page": more}
+        threads = [thread("t1", "2026-01-03T00:00:00", True), thread("t2", "2026-01-02T00:00:00", True), thread("t3", "2026-01-01T00:00:00", False)]
+        details = {"t1?limit=100": {"entries": [self.entry("e1", "q1", json.dumps({"answer": "a1"}), 1_767_225_600_000_000)], "has_next_page": True, "next_cursor": "c/1"},
+                   "t1?limit=100&cursor=c%2F1": {"entries": [self.entry("e2", "q2", "plain a2", 1_767_225_660_000_000)], "has_next_page": False},
+                   "t2?limit=100": {"entries": [self.entry("e3", "q3", None, 1)]}, "t3?limit=100": {"entries": []}}
+        calls = self.fake(monkeypatch, threads, details)
+        r = cli.fetch_perplexity("firefox")
+        assert [c["title"] for c in r.convs] == ["T1", "T2", "T3"] and [b["offset"] for u, b in calls if b] == [0, 2]
+        assert [(m["role"], m["content"], json.loads(m["metadata"])["provider_index"]) for m in r.msgs] == [("user", "q1", 0), ("assistant", "a1", 1), ("user", "q2", 2), ("assistant", "plain a2", 3), ("user", "q3", 0)]
+        conv = r.convs[0]; meta = json.loads(conv["metadata"])
+        assert conv["id"] == cli.gen_id("perplexity", "t1") and meta == {"session_id": "t1", "session_kind": "main", "session_kind_evidence": "exact", "capture_mode": "api"}
+        assert conv["created_at"] == cli.ts_from_iso("2026-01-01T00:00:00") and conv["updated_at"] == cli.ts_from_iso("2026-01-03T00:00:00") and conv["model"] == "pplx_pro"
+        assert len({m["id"] for m in r.msgs}) == 5 and r.msgs[0]["id"] == cli.gen_id("perplexity", f"{conv['id']}:e1:q")
+        calls.clear(); since = cli.fetch_perplexity("firefox", since=cli.ts_from_iso("2026-01-02T00:00:00"))
+        assert [c["title"] for c in since.convs] == ["T1"] and not any("t2" in u or "t3" in u for u, _ in calls)
+
+    def test_logged_out_raises_instead_of_empty_list(self, monkeypatch):
+        """An expired login lists no threads; that must fail loudly, not sync as '0 new'."""
+        from ai_convos import cli
+        self.fake(monkeypatch, [], {}, session={})
+        with pytest.raises(ValueError, match="not logged in"): cli.fetch_perplexity("firefox")
+        self.fake(monkeypatch, [], {})
+        assert cli.fetch_perplexity("firefox").convs == []
+
+    def test_json_body_is_posted_on_both_transports(self, monkeypatch):
+        from ai_convos.cli import fetch_json
+        import curl_cffi.requests
+        sent = []
+        monkeypatch.setattr(curl_cffi.requests, "request", lambda method, url, **k: sent.append((method, k["data"], k["headers"].get("Content-Type"))) or MagicMock(status_code=200, json=lambda: []))
+        fetch_json("https://www.perplexity.ai/x", {}, browser="firefox", body={"offset": 0}); fetch_json("https://www.perplexity.ai/x", {}, browser="firefox")
+        assert sent[0] == ("POST", b'{"offset": 0}', "application/json") and sent[1][0] == "GET"
+        with patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = b"[]"
+            fetch_json("https://www.perplexity.ai/x", {}, body={"offset": 0})
+        req = urlopen.call_args.args[0]
+        assert req.get_method() == "POST" and req.data == b'{"offset": 0}' and req.get_header("Content-type") == "application/json"
+
+
 # ---- Cookie Extraction Tests ----
 
 class TestCookieExtraction:
@@ -597,12 +658,12 @@ class TestHTTPErrors:
         from ai_convos.cli import fetch_json
         import urllib.error, curl_cffi.requests
         sent, replies = [], [MagicMock(status_code=429, reason="Too Many Requests", headers={"Retry-After": "7"}), MagicMock(status_code=200, json=lambda: {"ok": 1})]
-        monkeypatch.setattr(curl_cffi.requests, "get", lambda url, **k: sent.append(k) or replies.pop(0))
+        monkeypatch.setattr(curl_cffi.requests, "request", lambda method, url, **k: sent.append(k) or replies.pop(0))
         with patch("time.sleep") as sleep, patch("urllib.request.urlopen", side_effect=AssertionError("urllib used")):
             assert fetch_json("https://claude.ai/api", {"sessionKey": "s"}, {"Origin": "https://claude.ai"}, browser="firefox") == {"ok": 1}
         assert sleep.call_args.args[0] == 30 and [k["impersonate"] for k in sent] == ["firefox", "firefox"]
         assert sent[0]["headers"] == {"Cookie": "sessionKey=s", "Accept": "application/json", "Origin": "https://claude.ai"}
-        monkeypatch.setattr(curl_cffi.requests, "get", lambda url, **k: MagicMock(status_code=403, reason="Forbidden", headers={}))
+        monkeypatch.setattr(curl_cffi.requests, "request", lambda method, url, **k: MagicMock(status_code=403, reason="Forbidden", headers={}))
         with pytest.raises(urllib.error.HTTPError) as error: fetch_json("https://claude.ai/api", {}, retries=0, browser="chrome")
         assert error.value.code == 403
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, os, random, re, shlex, shutil, signal, site, ssl, subprocess, sys, sysconfig, tempfile, threading, time, typer, urllib.error, urllib.request, zipfile
+import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, os, random, re, shlex, shutil, signal, site, ssl, subprocess, sys, sysconfig, tempfile, threading, time, typer, urllib.error, urllib.parse, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -11,11 +11,11 @@ from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remot
 
 # Newer Typer vendors Click; command errors must use the active runtime.
 click=getattr(typer,"_click",click)
-app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, Codex, and Muse", pretty_exceptions_show_locals=False)
+app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, Codex, Muse, and Perplexity", pretty_exceptions_show_locals=False)
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT,DATA_DIR,DB_PATH,STATE_PATH=(root:=find_root()),(data:=root/"data"),data/"convos.db",data/"sync_state.json"
 HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF,OPEN_INGEST_STALE=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,12,19,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest(),300  # conservative web pacing stays below the observed ~200-detail failure point
-_CHATGPT_HOSTS,_CLAUDE_HEADERS=(("https://chatgpt.com",("chatgpt.com",)),("https://chat.openai.com",("chat.openai.com","openai.com"))),{"Origin":"https://claude.ai","Referer":"https://claude.ai/","Accept":"application/json","Accept-Language":"en-US,en;q=0.9","anthropic-client-sha":"unknown","anthropic-client-version":"unknown"}
+_PERPLEXITY,_CHATGPT_HOSTS,_CLAUDE_HEADERS="https://www.perplexity.ai",(("https://chatgpt.com",("chatgpt.com",)),("https://chat.openai.com",("chat.openai.com","openai.com"))),{"Origin":"https://claude.ai","Referer":"https://claude.ai/","Accept":"application/json","Accept-Language":"en-US,en;q=0.9","anthropic-client-sha":"unknown","anthropic-client-version":"unknown"}
 _INJECTED_RE,MESSAGE_ORDER,MESSAGE_ORDER_DESC=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*","m.created_at NULLS FIRST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) NULLS LAST,m.id","m.created_at DESC NULLS LAST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) DESC NULLS LAST,m.id DESC"
 
 def _open_db(path,read_only=False): return (path.parent.mkdir(parents=True,exist_ok=True),None if read_only and not path.exists() else duckdb.connect(str(path),read_only=read_only))[-1]
@@ -978,15 +978,15 @@ def chatgpt_headers(cookies, base, browser, debug_profile: str | None = None):
     with contextlib.suppress(Exception): ((headers.update({**({"Authorization":f"Bearer {token}"} if (token:=(session:=fetch_json(f"{base}/api/auth/session", cookies, headers, timeout=10, retries=0, rate_limit_backoff=300, browser=browser)).get("accessToken")) else {}),**({"ChatGPT-Account-ID":aid} if (aid:=session.get("account",{}).get("id")) else {})})),((debug_profile) and (typer.echo(f"  chatgpt chrome profile={debug_profile} user={session.get('user', {}).get('email')}", flush=True))))
     return headers
 
-def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 15, retries: int = 1, before_request=None, rate_limit_backoff=None, browser: str | None = None) -> dict:
-    parts,cookie_str,hdrs,req=(parts:=[s for k,v in cookies.items() for s in [f"{k}={v}"] if all(ord(c)<256 for c in s)]),(cookie_str:="; ".join(parts)),(hdrs:={"Cookie":cookie_str,"User-Agent":"Mozilla/5.0","Accept":"application/json",**(headers or {})}),urllib.request.Request(url,headers=hdrs)
+def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 15, retries: int = 1, before_request=None, rate_limit_backoff=None, browser: str | None = None, body: dict | None = None) -> dict:
+    parts,cookie_str,hdrs,req=(parts:=[s for k,v in cookies.items() for s in [f"{k}={v}"] if all(ord(c)<256 for c in s)]),(cookie_str:="; ".join(parts)),(hdrs:={"Cookie":cookie_str,"User-Agent":"Mozilla/5.0","Accept":"application/json",**({"Content-Type":"application/json"} if body is not None else {}),**(headers or {})}),urllib.request.Request(url,headers=hdrs,data=None if body is None else json.dumps(body).encode())
     for i in range(retries+1):
         before_request and before_request()
         try:
             if not browser:
                 with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=timeout) as resp: return json.loads(resp.read())
             from curl_cffi import requests as curl  # the cookies' browser's TLS fingerprint and User-Agent: Cloudflare challenges Python's own
-            if (resp:=curl.get(url,headers={k:v for k,v in hdrs.items() if k!="User-Agent"},impersonate=browser,timeout=timeout)).status_code>=400: raise urllib.error.HTTPError(url,resp.status_code,resp.reason,resp.headers,None)
+            if (resp:=curl.request(req.get_method(),url,headers={k:v for k,v in hdrs.items() if k!="User-Agent"},data=req.data,impersonate=browser,timeout=timeout)).status_code>=400: raise urllib.error.HTTPError(url,resp.status_code,resp.reason,resp.headers,None)
             return resp.json()
         except Exception as e:
             if i == retries: raise
@@ -1101,6 +1101,33 @@ def parse_chatgpt(path: Path) -> ParseResult:
         cid,gizmo,conv=(cid:=gen_id("chatgpt",c.get("id",""))),(gizmo:=c.get("gizmo_id")),dict(id=cid,source="chatgpt",title=c.get("title"),created_at=ts_any(c.get("create_time")),updated_at=ts_any(c.get("update_time")),model=c.get("default_model_slug"),cwd=None,git_branch=None,project_id=gizmo,metadata=json.dumps({"session_id":c.get("id",""),"session_kind":"main","session_kind_evidence":"exact","capture_mode":"export",**({"gizmo_id":gizmo} if gizmo else {})}))
         return ParseResult(convs=[conv],msgs=(parsed:=chatgpt_mapping(cid,c.get("mapping",{})))[0],tools=parsed[1],attachs=parsed[2])
     return sum((parsed for idx,c in enumerate(data) if (parsed:=safe_parse(f"chatgpt export conv {c.get('id') if isinstance(c,dict) else idx}",parse_conv,c))),ParseResult())
+
+def perplexity_cookies(browser): return required(get_cookies("perplexity.ai",browser),ValueError(f"No Perplexity cookies found in {browser}"))
+def perplexity_threads(cookies, browser, offset=0, limit=50):
+    if (threads:=fetch_json(f"{_PERPLEXITY}/rest/thread/list_ask_threads",cookies,timeout=20,browser=browser,body={"offset":offset,"limit":limit})) or offset or fetch_json(f"{_PERPLEXITY}/api/auth/session",cookies,browser=browser): return threads
+    raise ValueError(f"not logged in to perplexity.ai in {browser} (empty session) - log in again there")  # an expired login lists no threads instead of failing
+def perplexity_answer(entry):  # the FINAL step's answer is a JSON document with the markdown under "answer"
+    raw=next((step["content"].get("answer") for step in (json.loads(entry["text"]) if isinstance(entry.get("text"),str) else entry.get("text") or []) if step.get("step_type")=="FINAL"),None)
+    with contextlib.suppress(ValueError,TypeError,KeyError): return json.loads(raw)["answer"]
+    return raw if isinstance(raw,str) else ""
+
+def fetch_perplexity(browser: str = "safari", limit: int = 0, since: datetime = None) -> ParseResult:
+    cookies,r=perplexity_cookies(browser),ParseResult()
+    def listed(offset=0):  # newest activity first, so an incremental sync stops paging at the first thread it already has
+        while threads:=perplexity_threads(cookies,browser,offset):
+            yield from threads
+            if not threads[-1].get("has_next_page"): return
+            offset+=len(threads)
+    def entries(uuid,cursor=None):  # list_ask_threads' query_count stays 1 after follow-ups, so every thread is read in full
+        while True:
+            yield from (page:=fetch_json(f"{_PERPLEXITY}/rest/thread/{uuid}?limit=100"+(f"&cursor={urllib.parse.quote(cursor,safe='')}" if cursor else ""),cookies,timeout=20,browser=browser))["entries"]
+            if not page.get("has_next_page") or not (cursor:=page.get("next_cursor")): return
+    for t in itertools.islice(itertools.takewhile(lambda t:not since or ts_from_iso(t["last_query_datetime"])>since,listed()),limit or None):
+        cid,turns=gen_id("perplexity",t["uuid"]),[(i,e,ts_from_epoch(e["created_us"]/1e6)) for i,e in enumerate(entries(t["uuid"]))]
+        msgs=[dict(id=gen_id("perplexity",f"{cid}:{e['uuid']}:{suffix}"),conversation_id=cid,role=role,content=text,thinking=None,created_at=ts,model=model,metadata=json.dumps({"provider_index":2*i+k,"provider_id":e["uuid"]}),parent_id=None) for i,e,ts in turns for k,(suffix,role,text,model) in enumerate([("q","user",e.get("query_str") or "",None),("a","assistant",perplexity_answer(e),e.get("display_model"))]) if text]
+        r+=ParseResult(convs=[dict(id=cid,source="perplexity",title=t.get("title"),created_at=min((ts for *_,ts in turns),default=None),updated_at=ts_from_iso(t["last_query_datetime"]),model=next((m["model"] for m in msgs if m["model"]),None),cwd=None,git_branch=None,project_id=None,metadata=json.dumps({"session_id":t["uuid"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"api"}))],msgs=msgs)
+    print(f"  perplexity fetched {len(r.convs)}", flush=True)
+    return r
 
 def parse_claude(path: Path) -> ParseResult:
     data = json.loads(path.read_text())
@@ -1609,7 +1636,7 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
     for ep in entry_points(group="convos.doctor"):
         try: typer.echo(ep.load()())
         except Exception as e: typer.echo(f"{ep.name}: unavailable ({e})")
-    targets = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai"]
+    targets = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai", "perplexity.ai"]
     for name, getter in [("safari", safari_cookie_domains), ("chrome", chrome_cookie_domains), ("firefox", firefox_cookie_domains)]:
         try: domains = getter()
         except PermissionError: domains=typer.echo(f"{name}: no access to cookies")
@@ -1719,17 +1746,18 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if errors: typer.echo("chatgpt profiles skipped: "+" | ".join(errors),err=True)
         chatgpt_ok[browser],chatgpt_frontiers[browser]=[profile for profile,account,item in valid],{profile or "default":{"account":account,"updated":item.get("update_time"),"id":item["id"]} for profile,account,item in valid}
         return "|".join(f"{profile or 'default'}:{item['id']}:{item.get('update_time')}" for profile,account,item in valid)
+    def probe_perplexity(browser): return f"{(t:=threads[0])['uuid']}:{t['last_query_datetime']}" if (threads:=perplexity_threads(perplexity_cookies(browser),browser,limit=1)) else None
     def probe_claude(browser): return f"{(item:=items[0])['uuid']}:{item.get('updated_at') or item.get('created_at')}" if (items:=claude_listing(browser)[2]) else None
     def plan_web(name, fetcher, probe, known=None, sink=None, legacy=None, frontier_ok=True):
         pref,forced=web.get(name,{}),os.environ.get(f"CONVOS_{name.upper()}_BROWSER")
         order,errors=([forced] if forced else [pref.get("browser")]+[b for b in READERS if b!=pref.get("browser")]),[]
         for b in [x for x in order if x]:
             try:
-                head,((lu, current))=(head:=probe(b)),(head.split(":",1)[1] if name=="claude" and head and ":" in head else None,{**(pref.get("frontiers",{}) if b==pref.get("browser") else {}),**chatgpt_frontiers.get(b,{})} if name=="chatgpt" else None)
+                head,((lu, current))=(head:=probe(b)),(head.split(":",1)[1] if name!="chatgpt" and head and ":" in head else None,{**(pref.get("frontiers",{}) if b==pref.get("browser") else {}),**chatgpt_frontiers.get(b,{})} if name=="chatgpt" else None)
                 st={"browser":b,"head":head,**({"frontiers":current} if name=="chatgpt" else {"last_updated":lu} if lu else {})}
                 if name!="chatgpt" and head is not None and b==pref.get("browser") and head==pref.get("head") and not full: return set_state("web",name,st)
-                last,saved,coverage,since=(last:=pref.get("last_updated")),None if name=="claude" else [],pref.get("coverage"),ts_from_iso(last) if name=="claude" and last and not full else None
-                frontier,(func)=(frontier:=pref.get("frontiers") if frontier_ok and not full and b==pref.get("browser") and known and isinstance(coverage,list) and set(coverage)<=set(known) else None),((lambda b=b,since=since:fetcher(b,since=since)) if name=="claude" else (lambda b=b,saved=saved:fetcher(b,profiles=chatgpt_ok[b],known=known,legacy=legacy,frontiers=frontier,sink=lambda r:saved.append(sink(r)))))
+                last,saved,coverage,since=(last:=pref.get("last_updated")),None if name!="chatgpt" else [],pref.get("coverage"),ts_from_iso(last) if name!="chatgpt" and last and not full else None
+                frontier,(func)=(frontier:=pref.get("frontiers") if frontier_ok and not full and b==pref.get("browser") and known and isinstance(coverage,list) and set(coverage)<=set(known) else None),((lambda b=b,since=since:fetcher(b,since=since)) if name!="chatgpt" else (lambda b=b,saved=saved:fetcher(b,profiles=chatgpt_ok[b],known=known,legacy=legacy,frontiers=frontier,sink=lambda r:saved.append(sink(r)))))
                 return dict(name=name,label=name.title(),source=name,func=func,state=("web",name,st),saved=saved)
             except Exception as e: errors.append(f"{b}: {e}")
         if errors: typer.echo(f"{name}: no cookies found -- skipped" if all("cookies" in e.lower() for e in errors) else f"{name} sync failed: " + " | ".join(errors))
@@ -1767,6 +1795,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
             schedule(plan_web("chatgpt",fetch_chatgpt,probe_chatgpt,{} if full else known,lambda r:checkpoint(r,"chatgpt"),legacy,not repair_order))
             start("Claude","claude")
             schedule(plan_web("claude",fetch_claude,probe_claude))
+            start("Perplexity","perplexity")
+            schedule(plan_web("perplexity",fetch_perplexity,probe_perplexity))
         verbose and typer.echo(f"Planning took {time.perf_counter()-t0:.2f}s")
         if jobs:
             with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as ex:

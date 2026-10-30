@@ -101,7 +101,7 @@ convos install-skills
 
 - Fast full-text search with direct source, day, role, project, conversation, and thinking filters
 - Hybrid semantic search (BM25 + embeddings + Reciprocal Rank Fusion) via `convos query`
-- Fetch from ChatGPT and Claude using browser cookies (Safari, Chrome, Firefox)
+- Fetch from ChatGPT, Claude and Perplexity using browser cookies (Safari, Chrome, Firefox)
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
 - Capture completed Claude Code + Codex turns just in time with lifecycle hooks
 - Deterministic project resume packets and exact session replay
