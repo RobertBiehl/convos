@@ -123,6 +123,8 @@ IDs are SHA256 hashes of `source:original_id`. This ensures:
 
 Web fetchers extract cookies from Safari or Chrome to authenticate with APIs. No passwords stored, no OAuth flows. Cookies expire naturally.
 
+`cookies.py` reads them. Each browser is one `READERS` entry; per-OS differences (profile roots, keyring command, PBKDF2 rounds, built-in keys) are rows in its tables rather than branches. Chrome works on macOS (Keychain, `v10`) and Linux (`google-chrome`/`chromium`; `v11` via `secret-tool` from libsecret, `v10` via Chromium's built-in key).
+
 ### FTS via DuckDB
 
 Full-text search uses DuckDB's FTS extension with BM25 scoring. The index covers

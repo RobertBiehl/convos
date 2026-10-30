@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, os, random, re, shlex, shutil, signal, site, sqlite3, ssl, struct, subprocess, sys, sysconfig, tempfile, threading, time, typer, urllib.request, zipfile
+import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, os, random, re, shlex, shutil, signal, site, ssl, subprocess, sys, sysconfig, tempfile, threading, time, typer, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, reduce
 from importlib.metadata import entry_points, version
 from pathlib import Path
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from .cookies import READERS, chrome_cookie_domains, chrome_profiles, get_cookies, get_cookies_any, read_chrome_cookies, read_safari_cookies, safari_cookie_domains
 from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remote_data, migrate_remote_ids, migration_memory, remote_id_migration_scope
 
 # Newer Typer vendors Click; command errors must use the active runtime.
@@ -966,36 +966,6 @@ def extract_content(content) -> dict:
     blocks = [b for b in content if isinstance(b, dict)]
     return {"text":"\n".join(b.get("text","") or b.get("thinking","") if b.get("type") in ("text",None) else "" for b in blocks).strip() or "\n".join(str(b) for b in content if isinstance(b,str)).strip(),"thinking":"\n".join(b["thinking"] for b in blocks if b.get("type")=="thinking" and b.get("thinking")).strip() or None,"tools":[{"name":b["name"],"input":b.get("input",{}),"id":b.get("id")} for b in blocks if b.get("type")=="tool_use"]+[{"id":b.get("tool_use_id"),"output":b.get("content","") ,"error":b.get("is_error",False)} for b in blocks if b.get("type")=="tool_result"],"attachments":[{"filename":b.get("name",b.get("file_name")),"mime_type":b.get("content_type",b.get("file_type")),"size":b.get("size",b.get("file_size")),"url":b.get("asset_pointer",b.get("url"))} for b in blocks if b.get("type") in ("image_asset_pointer","file") or b.get("content_type") in ("image_asset_pointer","file")]}
 
-def _safari_records():
-    if not (path:=next((p for p in (Path.home()/"Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",Path.home()/"Library/Cookies/Cookies.binarycookies") if p.exists()),None)): return
-    if (data:=path.read_bytes())[:4]!=b"cook": return
-    sizes,pages=(sizes:=[struct.unpack(">I",data[8+i*4:12+i*4])[0] for i in range(struct.unpack(">I",data[4:8])[0])]),[data[start:start+size] for start,size in zip(itertools.accumulate([8+4*len(sizes),*sizes]),sizes)]
-    yield from ((text(fields[0]),text(fields[1]),text(struct.unpack("<I",page[off+28:off+32])[0])) for page in pages if page[:4]==b"\0\0\1\0" for i in range(struct.unpack("<I",page[4:8])[0]) for off in [struct.unpack("<I",page[8+i*4:12+i*4])[0]] for fields,text in [(struct.unpack("<III",page[off+16:off+28]),lambda pos,page=page,off=off:page[off+pos:page.find(b"\0",off+pos)].decode(errors="ignore"))])
-def read_safari_cookies(domain: str) -> dict[str,str]:
-    target=domain.lstrip(".").lower()
-    try: return {name:value for host,name,value in _safari_records() or () if target in (clean:=host.lstrip(".").lower()) or clean in target or clean.endswith(target) or target.endswith(clean)}
-    except PermissionError as e: raise ValueError("Safari cookies are not readable. Grant Full Disk Access to your terminal or use -b chrome.") from e
-
-def _chrome_path(profile=None): return (lambda root:next((path for path in (root/"Cookies",root/"Network/Cookies") if path.exists()),None))(Path.home()/"Library/Application Support/Google/Chrome"/(profile or os.environ.get("CONVOS_CHROME_PROFILE","Default")))
-
-def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, str]:
-    if not (db_path:=_chrome_path(profile)): return {}
-    if (result:=subprocess.run(["security","find-generic-password","-w","-a","Chrome","-s","Chrome Safe Storage"],capture_output=True,text=True,timeout=10)).returncode: return {}
-    key=hashlib.pbkdf2_hmac('sha1',result.stdout.strip().encode(),b'saltysalt',1003,16)
-    with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro&nolock=1",uri=True)) as db: return {name:(value[32:] if not value[:32].isascii() else value).decode(errors="ignore") for name,encrypted,host in db.execute("SELECT name,encrypted_value,host_key FROM cookies WHERE host_key LIKE ?",(f"%{domain}%",)) if encrypted[:3]==b"v10" for decryptor in [Cipher(algorithms.AES(key),modes.CBC(b" "*16)).decryptor()] for decrypted in [decryptor.update(encrypted[3:])+decryptor.finalize()] for value in [decrypted[:-decrypted[-1]]]}
-
-def get_cookies(domain: str, browser: str = "safari", profile: str | None = None) -> dict[str, str]: return read_safari_cookies(domain) if browser == "safari" else read_chrome_cookies(domain, profile=profile)
-
-def get_cookies_any(domains: list[str], browser: str = "safari", profile: str | None = None) -> dict[str, str]: return {name:value for domain in domains for name,value in get_cookies(domain,browser,profile=profile).items()}
-
-def safari_cookie_domains(): return {host for host,_,_ in _safari_records() or ()}
-
-def chrome_cookie_domains(profile: str | None = None):
-    if not (path:=_chrome_path(profile)): return set()
-    with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro&nolock=1",uri=True)) as db: return {r[0] for r in db.execute("SELECT DISTINCT host_key FROM cookies")}
-
-def chrome_profiles() -> list[str]: return [p.name for p in base.iterdir() if p.is_dir() and ((p/"Cookies").exists() or (p/"Network/Cookies").exists())] if (base:=Path.home()/"Library/Application Support/Google/Chrome").exists() else []
-
 def chatgpt_profiles(browser: str) -> list[str | None]: return [None] if browser!="chrome" else [prof] if (prof:=os.environ.get("CONVOS_CHROME_PROFILE")) else chrome_profiles() or [None]
 
 def chatgpt_cookie_base(browser: str, hosts: list[tuple[str, list[str]]], profile: str | None): return required(next(((cookies,url) for url,domains in hosts if (cookies:=get_cookies_any(domains,browser,profile=profile))),None),ValueError(f"No ChatGPT cookies found in {browser}"+(f" profile {profile}" if profile else "")))
@@ -1748,7 +1718,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
     def probe_claude(browser): return f"{(item:=items[0])['uuid']}:{item.get('updated_at') or item.get('created_at')}" if (items:=claude_listing(browser)[2]) else None
     def plan_web(name, fetcher, probe, known=None, sink=None, legacy=None, frontier_ok=True):
         pref,forced=web.get(name,{}),os.environ.get(f"CONVOS_{name.upper()}_BROWSER")
-        order,errors=([forced] if forced else [pref.get("browser")]+[b for b in ("safari","chrome") if b!=pref.get("browser")]),[]
+        order,errors=([forced] if forced else [pref.get("browser")]+[b for b in READERS if b!=pref.get("browser")]),[]
         for b in [x for x in order if x]:
             try:
                 head,((lu, current))=(head:=probe(b)),(head.split(":",1)[1] if name=="claude" and head and ":" in head else None,{**(pref.get("frontiers",{}) if b==pref.get("browser") else {}),**chatgpt_frontiers.get(b,{})} if name=="chatgpt" else None)
