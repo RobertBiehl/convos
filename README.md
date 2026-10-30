@@ -441,6 +441,8 @@ ciphertext and synchronization metadata, never workspace keys or plaintext.
 
 On macOS, Safari cookie access requires Full Disk Access for your terminal.
 If you prefer not to grant it, use Chrome cookies with `-b chrome`.
+On Linux, Chrome and Chromium cookies are read from `~/.config`; keyring-encrypted
+cookies need `secret-tool` (`apt install libsecret-tools`).
 
 ## FAQ
 

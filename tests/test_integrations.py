@@ -391,9 +391,11 @@ class TestCookieExtraction:
             cookies = read_chrome_cookies("example.com")
             assert cookies == {}
 
-    def test_chrome_keychain_failure(self):
+    def test_chrome_keychain_failure(self, monkeypatch):
         """Chrome cookies handles keychain access failure."""
+        from ai_convos import cookies
         from ai_convos.cli import read_chrome_cookies
+        monkeypatch.setattr(cookies, "PLATFORM", "darwin")
         with patch("pathlib.Path.exists", return_value=True):
             with patch("subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=1)
@@ -405,7 +407,8 @@ class TestCookieExtraction:
         import sqlite3, hashlib
         from hashlib import pbkdf2_hmac
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        from ai_convos import cli
+        from ai_convos import cli, cookies
+        monkeypatch.setattr(cookies, "PLATFORM", "darwin")
         key = pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1003, 16)
         def enc_v10(value, prefix=b""):
             plain = prefix + value
@@ -421,6 +424,29 @@ class TestCookieExtraction:
         monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
         monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "peanuts"})())
         assert cli.read_chrome_cookies("claude.ai") == {"sessionKey": "sk-ant-sid02-REAL", "legacy": "plain-token-123"}
+
+    @pytest.mark.parametrize("keyring", [b"from-keyring", None])
+    def test_chrome_cookies_linux_keyring_and_builtin_key(self, tmp_path, monkeypatch, keyring):
+        """Linux Chrome writes v11 with the keyring secret (1 PBKDF2 round) and v10 with the built-in 'peanuts'; without a keyring only v10 decrypts."""
+        import sqlite3
+        from hashlib import pbkdf2_hmac
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from ai_convos import cli, cookies
+        def enc(tag, secret, value):
+            plain = value + bytes([16 - len(value) % 16]) * (16 - len(value) % 16)
+            e = Cipher(algorithms.AES(pbkdf2_hmac("sha1", secret, b"saltysalt", 1, 16)), modes.CBC(b" " * 16)).encryptor()
+            return tag + e.update(plain) + e.finalize()
+        cdir = tmp_path / ".config/chromium/Default"; cdir.mkdir(parents=True)
+        con = sqlite3.connect(str(cdir / "Cookies"))
+        con.execute("CREATE TABLE cookies (name TEXT, encrypted_value BLOB, host_key TEXT)")
+        con.executemany("INSERT INTO cookies VALUES (?,?,?)", [["new", enc(b"v11", b"from-keyring", b"keyring-token"), ".claude.ai"], ["old", enc(b"v10", b"peanuts", b"builtin-token"), ".claude.ai"]])
+        con.commit(); con.close()
+        calls = []
+        monkeypatch.setattr(cookies, "PLATFORM", "linux")
+        monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(cookies, "_keyring", lambda command: calls.append(command) or keyring)
+        assert cli.read_chrome_cookies("claude.ai") == ({"new": "keyring-token"} if keyring else {}) | {"old": "builtin-token"}
+        assert calls == [["secret-tool", "lookup", "application", "chromium"]] and cli.chrome_profiles() == ["Default"]
 
 
 # ---- Deduplication Tests ----
