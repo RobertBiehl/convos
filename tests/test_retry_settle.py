@@ -1,11 +1,7 @@
-"""The own-row retry must let a sync settle: retained fork bodies never retire, so re-applying them each pass kept the watcher running full passes."""
+"""The own-row retry must let a sync settle: retained fork bodies never retire, so re-applying them each pass advanced the archive generation and kept the watcher running full passes."""
 import duckdb
-import ai_convos_remote as remote_client
-from ai_convos_remote import connect, load, setup_client, sync_once, workspace
 from ai_convos_remote.projection import apply_row_replicas, retry_own_replicas
 from ai_convos_remote.protocol import row_proof
-from ai_convos_remote_server import connect as server_connect
-from tests.test_remote_client import inject, no_approval_delay, transport, write_archive
 from tests.test_source_device_cutover import signed_graph
 
 
@@ -24,12 +20,25 @@ def test_retry_does_not_rewrite_an_applied_sibling_fork(tmp_path):
     assert state()==before  # b32: generation +1 per pass, so the next sync was never settled
 
 
-def test_retry_runs_only_after_the_archive_changed(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/'server.db'); monkeypatch.setattr(remote_client,'request',transport(server)); monkeypatch.setattr(remote_client,'drain_hooks',lambda:None)
-    calls,retry=[],remote_client.retry_own_replicas
-    monkeypatch.setattr(remote_client,'retry_own_replicas',lambda *a:(calls.append(1),retry(*a))[1])
-    root=tmp_path/'client'; setup_client('http://server','alice',root=root); write_archive(root/'data/convos.db','one'); sync_once(root,True)
-    calls.clear(); state=connect(root/'remote/state.db'); inject(load(root),state,server,workspace(load(root),'Personal'),'workspace.membership'); state.close(); sync_once(root)
-    assert calls==[]  # b32: every full pass retried every retained row
-    write_archive(root/'data/convos.db','two'); sync_once(root)
-    assert calls==[1]
+
+import json, pytest
+from ai_convos_remote.protocol import digest
+
+@pytest.mark.parametrize('base',['A','B'])
+def test_retry_advances_a_stale_native_base_to_the_retained_head(tmp_path,base):
+    # A(done) -> B(changed) -> C(done); the archive already holds C. Base A: C has the base's content but is its successor. Base B: the archive matches C, but the base must still advance before C's body may retire.
+    user,device,peer,control,bodies=signed_graph()
+    msg=bodies[1]
+    changed={**msg['row'],'data':{**msg['row']['data'],'content':'changed'}}
+    b=dict(row=changed,proof=row_proof(device,user,'w',1,changed,msg['proof']['revision']))
+    c=dict(row=msg['row'],proof=row_proof(device,user,'w',1,msg['row'],b['proof']['revision']))
+    path=tmp_path/'own.db'
+    for batch in (bodies,[b],[c]): apply_row_replicas(path,batch,'w',[control],local_user=user,local_device=device['id'])
+    stale={'A':msg,'B':b}[base]['proof']['revision']
+    with duckdb.connect(str(path)) as db:
+        db.execute("UPDATE remote.local_row_bases SET revision=? WHERE kind='messages' AND entity='m'",[stale])
+        db.execute("INSERT OR IGNORE INTO remote.row_conflicts VALUES (?,?)",[digest(c['proof']),json.dumps(c['row'],sort_keys=True,separators=(',',':'))])
+    retry_own_replicas(path,user,device['id'])
+    with duckdb.connect(str(path),read_only=True) as db:
+        assert db.execute("SELECT revision FROM remote.local_row_bases WHERE kind='messages' AND entity='m'").fetchone()[0]==c['proof']['revision']
+        assert db.execute("SELECT count(*) FROM remote.row_conflicts WHERE proof_id=?",[digest(c['proof'])]).fetchone()[0]==1

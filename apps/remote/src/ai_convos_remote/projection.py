@@ -620,11 +620,11 @@ def converge_own_rows(db_path,state,local_user,local_device,progress=lambda stag
         after=rows[-1][0] if len(rows)==page else 'done'
         (state.execute("INSERT OR REPLACE INTO meta VALUES ('retained_rows_checked',?)",(after,)),state.commit(),progress(f"checking retained rows {len(rows)}"),archive_yield(db_path))
 def retry_own_replicas(db_path,local_user,local_device=None,progress=lambda stage:None):
-    # A same-content fork of this device's base is applied already; its retained body never retires.
+    # A head whose base is a sibling leaf with the same content is applied already; that fork's bodies never retire.
     after=''
     while True:
         with contextlib.closing(open_db(db_path,True,purpose='remote.rows.retry-own')) as db:
-            rows=db.execute("SELECT p.id,'' FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id LEFT JOIN remote.local_row_bases b ON (b.kind,b.entity,b.author)=(p.row_kind,p.source_row_id,p.author_user_id) WHERE p.author_user_id=? AND p.state='active' AND p.id>? AND b.revision IS DISTINCT FROM p.revision AND NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) AND NOT EXISTS (SELECT 1 FROM remote.local_row_bases a JOIN remote.row_proofs q ON (q.row_kind,q.source_row_id,q.author_user_id,q.revision)=(a.kind,a.entity,a.author,a.revision) WHERE (a.kind,a.entity,a.author)=(p.row_kind,p.source_row_id,p.author_user_id) AND q.content_hash=p.content_hash) ORDER BY p.id LIMIT 500",[local_user,after]).fetchall()
+            rows=db.execute("SELECT p.id,'' FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id LEFT JOIN remote.local_row_bases b ON (b.kind,b.entity,b.author)=(p.row_kind,p.source_row_id,p.author_user_id) WHERE p.author_user_id=? AND p.state='active' AND p.id>? AND b.revision IS DISTINCT FROM p.revision AND NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs q WHERE (q.row_kind,q.source_row_id,q.author_user_id,q.revision,q.content_hash)=(p.row_kind,p.source_row_id,p.author_user_id,b.revision,p.content_hash) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(q.row_kind,q.source_row_id,q.author_user_id,q.revision))) ORDER BY p.id LIMIT 500",[local_user,after]).fetchall()
         if not rows: return
         apply_row_replicas(db_path,[],None,[],local_user=local_user,local_device=local_device,ready=False,retry=rows)
         after=rows[-1][0]
@@ -684,23 +684,18 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
                             pid,row,p=nodes[revision]
                             chosen[scope]=revision
                             if row is not None and pid not in parked: projected.append((row,p,pid,p["author_user_id"]==local_user and (local_device is None or p["author_device_id"]==local_device)))
-                    def held(entries):
-                        physical=dict(db.execute("SELECT proof_id,physical_row_id FROM remote.row_origins WHERE proof_id IN (SELECT UNNEST(?)) UNION ALL SELECT proof_id,physical_entity FROM remote.provenance_origins WHERE proof_id IN (SELECT UNNEST(?))",[[pid for pid,row,p in entries.values()]]*2).fetchall()) if entries else {}
-                        claims={scope:(kind,physical.get(pid,source if user==local_user or kind in PROVENANCE-{'edit.observed','checkpoint.link'} else foreign_id(user,'file_edits' if kind=='edit.observed' else kind,source)),source,user,p['state']) for scope,(pid,row,p) in entries.items() for kind,source,user in [scope]}
-                        found=typed_logical_rows(db,claims.values()) if claims else {}
-                        return [scope for scope,claim in claims.items() if matching_logical_row(found[claim],entries[scope][2]['content_hash']) is not None]
-                    # A retry re-projects only what the archive does not already hold: an unchanged projection still advances the archive generation and wakes the next sync.
-                    same=set(held({scope:chains[scope][revision] for scope,revision in chosen.items() if chains[scope][revision][1] is not None})) if isinstance(retry,list) else set()
-                    projected=[item for item in projected if (item[1]['row_kind'],item[1]['row_id'],item[1]['author_user_id']) not in same]
                     pending=set()
                     own_ids={(kind,entity):entity for row,p,pid,native in projected if p['author_user_id']==local_user for kind,entity in [(row['kind'],row['id']),*[(parent,row['data'][column]) for column,parent in FKS.get(row['kind'],()) if row['state']=='active' and row['data'][column]],*[(kind,entity) for e in (row['data'] or {}).get('edits',[]) for kind,entity in [('file_edits',e['id']),('messages',e['message_id'])]],*([('file_edits',row['id']),('messages',row['data']['turn'])] if row['kind']=='edit.observed' and row['state']=='active' else [('file_edits',row['data']['edit'])] if row['kind']=='checkpoint.link' and row['state']=='active' else [])]}
                     own_ids.update({(kind,source):physical for kind,source,physical in db.execute('SELECT table_name,source_row_id,physical_row_id FROM remote.row_origins WHERE author_user_id=? AND source_row_id IN (SELECT UNNEST(?))',[local_user,[entity for kind,entity in own_ids]]).fetchall()})
-                    project_logical_rows(db,[(row,p,pid,native,own_ids if p['author_user_id']==local_user else {}) for row,p,pid,native in projected],defer=pending.add)
+                    project_logical_rows(db,[(row,p,pid,native,own_ids if p['author_user_id']==local_user else {}) for row,p,pid,native in projected],defer=pending.add,quiet=isinstance(retry,list))
                     if pending and not retry: print(f"Remote facts retained pending dependencies: {len(pending)}",file=sys.stderr)
                     [set_attachment_path(db,row['id'] if p['author_user_id']==local_user else foreign_id(p['author_user_id'],'attachments',row['id']),attachment_paths[key],key) for row,p,*_ in values if row['kind']=='attachments' and row['state']=='active' and (key:=(row['data']['body_hash'],row['data']['size'])) in attachment_paths]
-                    resolved=[(row["kind"],row["id"],p["author_user_id"]) for row,p,pid,native in projected if pid not in pending]+list(same)
+                    resolved=[(row["kind"],row["id"],p["author_user_id"]) for row,p,pid,native in projected if pid not in pending]
                     missing={scope:chains[scope][revision] for scope,revision in chosen.items() if chains[scope][revision][1] is None}
-                    resolved += held(missing)
+                    physical=dict(db.execute("SELECT proof_id,physical_row_id FROM remote.row_origins WHERE proof_id IN (SELECT UNNEST(?)) UNION ALL SELECT proof_id,physical_entity FROM remote.provenance_origins WHERE proof_id IN (SELECT UNNEST(?))",[[pid for pid,row,p in missing.values()]]*2).fetchall()) if missing else {}
+                    claims={scope:(kind,physical.get(pid,source if user==local_user or kind in PROVENANCE-{'edit.observed','checkpoint.link'} else foreign_id(user,'file_edits' if kind=='edit.observed' else kind,source)),source,user,p['state']) for scope,(pid,row,p) in missing.items() for kind,source,user in [scope]}
+                    found=typed_logical_rows(db,claims.values()) if claims else {}
+                    resolved += [scope for scope,claim in claims.items() if matching_logical_row(found[claim],missing[scope][2]['content_hash']) is not None]
                     if resolved:
                         retired=[]
                         for scope in resolved:
