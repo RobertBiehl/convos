@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.6b33
+
+- Stop the remote watcher re-running full sync passes: the own-row retry no longer re-applies retained fork rows the archive already holds (that advanced the archive generation every pass), and it runs only after the archive changed.
+
 ## 0.11.6b32
 
 - Handle the relay's HTTP 400 missing-event response during guarded recovery while preserving other errors.
