@@ -70,12 +70,27 @@ Optional enhancement: detect `token_expired` in the fetch path and surface a
 clear "your ChatGPT session expired -- open chatgpt.com and sign in, then retry"
 message instead of swallowing it (see the silent-failure note above).
 
+## Linux: TLS fingerprint challenge (2026-10-30)
+
+On Linux, claude.ai answered urllib with `403` and `cf-mitigated: challenge`
+while the same, correctly decrypted cookies worked in the browser. Unlike the
+June macOS case above, the cookies were fine: Cloudflare challenged Python's TLS
+handshake. Since #162, web requests go through `curl-cffi` impersonating the
+browser the cookies came from (TLS fingerprint and User-Agent), on every OS.
+
+- macOS: the June finding stands (plain urllib worked once the cookies
+  decrypted); the switch to curl-cffi there is not yet verified by a live
+  `convos sync` with Safari and Chrome (maintainer run before merge).
+- curl-cffi reads proxies only from the environment; when it sets none, convos
+  passes the proxies urllib would use (macOS system settings).
+
 ## Implications
 
 - **Playwright is not needed** for the current sources -> `browser.py`'s
   Playwright code can be retired and the dep dropped ([01](01-foundation-core.md)
   sec 0), reclaiming ~125 core LoC. (Reverses the earlier "maybe we need a real
-  browser" worry -- TLS/anti-bot was never the problem.)
+  browser" worry -- TLS/anti-bot was not the problem on macOS in June; for
+  the later Linux TLS challenge see above.)
 - Ship the cookie fix regardless of the feature roadmap: it is a real bug that
   silently broke the majority of ingest.
 - Add a **regression test**: assert decrypted cookie values are printable ASCII

@@ -448,7 +448,8 @@ their names (`Default`); the others are prefixed (`chromium/Default`,
 `Default` holding the site's cookies is used. Keyring-encrypted cookies need
 `secret-tool` (`apt install libsecret-tools`) and an unlocked keyring; otherwise
 sync and `doctor` report `Chrome keyring unavailable`. Firefox needs no
-keyring; set `CONVOS_FIREFOX_PROFILE` to pick a profile other than the one used last.
+keyring; it reads the default container of the profile Firefox starts with
+(`profiles.ini`), or set `CONVOS_FIREFOX_PROFILE` to the profile folder's name.
 
 ## FAQ
 

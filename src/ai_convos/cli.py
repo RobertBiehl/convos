@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache, reduce
 from importlib.metadata import entry_points, version
 from pathlib import Path
-from .cookies import READERS, chrome_cookie_domains, chrome_profiles, firefox_cookie_domains, get_cookies, get_cookies_any, safari_cookie_domains
+from .cookies import READERS, chrome_cookie_domains, chrome_profiles, firefox_cookie_domains, get_cookies, get_cookies_any, host_match, safari_cookie_domains
 from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remote_data, migrate_remote_ids, migration_memory, remote_id_migration_scope
 
 # Newer Typer vendors Click; command errors must use the active runtime.
@@ -985,8 +985,8 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
         try:
             if not browser:
                 with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=timeout) as resp: return json.loads(resp.read())
-            from curl_cffi import requests as curl  # the cookies' browser's TLS fingerprint and User-Agent: Cloudflare challenges Python's own
-            if (resp:=curl.request(req.get_method(),url,headers={k:v for k,v in hdrs.items() if k!="User-Agent"},data=req.data,impersonate=browser,timeout=timeout)).status_code>=400: raise urllib.error.HTTPError(url,resp.status_code,resp.reason,resp.headers,None)
+            from curl_cffi import requests as curl  # the cookies' browser's TLS fingerprint and User-Agent: Cloudflare challenges Python's own; curl reads proxies from the environment only, urllib also macOS's settings
+            if (resp:=curl.request(req.get_method(),url,headers={k:v for k,v in hdrs.items() if k!="User-Agent"},data=req.data,impersonate=browser,timeout=timeout,proxies=None if urllib.request.getproxies_environment() else urllib.request.getproxies() or None)).status_code>=400: raise urllib.error.HTTPError(url,resp.status_code,resp.reason,resp.headers,None)
             return resp.json()
         except Exception as e:
             if i == retries: raise
@@ -1641,7 +1641,7 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
         try: domains = getter()
         except PermissionError as e: domains=typer.echo(f"{name}: no access to cookies ({e.strerror or e})")
         if domains is None: continue
-        typer.echo(f"{name}: "+", ".join(f"{target}={'yes' if any(target in domain or domain in target for domain in domains) else 'no'}" for target in targets))
+        typer.echo(f"{name}: "+", ".join(f"{target}={'yes' if any(host_match(domain,target) for domain in domains) else 'no'}" for target in targets))
         if verbose: typer.echo(f"{name}: chatgpt cookies={len(cg:=get_cookies('chatgpt.com',name))} keys={','.join(sig) if (sig:=[k for k in ['__Secure-next-auth.session-token','__Secure-next-auth.session-token.0','__Secure-next-auth.session-token.1','cf_clearance','__cf_bm'] if k in cg]) else 'none'}")
 
 

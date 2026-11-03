@@ -545,20 +545,60 @@ class TestCookieExtraction:
         monkeypatch.setattr(cookies.subprocess, "run", lambda *a, **k: MagicMock(returncode=0, stdout="secret"))
         assert cookies.get_cookies("claude.ai", "chrome") == {"sessionKey": "token"} and cookies.chrome_cookie_domains() == {".claude.ai"}
 
-    def test_firefox_cookies_read_a_copy_of_the_newest_profile_with_its_wal(self, tmp_path, monkeypatch):
-        """Firefox keeps recent cookies in the WAL of a locked live file: read a copy of both, from the profile written last unless one is named."""
+    @staticmethod
+    def firefox_store(folder, rows, mtime=None):
+        """A Firefox cookie store with its rows in the WAL, as while Firefox runs; rows are (name, value, host, originAttributes, lastAccessed)."""
         import sqlite3, os
+        folder.mkdir(parents=True); con = sqlite3.connect(str(folder / "cookies.sqlite")); con.execute("PRAGMA journal_mode=WAL"); con.execute("PRAGMA wal_autocheckpoint=0")
+        con.execute("CREATE TABLE moz_cookies (name TEXT, value TEXT, host TEXT, originAttributes TEXT NOT NULL DEFAULT '', lastAccessed INTEGER)"); con.executemany("INSERT INTO moz_cookies VALUES (?,?,?,?,?)", rows); con.commit()
+        assert (folder / "cookies.sqlite-wal").stat().st_size
+        if mtime: [os.utime(folder / f, (t, t)) for f, t in zip(("cookies.sqlite", "cookies.sqlite-wal"), mtime)]
+        return con
+
+    def test_cookie_hosts_match_on_boundaries_and_firefox_containers_stay_apart(self, tmp_path, monkeypatch, capsys):
+        """claude.ai takes its own, its subdomains' and its parents' cookies, never notclaude.ai's; Firefox reads its default container only."""
         from ai_convos import cli, cookies
+        con = self.firefox_store(tmp_path / ".mozilla/firefox/p.default", [("sessionKey", "right", ".claude.ai", "", 1), ("sessionKey", "evil", ".notclaude.ai", "", 2), ("sessionKey", "work", ".claude.ai", "^userContextId=2", 3), ("cf", "www", "www.claude.ai", "", 1), ("lone", "x", "notperplexity.ai", "", 1)])
+        self.chrome_store(tmp_path / ".config/google-chrome/Default", [("sessionKey", b"v10", b"peanuts", b"right", ".claude.ai"), ("sessionKey", b"v10", b"peanuts", b"evil", "notclaude.ai")])
+        monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path)); monkeypatch.setattr(cookies, "_keyring", lambda command: None)
+        assert cookies.get_cookies("claude.ai", "firefox") == {"sessionKey": "right", "cf": "www"} and cookies.get_cookies("perplexity.ai", "firefox") == {}
+        assert cookies.get_cookies("claude.ai", "chrome") == {"sessionKey": "right"}
+        monkeypatch.setattr(cookies, "_safari_records", lambda: iter([(".notclaude.ai", "sessionKey", "evil"), ("claude.ai", "sessionKey", "right"), ("openai.com", "parent", "p")]))
+        assert cookies.read_safari_cookies("claude.ai") == {"sessionKey": "right"} and cookies.read_safari_cookies("chat.openai.com") == {"parent": "p"}
+        cli.doctor(False)
+        assert "firefox: chatgpt.com=no, chat.openai.com=no, openai.com=no, claude.ai=yes, perplexity.ai=no" in capsys.readouterr().out
+        con.close()
+
+    def test_firefox_profile_is_the_default_else_the_one_written_last(self, tmp_path, monkeypatch):
+        """profiles.ini's default wins over a newer profile; without it, the profile whose db or WAL was written last; a name picks one; macOS keeps profiles under Profiles/."""
+        import os
+        from ai_convos import cookies
         root = tmp_path / ".mozilla/firefox"
-        def profile(name, value, mtime):
-            (d := root / name).mkdir(parents=True); con = sqlite3.connect(str(d / "cookies.sqlite")); con.execute("PRAGMA journal_mode=WAL"); con.execute("PRAGMA wal_autocheckpoint=0")
-            con.execute("CREATE TABLE moz_cookies (name TEXT, value TEXT, host TEXT, lastAccessed INTEGER)"); con.execute("INSERT INTO moz_cookies VALUES ('session', ?, '.perplexity.ai', 1)", [value]); con.commit()
-            assert (d / "cookies.sqlite-wal").stat().st_size; os.utime(d / "cookies.sqlite", (mtime, mtime)); return con
-        open_ = [profile("old.default", "stale", 1), profile("new.default-release", "fresh", 2)]
-        monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
-        assert cli.get_cookies("perplexity.ai", "firefox") == {"session": "fresh"} and cli.get_cookies("perplexity.ai", "firefox", "old.default") == {"session": "stale"}
-        assert cli.firefox_cookie_domains() == {".perplexity.ai"} and list(cookies.READERS) == ["safari", "chrome", "firefox"]
-        [con.close() for con in open_]
+        cons = [self.firefox_store(root / "a.default", [("session", "chosen", ".perplexity.ai", "", 1)], (1, 1)), self.firefox_store(root / "b.default-release", [("session", "other", ".perplexity.ai", "", 1)], (2, 2))]
+        (root / "profiles.ini").write_text("[Profile1]\nName=b\nIsRelative=1\nPath=b.default-release\nDefault=1\n\n[Profile0]\nName=a\nIsRelative=1\nPath=a.default\n\n[Install4F96D1932A9F858E]\nDefault=a.default\nLocked=1\n")
+        monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path))
+        assert cookies.get_cookies("perplexity.ai", "firefox") == {"session": "chosen"} and cookies.get_cookies("perplexity.ai", "firefox", "b.default-release") == {"session": "other"}
+        (root / "profiles.ini").unlink(); [os.utime(root / folder / name, (t, t)) for folder, times in (("a.default", (5, 1)), ("b.default-release", (2, 9))) for name, t in zip(("cookies.sqlite", "cookies.sqlite-wal"), times)]
+        assert cookies.get_cookies("perplexity.ai", "firefox") == {"session": "other"}
+        mac = tmp_path / "Library/Application Support/Firefox"; cons.append(self.firefox_store(mac / "Profiles/m.default-release", [("session", "mac", ".perplexity.ai", "", 1)]))
+        (mac / "profiles.ini").write_text("[Profile0]\nPath=Profiles/m.default-release\nIsRelative=1\nDefault=1\n"); monkeypatch.setattr(cookies, "PLATFORM", "darwin")
+        assert cookies.get_cookies("perplexity.ai", "firefox") == {"session": "mac"}
+        [con.close() for con in cons]
+
+    def test_firefox_snapshot_is_consistent_across_a_checkpoint(self, tmp_path, monkeypatch):
+        """Firefox holds its store exclusively and checkpoints often: a db copied before a checkpoint and a WAL copied after it don't fit, so the copy is taken again."""
+        import shutil
+        from ai_convos import cookies
+        writer = self.firefox_store(tmp_path / ".mozilla/firefox/p.default", [("session", "old", ".perplexity.ai", "", 1)])
+        writer.execute("PRAGMA locking_mode=EXCLUSIVE"); writer.execute("UPDATE moz_cookies SET lastAccessed=2"); writer.commit()
+        real, raced = shutil.copy2, []
+        def copy_racing_a_checkpoint(src, dst):
+            real(src, dst)
+            if src.name == "cookies.sqlite" and not raced: raced.append(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()); writer.execute("UPDATE moz_cookies SET value='new'"); writer.commit()
+        monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path)); monkeypatch.setattr(cookies.shutil, "copy2", copy_racing_a_checkpoint)
+        assert cookies.get_cookies("perplexity.ai", "firefox") == {"session": "new"} and raced == [(0, 0, 0)]
+        writer.close()
+        assert cookies.get_cookies("perplexity.ai", "firefox") == {"session": "new"}
 
 
 # ---- Deduplication Tests ----
@@ -702,6 +742,18 @@ class TestHTTPErrors:
         monkeypatch.setattr(curl_cffi.requests, "request", lambda method, url, **k: MagicMock(status_code=403, reason="Forbidden", headers={}))
         with pytest.raises(urllib.error.HTTPError) as error: fetch_json("https://claude.ai/api", {}, retries=0, browser="chrome")
         assert error.value.code == 403
+
+    def test_browser_requests_keep_the_system_proxy(self, monkeypatch):
+        """urllib reads macOS's system proxy settings; curl-cffi only reads the environment, so the system's proxies are passed on, and the environment's left to curl."""
+        from ai_convos import cli
+        import curl_cffi.requests
+        sent = []
+        monkeypatch.setattr(curl_cffi.requests, "request", lambda method, url, **k: sent.append(k.get("proxies")) or MagicMock(status_code=200, json=lambda: {}))
+        monkeypatch.setattr(cli.urllib.request, "getproxies_environment", lambda: {}); monkeypatch.setattr(cli.urllib.request, "getproxies", lambda: {"https": "http://proxy.corp:3128"})
+        cli.fetch_json("https://claude.ai/api", {}, browser="chrome")
+        monkeypatch.setattr(cli.urllib.request, "getproxies_environment", lambda: {"https": "http://env:8080"})
+        cli.fetch_json("https://claude.ai/api", {}, browser="chrome")
+        assert sent == [{"https": "http://proxy.corp:3128"}, None]
 
     @pytest.mark.parametrize("headers,delay", [({},300),({"Retry-After":"420"},420)])
     def test_429_uses_visible_long_backoff(self, headers, delay):
