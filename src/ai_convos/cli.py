@@ -1639,7 +1639,7 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
     targets = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai", "perplexity.ai"]
     for name, getter in [("safari", safari_cookie_domains), ("chrome", chrome_cookie_domains), ("firefox", firefox_cookie_domains)]:
         try: domains = getter()
-        except PermissionError: domains=typer.echo(f"{name}: no access to cookies")
+        except PermissionError as e: domains=typer.echo(f"{name}: no access to cookies ({e.strerror or e})")
         if domains is None: continue
         typer.echo(f"{name}: "+", ".join(f"{target}={'yes' if any(target in domain or domain in target for domain in domains) else 'no'}" for target in targets))
         if verbose: typer.echo(f"{name}: chatgpt cookies={len(cg:=get_cookies('chatgpt.com',name))} keys={','.join(sig) if (sig:=[k for k in ['__Secure-next-auth.session-token','__Secure-next-auth.session-token.0','__Secure-next-auth.session-token.1','cf_clearance','__cf_bm'] if k in cg]) else 'none'}")

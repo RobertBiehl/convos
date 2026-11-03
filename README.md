@@ -441,8 +441,13 @@ ciphertext and synchronization metadata, never workspace keys or plaintext.
 
 On macOS, Safari cookie access requires Full Disk Access for your terminal.
 If you prefer not to grant it, use Chrome cookies with `-b chrome`.
-On Linux, Chrome and Chromium cookies are read from `~/.config`; keyring-encrypted
-cookies need `secret-tool` (`apt install libsecret-tools`). Firefox needs no
+On Linux, Chrome and Chromium cookies are read from `$XDG_CONFIG_HOME` (default
+`~/.config`), snap Chromium and Flatpak Chrome/Chromium. Chrome's profiles keep
+their names (`Default`); the others are prefixed (`chromium/Default`,
+`snap-chromium/Default`, ...), and without `CONVOS_CHROME_PROFILE` the first
+`Default` holding the site's cookies is used. Keyring-encrypted cookies need
+`secret-tool` (`apt install libsecret-tools`) and an unlocked keyring; otherwise
+sync and `doctor` report `Chrome keyring unavailable`. Firefox needs no
 keyring; set `CONVOS_FIREFOX_PROFILE` to pick a profile other than the one used last.
 
 ## FAQ
