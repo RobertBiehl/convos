@@ -14,7 +14,7 @@ click=getattr(typer,"_click",click)
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, Codex, and Muse", pretty_exceptions_show_locals=False)
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT,DATA_DIR,DB_PATH,STATE_PATH=(root:=find_root()),(data:=root/"data"),data/"convos.db",data/"sync_state.json"
-HOOK_DIR,HOOK_STATE,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF,OPEN_INGEST_STALE=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,12,19,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest(),300  # conservative web pacing stays below the observed ~200-detail failure point
+HOOK_DIR,HOOK_STATE,HOOK_TAIL,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF,OPEN_INGEST_STALE=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_tails.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,12,19,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest(),300  # conservative web pacing stays below the observed ~200-detail failure point
 _CHATGPT_HOSTS,_BROWSER_UA,_CLAUDE_HEADERS=(("https://chatgpt.com",("chatgpt.com",)),("https://chat.openai.com",("chat.openai.com","openai.com"))),(ua:={"safari":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15","chrome":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}),{"Origin":"https://claude.ai","Referer":"https://claude.ai/","User-Agent":ua["safari"],"Accept":"application/json","Accept-Language":"en-US,en;q=0.9","anthropic-client-sha":"unknown","anthropic-client-version":"unknown"}
 _INJECTED_RE,MESSAGE_ORDER,MESSAGE_ORDER_DESC=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*","m.created_at NULLS FIRST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) NULLS LAST,m.id","m.created_at DESC NULLS LAST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) DESC NULLS LAST,m.id DESC"
 
@@ -1348,6 +1348,15 @@ def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home
 def hook_result(source,path,bindings=None):
     session=(parse_claude_code_session if source=="claude-code" else parse_muse_session if source=="muse" else parse_codex_session)(path,bindings)
     return ParseResult(convs=[session["conv"]],msgs=session["msgs"],tools=session["tools"],attachs=session["attachs"],edits=session["edits"],edit_evidence=session["edit_evidence"]) if session else ParseResult()
+def tail_cut(r,path,tail):  # keep only rows after the last transcript anchor that still matches (and from tool calls awaiting a result); returns the anchors for the next drain
+    if not r.msgs: return None
+    at,old=(at:={m["id"]:json.loads(m["metadata"])["provider_index"] for m in r.msgs}),dict(tail["marks"]) if tail else {}
+    end,resume=max(at.values()),min([at[t["message_id"]] for t in r.tools if t["status"]=="pending" and at[t["message_id"]]>max((at[m["id"]] for m in r.msgs if m["role"]=="user"),default=-1)],default=1<<60)
+    with path.open("rb") as f: marks={i:hashlib.sha1(l).hexdigest() for i,l in enumerate(itertools.islice(f,end+1)) if i%2048==0 or i==end or i in old}
+    cut=min(max(itertools.takewhile(lambda i:marks.get(i)==old[i],sorted(old)),default=-1)+1,tail["resume"] if tail else 0)
+    r.msgs,r.tools,r.attachs,r.edits=[[x for x in rows if at[x.get("message_id",x["id"])]>=cut] for rows in (r.msgs,r.tools,r.attachs,r.edits)]
+    r.edit_evidence=[v for v in r.edit_evidence if v["file_edit_id"] in {e["id"] for e in r.edits}]
+    return dict(marks=sorted(marks.items()),resume=resume)
 def wake_hooks(attempt=None,root=None):
     with operation_lock((Path(root)/"data/hook_inbox" if root is not None else HOOK_DIR)/".drain.lock","hooks.dispatch",0,mandatory=False) as available: pass
     if available: subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env={**os.environ,**({"CONVOS_PROJECT_ROOT":str(root)} if root is not None else {}),**({"CONVOS_HOOK_ATTEMPT":attempt} if attempt else {})})
@@ -1374,7 +1383,7 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
     with operation_lock(HOOK_DIR/".drain.lock","hooks.drain",30 if block else 0,mandatory=block) as pulse:
         if not pulse: return 0
         with operation_lock(HOOK_DIR/".lock","hooks.queue"):
-            state,previous=json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {},json.loads(HOOK_PROGRESS.read_text()) if HOOK_PROGRESS.exists() else {}
+            state,tails,previous=json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {},json.loads(HOOK_TAIL.read_text()) if HOOK_TAIL.exists() else {},json.loads(HOOK_PROGRESS.read_text()) if HOOK_PROGRESS.exists() else {}
             attempted=previous.get("failed_claims",{}) if previous.get("attempt")==attempt else {}
             [done.append((work,work.stem,event["snap"],set(event["changed"]))) if "changed" in event else retry_hook(work,True) for work in HOOK_DIR.glob("*.work") for event in [json.loads(work.read_text())]]
             queued,(claims)=(queued:={p:_hook_stamp(p) for p in HOOK_DIR.glob("*.json")}),([(work,queued[queue]) for queue in [p for p in sorted(queued,key=lambda p:(queued[p][0],p.name)) if attempted.get(p.stem)!=queued[p]][:HOOK_DRAIN_EVENTS] for work in [queue.with_suffix(".work")] if not work.exists() and os.replace(queue,work) is None])
@@ -1389,7 +1398,7 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
                     continue
                 if bindings is None:
                     with _core(ready=True,purpose="hooks.schema") as conn: bindings=session_bindings(conn)
-                r,st2=hook_result(e["source"],path,bindings),path.stat()
+                r,record,st2=(r:=hook_result(e["source"],path,bindings)),tail_cut(r,path,None if e.get("retry") else tails.get(key)) if e["source"]=="claude-code" else None,path.stat()
                 if snap!=[st2.st_mtime_ns,st2.st_size]:
                     with operation_lock(HOOK_DIR/".lock","hooks.queue"): retry_hook(work)
                     continue
@@ -1397,7 +1406,7 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
                     done.append((work,key,snap,set()))
                     continue
                 changed=commit_result(r,purpose="hooks.ingest",progress=pulse)[-1]|({m["id"] for m in r.msgs} if e.get("retry") else set())
-                (atomic_json(work,{**e,"snap":snap,"changed":sorted(changed)}),done.append((work,key,snap,changed)))
+                (atomic_json(work,{**e,"snap":snap,"changed":sorted(changed)}),done.append((work,key,snap,changed)),record and tails.update({key:record}))
             except Exception as error:
                 with operation_lock(HOOK_DIR/".lock","hooks.queue"): retry_hook(work)
                 attempted[work.stem]=stamp
@@ -1405,7 +1414,7 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
                 log_parse_error(f"hook inbox {work}",error)
         if done:
             with operation_lock(HOOK_DIR/".lock","hooks.queue"):
-                (state.update((key,snap) for _,key,snap,_ in done),atomic_json(HOOK_STATE,state))
+                (state.update((key,snap) for _,key,snap,_ in done),atomic_json(HOOK_TAIL,tails),atomic_json(HOOK_STATE,state))
                 for work,_,_,_ in done: work.unlink(missing_ok=True)
         if DB_PATH.exists() and (done or provenance or previous.get("provenance_pending")):
             with _core(read_only=True,purpose="hooks.provenance.plan") as conn: before=conn.execute("SELECT count(*) FROM provenance.pending").fetchone()[0]
