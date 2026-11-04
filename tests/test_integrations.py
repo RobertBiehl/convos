@@ -438,6 +438,8 @@ class TestPerplexity:
         thread = {"uuid": "t1", "title": "T", "last_query_datetime": "2026-01-01T00:00:00", "has_next_page": False}
         self.fake(monkeypatch, [thread], {"t1?limit=100": {"entries": [self.entry("e1", "q", "a", 1)], "has_next_page": True}})
         with pytest.raises(ValueError, match="next page but no cursor"): cli.fetch_perplexity("firefox")
+        self.fake(monkeypatch, [thread], {"t1?limit=100": {"entries": [self.entry("e1", "q", "a", 1)], "has_next_page": True, "next_cursor": "c2"}, "t1?limit=100&cursor=c2": {"entries": [], "has_next_page": False}})
+        with pytest.raises(ValueError, match="ended early after an advertised next page"): cli.fetch_perplexity("firefox")
         self.fake(monkeypatch, [thread], {"t1?limit=100": {"entries": []}})
         assert json.loads(cli.fetch_perplexity("firefox").convs[0]["metadata"])["remote_complete"] is False
 

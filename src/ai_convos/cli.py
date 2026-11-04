@@ -1122,6 +1122,7 @@ def fetch_perplexity(browser: str = "safari", limit: int = 0, since: datetime = 
     def entries(uuid,cursor=None):  # list_ask_threads' query_count stays 1 after follow-ups, so every thread is read in full
         while True:
             yield from (page:=fetch_json(f"{_PERPLEXITY}/rest/thread/{uuid}?limit=100"+(f"&cursor={urllib.parse.quote(cursor,safe='')}" if cursor else ""),cookies,timeout=20,browser=browser))["entries"]
+            if cursor and not page["entries"]: raise ValueError(f"perplexity.ai thread {uuid} ended early after an advertised next page")
             if not page.get("has_next_page"): return
             cursor=required(page.get("next_cursor"),ValueError(f"perplexity.ai thread {uuid} has a next page but no cursor"))
     for t in (fresh:=list(itertools.islice(itertools.takewhile(lambda t:not since or ts_from_iso(t["last_query_datetime"])>since,listed()),limit or None)))+[t for t in pending if t["uuid"] not in {f["uuid"] for f in fresh}]:  # threads left unfinished are read again whatever the cutoff

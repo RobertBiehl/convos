@@ -42,7 +42,7 @@ GET https://www.perplexity.ai/rest/thread/{uuid}?limit=100[&cursor=...]
 ```
 `has_next_page` and `next_cursor` page through long threads; the cursor is
 an opaque JSON string and is URL-encoded in full. `has_next_page` without a
-cursor raises. A thread that answers `404` (deleted since it was listed or
+cursor raises, and so does an empty page reached through a cursor. A thread that answers `404` (deleted since it was listed or
 left pending) is skipped.
 
 ## Mapping
