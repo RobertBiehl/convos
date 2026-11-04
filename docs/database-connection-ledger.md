@@ -120,7 +120,7 @@ SQLite connections never take the DuckDB archive lock. They can contend only wit
 
 | ID | Site | Database and mode | Lifetime and cardinality | Possible impact | Mitigation |
 |---|---|---|---|---|---|
-| S01 | `src/ai_convos/cookies.py::_chrome_rows` | Browser cookie store, read-only URI | Cookie rows for one host, or all rows for `doctor` | Browser copy/write contention only | URI read-only connection; immediate materialization and close |
+| S01 | `src/ai_convos/cookies.py::_chrome_cookies` | Browser cookie store, read-only URI | `meta` version and cookie rows for one host, or all rows for `doctor`; one install at a time | Browser copy/write contention only | URI read-only connection; immediate materialization and close |
 | S03 | `apps/memory/src/ai_convos_memory/__init__.py::_scope` | Memory ledger, read/write | Repository-scope lookup and at most one binding write | Can briefly serialize Memory operations | Explicit commit and close; Git evidence collected before open |
 | S04 | `apps/memory/src/ai_convos_memory/__init__.py::connect` | Memory ledger, read/write | Schema check/migration plus caller-owned operation | Caller can hold the Memory writer | Transactions are explicit; all callers close; separate product ledger |
 | S05 | `apps/memory/src/ai_convos_memory/__init__.py::backup_data` | New backup target, read/write | Whole Memory ledger backup and validation | Holds source Memory connection during copy | Foreground explicit backup to a new private file |

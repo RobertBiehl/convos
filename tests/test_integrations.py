@@ -464,66 +464,81 @@ class TestCookieExtraction:
         monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path))
         assert cookies.read_chrome_cookies("example.com") == {} and cookies.chrome_cookie_domains() == set()
 
-    def test_chrome_cookies_strip_v10_prefix(self, tmp_path, monkeypatch):
-        """Recent Chrome prepends a 32-byte hash to each decrypted cookie; strip it (legacy unprefixed values stay intact)."""
-        import sqlite3, hashlib
-        from hashlib import pbkdf2_hmac
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        from ai_convos import cli, cookies
-        monkeypatch.setattr(cookies, "PLATFORM", "darwin")
-        key = pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1003, 16)
-        def enc_v10(value, prefix=b""):
-            plain = prefix + value
-            pad = 16 - (len(plain) % 16); plain += bytes([pad]) * pad
-            e = Cipher(algorithms.AES(key), modes.CBC(b" " * 16)).encryptor()
-            return b"v10" + e.update(plain) + e.finalize()
-        cdir = tmp_path / "Library/Application Support/Google/Chrome/Default"; cdir.mkdir(parents=True)
-        con = sqlite3.connect(str(cdir / "Cookies"))
-        con.execute("CREATE TABLE cookies (name TEXT, encrypted_value BLOB, host_key TEXT)")
-        con.execute("INSERT INTO cookies VALUES (?,?,?)", ["sessionKey", enc_v10(b"sk-ant-sid02-REAL", hashlib.sha256(b"claude.ai").digest()), ".claude.ai"])
-        con.execute("INSERT INTO cookies VALUES (?,?,?)", ["legacy", enc_v10(b"plain-token-123"), ".claude.ai"])
-        con.commit(); con.close()
-        monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
-        monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "peanuts"})())
-        assert cookies.read_chrome_cookies("claude.ai") == {"sessionKey": "sk-ant-sid02-REAL", "legacy": "plain-token-123"}
+    @pytest.mark.parametrize("version", [24, 23])
+    def test_chrome_cookies_strip_v10_prefix(self, tmp_path, monkeypatch, version):
+        """Cookie db version 24 prepends SHA256(host_key) to each plaintext; strip it there, keep older values intact."""
+        from ai_convos import cookies
+        self.chrome_store(tmp_path / "Library/Application Support/Google/Chrome/Default", [("sessionKey", b"v10", b"peanuts", b"sk-ant-sid02-REAL", ".claude.ai")], 1003, version)
+        monkeypatch.setattr(cookies, "PLATFORM", "darwin"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(cookies.subprocess, "run", lambda *a, **k: MagicMock(returncode=0, stdout="peanuts"))
+        assert cookies.read_chrome_cookies("claude.ai") == {"sessionKey": "sk-ant-sid02-REAL"}
 
     @pytest.mark.parametrize("keyring", [b"from-keyring", None])
     def test_chrome_cookies_linux_keyring_and_builtin_key(self, tmp_path, monkeypatch, keyring):
-        """Linux Chrome writes v11 with the keyring secret (1 PBKDF2 round) and v10 with the built-in 'peanuts'; without a keyring only v10 decrypts."""
-        import sqlite3
-        from hashlib import pbkdf2_hmac
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        from ai_convos import cli, cookies
-        def enc(tag, secret, value):
-            plain = value + bytes([16 - len(value) % 16]) * (16 - len(value) % 16)
-            e = Cipher(algorithms.AES(pbkdf2_hmac("sha1", secret, b"saltysalt", 1, 16)), modes.CBC(b" " * 16)).encryptor()
-            return tag + e.update(plain) + e.finalize()
-        cdir = tmp_path / ".config/chromium/Default"; cdir.mkdir(parents=True)
-        con = sqlite3.connect(str(cdir / "Cookies"))
-        con.execute("CREATE TABLE cookies (name TEXT, encrypted_value BLOB, host_key TEXT)")
-        con.executemany("INSERT INTO cookies VALUES (?,?,?)", [["new", enc(b"v11", b"from-keyring", b"keyring-token"), ".claude.ai"], ["old", enc(b"v10", b"peanuts", b"builtin-token"), ".claude.ai"]])
-        con.commit(); con.close()
+        """Linux Chrome writes v11 with the keyring secret (1 PBKDF2 round) and v10 with the built-in 'peanuts'; without a keyring the v11 cookie fails the install."""
+        from ai_convos import cookies
+        self.chrome_store(tmp_path / ".config/chromium/Default", [("new", b"v11", b"from-keyring", b"keyring-token", ".claude.ai"), ("old", b"v10", b"peanuts", b"builtin-token", ".claude.ai")])
         calls = []
-        monkeypatch.setattr(cookies, "PLATFORM", "linux")
-        monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path))
         monkeypatch.setattr(cookies, "_keyring", lambda command: calls.append(command) or keyring)
         if keyring: assert cookies.read_chrome_cookies("claude.ai") == {"new": "keyring-token", "old": "builtin-token"}
         else: pytest.raises(ValueError, cookies.read_chrome_cookies, "claude.ai")
-        assert calls == [["secret-tool", "lookup", "application", "chromium"]] and cli.chrome_profiles() == ["chromium/Default"]
+        assert calls == [["secret-tool", "lookup", "application", "chromium"]] and cookies.chrome_profiles() == ["chromium/Default"]
 
     @staticmethod
-    def chrome_store(path, rows, rounds=1):
-        """A synthetic Chrome cookie store; rows are (name, tag, secret, value, host)."""
-        import sqlite3
-        from hashlib import pbkdf2_hmac
+    def chrome_store(path, rows, rounds=1, version=24):
+        """A synthetic Chrome cookie store; rows are (name, tag, secret, value, host[, hashed host]); version >= 24 prepends SHA256(host) like Chrome."""
+        import sqlite3, hashlib
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        def enc(tag, secret, value):
-            plain = value + bytes([16 - len(value) % 16]) * (16 - len(value) % 16)
-            e = Cipher(algorithms.AES(pbkdf2_hmac("sha1", secret, b"saltysalt", rounds, 16)), modes.CBC(b" " * 16)).encryptor()
+        def enc(tag, secret, value, host):
+            plain = (hashlib.sha256(host.encode()).digest() if version >= 24 else b"") + value
+            plain += bytes([16 - len(plain) % 16]) * (16 - len(plain) % 16)
+            e = Cipher(algorithms.AES(hashlib.pbkdf2_hmac("sha1", secret, b"saltysalt", rounds, 16)), modes.CBC(b" " * 16)).encryptor()
             return tag + e.update(plain) + e.finalize()
         path.mkdir(parents=True); con = sqlite3.connect(str(path / "Cookies"))
+        con.execute("CREATE TABLE meta (key TEXT, value TEXT)"); con.execute("INSERT INTO meta VALUES ('version', ?)", [str(version)])
         con.execute("CREATE TABLE cookies (name TEXT, encrypted_value BLOB, host_key TEXT)")
-        con.executemany("INSERT INTO cookies VALUES (?,?,?)", [(name, enc(tag, secret, value), host) for name, tag, secret, value, host in rows]); con.commit(); con.close()
+        con.executemany("INSERT INTO cookies VALUES (?,?,?)", [(name, enc(tag, secret, value, hashed[0] if hashed else host), host) for name, tag, secret, value, host, *hashed in rows]); con.commit(); con.close()
+
+    def linux(self, monkeypatch, tmp_path, keyring=None):
+        from ai_convos import cookies
+        calls = []
+        monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path)); monkeypatch.setattr(cookies, "_keyring", lambda command: calls.append(command[-1]) or keyring)
+        return cookies, calls
+
+    @pytest.mark.parametrize("broken_first", [True, False])
+    def test_one_broken_install_does_not_block_another(self, tmp_path, monkeypatch, broken_first):
+        """Installs are read one at a time and the first whose cookies all check out wins; a broken one counts only when none works."""
+        (good, bad) = (".config/chromium/Default", ".config/google-chrome/Default") if broken_first else (".config/google-chrome/Default", ".config/chromium/Default")
+        self.chrome_store(tmp_path / good, [("sessionKey", b"v10", b"peanuts", b"token", ".claude.ai")])
+        (tmp_path / bad).mkdir(parents=True); (tmp_path / bad / "Cookies").write_bytes(b"not a database" * 100)
+        cookies, _ = self.linux(monkeypatch, tmp_path)
+        assert cookies.read_chrome_cookies("claude.ai") == {"sessionKey": "token"}
+        (tmp_path / good / "Cookies").write_bytes(b"not a database" * 100)
+        with pytest.raises(ValueError, match="Default: file is not a database .* chromium/Default: file is not a database"): cookies.read_chrome_cookies("claude.ai")
+
+    def test_decryption_is_verified_not_guessed(self, tmp_path, monkeypatch):
+        """A wrong keyring secret, a hash of another host or broken padding fail that install instead of yielding garbage; an empty value is a value."""
+        self.chrome_store(tmp_path / ".config/google-chrome/Default", [("sessionKey", b"v11", b"old-keyring-secret", b"valid-session-token", ".perplexity.ai")])
+        self.chrome_store(tmp_path / ".config/chromium/Default", [("sessionKey", b"v10", b"peanuts", b"chromium-token", ".perplexity.ai"), ("empty", b"v10", b"peanuts", b"", ".perplexity.ai")])
+        self.chrome_store(tmp_path / ".config/chromium/Profile 1", [("sessionKey", b"v10", b"peanuts", b"token", ".perplexity.ai", ".evil.example")])
+        cookies, _ = self.linux(monkeypatch, tmp_path, b"new-keyring-secret")
+        assert cookies.read_chrome_cookies("perplexity.ai") == {"sessionKey": "chromium-token", "empty": ""}
+        with pytest.raises(ValueError, match="does not decrypt"): cookies.read_chrome_cookies("perplexity.ai", "Default")
+        with pytest.raises(ValueError, match="does not decrypt"): cookies.read_chrome_cookies("perplexity.ai", "chromium/Profile 1")
+
+    def test_keyring_is_asked_only_for_rows_that_need_it_once_per_read(self, tmp_path, monkeypatch):
+        """Fixed-key cookies never prompt the keyring; a read asks it at most once per browser, across installs."""
+        for root, secret in ((".config/chromium/Default", b"stale-secret"), (".var/app/org.chromium.Chromium/config/chromium/Default", b"secret")):
+            self.chrome_store(tmp_path / root, [("sessionKey", b"v10", b"peanuts", b"token", ".claude.ai"), ("sid", b"v11", secret, b"keyring-token", ".example.com")])
+        cookies, calls = self.linux(monkeypatch, tmp_path, b"secret")
+        assert cookies.read_chrome_cookies("claude.ai") == {"sessionKey": "token"} and calls == []
+        assert cookies.read_chrome_cookies("example.com") == {"sid": "keyring-token"} and calls == ["chromium"]
+
+    def test_doctor_sees_a_locked_cookie_next_to_a_readable_one_of_the_same_host(self, tmp_path, monkeypatch):
+        self.chrome_store(tmp_path / ".config/chromium/Default", [("sessionKey", b"v11", b"secret", b"token", ".claude.ai"), ("preference", b"v10", b"peanuts", b"1", ".claude.ai")])
+        cookies, _ = self.linux(monkeypatch, tmp_path)
+        with pytest.raises(PermissionError, match="keyring unavailable"): cookies.chrome_cookie_domains()
 
     def test_chromium_is_reachable_next_to_chrome(self, tmp_path, monkeypatch):
         """Both installs have a Default profile: each is its own profile, and the default lookup falls through to the one holding the domain."""
@@ -535,7 +550,7 @@ class TestCookieExtraction:
         assert cookies.get_cookies("claude.ai", "chrome", "Default") == {} and cookies.get_cookies("claude.ai", "chrome", "chromium/Default") == {"sessionKey": "chromium-token"}
         assert cookies.chrome_cookie_domains() == {".example.com", ".claude.ai"}
 
-    @pytest.mark.parametrize("root,app", [("xdg/google-chrome", "chrome"), ("snap/chromium/common/.config/chromium", "chromium"), (".var/app/com.google.Chrome/config/google-chrome", "chrome"), (".var/app/org.chromium.Chromium/config/chromium", "chromium")])
+    @pytest.mark.parametrize("root,app", [("xdg/google-chrome", "chrome"), ("snap/chromium/common/chromium", "chromium"), (".var/app/com.google.Chrome/config/google-chrome", "chrome"), (".var/app/org.chromium.Chromium/config/chromium", "chromium")])
     def test_chrome_linux_installs(self, tmp_path, monkeypatch, root, app):
         """XDG_CONFIG_HOME, snap and flatpak installs are found, and their keyring secret is looked up under the right application."""
         from ai_convos import cookies
@@ -612,6 +627,31 @@ class TestCookieExtraction:
         assert cookies.get_cookies("perplexity.ai", "firefox") == {"session": "new"} and raced == [(0, 0, 0)]
         writer.close()
         assert cookies.get_cookies("perplexity.ai", "firefox") == {"session": "new"}
+
+    def test_firefox_snapshot_retries_when_the_wal_vanishes_mid_copy(self, tmp_path, monkeypatch):
+        """A checkpoint can delete the WAL between exists() and the copy; that attempt is retaken, not the sync failed."""
+        import shutil
+        from ai_convos import cookies
+        writer = self.firefox_store(tmp_path / ".mozilla/firefox/p.default", [("session", "token", ".perplexity.ai", "", 1)])
+        writer.execute("PRAGMA locking_mode=EXCLUSIVE"); writer.execute("UPDATE moz_cookies SET lastAccessed=2"); writer.commit()
+        real, vanished = shutil.copy2, []
+        def copy(src, dst):
+            if src.name.endswith("-wal") and not vanished: vanished.append(src); raise FileNotFoundError(src)
+            return real(src, dst)
+        monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path)); monkeypatch.setattr(cookies.shutil, "copy2", copy)
+        assert cookies.get_cookies("perplexity.ai", "firefox") == {"session": "token"} and len(vanished) == 1
+        writer.close()
+
+    @pytest.mark.parametrize("xdg", [True, False])
+    def test_firefox_xdg_profiles_are_found(self, tmp_path, monkeypatch, xdg):
+        """Firefox 147+ keeps new profiles under $XDG_CONFIG_HOME/mozilla/firefox (default ~/.config)."""
+        from ai_convos import cookies
+        root = (tmp_path / "xdg" if xdg else tmp_path / ".config") / "mozilla/firefox"
+        con = self.firefox_store(root / "x.default-release", [("session", "xdg", ".perplexity.ai", "", 1)]); (root / "profiles.ini").write_text("[Profile0]\nPath=x.default-release\nIsRelative=1\nDefault=1\n")
+        monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg")) if xdg else monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        assert cookies.get_cookies("perplexity.ai", "firefox") == {"session": "xdg"}
+        con.close()
 
 
 # ---- Deduplication Tests ----
