@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, os, random, re, shlex, shutil, signal, site, ssl, subprocess, sys, sysconfig, tempfile, threading, time, typer, urllib.error, urllib.parse, urllib.request, zipfile
+import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, mmap, os, random, re, shlex, shutil, signal, site, ssl, subprocess, sys, sysconfig, tempfile, threading, time, typer, urllib.error, urllib.parse, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -867,8 +867,9 @@ def _repository_alias_migration(conn):
     _refresh_repository()
     ambiguous={rid for rid, in conn.execute("SELECT DISTINCT repository FROM provenance.repository_checkouts").fetchall() if len({repository_evidence(value) for root, in conn.execute("SELECT root FROM provenance.repository_checkouts WHERE repository=?",(rid,)).fetchall() if os.path.isdir(root) and (where:=_git_where(root)) and (git_root:=where[0])==Path(root).resolve() and (value:=_repository(str(git_root)))["lineage"]})>1}
     return [(rid,repository_evidence({"lineage":lineage,"remotes":json.loads(remotes)})) for rid,lineage,remotes in conn.execute("SELECT id,lineage,CAST(remotes AS VARCHAR) FROM provenance.repositories WHERE lineage IS NOT NULL").fetchall() if rid not in ambiguous],ambiguous
-def session_bindings(conn):
-    return {(source,session):cid for source,session,cid in conn.execute("SELECT source,session_id,conversation_id FROM provider_sessions").fetchall()}|{(source,'id',generated):assigned for source,generated,assigned in conn.execute('SELECT * FROM parser_id_bindings').fetchall()}|{(source,cid,'message',index):mid for source,cid,index,mid in conn.execute("SELECT c.source,c.id,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT),m.id FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT)>=0 AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) QUALIFY count(*) OVER(PARTITION BY c.id,json_extract_string(m.metadata,'$.provider_index'))=1").fetchall()}|{(source,cid,'provider-message',uid):mid for source,cid,uid,mid in conn.execute("SELECT c.source,c.id,json_extract_string(m.metadata,'$.provider_id'),m.id FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE json_extract_string(m.metadata,'$.provider_id') IS NOT NULL").fetchall()}|{(source,cid,'idless',index):mid for source,cid,index,mid in conn.execute("SELECT c.source,c.id,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT),m.id FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE json_extract_string(m.metadata,'$.provider_id') IS NULL").fetchall()}|{(source,cid,'title'):title for source,cid,title in conn.execute('SELECT source,id,title FROM conversations WHERE title IS NOT NULL').fetchall()}
+def session_bindings(conn,sessions=None):  # sessions: message-level bindings only for these provider sessions' conversations
+    bound,scope=(bound:={(source,session):cid for source,session,cid in conn.execute("SELECT source,session_id,conversation_id FROM provider_sessions").fetchall()}),lambda q:conn.execute(q,[]) if sessions is None else conn.execute(q.replace(" WHERE "," WHERE c.id IN (SELECT UNNEST(?)) AND ",1),[[bound.get(k,gen_id(*k)) for k in sessions]])
+    return bound|{(source,'id',generated):assigned for source,generated,assigned in conn.execute('SELECT * FROM parser_id_bindings').fetchall()}|{(source,cid,'message',index):mid for source,cid,index,mid in scope("SELECT c.source,c.id,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT),m.id FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT)>=0 AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id) QUALIFY count(*) OVER(PARTITION BY c.id,json_extract_string(m.metadata,'$.provider_index'))=1").fetchall()}|{(source,cid,'provider-message',uid):mid for source,cid,uid,mid in scope("SELECT c.source,c.id,json_extract_string(m.metadata,'$.provider_id'),m.id FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE json_extract_string(m.metadata,'$.provider_id') IS NOT NULL").fetchall()}|{(source,cid,'idless',index):mid for source,cid,index,mid in scope("SELECT c.source,c.id,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT),m.id FROM conversations c JOIN messages m ON m.conversation_id=c.id WHERE json_extract_string(m.metadata,'$.provider_id') IS NULL").fetchall()}|{(source,cid,'title'):title for source,cid,title in conn.execute('SELECT source,id,title FROM conversations WHERE title IS NOT NULL').fetchall()}
 
 def _schema_migrate(conn,version,fn):
     with _transaction(conn) if (needed:=conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone()[0]<version) else contextlib.nullcontext(): needed and fn()
@@ -1012,6 +1013,7 @@ class ParseResult:
     attachment_indexes: dict = field(default_factory=dict)
     failed_inputs: list = field(default_factory=list)
     input_sessions: dict = field(default_factory=dict)
+    tail: dict | None = None
 
     def __iadd__(self,other): return ([getattr(self,name).extend(getattr(other,name)) for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence","failed_inputs")],self.input_sessions.update(other.input_sessions),self)[-1]
     def __add__(self,other): return ParseResult(**{name:[*getattr(self,name),*getattr(other,name)] for name in ("convs","msgs","tools","attachs","artifacts","edits","edit_evidence","failed_inputs")},input_sessions=self.input_sessions|other.input_sessions)
@@ -1145,34 +1147,39 @@ def parse_claude(path: Path) -> ParseResult:
         return {"conv":dict(id=cid,source="claude",title=c.get("name") or c.get("title"),created_at=ts_from_iso(c.get("created_at")),updated_at=ts_from_iso(c.get("updated_at")),model=c.get("model"),cwd=None,git_branch=None,project_id=None,metadata=json.dumps({"session_id":c["uuid"] if "uuid" in c else c["id"],"session_kind":"main","session_kind_evidence":"exact","capture_mode":"export"})),"msgs":[dict(id=mid,conversation_id=cid,role="user" if m.get("sender")=="human" else m.get("sender","unknown"),content=ec["text"],thinking=ec["thinking"],created_at=ts_from_iso(m.get("created_at")),model=m.get("model"),metadata=json.dumps({"provider_index":i}),parent_id=None) for i,m,mid,ec in parsed if ec["text"] or ec["tools"] or ec["attachments"] or m.get("attachments")],"tools":[dict(id=gen_id("claude",f"tool:{mid}:{t.get('id') or j}"),message_id=mid,tool_name=t["name"],input=json.dumps(t.get("input",{})),output=json.dumps((results.get(t.get("id")) or {}).get("output","")),status="failed" if (results.get(t.get("id")) or {}).get("error") else "complete" if t.get("id") in results else "pending",duration_ms=None,created_at=ts_from_iso(m.get("created_at"))) for i,m,mid,ec in parsed for j,t in enumerate(ec["tools"]) if "name" in t],"attachs":[dict(id=gen_id("claude",f"attach:{mid}:{j}"),message_id=mid,filename=a.get("name",a.get("file_name")),mime_type=a.get("content_type",a.get("file_type")),size=a.get("size",a.get("file_size")),path=None,url=a.get("asset_pointer",a.get("url")),created_at=ts_from_iso(m.get("created_at"))) for i,m,mid,ec in parsed for j,a in enumerate([*ec["attachments"],*m.get("attachments",[])])]}
     return (lambda parsed:ParseResult(convs=[p["conv"] for p in parsed],msgs=[m for p in parsed for m in p["msgs"]],tools=[t for p in parsed for t in p["tools"]],attachs=[a for p in parsed for a in p["attachs"]]))([p for idx,c in enumerate(data) if (p:=safe_parse(f"claude export conv {c.get('uuid') if isinstance(c,dict) else idx}",parse_conv,c))])
 
-def iter_jsonl(path: Path):
-    for i, line in enumerate(path.open(), start=1):
-        if line.strip():
-            try: yield i-1,json.loads(line)
-            except Exception as e: log_parse_error(f"jsonl {path} line {i}", e)
+def iter_jsonl(path: Path, offset=0, line=0):  # line: the index of the line that starts at byte offset
+    for i, raw in enumerate((f:=path.open("rb"),f.seek(offset))[0], start=line):
+        if raw.strip():
+            try: yield i,json.loads(raw)
+            except Exception as e: log_parse_error(f"jsonl {path} line {i+1}", e)
+def jsonl_mark(path,offset,line=0,cut=0):  # the byte offset of line cut, counted from a known (offset,line), and a digest of the first and last 4 KiB before it that a rewrite or truncation changes
+    with path.open("rb") as f: return dict(offset=(end:=offset+sum(map(len,itertools.islice((f.seek(offset),f)[1],cut-line)))),digest=hashlib.sha256(b"".join((f.seek(0),f.read(min(end,4096)),f.seek(max(end-4096,0)),f.read(end-max(end-4096,0)))[1::2])).hexdigest())
+def jsonl_before(path,end,needles):  # which needles occur in the bytes before a resume offset: a search, not a parse
+    with path.open("rb") as f,mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) as m: return {k for k,xs in needles.items() if any(m.rfind(x.encode(),0,end)>=0 for x in xs)}
 
 def parser_logical_row(kind,row): return logical_row(kind,list(row),[v.astimezone(timezone.utc).replace(tzinfo=None) if isinstance(v,datetime) and v.tzinfo else json.dumps(v) if k in ROW_JSON_V1 and isinstance(v,(dict,list)) else v for k,v in row.items()])
 
 def provider_message_id(source,conversation,index,provider,bindings): return bindings.get((source,conversation,'provider-message',provider),bindings.get((source,conversation,'idless',index),gen_id(source,f'message:{conversation}:{provider}'))) if provider else bindings.get((source,conversation,'message',index),gen_id(source,f'{conversation}:{index}'))
 
-def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
-    indexed = list(iter_jsonl(jsonl))
-    events = [e for _,e in indexed]
-    if not events: return None
-    system,root_session,explicit_agent,sidechain=next((e for e in events if e.get("type")=="system"),{}),next((e.get("sessionId") or e.get("session_id") for e in events if e.get("sessionId") or e.get("session_id")),jsonl.stem),next((e["agentId"] for e in events if e.get("agentId")),None),any(e.get("isSidechain") for e in events)
-    agent_id,src,kind,parent,cid=(agent_id:=explicit_agent or (jsonl.stem if "subagents" in jsonl.parts else None)),"claude-code","subagent" if agent_id or sidechain else "main",root_session if agent_id and agent_id!=root_session else None,(cid:=(bindings or {}).get(("claude-code",agent_id or root_session),gen_id("claude-code",agent_id or root_session)))
-    item_id=lambda recipe:(bindings or {}).get((src,'id',gen_id(src,recipe)),gen_id(src,recipe))
-    event_ids={i:e['uuid'] for i,e in indexed if e.get('uuid')}
-    message_id=lambda idx,i:provider_message_id(src,cid,i,event_ids.get(i),bindings or {})
-    timestamps,msg_events,tool_results,uuid2id=[ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e],(msg_events:=[(i,e) for i,e in indexed if "message" in e and e["type"] in ("user","human","assistant")]),{t["id"]:t for _,e in msg_events for t in extract_content(e["message"].get("content",[]))["tools"] if "output" in t and t.get("id")},{e["uuid"]:message_id(idx,i) for idx,(i,e) in enumerate(msg_events) if "uuid" in e}  # api-request-blob events copy request history; only these events are turns
+def claude_head(head,events,fields=dict(system=lambda e:{k:e.get(k) for k in ("cwd","gitBranch","entrypoint","version")} if e.get("type")=="system" else None,session=lambda e:e.get("sessionId") or e.get("session_id") or None,agent=lambda e:e.get("agentId") or None,sidechain=lambda e:e.get("isSidechain") or None,cwd=lambda e:e.get("cwd") or None,branch=lambda e:e.get("gitBranch") or None,name=lambda e:e.get("agentName") or None,role=lambda e:e.get("agentType") or None,depth=lambda e:e.get("agentDepth"),model=lambda e:m if "message" in e and e["type"]=="assistant" and (m:=e["message"].get("model")) and m!="<synthetic>" else None,first=lambda e:[e["timestamp"]] if "timestamp" in e else None)): return {k:head[k] if head and head[k] is not None else next((v for e in events if (v:=f(e)) is not None),None) for k,f in fields.items()}|{"last":next(([e["timestamp"]] for e in reversed(events) if "timestamp" in e),head and head["last"])}  # conversation fields a session takes from its first (or last) line that has them
 
-    turns=[(idx,i,e,extract_content(e["message"].get("content",e["message"].get("text",""))),ts_from_iso(e.get("timestamp")),message_id(idx,i)) for idx,(i,e) in enumerate(msg_events)]
-    msgs,(msgs)=(msgs:=[dict(id=mid,conversation_id=cid,role="user" if e["type"] in ("human","user") else e["type"],content=c["text"],thinking=c["thinking"],created_at=ts,model=e["message"].get("model") if e["type"]=="assistant" else None,metadata=json.dumps({"provider_index":i,**({"provider_id":e["uuid"]} if e.get("uuid") else {})}),parent_id=uuid2id.get(e.get("parentUuid"))) for idx,i,e,c,ts,mid in turns]),([{**m,"parent_id":m["parent_id"] if m["parent_id"] in mids else None} for m in msgs] if (mids:={x["id"] for x in msgs}) else [])  # retain every source message, including thinking-only turns
-    if not msgs: return None
+def parse_claude_code_session(jsonl: Path, bindings=None, tail=None) -> dict:  # tail: resume at its line and byte offset with the state of the lines before it; None back means only a full parse is right
+    if not (indexed:=list(iter_jsonl(jsonl,*((tail["offset"],tail["cut"]) if tail else ())))) and not tail: return None
+    root_session,explicit_agent,sidechain,system,b=(head:=claude_head(tail and tail["head"],[e for _,e in indexed]))["session"] or jsonl.stem,head["agent"],bool(head["sidechain"]),head["system"] or {},bindings or {}
+    agent_id,src,kind,parent,cid=(agent_id:=explicit_agent or (jsonl.stem if "subagents" in jsonl.parts else None)),"claude-code","subagent" if agent_id or sidechain else "main",root_session if agent_id and agent_id!=root_session else None,(cid:=b.get(("claude-code",agent_id or root_session),gen_id("claude-code",agent_id or root_session)))
+    item_id,event_ids,message_id=lambda recipe:b.get((src,'id',gen_id(src,recipe)),gen_id(src,recipe)),{i:e['uuid'] for i,e in indexed if e.get('uuid')},lambda idx,i:provider_message_id(src,cid,i,event_ids.get(i),b)
+    msg_events,tool_results,uuid2id=(msg_events:=[(i,e) for i,e in indexed if "message" in e and e["type"] in ("user","human","assistant")]),{t["id"]:t for _,e in msg_events for t in extract_content(e["message"].get("content",[]))["tools"] if "output" in t and t.get("id")},{e["uuid"]:message_id(idx,i) for idx,(i,e) in enumerate(msg_events) if "uuid" in e}  # api-request-blob events copy request history; only these events are turns
+
+    turns,parent_of=[(idx,i,e,extract_content(e["message"].get("content",e["message"].get("text",""))),ts_from_iso(e.get("timestamp")),message_id(idx,i)) for idx,(i,e) in enumerate(msg_events)],lambda p:uuid2id.get(p,b.get((src,cid,'provider-message',p)) if tail else None)  # a resumed parse finds parents before its offset among the stored messages
+    msgs=[dict(id=mid,conversation_id=cid,role="user" if e["type"] in ("human","user") else e["type"],content=c["text"],thinking=c["thinking"],created_at=ts,model=e["message"].get("model") if e["type"]=="assistant" else None,metadata=json.dumps({"provider_index":i,**({"provider_id":e["uuid"]} if e.get("uuid") else {})}),parent_id=parent_of(e.get("parentUuid"))) for idx,i,e,c,ts,mid in turns]  # retain every source message, including thinking-only turns
+    # Lines before the offset are not parsed: a parent not seen yet may still be appended, and a new result for a call before the offset (or such a parent) needs the full parse.
+    loose,orphans=[(i,p) for seen in [{e.get("uuid") for _,e in indexed}] for _,i,e,*_ in turns if (p:=e.get("parentUuid")) and parent_of(p) is None and p not in seen],{t["id"] for _,i,e,c,*_ in turns if tail and i>=tail["end"] for t in c["tools"] if "output" in t and t.get("id")}-{t.get("id") for *_,c,_,_ in turns for t in c["tools"] if "name" in t}
+    found=jsonl_before(jsonl,tail["offset"],{("uuid",p):[f'"uuid":"{p}"',f'"uuid": "{p}"'] for _,p in loose}|{("tool",t):[json.dumps(t)] for t in orphans}) if tail else set()
     edit_id=lambda idx,j,t:item_id(f"edit:{item_id(f'tool:{cid}:{t.get("id") or f"{idx}:{j}"}')}:{0}")
     tools,edit_calls,edits=(tools:=[dict(id=item_id(f"tool:{cid}:{t.get('id') or f'{i}:{j}'}"),message_id=mid,tool_name=t["name"],input=json.dumps(t.get("input",{})),output=json.dumps((tool_results.get(t.get("id")) or {}).get("output","")),status="failed" if (tool_results.get(t.get("id")) or {}).get("error") else "complete" if t.get("id") in tool_results else "pending",duration_ms=None,created_at=ts) for idx,i,e,c,ts,mid in turns for j,t in enumerate(c["tools"]) if "name" in t]),(edit_calls:=[(i,ts,mid,j,t,tool_results.get(t.get("id"))) for idx,i,e,c,ts,mid in turns for j,t in enumerate(c["tools"]) if t.get("name") in ("Write","Edit","MultiEdit") and t.get("input",{}).get("file_path")]),[dict(id=edit_id(idx,j,t),message_id=mid,file_path=t["input"]["file_path"],edit_type=t["name"].lower(),content=t["input"].get("content") or t["input"].get("new_string",""),created_at=ts,old_content=t["input"].get("old_string")) for idx,ts,mid,j,t,result in edit_calls if result is not None and not result.get("error")]
     evidence=[dict(file_edit_id=edit_id(idx,j,t),status=status,reason=reason,tool_call_id=item_id(f"tool:{cid}:{t.get('id') or f'{idx}:{j}'}")) for idx,ts,mid,j,t,result in edit_calls for status,reason in [(('unknown','result_missing') if result is None else ('invalid','provider_failure') if result.get('error') else ('confirmed','provider_success'))]]
-    return {"conv":dict(id=cid,source=src,title=f"{jsonl.parent.name.replace('-Users-','~/').replace('-','/')} ({jsonl.stem[:8]})",created_at=timestamps[0] if timestamps else None,updated_at=timestamps[-1] if timestamps else None,model=next((m["model"] for m in msgs if m["model"] and m["model"]!="<synthetic>"),None),cwd=system.get("cwd") or next((e.get("cwd") for e in events if e.get("cwd")),None),git_branch=system.get("gitBranch") or next((e.get("gitBranch") for e in events if e.get("gitBranch")),None),project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":agent_id or root_session,"parent_session_id":parent,"session_kind":kind,"session_kind_evidence":"exact" if explicit_agent or sidechain else "inferred","agent_id":agent_id,"agent_name":next((e.get("agentName") for e in events if e.get("agentName")),None),"agent_role":next((e.get("agentType") for e in events if e.get("agentType")),None),"agent_depth":next((e.get("agentDepth") for e in events if e.get("agentDepth") is not None),None),"originator":system.get("entrypoint"),"client_version":system.get("version"),"capture_mode":"transcript","timestamp_basis":"utc"}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[],"edits":edits,"edit_evidence":evidence}
+    return None if not msgs and not tail or tail and (cid!=tail["cid"] or {e.get("uuid") for _,e in msg_events}&set(tail["dangling"]) or any(k=="tool" for k,_ in found)) else {"conv":dict(id=cid,source=src,title=f"{jsonl.parent.name.replace('-Users-','~/').replace('-','/')} ({jsonl.stem[:8]})",created_at=ts_from_iso(head["first"][0]) if head["first"] else None,updated_at=ts_from_iso(head["last"][0]) if head["last"] else None,model=head["model"],cwd=system.get("cwd") or head["cwd"],git_branch=system.get("gitBranch") or head["branch"],project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":agent_id or root_session,"parent_session_id":parent,"session_kind":kind,"session_kind_evidence":"exact" if explicit_agent or sidechain else "inferred","agent_id":agent_id,"agent_name":head["name"],"agent_role":head["role"],"agent_depth":head["depth"],"originator":system.get("entrypoint"),"client_version":system.get("version"),"capture_mode":"transcript","timestamp_basis":"utc"}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[],"edits":edits,"edit_evidence":evidence,
+            "tail":dict(cut=(cut:=min([max((i for _,i,*_ in turns),default=tail and tail["cut"]-1)+1,*(i for _,i,e,c,*_ in turns for t in c["tools"] if "name" in t and t.get("id") not in tool_results)])),cid=cid,session=agent_id or root_session,head=claude_head(tail and tail["head"],[e for i,e in indexed if i<cut]),end=indexed[-1][0]+1 if indexed else tail["end"],dangling=sorted({*(tail["dangling"] if tail else ()),*(p for i,p in loose if i<cut and ("uuid",p) not in found)}))}  # the next parse starts at the earliest pending call, else after the last message
 
 def _parse_sessions(paths,parser,bindings):
     def one(path,bound):
@@ -1355,16 +1362,11 @@ def commit_result(r,purpose,progress=None):
     return (*total,changed)
 
 def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("MUSE_HOME",Path.home()/".local/share/muse"))/"sessions" if source=="muse" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
-def hook_result(source,path,bindings=None):
-    session=(parse_claude_code_session if source=="claude-code" else parse_muse_session if source=="muse" else parse_codex_session)(path,bindings)
-    return ParseResult(convs=[session["conv"]],msgs=session["msgs"],tools=session["tools"],attachs=session["attachs"],edits=session["edits"],edit_evidence=session["edit_evidence"]) if session else ParseResult()
-def tail_cut(r,tail):  # skip rows whose full parse is unchanged since a previous drain committed them (a pending call pins its message); any difference means a full ingest
-    if not r.msgs: return None
-    at,tool,groups=(at:={m["id"]:json.loads(m["metadata"])["provider_index"] for m in r.msgs}),{t["id"]:t["message_id"] for t in r.tools},(r.msgs,r.tools,r.attachs,r.edits,r.edit_evidence)
-    of,below=(of:=lambda x:at[x["message_id"] if "message_id" in x else tool[x["tool_call_id"]] if "tool_call_id" in x else x["id"]]),lambda n:hashlib.sha256(json.dumps([[x for x in rows if of(x)<n] for rows in groups],default=str).encode()).hexdigest()
-    cut,nxt=tail["cut"] if tail and below(tail["cut"])==tail["digest"] else 0,min([max(at.values())+1,*(at[t["message_id"]] for t in r.tools if t["status"]=="pending")])
-    r.msgs,r.tools,r.attachs,r.edits,r.edit_evidence=[[x for x in rows if of(x)>=cut] for rows in groups]
-    return dict(cut=nxt,digest=below(nxt))
+def hook_result(source,path,bindings=None,tail=None):  # tail: a verified Claude Code tail record to resume from; the result's tail is the next one (None: parse in full)
+    session=parse_claude_code_session(path,bindings,tail) if source=="claude-code" else (parse_muse_session if source=="muse" else parse_codex_session)(path,bindings)
+    return ParseResult(convs=[session["conv"]],msgs=session["msgs"],tools=session["tools"],attachs=session["attachs"],edits=session["edits"],edit_evidence=session["edit_evidence"],tail=session.get("tail") and session["tail"]|jsonl_mark(path,*((tail["offset"],tail["cut"]) if tail else (0,0)),session["tail"]["cut"])) if session else ParseResult()
+def hook_bindings(sessions=None):
+    with _core(ready=True,purpose="hooks.schema") as conn: return session_bindings(conn,sessions)
 def wake_hooks(attempt=None,root=None):
     with operation_lock((Path(root)/"data/hook_inbox" if root is not None else HOOK_DIR)/".drain.lock","hooks.dispatch",0,mandatory=False) as available: pass
     if available: subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env={**os.environ,**({"CONVOS_PROJECT_ROOT":str(root)} if root is not None else {}),**({"CONVOS_HOOK_ATTEMPT":attempt} if attempt else {})})
@@ -1395,7 +1397,7 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
             attempted=previous.get("failed_claims",{}) if previous.get("attempt")==attempt else {}
             [(done.append((work,work.stem,event["snap"],set(event["changed"]))),tails.__setitem__(work.stem,event.get("tail"))) if "changed" in event else (tails.pop(work.stem,None),atomic_json(HOOK_TAIL,tails),retry_hook(work,True)) for work in HOOK_DIR.glob("*.work") for event in [json.loads(work.read_text())]]
             queued,(claims)=(queued:={p:_hook_stamp(p) for p in HOOK_DIR.glob("*.json")}),([(work,queued[queue]) for queue in [p for p in sorted(queued,key=lambda p:(queued[p][0],p.name)) if attempted.get(p.stem)!=queued[p]][:HOOK_DRAIN_EVENTS] for work in [queue.with_suffix(".work")] if not work.exists() and os.replace(queue,work) is None])
-        bindings=None
+        full=None
         for n,(work,stamp) in enumerate(claims):
             if n and time.monotonic()-started>=HOOK_DRAIN_SECONDS and (rest:=claims[n:]): break  # released below as ordinary events; only a dead drain's claim is retried
             try:
@@ -1404,9 +1406,9 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
                 if state.get(key)==snap:
                     work.unlink()
                     continue
-                if bindings is None:
-                    with _core(ready=True,purpose="hooks.schema") as conn: bindings=session_bindings(conn)
-                r,record,st2=(r:=hook_result(e["source"],path,bindings)),tail_cut(r,None if e.get("retry") else tails.get(key)) if e["source"]=="claude-code" else None,path.stat()
+                start=tail if e["source"]=="claude-code" and not e.get("retry") and (tail:=tails.get(key)) and tail.get("offset") and jsonl_mark(path,tail["offset"])["digest"]==tail["digest"] else None  # same bytes before the offset: resume there
+                r=hook_result(e["source"],path,hook_bindings([("claude-code",start["session"])]) if start else full or (full:=hook_bindings()),start)
+                r,st2=r if r.tail or not start else hook_result(e["source"],path,full or (full:=hook_bindings())),path.stat()
                 if snap!=[st2.st_mtime_ns,st2.st_size]:
                     with operation_lock(HOOK_DIR/".lock","hooks.queue"): retry_hook(work)
                     continue
@@ -1414,7 +1416,7 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
                     done.append((work,key,snap,set()))
                     continue
                 changed=commit_result(r,purpose="hooks.ingest",progress=pulse)[-1]|({m["id"] for m in r.msgs} if e.get("retry") else set())
-                (atomic_json(work,{**e,"snap":snap,"changed":sorted(changed),"tail":record}),done.append((work,key,snap,changed)),tails.__setitem__(key,record))
+                (atomic_json(work,{**e,"snap":snap,"changed":sorted(changed),"tail":r.tail}),done.append((work,key,snap,changed)),tails.__setitem__(key,r.tail))
             except Exception as error:  # the archive may hold this snapshot already, so its tail no longer vouches for it
                 with operation_lock(HOOK_DIR/".lock","hooks.queue"): (tails.pop(work.stem,None),atomic_json(HOOK_TAIL,tails),retry_hook(work))
                 attempted[work.stem]=stamp

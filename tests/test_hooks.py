@@ -173,9 +173,9 @@ def test_failed_only_drain_does_not_respawn_tight_loop(hooks,monkeypatch):
 def test_failed_prefix_does_not_starve_healthy_capture_or_spin(hooks,monkeypatch):
     sessions,_=hooks; launched=[]; parse=cli.hook_result; monkeypatch.setattr(cli,"HOOK_DRAIN_EVENTS",2)
     for name in ("bad-0","bad-1","bad-2","good"): transcript(path:=sessions/f"{name}.jsonl",name); enqueue(path)
-    def broken(source,path,bindings):
+    def broken(source,path,*a):
         if path.stem.startswith("bad"): raise ValueError("bad transcript")
-        return parse(source,path,bindings)
+        return parse(source,path,*a)
     monkeypatch.setattr(cli,"hook_result",broken); monkeypatch.setattr(cli.subprocess,"Popen",lambda args,**kwargs:launched.append(kwargs))
     assert cli.drain_hooks()==0 and len(launched)==1
     monkeypatch.setenv("CONVOS_HOOK_ATTEMPT",launched[0]["env"]["CONVOS_HOOK_ATTEMPT"])
