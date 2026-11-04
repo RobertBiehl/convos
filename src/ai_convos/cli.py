@@ -1386,7 +1386,7 @@ def retry_hook(work, force=False):
     work.unlink(missing_ok=True) if q.exists() else os.replace(work, q)
 def _hook_stamp(path): return [(st:=path.stat()).st_mtime_ns,st.st_ino,st.st_size]
 def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
-    done,claims,failed,started,attempt,remaining,resume,provenance_error=[],[],0,time.monotonic(),os.environ.get("CONVOS_HOOK_ATTEMPT") or str(time.time_ns()),0,False,None
+    done,claims,rest,failed,started,attempt,remaining,resume,provenance_error=[],[],[],0,time.monotonic(),os.environ.get("CONVOS_HOOK_ATTEMPT") or str(time.time_ns()),0,False,None
     with operation_lock(HOOK_DIR/".drain.lock","hooks.drain",30 if block else 0,mandatory=block) as pulse:
         if not pulse: return 0
         with operation_lock(HOOK_DIR/".lock","hooks.queue"):
@@ -1396,7 +1396,7 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
             queued,(claims)=(queued:={p:_hook_stamp(p) for p in HOOK_DIR.glob("*.json")}),([(work,queued[queue]) for queue in [p for p in sorted(queued,key=lambda p:(queued[p][0],p.name)) if attempted.get(p.stem)!=queued[p]][:HOOK_DRAIN_EVENTS] for work in [queue.with_suffix(".work")] if not work.exists() and os.replace(queue,work) is None])
         bindings=None
         for n,(work,stamp) in enumerate(claims):
-            if n and time.monotonic()-started>=HOOK_DRAIN_SECONDS: break
+            if n and time.monotonic()-started>=HOOK_DRAIN_SECONDS and (rest:=claims[n:]): break  # released below as ordinary events; only a dead drain's claim is retried
             try:
                 pulse(f"processing {work.name}")
                 e,path,key,st,snap=(e:=json.loads(work.read_text())),(path:=Path(e["path"])),work.stem,(st:=path.stat()),[st.st_mtime_ns,st.st_size]
@@ -1419,9 +1419,9 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
                 attempted[work.stem]=stamp
                 failed+=1
                 log_parse_error(f"hook inbox {work}",error)
-        if done:
+        if done or rest:
             with operation_lock(HOOK_DIR/".lock","hooks.queue"):
-                (state.update((key,snap) for _,key,snap,_ in done),atomic_json(HOOK_TAIL,tails),atomic_json(HOOK_STATE,state))
+                (state.update((key,snap) for _,key,snap,_ in done),atomic_json(HOOK_TAIL,tails),atomic_json(HOOK_STATE,state),[retry_hook(work) for work,_ in rest])
                 for work,_,_,_ in done: work.unlink(missing_ok=True)
         if DB_PATH.exists() and (done or provenance or previous.get("provenance_pending")):
             with _core(read_only=True,purpose="hooks.provenance.plan") as conn: before=conn.execute("SELECT count(*) FROM provenance.pending").fetchone()[0]

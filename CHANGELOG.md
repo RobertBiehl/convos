@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Hook drains that stop at their 10 s time budget put the events they claimed but did not reach back in the queue as ordinary events. The next drain treated them as a crashed drain's work, dropped their tail records and re-ingested each of those transcripts in full.
+
 ## 0.11.6b33
 
 - Let sync settle: the own-row retry reports an archive change only for rows whose stored content changed, so retained fork bodies no longer keep `remote watch` running full passes (archive generation +0 per pass on a copy of a real archive, was +6).

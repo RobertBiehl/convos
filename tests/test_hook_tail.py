@@ -66,6 +66,16 @@ def test_unchanged_prefix_is_never_reparsed_into_the_archive_twice(session):
     path, data, committed = session; write(path, turns(0, 3000)); assert drain(path) == 1; write(path, turns(3000, 3002), "a"); assert drain(path) == 1; write(path, turns(3002, 3004), "a"); assert drain(path) == 1
     assert [c[0] for c in committed][1:] == [committed[1][0]] * 2 and committed[1][0] < 40 and current(path, data) and len(archive(data)[0]) == 3004
 
+def test_claims_left_at_the_time_budget_keep_their_tail(session, monkeypatch):  # an unprocessed claim is not crashed work
+    path, data, committed = session; paths = [path, path.with_name("other.jsonl")]; other = lambda es: [{**e, "sessionId": "other"} for e in es]
+    write(paths[0], turns(0, 200)); write(paths[1], other(turns(0, 200))); [capture(p) for p in paths]; assert cli.drain_hooks() == 2
+    write(paths[0], turns(200, 202), "a"); write(paths[1], other(turns(200, 202)), "a"); [capture(p) for p in paths]
+    monkeypatch.setattr(cli, "HOOK_DRAIN_SECONDS", -1); assert cli.drain_hooks() == 1
+    queue, progress = sorted((p.suffix, json.loads(p.read_text()).get("retry")) for p in [*cli.HOOK_DIR.glob("*.json"), *cli.HOOK_DIR.glob("*.work")]), json.loads(cli.HOOK_PROGRESS.read_text())
+    monkeypatch.setattr(cli, "HOOK_DRAIN_SECONDS", 10); assert cli.drain_hooks() == 1
+    assert committed[-2:] == [(2, 0), (2, 0)] and current(paths[1], data), committed  # both commit only their appended turns; a retry would re-commit all 202
+    assert queue == [(".json", None)] and (progress["failed"], progress["pending"], progress["failed_claims"]) == (0, 1, {})
+
 def rows(data):  # every column of every archive table the hook writes
     db = duckdb.connect(str(data / "convos.db"), read_only=True)
     try: return {t: sorted((dict(zip([d[0] for d in c.description], r)) for r in c.fetchall()), key=repr) for t in ("conversations", "messages", "tool_calls", "attachments", "file_edits", "provenance.file_edit_evidence") for c in [db.execute(f"SELECT * FROM {t}")]}
