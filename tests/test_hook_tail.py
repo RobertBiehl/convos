@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import duckdb, pytest
 from typer.testing import CliRunner
 from ai_convos import cli
-POPEN = subprocess.Popen
+POPEN, TAIL_CUT = subprocess.Popen, cli.tail_cut
 
 def event(i, role, content, parent=None):
     stamp = (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -72,13 +72,15 @@ def rows(data):  # archive state a tail drain must share with a full ingest
     try: return {k: sorted(db.execute(q).fetchall()) for k, q in (("messages", "SELECT id, role, content, parent_id FROM messages"), ("tools", "SELECT id, message_id, tool_name, status, output FROM tool_calls"), ("edits", "SELECT id, message_id, file_path, content FROM file_edits"), ("evidence", "SELECT * FROM provenance.file_edit_evidence"))}
     finally: db.close()
 
-def replay(session, monkeypatch, snapshots):  # drain each transcript snapshot into the tail archive, then into a second archive that always ingests the full parse
-    path, data, committed = session
-    for s in snapshots: write(path, s); assert drain(path) == 1
-    use(monkeypatch, full := data.parent / "full"); monkeypatch.setattr(cli, "tail_cut", lambda r, path, tail: None)
-    for s in snapshots: write(path, s); assert drain(path) == 1
-    assert (tail := rows(data)) == rows(full)
-    return tail
+def step(monkeypatch, data, path, snapshot, full=False):  # full=True: an archive that always ingests the full parse
+    use(monkeypatch, data); monkeypatch.setattr(cli, "tail_cut", (lambda *a: None) if full else TAIL_CUT)
+    write(path, snapshot); assert drain(path) == 1
+    return rows(data)
+
+def replay(session, monkeypatch, snapshots):  # after every snapshot the tail archive equals the full-ingest archive
+    path, data, _ = session
+    for s in snapshots: assert (got := step(monkeypatch, data, path, s)) == step(monkeypatch, data.parent / "full", path, s, True)
+    return got
 
 def call(i, parent, *tools): return event(i, "assistant", [{"type": "tool_use", "id": t, "name": "Edit" if t.startswith("e") else "Bash", "input": {"file_path": "/repo/x.py", "old_string": "a", "new_string": t} if t.startswith("e") else {"command": "ls"}} for t in tools], parent)
 def result(i, parent, tool, out="ok", error=False): return event(i, "user", [{"type": "tool_result", "tool_use_id": tool, "content": out, **({"is_error": True} if error else {})}], parent)
@@ -101,3 +103,43 @@ def test_failed_edit_evidence_reaches_the_archive(session, monkeypatch):
     base = [event(0, "user", "go"), call(1, "u0", "e1")]
     got = replay(session, monkeypatch, [base + [result(2, "u1", "e1")], base + [result(2, "u1", "e1", "boom", True)]])
     assert ("Edit", "failed") in [t[2:4] for t in got["tools"]] and [v[1:3] for v in got["evidence"]] == [("invalid", "provider_failure")]
+
+def test_second_result_for_a_completed_call_reaches_the_archive(session, monkeypatch):
+    s0 = [call(0, None, "e1"), result(1, "u0", "e1", "boom", True)]; s1 = s0 + [result(2, "u1", "e1")]
+    got = replay(session, monkeypatch, [s0, s1, s1 + [result(3, "u2", "e1", "boom", True)]])  # failed -> succeeded -> failed again
+    assert len(got["edits"]) == 1 and [v[1:3] for v in got["evidence"]] == [("invalid", "provider_failure")]
+
+def test_rewrite_between_previous_drain_ends_is_detected(session, monkeypatch):
+    done = event(2, "assistant", [{"type": "text", "text": "done"}], "u1")
+    got = replay(session, monkeypatch, [[call(0, None, "t1"), result(1, "u0", "t1", "old"), done], [call(0, None, "t1"), result(1, "u0", "t1", "new"), done, *turns(3, 4)]])
+    assert '"new"' in [t[4] for t in got["tools"]]
+
+def test_appended_parent_reaches_its_earlier_child(session, monkeypatch):
+    child = event(1, "user", "child", "u0")
+    got = replay(session, monkeypatch, [[child], [child, event(0, "assistant", [{"type": "text", "text": "parent"}])]])
+    assert all(m[3] for m in got["messages"] if m[2] == "child")
+
+def test_late_agent_identity_reingests_the_prefix(session, monkeypatch):
+    got = replay(session, monkeypatch, [turns(0, 3), turns(0, 3) + [{**event(3, "user", "late"), "agentId": "a1"}]])
+    assert len(got["messages"]) == 3 + 4
+
+def crash_and_restore(session, monkeypatch, fail):  # S0 succeeds; S1 rewrites the result to a failure and crashes where fail(path) says; then S0 returns with one appended turn
+    path, data, _ = session; ok, more = [call(0, None, "e1"), result(1, "u0", "e1")], turns(2, 3)
+    snapshots, save = [ok, [call(0, None, "e1"), result(1, "u0", "e1", "boom", True)], ok + more], cli.atomic_json
+    step(monkeypatch, data, path, ok); monkeypatch.setattr(cli, "atomic_json", lambda p, v: (_ for _ in ()).throw(OSError("crash")) if fail(p) else save(p, v))
+    write(path, snapshots[1]); outcome = drain_or_raise(path); monkeypatch.setattr(cli, "atomic_json", save)
+    (outcome == "raised" and cli.drain_hooks()), write(path, snapshots[2]); assert drain(path) == 1
+    assert (got := rows(data)) == [step(monkeypatch, data.parent / "full", path, s, True) for s in snapshots][-1]
+    return outcome, got
+
+def drain_or_raise(path):
+    try: return drain(path)
+    except OSError: return "raised"
+
+def test_recovered_journal_restores_the_tail_of_its_commit(session, monkeypatch):  # crash after the completion journal, before hook_tails.json
+    outcome, got = crash_and_restore(session, monkeypatch, lambda p: p == cli.HOOK_TAIL)
+    assert outcome == "raised" and [v[1:3] for v in got["evidence"]] == [("confirmed", "provider_success")]
+
+def test_failed_completion_marker_invalidates_the_tail(session, monkeypatch):  # commit succeeded, writing the completion journal failed
+    outcome, got = crash_and_restore(session, monkeypatch, lambda p: p.suffix == ".work")
+    assert outcome == 0 and [v[1:3] for v in got["evidence"]] == [("confirmed", "provider_success")]
