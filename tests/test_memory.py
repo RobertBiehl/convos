@@ -381,7 +381,7 @@ def test_codex_hook_trust_uses_bounded_hook_list(monkeypatch):
 def test_top_level_doctor_loads_memory_health_entry_point(tmp_path, monkeypatch):
     from ai_convos import cli
     roots(tmp_path, monkeypatch); repo = tmp_path/"repo"; repo.mkdir(); (repo/".git").mkdir(); monkeypatch.chdir(repo)
-    for name, value in (("DATA_DIR", tmp_path/"archive"), ("DB_PATH", tmp_path/"archive"/"convos.db"), ("HOOK_DIR", tmp_path/"archive"/"hooks"), ("HOOK_STATE", tmp_path/"archive"/"state.json"), ("HOOK_EMBED_DIRTY", tmp_path/"archive"/"dirty")): monkeypatch.setattr(cli, name, value)
+    for name, value in (("DATA_DIR", tmp_path/"archive"), ("DB_PATH", tmp_path/"archive"/"convos.db"), ("HOOK_DIR", tmp_path/"archive"/"hooks"), ("HOOK_STATE", tmp_path/"archive"/"state.json"), ("HOOK_TAIL", tmp_path/"archive"/"tails.json"), ("HOOK_EMBED_DIRTY", tmp_path/"archive"/"dirty")): monkeypatch.setattr(cli, name, value)
     monkeypatch.setattr(cli, "install_hooks", lambda **_: None); monkeypatch.setattr(cli, "safari_cookie_domains", lambda: []); monkeypatch.setattr(cli, "chrome_cookie_domains", lambda: [])
     result = CliRunner().invoke(cli.app, ["doctor"])
     assert result.exit_code == 0 and f"memory: attention, scope={repo}, ledger=missing" in result.output
