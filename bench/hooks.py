@@ -34,16 +34,16 @@ def probe():  # runs in every spawned `drain-hooks` (sitecustomize): logs per-ev
             with ol(path, purpose, *a, **k) as pulse:
                 yield (lambda stage: (stage.startswith("processing ") and (flush(), ev.update(key=stage.split()[1].rsplit(".", 1)[0], start=now())), pulse(stage))[-1]) if pulse and purpose == "hooks.drain" else pulse
         return wrapped
-    def cut(r, tail):
-        before = len(r.msgs)
-        return (out := tail_cut(r, tail), ev.update(rows=len(r.msgs), full=len(r.msgs) == before > 0, tail=tail is not None, end=now()), ev["full"] and log(kind="full", key=ev["key"], rows=before))[0]
-    close, tail_cut, drain = cli._LockedDB.close, cli.tail_cut, cli.drain_hooks
+    def parsed(s, r, src, path, bindings=None, tail=None):  # a drain that cannot resume parses again without its tail: that call is the full ingest
+        ev.update(size=(n := path.stat().st_size), parsed=n - (tail["offset"] if tail else 0), rows=len(r.msgs), full=tail is None and bool(r.msgs), tail=tail is not None, parse=now() - s, end=now())
+        ev["full"] and log(kind="full", key=ev["key"], rows=len(r.msgs))
+    close, drain = cli._LockedDB.close, cli.drain_hooks
     def closing(self):
         purpose, ro, opened, start = *self.audit, now()
         return (out := close(self), self.db is None and log(kind="close", purpose=purpose, ro=ro, hold=time.monotonic() - opened, close=now() - start))[0] if self.db else close(self)
-    cli.operation_lock, cli.tail_cut, cli._LockedDB.close = lock(cli.operation_lock), cut, closing
+    cli.operation_lock, cli._LockedDB.close = lock(cli.operation_lock), closing
     cli.session_bindings = timed(cli.session_bindings, lambda s, out, *a: ev.update(bindings=now() - s))
-    cli.hook_result = timed(cli.hook_result, lambda s, r, src, path, *a: ev.update(size=path.stat().st_size, parsed=len(r.msgs), parse=now() - s, end=now()))
+    cli.hook_result = timed(cli.hook_result, parsed)
     cli.commit_result = timed(cli.commit_result, lambda s, out, *a: (ev.update(commit=now() - s, committed=True, end=now()), log(kind="commit", key=ev["key"], size=ev["size"])))
     cli.retry_hook = timed(cli.retry_hook, lambda s, out, work, force=False: log(kind="retry" if force else "requeue", key=work.stem))
     cli.log_parse_error = timed(cli.log_parse_error, lambda s, out, context, error: log(kind="error", error=type(error).__name__, key=Path(context.split()[-1]).stem))
@@ -103,7 +103,7 @@ def sync_writer(cli, stop, holds):  # remote-sync-like: every 45 s two 15 s writ
 
 def seed(cli, copies):  # the tail record a drain stores after committing each prefix; the clone already holds those rows (the live archive ingested the originals)
     with cli._core(read_only=True, purpose="bench.seed") as conn: bindings = cli.session_bindings(conn)
-    cli.atomic_json(cli.HOOK_TAIL, {c["key"]: cli.tail_cut(cli.hook_result("claude-code", c["path"], bindings), None) for c in copies})
+    cli.atomic_json(cli.HOOK_TAIL, {c["key"]: cli.hook_result("claude-code", c["path"], bindings).tail for c in copies})
 
 def capture(cli, path):
     return subprocess.Popen([sys.executable, "-m", "ai_convos", "capture", "claude-code"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True).communicate(json.dumps(dict(transcript_path=str(path), hook_event_name="Stop", session_id=path.stem)))
@@ -176,7 +176,7 @@ def report(out, cli, a, copies, fired, rs, t0, t1, holds, drained, aborted, disk
     last, appended = {}, []
     for r in sorted(done, key=lambda r: r["start"]): (appended.append(r["size"] - last[r["key"]]) if r["key"] in last else None, last.__setitem__(r["key"], r["size"]))
     v = dict(latency=latency, tail_event=[r["end"] - r["start"] for r in done if r["rows"] <= 100], all_event=[r["end"] - r["start"] for r in done],
-             hold=[r["hold"] for r in closes], close=[r["close"] for r in closes], parsed_mb=[r["size"] / 1e6 for r in done], appended_mb=[x / 1e6 for x in appended],
+             hold=[r["hold"] for r in closes], close=[r["close"] for r in closes], parsed_mb=[r["parsed"] / 1e6 for r in done], appended_mb=[x / 1e6 for x in appended],
              rows=[r["rows"] for r in done], bindings=[r["bindings"] for r in events if "bindings" in r], sync=holds)
     full, retry, requeue, errors = (sum(r["kind"] == k for r in rs) for k in ("full", "retry", "requeue", "error"))  # a full ingest counts when it starts: a long one may not finish
     git = subprocess.run(["git", "-C", Path(cli.__file__).parent, "describe", "--always", "--dirty"], capture_output=True, text=True).stdout.strip()
