@@ -101,7 +101,7 @@ convos install-skills
 
 - Fast full-text search with direct source, day, role, project, conversation, and thinking filters
 - Hybrid semantic search (BM25 + embeddings + Reciprocal Rank Fusion) via `convos query`
-- Fetch from ChatGPT and Claude using browser cookies
+- Fetch from ChatGPT, Claude and Perplexity using browser cookies (Safari, Chrome, Firefox)
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
 - Capture completed Claude Code + Codex turns just in time with lifecycle hooks
 - Deterministic project resume packets and exact session replay
@@ -275,7 +275,7 @@ convos search "one-line fix" -s claude-code -n 10
 convos query "duplicate-job bug after restart"
 ```
 
-If Safari cookies are protected by macOS privacy, `sync` will fall back to Chrome.
+If Safari cookies are protected by macOS privacy, `sync` falls back to Chrome, then Firefox.
 The search phrases above are illustrative; your agent should use terms from your
 actual work.
 
@@ -441,6 +441,17 @@ ciphertext and synchronization metadata, never workspace keys or plaintext.
 
 On macOS, Safari cookie access requires Full Disk Access for your terminal.
 If you prefer not to grant it, use Chrome cookies with `-b chrome`.
+On Linux, Chrome and Chromium cookies are read from `$XDG_CONFIG_HOME` (default
+`~/.config`), snap Chromium and Flatpak Chrome/Chromium. Chrome's profiles keep
+their names (`Default`); the others are prefixed (`chromium/Default`,
+`snap-chromium/Default`, ...). A bare name (`CONVOS_CHROME_PROFILE`, default
+`Default`) takes the first install's profile of that name holding the site's
+cookies, a prefixed one only that install's. Keyring-encrypted cookies need
+`secret-tool` (`apt install libsecret-tools`) and an unlocked keyring; otherwise
+sync and `doctor` report `Chrome keyring unavailable`. Firefox needs no
+keyring; it reads `~/.mozilla/firefox`, `$XDG_CONFIG_HOME/mozilla/firefox`
+(Firefox 147+), snap and Flatpak, and the default container of the profile
+Firefox starts with (`profiles.ini`), or set `CONVOS_FIREFOX_PROFILE` to the profile folder's name.
 
 ## FAQ
 

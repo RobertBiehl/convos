@@ -34,7 +34,7 @@ metadata and never invents facts a source did not record.
 
 | Field | Meaning |
 | --- | --- |
-| `source` | Provider/integration namespace: `codex`, `claude-code`, `chatgpt`, or `claude`. |
+| `source` | Provider/integration namespace: `codex`, `claude-code`, `chatgpt`, `claude`, or `perplexity`. |
 | `title` | Display label only; never identity. |
 | `created_at`, `updated_at` | Earliest and latest recorded event timestamps. |
 | `model` | First exact non-synthetic assistant model recorded for the session; NULL when unavailable. |
