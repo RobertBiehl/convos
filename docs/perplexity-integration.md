@@ -16,9 +16,10 @@ Browser cookies for `perplexity.ai` (Safari, Chrome or Firefox), sent through
 `curl-cffi` impersonating that browser: plain Python requests get a Cloudflare
 challenge. An expired login is **not** an API error: `list_ask_threads` just
 returns `[]`. When the first page is empty, `/api/auth/session` tells the two
-apart; an empty session (`{}`) raises
+apart; a session without a user (`{}`) raises
 `not logged in to perplexity.ai in <browser>`, so sync reports a failure
-instead of "0 new" forever.
+instead of "0 new" forever. The session's `user.id` (else `user.email`) is the
+account identity sync scopes its cutoff to.
 
 ## Endpoints
 
@@ -49,15 +50,29 @@ an opaque JSON string and is URL-encoded in full.
 | `created_at` / `updated_at` | first entry's `created_us` / thread `last_query_datetime` |
 | user message | entry `query_str` |
 | assistant message | the `FINAL` step's `content.answer` in entry `text` (a JSON document whose `answer` holds the markdown) |
-| `messages.model` | entry `display_model` on the answer |
+| `messages.model`, `conversations.model` | NULL: `display_model` is a product label, not an exact model |
 | `metadata.provider_index` | `2 * entry index` for the question, `+1` for the answer |
 | `metadata.provider_id` | entry `uuid` |
+| user `metadata.attachments` | entry `attachments`, as sent |
+| assistant `metadata.sources` | the answer document's `web_results`, as sent |
+| assistant `metadata.display_model` | entry `display_model` (e.g. `pplx_pro`) |
+| `metadata.remote_complete` | every entry has a `FINAL` answer |
 
-Sources, attachments and intermediate search steps are not stored.
+A question with attachments but no text is kept. Intermediate search steps are
+not stored.
 
 ## Incremental sync
 
-`sync` probes the newest thread (`uuid:last_query_datetime`). An unchanged head
-is a no-op; otherwise only threads whose `last_query_datetime` is newer than the
-last sync are fetched. A follow-up question moves its thread back to the top,
-so it is fetched again in full.
+`sync` probes the newest thread (`uuid:last_query_datetime`) and the account. An
+unchanged head is a no-op; otherwise only threads whose `last_query_datetime`
+is newer than the last sync are fetched. A follow-up question moves its thread
+back to the top, so it is fetched again in full.
+
+- The cutoff belongs to the account that set it. When sync falls back to
+  another browser logged in to another account (or none can be established),
+  that account's threads are fetched in full. Claude does the same with its
+  organization.
+- A head thread synced while its answer was still being written
+  (`remote_complete: false`) keeps no head in the sync state and a cutoff just
+  before it, so the next sync fetches it again; its `last_query_datetime` does
+  not move when the answer lands.

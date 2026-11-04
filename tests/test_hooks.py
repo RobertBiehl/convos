@@ -692,3 +692,36 @@ def test_unchanged_source_reparses_only_after_its_provider_binding_changes(hooks
     parsed.clear()
     cli.sync(False,300,False,True,False,False,True)
     assert parsed==[]
+
+
+def perplexity_web(monkeypatch, threads, entries, accounts, detail_calls):
+    """Fake perplexity.ai: firefox's login is accounts['firefox'], chrome has none; ChatGPT and Claude find no cookies."""
+    monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: []); monkeypatch.setattr(cli, "get_cookies", lambda domain, browser="safari", profile=None: {"s": browser} if domain == "perplexity.ai" and browser in accounts else {})
+    def fetch(url, cookies, *a, body=None, **k):
+        if url.endswith("/list_ask_threads"): return threads[body["offset"]:body["offset"] + body["limit"]]
+        if url.endswith("/api/auth/session"): return {"user": {"id": accounts[cookies["s"]]}}
+        detail_calls.append(uuid := url.split("/rest/thread/")[1].split("?")[0]); return {"entries": entries[uuid]}
+    monkeypatch.setattr(cli, "fetch_json", fetch)
+
+def perplexity_entry(uuid, query, answer, us=1_767_225_600_000_000):
+    return {"uuid": uuid, "query_str": query, "created_us": us, "text": json.dumps([{"step_type": "INITIAL_QUERY", "content": {}}] + ([{"step_type": "FINAL", "content": {"answer": json.dumps({"answer": answer})}}] if answer else []))}
+
+def test_sync_fetches_a_perplexity_head_again_when_its_answer_was_unfinished(hooks, monkeypatch):
+    _, data = hooks; monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); calls, entries = [], {"t1": [perplexity_entry("e1", "still answering?", None)]}
+    perplexity_web(monkeypatch, [{"uuid": "t1", "title": "T", "last_query_datetime": "2026-11-03T10:00:00", "has_next_page": False}], entries, {"firefox": "A"}, calls)
+    cli.sync(False, 300, False, False, False, False)
+    entries["t1"] = [perplexity_entry("e1", "still answering?", "done now")]
+    cli.sync(False, 300, False, False, False, False); cli.sync(False, 300, False, False, False, False)
+    db = duckdb.connect(str(data/"convos.db"), read_only=True); rows = db.execute("SELECT role, content FROM messages ORDER BY role DESC").fetchall(); db.close()
+    assert rows == [("user", "still answering?"), ("assistant", "done now")] and calls == ["t1", "t1"]
+
+def test_sync_does_not_carry_one_perplexity_accounts_cutoff_to_another(hooks, monkeypatch):
+    _, data = hooks; monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); calls = []
+    cli.atomic_json(cli.STATE_PATH, {"web": {"perplexity": {"browser": "chrome", "head": "a1:2026-11-03T00:00:00", "last_updated": "2026-11-03T00:00:00", "account": "A"}}})
+    threads = [{"uuid": u, "title": u, "last_query_datetime": t, "has_next_page": False} for u, t in (("b9", "2026-11-04T00:00:00"), ("b1", "2026-11-01T00:00:00"))]
+    perplexity_web(monkeypatch, threads, {"b9": [perplexity_entry("e9", "new", "a")], "b1": [perplexity_entry("e1", "older history", "a")]}, {"firefox": "B"}, calls)
+    cli.sync(False, 300, False, False, False, False)
+    assert calls == ["b9", "b1"] and json.loads(cli.STATE_PATH.read_text())["web"]["perplexity"] == {"browser": "firefox", "head": "b9:2026-11-04T00:00:00", "last_updated": "2026-11-04T00:00:00", "account": "B"}
+    cli.atomic_json(cli.STATE_PATH, {"web": {"perplexity": {"browser": "chrome", "head": "b1:2026-11-01T00:00:00", "last_updated": "2026-11-01T00:00:00", "account": "B"}}}); calls.clear()
+    cli.sync(False, 300, False, False, False, False)
+    assert calls == ["b9"]

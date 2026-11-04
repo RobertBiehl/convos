@@ -405,11 +405,24 @@ class TestPerplexity:
         assert [c["title"] for c in r.convs] == ["T1", "T2", "T3"] and [b["offset"] for u, b in calls if b] == [0, 2]
         assert [(m["role"], m["content"], json.loads(m["metadata"])["provider_index"]) for m in r.msgs] == [("user", "q1", 0), ("assistant", "a1", 1), ("user", "q2", 2), ("assistant", "plain a2", 3), ("user", "q3", 0)]
         conv = r.convs[0]; meta = json.loads(conv["metadata"])
-        assert conv["id"] == cli.gen_id("perplexity", "t1") and meta == {"session_id": "t1", "session_kind": "main", "session_kind_evidence": "exact", "capture_mode": "api"}
-        assert conv["created_at"] == cli.ts_from_iso("2026-01-01T00:00:00") and conv["updated_at"] == cli.ts_from_iso("2026-01-03T00:00:00") and conv["model"] == "pplx_pro"
+        assert conv["id"] == cli.gen_id("perplexity", "t1") and meta == {"session_id": "t1", "session_kind": "main", "session_kind_evidence": "exact", "capture_mode": "api", "remote_complete": True}
+        assert conv["created_at"] == cli.ts_from_iso("2026-01-01T00:00:00") and conv["updated_at"] == cli.ts_from_iso("2026-01-03T00:00:00")
+        assert json.loads(r.convs[1]["metadata"])["remote_complete"] is False
         assert len({m["id"] for m in r.msgs}) == 5 and r.msgs[0]["id"] == cli.gen_id("perplexity", f"{conv['id']}:e1:q")
         calls.clear(); since = cli.fetch_perplexity("firefox", since=cli.ts_from_iso("2026-01-02T00:00:00"))
         assert [c["title"] for c in since.convs] == ["T1"] and not any("t2" in u or "t3" in u for u, _ in calls)
+
+    def test_sources_attachments_and_display_model_are_provider_metadata(self, monkeypatch):
+        """Sources and attachments are kept with their messages; display_model (pplx_pro) is a product label, so model stays NULL."""
+        from ai_convos import cli
+        entry = {**self.entry("e1", "summarize", json.dumps({"answer": "a1", "web_results": [{"name": "Src", "url": "https://src.example/1"}]}), 1), "attachments": ["https://ppl-ai-file-upload.example/report.pdf"]}
+        self.fake(monkeypatch, [{"uuid": "t1", "title": "T", "last_query_datetime": "2026-01-01T00:00:00", "has_next_page": False}], {"t1?limit=100": {"entries": [entry, {**self.entry("e2", "", None, 2), "attachments": ["https://ppl-ai-file-upload.example/only.png"]}]}})
+        r = cli.fetch_perplexity("firefox")
+        meta = [json.loads(m["metadata"]) for m in r.msgs]
+        assert {m["model"] for m in r.msgs} == {None} and r.convs[0]["model"] is None
+        assert meta[0] == {"provider_index": 0, "provider_id": "e1", "attachments": ["https://ppl-ai-file-upload.example/report.pdf"]}
+        assert meta[1] == {"provider_index": 1, "provider_id": "e1", "sources": [{"name": "Src", "url": "https://src.example/1"}], "display_model": "pplx_pro"}
+        assert meta[2]["attachments"] == ["https://ppl-ai-file-upload.example/only.png"] and len(r.msgs) == 3
 
     def test_logged_out_raises_instead_of_empty_list(self, monkeypatch):
         """An expired login lists no threads; that must fail loudly, not sync as '0 new'."""
