@@ -1,6 +1,6 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
 import contextvars, duckdb, hashlib, http.client, itertools, json, os, re, shutil, sqlite3, sys, time, traceback, urllib.error, urllib.parse, urllib.request
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from functools import wraps
 from pathlib import Path
 from typing import Optional
@@ -9,7 +9,7 @@ import typer
 from ai_convos_redact import protect_all
 _pending,_leases,_PROGRESS,MANUAL_WAIT=[],contextvars.ContextVar("remote_leases",default=()),[0,0,""],5
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, canonicalize_repositories, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, provider_session_key, retire_sync_identity, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
+from ai_convos.cli import CORE_VERSION, PROJECT_ROOT, LockBusy, _migration_backup, _transaction, archive_state as core_archive_state, archive_yield, atomic_json, _git_identity, canonicalize_repositories, capture_repository as core_capture_repository, drain_hooks, durable_replace, init_schema, install_hooks, lock_holder, open_db, operation_lock, project_attachment_body, provider_session_key, retire_sync_identity, project_workspace_controls, provenance_digest, repository as core_repository, repository_evidence, repository_state as core_repository_state, required, merge_archive_backup
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .projection import PROJECTION_VERSION, PROOF_FIELDS, SIGNED, TABLES, apply_row_replicas, attest_rows, audit_rows, blob_replicas, bridge_records, bridge_replicas, bridge_stamp, bridge_stamps, bridge_state, closed_generation, connect, control_chain, converge_own_rows, cutover_state, event_support, inspect_state, local_repack_envelopes, repack_index, project, project_many, read_state, relocate_attachments, reset_history, retained_proof_pages, retry_edit_replicas, retry_own_replicas, row_replicas, scan, scan_archive, sequence, sharing, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
@@ -30,20 +30,20 @@ def archive_info(root=None,create=False):
     if not (path:=core_path(root)).exists() and not create: return None
     path.parent.mkdir(parents=True,exist_ok=True)
     with _core(root,not create,purpose="remote.archive_info") as db: return core_archive_state(db)
-def _archive_marker(root):
+def _archive_marker(root,db=None):
     if not core_path(root).is_file(): return None
     try:
-        with _core(root,True,purpose="remote.settled.read") as db: return db.execute("SELECT archive_id::VARCHAR,generation,(SELECT version FROM core_schema WHERE singleton),EXISTS(SELECT 1 FROM remote.edit_ready WHERE dependency_key<>'' OR after_proof_id<>'done'),(SELECT count(*) FROM remote.row_proofs) FROM archive_state WHERE singleton").fetchone()
+        with nullcontext(db) if db else _core(root,True,purpose="remote.settled.read") as db: return db.execute("SELECT archive_id::VARCHAR,generation,(SELECT version FROM core_schema WHERE singleton),EXISTS(SELECT 1 FROM remote.edit_ready WHERE dependency_key<>'' OR after_proof_id<>'done'),(SELECT count(*) FROM remote.row_proofs) FROM archive_state WHERE singleton").fetchone()
     except duckdb.CatalogException: return None
-def _sync_marker(cfg,root,archive): return (lambda bridges:digest({"v":3,"projection":PROJECTION_VERSION,"archive":archive,"controls":{ws:state_hash(cfg["controls"][ws]) for ws in sorted(bridges)},"keys":cfg["keys"],"sharing":cfg.get("sharing",{}),"bindings":cfg.get("bindings",{}),"promotions":cfg.get("promotions",{}),"routes":{key:core_repository(path) for key,value in cfg.get("bindings",{}).items() if (path:=binding_path(value))},"bridges":bridges}) if all(value is not None for value in bridges.values()) else None)({w["id"]:bridge_state(root,cfg,w["id"],w["kind"],archive[1]) for w in cfg["server_state"]["workspaces"] if w["device_authorized"]})
+def _sync_marker(cfg,root,archive,state): return (lambda bridges:digest({"v":3,"projection":PROJECTION_VERSION,"archive":archive,"controls":{ws:state_hash(cfg["controls"][ws]) for ws in sorted(bridges)},"keys":cfg["keys"],"sharing":cfg.get("sharing",{}),"bindings":cfg.get("bindings",{}),"promotions":cfg.get("promotions",{}),"routes":{key:cached_repository(state,path) for key,value in cfg.get("bindings",{}).items() if (path:=binding_path(value))},"bridges":bridges}) if all(value is not None for value in bridges.values()) else None)({w["id"]:bridge_state(root,cfg,w["id"],w["kind"],archive[1]) for w in cfg["server_state"]["workspaces"] if w["device_authorized"]})
 def _meta(state,key,default=0): return (state.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone() or [default])[0]
 def _local_tails(state,ws): return {"events":(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(ws,)).fetchone() or [0])[0],"replicas":int(_meta(state,f"replica_cursor:{ws}")),"blobs":int(_meta(state,f"blob_cursor:{ws}")),"origins":state.execute("SELECT COALESCE(MAX(cursor),0) FROM (SELECT cursor FROM origin_bindings WHERE workspace=? UNION ALL SELECT cursor FROM control_dependencies WHERE workspace=?)",(ws,ws)).fetchone()[0]}
-def _settled(cfg,state,root):
-    if cfg["server_state"].get("capabilities",{}).get("sync_tails")!=1 or not (archive:=_archive_marker(root)) or archive[2]!=CORE_VERSION or archive[3]: return False
+def _settled(cfg,state,root,archive):
+    if cfg["server_state"].get("capabilities",{}).get("sync_tails")!=1 or not archive or archive[2]!=CORE_VERSION or archive[3]: return False
     active={w["id"]:w for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
     dirty=not active or _meta(state,"retained_rows_checked",None)!="done" or any(state.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() for table in ("outbox","blob_outbox","lazy_events","sequence_gaps")) or any(path.exists() and any(path.iterdir()) for path in (paths(root)[0]/"outbox",paths(root)[0]/"attachments")) or state.execute("SELECT 1 FROM meta WHERE key LIKE 'replica_repair:%' OR key LIKE 'archive_mode:%' OR key LIKE 'replica_upload_blocked:%' LIMIT 1").fetchone() or any(event_support(row)!=("required" if row[2] else "optional") for row in state.execute("SELECT kind,payload_v,required FROM deferred_events"))
     ready=all((lifecycle:=state.execute("SELECT lifecycle,error FROM sync_states WHERE workspace=?",(ws,)).fetchone()) and lifecycle[0]=="ready" and not lifecycle[1] and remote.get("sync")==_local_tails(state,ws) and int(_meta(state,f"core_generation:{ws}"))==archive[1] and _meta(state,f"replica_projection:{ws}",None)==bridge_stamp(root) for ws,remote in active.items())
-    return not dirty and ready and (marker:=_sync_marker(cfg,root,archive)) is not None and _meta(state,"sync_settled",None)==marker
+    return not dirty and ready and (marker:=_sync_marker(cfg,root,archive,state)) is not None and _meta(state,"sync_settled",None)==marker
 def load(root=None):
     if not (path:=paths(root)[1]).exists(): raise ValueError("Remote is not configured. Run `convos remote setup`.")
     return json.loads(path.read_text())
@@ -253,8 +253,8 @@ def access_from(cfg,ws):
     first=min(value["epoch"] for remote in cfg["server_state"]["workspaces"] if remote["id"]==ws for value in remote["controls"] if device in value["devices"])
     return head["members"][cfg["user"]]["history_from"] if head["devices"][device]["history"] else first
 def sequence_heads(state,ws): return {author:{"seq":seq,"event":event} for author,seq,event in state.execute("SELECT s.author,s.seq,s.event FROM event_sequences s JOIN (SELECT author,MAX(seq) seq FROM event_sequences WHERE workspace=? GROUP BY author) h ON h.author=s.author AND h.seq=s.seq WHERE s.workspace=?",(ws,ws)).fetchall()}
-def prepare_archive(cfg,state,root=None,create=True):
-    info=archive_info(root)
+def prepare_archive(cfg,state,root=None,create=True,info=None):
+    info=info or archive_info(root)
     empty=not info or info[1:]==(0,0)
     cached=[(state.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone() or [None])[0] for key in ("archive_id","archive_generation")]
     proofs=[p for p in (cfg.get("archive"),{"id":cached[0],"generation":int(cached[1])} if all(cached) else None) if p]
@@ -283,8 +283,8 @@ def prepare_archive(cfg,state,root=None,create=True):
         state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'rebaselining',COALESCE((SELECT tail FROM sync_states WHERE workspace=?),0),COALESCE((SELECT floor FROM sync_states WHERE workspace=?),0),NULL)",(ws,ws,ws))
     state.commit()
     return existing or mode
-def remember_archive(cfg,state,root=None):
-    if info:=archive_info(root):
+def remember_archive(cfg,state,root=None,info=None):
+    if info:=info or archive_info(root):
         with local_lock(root,"mutation",True):
             current=load(root)
             current["archive"]={"id":info[0],"generation":info[1]}
@@ -530,6 +530,25 @@ def settle_sharing(cfg,state,ready,root=None):
     if changed: update_recovery(cfg,root)
 def policy_binding(ws,kind,value): return f"{ws}:{kind}:{value}"
 def binding_path(value): return value.get("path") if isinstance(value,dict) else value
+def _stat(path):
+    try: return (s:=os.stat(path)).st_ino,s.st_mtime_ns,s.st_size
+    except OSError: return None
+def repository_stamp(path):
+    # Files whose change can alter core_repository(path): the checkout, HEAD and its ref, refs, configs (remote URLs and insteadOf rules), shallow grafts.
+    try:
+        if not (p:=Path(path)).exists() or not (root:=next((r for r in (p,*p.parents) if (r/".git").exists()),None)): return None
+        gitdir=root/(git.read_text().removeprefix("gitdir:").strip()) if (git:=root/".git").is_file() else git
+        common,head=gitdir/(gitdir/"commondir").read_text().strip() if (gitdir/"commondir").is_file() else gitdir,(gitdir/"HEAD").read_text()
+    except OSError: return None
+    return [str(root),head,_git_identity(),*map(_stat,[git,gitdir/"HEAD",gitdir/"config.worktree",common/"config",common/"packed-refs",common/"shallow",common/"info/grafts",common/"reftable/tables.list",common/head.removeprefix("ref:").strip() if head.startswith("ref:") else git,Path.home()/".gitconfig",Path(os.environ.get("XDG_CONFIG_HOME") or Path.home()/".config")/"git/config"])]
+def cached_repository(state,path,known=None):
+    # Persisted across sync runs: an unchanged checkout costs stats instead of six git subprocesses.
+    known=core_repository_state(known) if hasattr(known,"execute") else known
+    if not path or not (stamp:=repository_stamp(path)): return core_repository(path,known,True) if path else None
+    slot,key=f"repository:{'known:'*(known is not None)}{path}",digest([stamp,known])
+    if (hit:=state.execute("SELECT value FROM meta WHERE key=?",(slot,)).fetchone()) and (cached:=json.loads(hit[0]))["key"]==key: return cached["repo"]
+    repo,pending=core_repository(path,known,True),state.in_transaction
+    return (state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(slot,json.dumps({"key":key,"repo":repo}))),pending or state.commit(),repo)[-1]
 def sharing_routes(state,ws,user,bindings,core):
     pref=sharing(state,ws,user)
     known=core_repository_state(core) if hasattr(core,"execute") else core
@@ -542,18 +561,18 @@ def sharing_routes(state,ws,user,bindings,core):
         expected=binding["repository"] if isinstance(binding,dict) else known["aliases"].get(repository_evidence(json.loads(p[3])))
         if isinstance(binding,dict):
             for location in (path,known["checkout_roots"].get(binding["checkout"])):
-                if location and (repo:=core_repository(location,known,True)) and (repo["checkout"],repo["lineage"])==(binding["checkout"],json.loads(p[3])["lineage"]): return known["checkouts"].get(repo["checkout"],repo["id"])
+                if location and (repo:=cached_repository(state,location,known)) and (repo["checkout"],repo["lineage"])==(binding["checkout"],json.loads(p[3])["lineage"]): return known["checkouts"].get(repo["checkout"],repo["id"])
             return None
-        if path and (repo:=core_repository(path,known,True)) and repo["id"]==expected: return expected
+        if path and (repo:=cached_repository(state,path,known)) and repo["id"]==expected: return expected
         for checkout,rid in known["checkouts"].items():
-            if rid==expected and (repo:=core_repository(known.get("checkout_roots",{}).get(checkout),known,True)) and (repo["id"],repo["checkout"])==(expected,checkout): return expected
+            if rid==expected and (repo:=cached_repository(state,known["checkout_roots"].get(checkout),known)) and (repo["id"],repo["checkout"])==(expected,checkout): return expected
         return None
     return sorted({repo for p in active if (repo:=resolve(p))}),[binding_path(bindings[key]) for p in policies if p[0]==user and p[1]=="path" and (key:=policy_binding(ws,p[1],p[2])) in bindings],pref["match"]
 def upgrade_repository_policies(cfg,state,core,root=None):
     changed=False
     for ws,owner,value in state.execute("SELECT workspace,owner,value FROM policies WHERE kind='repository' AND evidence IS NULL").fetchall():
         if owner!=cfg["user"] or ws not in cfg["workspaces"] or cfg["workspaces"][ws]["kind"]!="team": continue
-        repos={repository_evidence({k:repo[k] for k in ("lineage","remotes")}):(path,repo) for checkout,rid in core["checkouts"].items() if rid==value and (path:=core["checkout_roots"].get(checkout)) and (repo:=core_repository(path,core,True)) and repo["id"]==rid and repo["lineage"]}
+        repos={repository_evidence({k:repo[k] for k in ("lineage","remotes")}):(path,repo) for checkout,rid in core["checkouts"].items() if rid==value and (path:=core["checkout_roots"].get(checkout)) and (repo:=cached_repository(state,path,core)) and repo["id"]==rid and repo["lineage"]}
         if len(repos)!=1: continue
         path,repo=next(iter(repos.values()))
         binding={"path":path,"repository":repo["id"],"checkout":repo["checkout"]}
@@ -569,7 +588,7 @@ def promote_paths(cfg,state,core,root=None):
     for ws,value in state.execute("SELECT workspace,value FROM policies WHERE owner=? AND kind='path'",(cfg["user"],)).fetchall():
         binding=cfg.get("bindings",{}).get(policy_binding(ws,"path",value))
         path=binding_path(binding) if binding else None
-        repo=core_repository(path,core,True) if path else None
+        repo=cached_repository(state,path,core)
         if not repo or not repo["lineage"] or Path(repo["root"])!=Path(path).resolve(): continue
         promotions,key=cfg.setdefault("promotions",{}),policy_binding(ws,"path",value)
         promotion=promotions.get(key)
@@ -737,9 +756,9 @@ def upload_blobs(cfg,state,root,workspaces):
         state.execute("DELETE FROM blob_outbox WHERE workspace=? AND blob=? AND epoch=? AND uploader=?",(row["workspace"],row["blob"],row["epoch"],row["uploader"]))
         state.commit()
         path.unlink(missing_ok=True)
-def pull_origins(cfg,state,root,ws):
+def pull_origins(cfg,state,root,ws,idle=False):
     sid=ws["id"]
-    values=request(cfg,{"op":"origin_pull","workspace":sid})["origins"]
+    values=[] if idle else request(cfg,{"op":"origin_pull","workspace":sid})["origins"]
     if not values: return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
     valid,invalid={},{}
     for item in values:
@@ -919,12 +938,13 @@ def pull(cfg,state,root=None,concurrent=False,keep_going=False,fresh=False,ready
             state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?),(?,?)",(f"boundary:{sid}",proof,f"replica_cursor:{sid}","0",f"blob_cursor:{sid}","0"))
             state.commit()
         try:
-            total=0
-            origins=pull_origins(cfg,state,root,ws)
-            replicas=pull_row_replicas(cfg,state,root,ws,recover,origins,fresh)
-            blobs=pull_blobs(cfg,state,root,ws,recover)
+            # The relay's state response carries each stream's tail; a stream whose local cursor is already there has nothing to receive.
+            total,same=0,set() if fresh else {k for k,v in _local_tails(state,sid).items() if (ws.get("sync") or {}).get(k)==v}
+            origins=pull_origins(cfg,state,root,ws,"origins" in same)
+            replicas=0 if "replicas" in same and _meta(state,f"replica_projection:{sid}",None)==bridge_stamp(root) and not _meta(state,f"replica_repair:{sid}",None) else pull_row_replicas(cfg,state,root,ws,recover,origins,fresh)
+            blobs=0 if "blobs" in same else pull_blobs(cfg,state,root,ws,recover)
             while True:
-                result=request(cfg,{"op":"pull","workspace":sid,"after":after,"limit":500})
+                result={"events":[],"floor":state.execute("SELECT floor FROM sync_states WHERE workspace=?",(sid,)).fetchone()[0],"tail":after} if "events" in same else request(cfg,{"op":"pull","workspace":sid,"after":after,"limit":500})
                 floor,tail=result["floor"],result["tail"]
                 if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail or after>tail: raise ValueError("relay cursor window is invalid")
                 incoming=[]
@@ -1034,7 +1054,7 @@ def sync_once(root=None,repair=False,manual=False):
             canonicalize_repositories(core_path(root))
             server=refresh(cfg,root,True)
             repair_parked_memberships(cfg,state,root,server)
-            if not repair and _settled(cfg,state,root):
+            if not repair and _settled(cfg,state,root,_archive_marker(root)):
                 state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))
                 state.commit()
                 return cutover
@@ -1045,21 +1065,20 @@ def sync_once(root=None,repair=False,manual=False):
                 for ws in ready: state.execute("INSERT OR REPLACE INTO meta VALUES (?,'1')",(f"replica_repair:{ws}",))
             state.commit()
             upload_isolated(failures:={},cfg,state,root,ready,True,server)
-            prepare_archive(cfg,state,root)
-            baseline=archive_info(root)
+            prepare_archive(cfg,state,root,info=(baseline:=archive_info(root)))
+            baseline=baseline or archive_info(root)
             bound={r[0] for r in state.execute("SELECT DISTINCT workspace FROM origin_bindings").fetchall()}
             failures.update({ws:value["error"] for ws,value in pull(cfg,state,root,True,True,server=server).items() if "error" in value})
-            retry_own_replicas(core_path(root),state,cfg['user'],cfg['device']['id'],_progress)
-            retry_edit_replicas(core_path(root),cfg['user'],cfg['device']['id'],root,_progress)
+            if retry_own_replicas(core_path(root),state,cfg['user'],cfg['device']['id'],_progress): (_progress("retrying edit facts"),retry_edit_replicas(core_path(root),cfg['user'],cfg['device']['id'],root,_progress))
+            _progress("checking retained rows")
             converge_own_rows(core_path(root),state,cfg['user'],cfg['device']['id'],_progress)
             ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
             authorized={w["id"] for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
-            reconciled=_archive_marker(root)
             path,active=core_path(root),authorized
-            generation=closed_generation(path) if path.is_file() else 0
             if path.is_file():
-                with closing(open_db(path,True,purpose="remote.routes")) as core: known=core_repository_state(core)
-            else: known={"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}}
+                with _core(root,True,purpose="remote.routes") as core: reconciled,generation,known=_archive_marker(root,core),closed_generation(path,core),core_repository_state(core)
+            else: reconciled,generation,known=None,0,{"roots":{},"checkouts":{},"checkout_roots":{},"lineages":{},"aliases":{}}
+            _progress("applying sharing policies")
             with local_lock(root,"mutation",True):
                 current=load(root)
                 required(all(current.get("controls",{}).get(ws,{}).get("revision",0)==control.get("revision",0) for ws,control in cfg.get("controls",{}).items()),RuntimeError("Remote configuration changed during sync; retry"))
@@ -1114,20 +1133,24 @@ def sync_once(root=None,repair=False,manual=False):
                     upload_replicas(cfg,state,root,{ws},{final for tmp,final in prepared} if full else ())
                     state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_upload_blocked:{ws}",json.dumps(sorted(set(upload_blocked))))) if upload_blocked else state.execute("DELETE FROM meta WHERE key=?",(f"replica_upload_blocked:{ws}",))
                     if upload_blocked: typer.echo(f"Remote upload skipped {len(set(upload_blocked))} received row(s) whose local projection does not match the author's proof; run `convos remote repull` to restore them.",err=True)
+            _progress("reconciling replicas")
             for ws,meta in cfg["workspaces"].items():
                 if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"]:
                     repair=bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone())
                     reconcile_replicas(cfg,state,root,ws,bridge_replicas(root,cfg,ws,meta["kind"],key(cfg,ws,meta["epoch"]),(),lambda ids:replica_inventory(cfg,state,ws,ids) if repair else {rid for rid,epoch in local_receipts(state,"replica",ws,ids)},ws in deltas,deltas.get(ws)),True)
                     if ws in deltas: (state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation))),state.commit())
             for ws in ready&active: state.execute("DELETE FROM meta WHERE key=?",(f"replica_repair:{ws}",))
-            state.commit()
+            (state.commit(),_progress("receiving updates"))
             server=refresh(cfg,root,True)
             upload_isolated(failures,cfg,state,root,ready,True,server)
             failures.update({ws:value["error"] for ws,value in pull(cfg,state,root,True,True,ready=False,server=server).items() if "error" in value})
             state.commit()
             if failures: raise next(iter(failures.values())) if len(authorized)==1 else (ConnectionError if all(isinstance(error,ConnectionError) for error in failures.values()) else RuntimeError)(f"Remote sync completed partially: {len(failures)} workspace error(s); workspaces were isolated and failed data was not accepted or acknowledged. "+"; ".join(f"{cfg['workspaces'].get(ws,{}).get('name',ws[:8])}: {error}" for ws,error in failures.items()))
-            remember_archive(cfg,state,root)
-            marker=_sync_marker(cfg,root,archive) if (archive:=_archive_marker(root)) and archive==reconciled else None
+            if path.is_file():
+                with _core(root,True,purpose="remote.sync.done") as core: archive,info=_archive_marker(root,core),core_archive_state(core)
+            else: archive=info=None
+            remember_archive(cfg,state,root,info)
+            marker=_sync_marker(cfg,root,archive,state) if archive and archive==reconciled else None
             state.execute("INSERT OR REPLACE INTO meta VALUES ('sync_settled',?)",(marker,)) if marker else state.execute("DELETE FROM meta WHERE key='sync_settled'")
             state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),))
             state.commit()

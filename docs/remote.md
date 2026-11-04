@@ -243,6 +243,12 @@ Repository lifecycle is passive and conservative:
   one workspace. A nested repository is classified by Git's deepest enclosing
   root.
 
+Each sync pass re-resolves bound checkouts. The result is kept in `state.db`
+with a stamp of the files Git reads for it (`.git`, `HEAD` and its ref,
+`packed-refs`, repository and global configs, shallow and graft files) and of
+the core identity rules, so an unchanged checkout costs a few `stat` calls
+instead of six Git subprocesses; any changed file resolves it again.
+
 Starting-directory and edit classification freeze the resolved path and Git
 checkout marker during ingestion. Delayed Git enrichment is accepted only when
 that marker still matches; pre-upgrade scope without a trustworthy snapshot is
@@ -367,7 +373,10 @@ convos remote sync --repair         # verify and restore the full retained repli
 After one full successful cycle, an unchanged client completes ordinary sync with
 one authenticated `state` request. The response carries indexed per-workspace
 channel tails; any changed tail, local archive generation, bridge state, policy,
-pending work, or uncertainty falls back to the complete idempotent cycle.
+pending work, or uncertainty falls back to the complete idempotent cycle. Within
+that cycle, a channel (events, row replicas, blobs, origin bundles) whose local
+cursor already equals its tail is not pulled, so a pass driven only by local
+archive changes asks the relay for `state` twice plus its own uploads.
 
 The worker writes errors to `<root>/remote/last_error` (by default,
 `~/.convos/remote/last_error`). Queries never wait for the server. `doctor`
