@@ -4,9 +4,8 @@ import argparse, json, shutil, subprocess, sys, tempfile, time
 from datetime import timedelta
 from pathlib import Path
 
-import duckdb
 import ai_convos_remote as remote
-from ai_convos.cli import ARCHIVE_COLUMNS, init_schema, project_archive_row
+from ai_convos.cli import ARCHIVE_COLUMNS, _open_db, init_schema, project_archive_row
 from ai_convos_remote.projection import connect as state_connect
 from ai_convos_remote_server import action, connect as relay_connect
 
@@ -23,7 +22,7 @@ def sqlite_settle(db,path):
     return files_size(path)
 def transport(db): return lambda cfg,body,auth=True:action(db,body,cfg.get("token") if auth else None)
 def duck_settle(path):
-    db=duckdb.connect(str(path))
+    db=_open_db(path)
     db.execute("CHECKPOINT")
     counts={t:db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("remote.row_proofs","remote.row_signers","remote.provenance_origins","provenance.local_facts")}
     db.close()
@@ -47,7 +46,7 @@ def run(source,keep=False):
         phase("copy-on-write archive clone")
         clone(source,core)
         started=time.perf_counter()
-        db=duckdb.connect(str(core))
+        db=_open_db(core)
         init_schema(db)
         archive_counts={table:db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("conversations","messages","tool_calls","attachments","artifacts","file_edits")}
         db.close()
@@ -96,7 +95,7 @@ def run(source,keep=False):
         relay_page_replicas,page_seconds=relay_page_walk(relay,alice,origin)
         result|={"interrupted_attempt_seconds":interrupted_attempt_seconds,"interruption_recovery_seconds":interruption_recovery_seconds,"initial_signing_seconds":sum(t["seconds"] for t in timings if t["phase"]=="sign"),"core_replication_growth_bytes":initial_size-result["source_bytes"],"core_counts":initial_counts,"relay_page_replicas":relay_page_replicas,"relay_page_seconds":round(page_seconds,3),"relay_page_rows_per_second":round(relay_page_replicas/page_seconds,3)}
         phase("one-row incremental sync")
-        db=duckdb.connect(str(core))
+        db=_open_db(core)
         row=list(db.execute("SELECT * FROM conversations ORDER BY id LIMIT 1").fetchone())
         row[4]=(row[4] or row[3])+timedelta(microseconds=1)
         db.execute("BEGIN")

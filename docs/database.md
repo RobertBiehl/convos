@@ -244,6 +244,12 @@ migration; a symlinked body still refuses. Manual `convos backup`
 uses the same complete format without silently migrating the live archive. Relay and
 `state.db` remain rebuildable and are not migrated during this clean cutover.
 
+Schema 20 rewrites the six `ARCHIVE_COLUMNS` tables (`conversations`, `messages`,
+`tool_calls`, `attachments`, `artifacts`, `file_edits`) once into row groups of 4,096 rows,
+keeping their constraints, row order and FTS document ids; the rewrite also drops the rows
+DuckDB still kept for deleted and replaced versions. See `database-connections.md` for why
+every connection sets the row group size.
+
 ## Full-Text Search
 
 FTS index on `messages` covering `content` and `thinking`. The singleton

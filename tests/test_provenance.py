@@ -743,6 +743,6 @@ def test_v19_rebuilds_each_indexed_table_from_its_rows(tmp_path):
     path=tmp_path/"v18.db"; db=graph(path); shape="SELECT t.table_oid,t.sql,list(i.sql ORDER BY i.index_name) FROM duckdb_tables() t JOIN duckdb_indexes() i USING (schema_name,table_name) WHERE t.table_name='edit_dependencies' GROUP BY ALL"
     db.execute("INSERT INTO remote.edit_dependencies VALUES ('k','p1'),('k','p2'),('j','p1'); UPDATE core_schema SET version=18"); (oid,ddl,indexes),rows=db.execute(shape).fetchone(),db.execute("SELECT * FROM remote.edit_dependencies ORDER BY ALL").fetchall(); db.close()
     db=duckdb.connect(str(path)); init_schema(db); new_oid,*same=db.execute(shape).fetchone()
-    assert db.execute("SELECT version FROM core_schema").fetchone()[0]==core_module.CORE_VERSION==19 and new_oid!=oid and same==[ddl,indexes] and db.execute("SELECT * FROM remote.edit_dependencies ORDER BY ALL").fetchall()==rows
+    assert db.execute("SELECT version FROM core_schema").fetchone()[0]==core_module.CORE_VERSION==20 and new_oid!=oid and same==[ddl,indexes] and db.execute("SELECT * FROM remote.edit_dependencies ORDER BY ALL").fetchall()==rows
     db.execute("BEGIN; DELETE FROM remote.edit_dependencies; COMMIT"); db.close()
     assert duckdb.connect(str(path.with_name("v18.db.pre-v19.bak")),read_only=True).execute("SELECT version FROM core_schema").fetchone()[0]==18

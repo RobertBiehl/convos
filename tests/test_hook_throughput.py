@@ -1,5 +1,5 @@
 """Structural hook-ingest throughput checks: counters (full ingests, retry flags, rows parsed), never wall time."""
-import json, subprocess, sys
+import contextlib, duckdb, json, subprocess, sys
 from datetime import datetime, timedelta, timezone
 import pytest
 from typer.testing import CliRunner
@@ -74,3 +74,15 @@ def test_sync_holding_the_archive_delays_drains_without_retry(hooks, monkeypatch
     assert sync.stdout.readline() == "\n"
     drained = [cli.drain_hooks() for _ in range(len(sids)) if queue()]
     assert sync.wait() == 0 and sum(drained) == len(sids) and (full(), meter["retry"], queue()) == ([], [], [])
+
+def test_drains_keep_appended_tables_in_small_row_groups(hooks):  # a checkpoint rewrites the whole last row group of each table it appended to
+    grow, meter, full, queue = hooks; cli.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(duckdb.connect(str(cli.DB_PATH))) as db:  # a schema-19 archive: one 10,000-row group per table, written without the size
+        cli.init_schema(db); db.execute("UPDATE core_schema SET version=19; INSERT INTO conversations(id,source) VALUES ('c','claude-code'); INSERT INTO messages(id,conversation_id,role,content) SELECT 'm'||range,'c','user','old' FROM range(10000); INSERT INTO tool_calls(id,message_id,output) SELECT 't'||range,'m'||range,'\"old\"' FROM range(10000)")
+    warm(grow, meter, ["r0", "r1"], 300); [(grow(f"r{i % 2}", 6), cli.drain_hooks()) for i in range(6)]
+    with contextlib.closing(cli.open_db(purpose="test.row_groups")) as db:
+        groups = {t: [n for n, in db.execute(f"SELECT sum(count) FROM pragma_storage_info('{t}') WHERE column_path='[0]' GROUP BY row_group_id").fetchall()] for t in ("messages", "tool_calls")}
+        kept = db.execute("SELECT (SELECT count(*) FROM messages WHERE content='old'), (SELECT count(*) FROM tool_calls WHERE output='\"old\"'), (SELECT count(*) FROM messages)").fetchone()
+        with pytest.raises(duckdb.ConstraintException): db.execute("INSERT INTO tool_calls(id,message_id) VALUES ('t0','m0')")
+    assert max(groups["messages"] + groups["tool_calls"]) <= cli.ROW_GROUP_ROWS, groups
+    assert kept == (10000, 10000, 10636) and cli.DB_PATH.with_name("convos.db.pre-v20.bak").is_file()

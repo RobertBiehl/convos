@@ -231,7 +231,7 @@ def test_db_waits_for_writer(tmp_path, monkeypatch, read_only):
         calls["n"] += 1
         if calls["n"] < 3: raise duckdb.IOException("Conflicting lock is held")
         return type("Connection",(),{"close":lambda _:None})()
-    monkeypatch.setattr(cli.duckdb, "connect", connect)
+    monkeypatch.setattr(cli, "_open_db", connect)
     conn=cli.get_db(read_only=read_only); conn.close()
     assert calls["n"] == 3
 
@@ -242,9 +242,9 @@ def test_db_retry_notices_are_per_archive_and_fast_path_has_none(tmp_path,monkey
     calls={}
     def connect(path,read_only=False):
         calls[path]=calls.get(path,0)+1
-        if path.endswith("a.db") and calls[path]==1: raise duckdb.IOException("Conflicting lock is held")
+        if path.name=="a.db" and calls[path]==1: raise duckdb.IOException("Conflicting lock is held")
         return type("Connection",(),{"close":lambda _:None})()
-    monkeypatch.setattr(cli.duckdb,"connect",connect); monkeypatch.setattr(cli.time,"sleep",lambda _:None)
+    monkeypatch.setattr(cli,"_open_db",connect); monkeypatch.setattr(cli.time,"sleep",lambda _:None)
     cli.get_db(path=tmp_path/"a.db").close(); cli.get_db(path=tmp_path/"b.db").close()
     assert len(events)==1 and events[0].parent==tmp_path/".a.db.waiters" and not (tmp_path/".b.db.waiters").exists()
 
