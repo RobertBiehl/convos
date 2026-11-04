@@ -544,6 +544,32 @@ class TestCookieExtraction:
         with pytest.raises(ValueError, match="does not decrypt"): cookies.read_chrome_cookies("perplexity.ai", "Default")
         with pytest.raises(ValueError, match="does not decrypt"): cookies.read_chrome_cookies("perplexity.ai", "chromium/Profile 1")
 
+    def test_cookie_bytes_that_are_not_utf8_are_kept(self, tmp_path, monkeypatch):
+        """Chromium lets cookie values hold any 0x80-0xff octets: such a value is kept byte for byte (latin-1), and does not fail the install."""
+        self.chrome_store(tmp_path / ".config/chromium/Default", [("sessionKey", b"v10", b"peanuts", b"token", ".claude.ai"), ("pref", b"v10", b"peanuts", b"caf\xe9", ".claude.ai"), ("name", b"v10", b"peanuts", "café".encode(), ".claude.ai")])
+        cookies, _ = self.linux(monkeypatch, tmp_path)
+        assert (got := cookies.read_chrome_cookies("claude.ai")) == {"sessionKey": "token", "pref": "caf\xe9", "name": "café"} and got["pref"].encode("latin-1") == b"caf\xe9"
+        assert cookies.chrome_cookie_domains() == {".claude.ai"}
+
+    def test_an_install_that_cannot_be_listed_does_not_hide_the_others(self, tmp_path, monkeypatch):
+        import os
+        self.chrome_store(tmp_path / ".config/google-chrome/Default", [("sessionKey", b"v10", b"peanuts", b"token", ".claude.ai")])
+        (locked := tmp_path / ".config/chromium").mkdir(parents=True); os.chmod(locked, 0)
+        try:
+            cookies, _ = self.linux(monkeypatch, tmp_path)
+            assert cookies.read_chrome_cookies("claude.ai") == {"sessionKey": "token"} and cookies.chrome_profiles() == ["Default"]
+        finally: os.chmod(locked, 0o700)
+
+    def test_paths_with_uri_characters(self, tmp_path, monkeypatch):
+        """'#' and '?' in a path are escaped in the SQLite URI, not read as its fragment or query (which opened, and created, a stray database)."""
+        home = tmp_path / "we#ird?home"
+        self.chrome_store(home / ".config/google-chrome/Default", [("sessionKey", b"v10", b"peanuts", b"chrome", ".claude.ai")])
+        con = self.firefox_store(home / ".mozilla/firefox/abc.work#1", [("session", "firefox", ".claude.ai", "", 1)])
+        cookies, _ = self.linux(monkeypatch, home)
+        assert cookies.get_cookies("claude.ai", "firefox") == {"session": "firefox"} and not (home / ".mozilla/firefox/abc.work").exists()
+        assert cookies.get_cookies("claude.ai", "chrome") == {"sessionKey": "chrome"} and not (tmp_path / "we").exists()
+        con.close()
+
     def test_keyring_is_asked_only_for_rows_that_need_it_once_per_read(self, tmp_path, monkeypatch):
         """Fixed-key cookies never prompt the keyring; a read asks it at most once per browser, across installs."""
         for root, secret in ((".config/chromium/Default", b"stale-secret"), (".var/app/org.chromium.Chromium/config/chromium/Default", b"secret")):
@@ -657,6 +683,27 @@ class TestCookieExtraction:
             return real(src, dst)
         monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path)); monkeypatch.setattr(cookies.shutil, "copy2", copy)
         assert cookies.get_cookies("perplexity.ai", "firefox") == {"session": "token"} and len(vanished) == 1
+        writer.close()
+
+    def test_firefox_copy_never_mixes_two_wal_generations(self, tmp_path, monkeypatch):
+        """A checkpoint, then a WAL reset and reuse while the WAL is being copied: the copy holds the old header and first commit plus new frames, which SQLite reads as a state that never existed (a from before, b from after the checkpoint). The copy is taken again."""
+        import shutil, sqlite3
+        from ai_convos import cookies
+        folder = tmp_path / ".mozilla/firefox/p.default"; folder.mkdir(parents=True)
+        writer = sqlite3.connect(str(folder / "cookies.sqlite")); writer.execute("PRAGMA journal_mode=WAL"); writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE moz_cookies (name TEXT, value TEXT, host TEXT, originAttributes TEXT NOT NULL DEFAULT '', lastAccessed INTEGER)")
+        set_ = lambda **values: (writer.executemany("UPDATE moz_cookies SET value=? WHERE name=?", [(f"{v}" + "x" * 3000, k) for k, v in values.items()]), writer.commit())
+        writer.executemany("INSERT INTO moz_cookies VALUES (?,?,'.perplexity.ai','',1)", [(k, "0" + "x" * 3000) for k in "abc"]); writer.commit()
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)"); writer.execute("PRAGMA locking_mode=EXCLUSIVE")
+        set_(a=1); set_(a=2, b=2); writer.execute("PRAGMA wal_checkpoint(FULL)").fetchone()  # main db (2,2,0); the old WAL stays, starting with the commit a=1
+        page = writer.execute("PRAGMA page_size").fetchone()[0]
+        real, reused = shutil.copy2, []
+        def copy(src, dst):
+            if not src.name.endswith("-wal") or reused: return real(src, dst)
+            head = src.read_bytes()[:32 + page + 24]; set_(b=3, c=3); reused.append(src.read_bytes()[:32] != head[:32])
+            Path(dst).write_bytes(head + src.read_bytes()[len(head):])
+        monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path)); monkeypatch.setattr(cookies.shutil, "copy2", copy)
+        assert {k: v[0] for k, v in cookies.get_cookies("perplexity.ai", "firefox").items()} == {"a": "2", "b": "3", "c": "3"} and reused == [True]
         writer.close()
 
     @pytest.mark.parametrize("xdg", [True, False])

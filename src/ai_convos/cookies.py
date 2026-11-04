@@ -23,18 +23,22 @@ def safari_cookie_domains(): return {host for host,_,_ in _safari_records() or (
 
 def _root(root): return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home()/".config")/root[5:] if root[:5]=="$XDG/" else Path.home()/root
 def _chrome_roots(): return [(_root(root),app,tag) for root,(app,tag) in _CHROME_ROOTS.get(PLATFORM,{}).items()]
-def _chrome_found(): return [(f"{tag}/{d.name}" if tag else d.name,path,app) for root,app,tag in _chrome_roots() if root.is_dir() for d in sorted(root.iterdir()) if d.is_dir() and (path:=next((p for p in (d/"Cookies",d/"Network/Cookies") if p.exists()),None))]
-def _chrome_paths(profile=None): return (lambda want,found:[f for f in found if f[0]==want] or [f for f in found if f[0].rpartition("/")[2]==(want or "Default")])(profile or os.environ.get("CONVOS_CHROME_PROFILE"),_chrome_found())  # a bare name matches that profile in every install
+def _chrome_found():  # an install whose folder cannot be listed is left out, not the others with it
+    for root,app,tag in _chrome_roots():
+        with contextlib.suppress(OSError): yield from [(f"{tag}/{d.name}" if tag else d.name,path,app) for d in sorted(root.iterdir()) if d.is_dir() and (path:=next((p for p in (d/"Cookies",d/"Network/Cookies") if p.exists()),None))]
+def _chrome_paths(profile=None): return (lambda want,found:[f for f in found if f[0]==want] or [f for f in found if f[0].rpartition("/")[2]==(want or "Default")])(profile or os.environ.get("CONVOS_CHROME_PROFILE"),list(_chrome_found()))  # a bare name matches that profile in every install
 def _keyring(command):
     with contextlib.suppress(OSError,subprocess.SubprocessError):
         if not (result:=subprocess.run(command,capture_output=True,text=True,timeout=10)).returncode and result.stdout.strip(): return result.stdout.strip().encode()
-def _decrypt(key,encrypted,host,hashed):  # padding, the host hash (cookie db version >= 24) and UTF-8 must all check out
+def _decrypt(key,encrypted,host,hashed):  # padding and the host hash (cookie db version >= 24) must check out
     with contextlib.suppress(ValueError):
-        if (plain:=(u:=padding.PKCS7(128).unpadder()).update((d:=ciphers.Cipher(ciphers.algorithms.AES(key),ciphers.modes.CBC(b" "*16)).decryptor()).update(encrypted[3:])+d.finalize())+u.finalize())[:32]==hashlib.sha256(host.encode()).digest() or not hashed: return plain[32*hashed:].decode()
+        if (plain:=(u:=padding.PKCS7(128).unpadder()).update((d:=ciphers.Cipher(ciphers.algorithms.AES(key),ciphers.modes.CBC(b" "*16)).decryptor()).update(encrypted[3:])+d.finalize())+u.finalize())[:32]==hashlib.sha256(host.encode()).digest() or not hashed:
+            with contextlib.suppress(UnicodeDecodeError): return plain[32*hashed:].decode()
+            return plain[32*hashed:].decode("latin-1")  # cookie values may hold any 0x80-0xff octets; latin-1 keeps them byte for byte
     raise ValueError(f"a cookie of {host} does not decrypt (wrong keyring secret?)")
 def _chrome_cookies(path,app,secrets,domain=None):  # one install's (host, name, value); the keyring is asked only when a matching row needs it, once per app and operation
     command,rounds,tag=_CHROME_KEYRING[PLATFORM]
-    with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro&nolock=1",uri=True)) as db: hashed,rows=int(db.execute("SELECT value FROM meta WHERE key='version'").fetchone()[0])>=24,[r for r in db.execute("SELECT host_key,name,encrypted_value FROM cookies") if not domain or host_match(r[0],domain)]
+    with contextlib.closing(sqlite3.connect(f"{path.as_uri()}?mode=ro&nolock=1",uri=True)) as db: hashed,rows=int(db.execute("SELECT value FROM meta WHERE key='version'").fetchone()[0])>=24,[r for r in db.execute("SELECT host_key,name,encrypted_value FROM cookies") if not domain or host_match(r[0],domain)]
     if any(e[:3]==tag for *_,e in rows) and (secrets[app] if app in secrets else secrets.setdefault(app,_keyring(command(app)))) is None: raise ValueError(_KEYRING_ERROR)
     keys={prefix:hashlib.pbkdf2_hmac("sha1",secret,b"saltysalt",rounds,16) for prefix,secret in {**_CHROME_FIXED.get(PLATFORM,{}),tag:secrets.get(app)}.items() if secret}
     return [(host,name,_decrypt(keys[e[:3]],e,host,hashed)) for host,name,e in rows if e[:3] in keys]
@@ -61,12 +65,13 @@ def _firefox_profiles():  # (cookies.sqlite, is a profile Firefox starts with) f
 def _firefox_path(profile=None): return (lambda want:max(((path,default) for path,default in _firefox_profiles() if not want or path.parent.name==want),key=lambda c:(c[1],max(f.stat().st_mtime for f in (c[0],c[0].with_name(f"{c[0].name}-wal")) if f.exists())),default=(None,))[0])(profile or os.environ.get("CONVOS_FIREFOX_PROFILE"))  # a named profile, else profiles.ini's default, else the one whose db or WAL was written last
 def _backup(source,db):  # Python's backup would retry a lock that Firefox never releases, forever
     with contextlib.closing(sqlite3.connect(source,uri=True,timeout=0)) as src: src.backup(db,progress=lambda status,*_:status in (sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED) and (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")))
-def _snapshot(path,db):  # SQLite's online backup is consistent; while Firefox holds the file exclusively, back up a copy of db and WAL taken with no checkpoint in between
-    with contextlib.suppress(sqlite3.OperationalError): return _backup(f"file:{path}?mode=ro",db)
+def _stamp(path): return [(f.stat().st_mtime_ns,f.stat().st_size,f.read_bytes()[:32]) if f.exists() else None for f in (path,path.with_name(f"{path.name}-wal"))]  # the WAL header holds its salts and checkpoint sequence
+def _snapshot(path,db):  # SQLite's online backup is consistent; while Firefox holds the file exclusively, back up a copy of db and WAL during which neither changed
+    with contextlib.suppress(sqlite3.OperationalError): return _backup(f"{path.as_uri()}?mode=ro",db)
     for _ in range(3):
         with tempfile.TemporaryDirectory() as tmp,contextlib.suppress(FileNotFoundError):  # the WAL can vanish in a checkpoint between exists() and the copy
-            stamp,_=(path.stat().st_mtime_ns,path.stat().st_size),[shutil.copy2(src,Path(tmp)/src.name) for src in (path,path.with_name(f"{path.name}-wal")) if src.exists()]
-            if stamp==(path.stat().st_mtime_ns,path.stat().st_size): return _backup(f"file:{Path(tmp)/path.name}",db)
+            stamp,_=_stamp(path),[shutil.copy2(src,Path(tmp)/src.name) for src in (path,path.with_name(f"{path.name}-wal")) if src.exists()]
+            if stamp==_stamp(path): return _backup((Path(tmp)/path.name).as_uri(),db)
     raise ValueError("Firefox cookies kept changing while being copied; retry")
 def _firefox_rows(sql, args=(), profile=None):
     if not (path:=_firefox_path(profile)): return []
