@@ -739,10 +739,11 @@ def test_provenance_git_observation_does_not_hold_duckdb_lock(tmp_path,monkeypat
     monkeypatch.setattr(core_module,"_git_run",unlocked); capture(path)
 
 def test_v19_rebuilds_each_indexed_table_from_its_rows(tmp_path):
-    # DuckDB can persist an index that misses rows of its table (seen in real archives); v19 recreates every indexed table and its indexes from the rows
+    # DuckDB can persist an index that misses rows of its table (seen in real archives); v19 recreates every indexed table and its indexes from the rows, dropping the indexes first (DuckDB 1.5.6 built from source for Python 3.15 keeps a dropped table's index; CI has no such build)
     path=tmp_path/"v18.db"; db=graph(path); shape="SELECT t.table_oid,t.sql,list(i.sql ORDER BY i.index_name) FROM duckdb_tables() t JOIN duckdb_indexes() i USING (schema_name,table_name) WHERE t.table_name='edit_dependencies' GROUP BY ALL"
     db.execute("INSERT INTO remote.edit_dependencies VALUES ('k','p1'),('k','p2'),('j','p1'); UPDATE core_schema SET version=18"); (oid,ddl,indexes),rows=db.execute(shape).fetchone(),db.execute("SELECT * FROM remote.edit_dependencies ORDER BY ALL").fetchall(); db.close()
-    db=duckdb.connect(str(path)); init_schema(db); new_oid,*same=db.execute(shape).fetchone()
+    db=core_module._open_db(path); db.execute("CALL enable_logging('QueryLog')"); init_schema(db); new_oid,*same=db.execute(shape).fetchone(); log=[m.strip() for m, in db.execute("SELECT message FROM duckdb_logs WHERE type='QueryLog' ORDER BY query_id").fetchall()]
     assert db.execute("SELECT version FROM core_schema").fetchone()[0]==core_module.CORE_VERSION==20 and new_oid!=oid and same==[ddl,indexes] and db.execute("SELECT * FROM remote.edit_dependencies ORDER BY ALL").fetchall()==rows
+    assert all(log.index(f'DROP INDEX "{s}"."{i}"')<log.index(f'DROP TABLE "{s}"."{t}"') for s,t,i in db.execute("SELECT schema_name,table_name,index_name FROM duckdb_indexes() WHERE database_name=current_database()").fetchall())
     db.execute("BEGIN; DELETE FROM remote.edit_dependencies; COMMIT"); db.close()
     assert duckdb.connect(str(path.with_name("v18.db.pre-v19.bak")),read_only=True).execute("SELECT version FROM core_schema").fetchone()[0]==18

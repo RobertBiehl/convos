@@ -7,6 +7,7 @@
 
 - Hook drains that stop at their 10 s time budget put the events they claimed but did not reach back in the queue as ordinary events. The next drain treated them as a crashed drain's work, dropped their tail records and re-ingested each of those transcripts in full.
 - `bench/hooks.py OUT_DIR [--sync] [--minutes N]` measures hook ingest on an APFS clone of the local archive: four real transcripts (2 to 350 MB) grow at their recorded rates through `capture claude-code` and the spawned drains, and the report gives p50/p95 capture-to-commit latency, drain time per event, write-lock hold, checkpoint on close and bytes parsed, each against a target. `tests/test_hook_throughput.py` counts full ingests and retry flags for repeated budget breaks, steady growth, a crash mid-commit and a sync holding the archive.
+- Schema 19 drops each index before rebuilding its table: on Python 3.15, where DuckDB 1.5.6 is built from source (no wheel), a dropped table kept its index, so the migration failed with `Index with name "edit_dependency_key" already exists` and the archive stayed at schema 18. Found by Michael Leigsnering.
 
 ## 0.11.6b33
 
