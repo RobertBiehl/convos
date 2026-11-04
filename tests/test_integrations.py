@@ -585,6 +585,14 @@ class TestCookieExtraction:
         assert cookies.read_chrome_cookies("claude.ai") == {"sessionKey": "token"} and calls == []
         assert cookies.read_chrome_cookies("example.com") == {"sid": "keyring-token"} and calls == ["chromium"]
 
+    def test_a_cookie_of_an_unknown_encryption_fails_its_install(self, tmp_path, monkeypatch):
+        """Chromium's opt-in Secret Portal writes v12: such a cookie fails its install instead of being left out of an otherwise readable set."""
+        self.chrome_store(tmp_path / ".config/google-chrome/Default", [("session", b"v12", b"portal", b"portal-token", ".claude.ai"), ("pref", b"v10", b"peanuts", b"1", ".claude.ai")])
+        self.chrome_store(tmp_path / ".config/chromium/Default", [("session", b"v10", b"peanuts", b"token", ".claude.ai")])
+        cookies, _ = self.linux(monkeypatch, tmp_path)
+        assert cookies.read_chrome_cookies("claude.ai") == {"session": "token"}
+        with pytest.raises(PermissionError, match="a cookie of .claude.ai uses unsupported encryption b'v12'"): cookies.chrome_cookie_domains()
+
     def test_doctor_sees_a_locked_cookie_next_to_a_readable_one_of_the_same_host(self, tmp_path, monkeypatch):
         self.chrome_store(tmp_path / ".config/chromium/Default", [("sessionKey", b"v11", b"secret", b"token", ".claude.ai"), ("preference", b"v10", b"peanuts", b"1", ".claude.ai")])
         cookies, _ = self.linux(monkeypatch, tmp_path)

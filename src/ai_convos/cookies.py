@@ -44,7 +44,8 @@ def _chrome_cookies(path,app,secrets,domain=None):  # one install's (host, name,
     with contextlib.closing(sqlite3.connect(f"{path.as_uri()}?mode=ro&nolock=1",uri=True)) as db: hashed,rows=int(db.execute("SELECT value FROM meta WHERE key='version'").fetchone()[0])>=24,[r for r in db.execute("SELECT host_key,name,encrypted_value FROM cookies") if not domain or host_match(r[0],domain)]
     if any(e[:3]==tag for *_,e in rows) and (secrets[app] if app in secrets else secrets.setdefault(app,_keyring(command(app)))) is None: raise ValueError(_KEYRING_ERROR)
     keys={prefix:hashlib.pbkdf2_hmac("sha1",secret,b"saltysalt",rounds,16) for prefix,secret in {**_CHROME_FIXED.get(PLATFORM,{}),tag:secrets.get(app)}.items() if secret}
-    return [(host,name,_decrypt(keys[e[:3]],e,host,hashed)) for host,name,e in rows if e[:3] in keys]
+    if bad:=[(host,e[:3]) for host,_,e in rows if e and e[:3] not in keys]: raise ValueError(f"a cookie of {bad[0][0]} uses unsupported encryption {bad[0][1]!r}")
+    return [(host,name,_decrypt(keys[e[:3]],e,host,hashed)) for host,name,e in rows if e]
 _KEYRING_ERROR="Chrome keyring unavailable: no secret from `secret-tool lookup application chrome|chromium` (Linux; unlock the keyring) or the Keychain (macOS)"
 
 def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, str]:  # the first install whose matching cookies all decrypt; the others' failures count only when none does
