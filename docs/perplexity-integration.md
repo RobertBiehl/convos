@@ -29,7 +29,10 @@ POST https://www.perplexity.ai/rest/thread/list_ask_threads
 {"offset": 0, "limit": 50}
 ```
 Each item has `uuid`, `title`, `last_query_datetime` (naive ISO, UTC) and
-`has_next_page`; the next page starts at `offset + len(page)`.
+`has_next_page`; the next page starts at `offset + len(page)`. An empty page
+after `has_next_page` (a login that expired mid-scan, or a broken listing)
+fails the scan: the session is checked, and the error is `not logged in` or
+`thread list ended early`; the sync state keeps its old head and cutoff.
 `query_count` stays `1` after follow-up questions, so it cannot be used to
 skip the detail request.
 
@@ -38,7 +41,9 @@ skip the detail request.
 GET https://www.perplexity.ai/rest/thread/{uuid}?limit=100[&cursor=...]
 ```
 `has_next_page` and `next_cursor` page through long threads; the cursor is
-an opaque JSON string and is URL-encoded in full.
+an opaque JSON string and is URL-encoded in full. `has_next_page` without a
+cursor raises. A thread that answers `404` (deleted since it was listed or
+left pending) is skipped.
 
 ## Mapping
 
@@ -56,7 +61,7 @@ an opaque JSON string and is URL-encoded in full.
 | user `metadata.attachments` | entry `attachments`, as sent |
 | assistant `metadata.sources` | the answer document's `web_results`, as sent |
 | assistant `metadata.display_model` | entry `display_model` (e.g. `pplx_pro`) |
-| `metadata.remote_complete` | every entry has a `FINAL` answer |
+| `metadata.remote_complete` | at least one entry, and every entry has a `FINAL` answer |
 
 A question with attachments but no text is kept. Intermediate search steps are
 not stored.
@@ -64,7 +69,7 @@ not stored.
 ## Incremental sync
 
 `sync` probes the newest thread (`uuid:last_query_datetime`) and the account. An
-unchanged head is a no-op; otherwise only threads whose `last_query_datetime`
+unchanged head of the same account with no pending threads is a no-op; otherwise only threads whose `last_query_datetime`
 is newer than the last sync are fetched. A follow-up question moves its thread
 back to the top, so it is fetched again in full.
 
@@ -72,7 +77,9 @@ back to the top, so it is fetched again in full.
   another browser logged in to another account (or none can be established),
   that account's threads are fetched in full. Claude does the same with its
   organization.
-- A head thread synced while its answer was still being written
-  (`remote_complete: false`) keeps no head in the sync state and a cutoff just
-  before it, so the next sync fetches it again; its `last_query_datetime` does
-  not move when the answer lands.
+- A thread synced while its answer was still being written
+  (`remote_complete: false`), head or not, is kept in the sync state's
+  `pending` list (`uuid`, `title`, `last_query_datetime`) and fetched again on
+  every sync, whatever the cutoff, until it is complete: its
+  `last_query_datetime` does not move when the answer lands. Pending threads
+  belong to the account too.

@@ -725,3 +725,29 @@ def test_sync_does_not_carry_one_perplexity_accounts_cutoff_to_another(hooks, mo
     cli.atomic_json(cli.STATE_PATH, {"web": {"perplexity": {"browser": "chrome", "head": "b1:2026-11-01T00:00:00", "last_updated": "2026-11-01T00:00:00", "account": "B"}}}); calls.clear()
     cli.sync(False, 300, False, False, False, False)
     assert calls == ["b9"]
+
+def test_sync_fetches_an_unfinished_perplexity_thread_below_a_finished_head_again(hooks, monkeypatch):
+    _, data = hooks; monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); calls = []
+    threads = [{"uuid": u, "title": u, "last_query_datetime": t, "has_next_page": False} for u, t in (("B", "2026-11-03T10:02:00"), ("A", "2026-11-03T10:01:00"))]
+    entries = {"B": [perplexity_entry("eb", "finished", "b")], "A": [perplexity_entry("ea", "still answering?", None)]}
+    perplexity_web(monkeypatch, threads, entries, {"firefox": "acct"}, calls)
+    cli.sync(False, 300, False, False, False, False)
+    entries["A"] = [perplexity_entry("ea", "still answering?", "done now")]
+    cli.sync(False, 300, False, False, False, False); cli.sync(False, 300, False, False, False, False)
+    db = duckdb.connect(str(data/"convos.db"), read_only=True); answers = db.execute("SELECT content FROM messages WHERE role='assistant' ORDER BY content").fetchall(); db.close()
+    assert answers == [("b",), ("done now",)] and calls == ["B", "A", "A"] and "pending" not in json.loads(cli.STATE_PATH.read_text())["web"]["perplexity"]
+
+def test_sync_shortcut_needs_the_same_perplexity_account(hooks, monkeypatch):
+    _, data = hooks; monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); calls = []
+    cli.atomic_json(cli.STATE_PATH, {"web": {"perplexity": {"browser": "firefox", "head": "t1:2026-11-03T10:00:00", "last_updated": "2026-11-03T10:00:00", "account": "A"}}})
+    threads = [{"uuid": u, "title": u, "last_query_datetime": t, "has_next_page": False} for u, t in (("t1", "2026-11-03T10:00:00"), ("t0", "2026-11-01T00:00:00"))]
+    perplexity_web(monkeypatch, threads, {"t1": [perplexity_entry("e1", "shared", "a")], "t0": [perplexity_entry("e0", "older", "a")]}, {"firefox": "B"}, calls)
+    cli.sync(False, 300, False, False, False, False)
+    assert calls == ["t1", "t0"] and json.loads(cli.STATE_PATH.read_text())["web"]["perplexity"]["account"] == "B"
+
+def test_sync_keeps_no_perplexity_head_after_a_scan_that_ended_early(hooks, monkeypatch):
+    _, data = hooks; monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); calls = []
+    threads = [{"uuid": f"t{i}", "title": "T", "last_query_datetime": f"2026-11-03T10:{59-i:02d}:00", "has_next_page": True} for i in range(50)]
+    perplexity_web(monkeypatch, threads, {f"t{i}": [perplexity_entry(f"e{i}", "q", "a")] for i in range(50)}, {"firefox": "acct"}, calls)
+    with pytest.raises(cli.click.ClickException, match="Sync incomplete: perplexity"): cli.sync(False, 300, False, False, False, False)
+    assert "perplexity" not in json.loads(cli.STATE_PATH.read_text()).get("web", {})

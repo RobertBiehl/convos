@@ -424,6 +424,23 @@ class TestPerplexity:
         assert meta[1] == {"provider_index": 1, "provider_id": "e1", "sources": [{"name": "Src", "url": "https://src.example/1"}], "display_model": "pplx_pro"}
         assert meta[2]["attachments"] == ["https://ppl-ai-file-upload.example/only.png"] and len(r.msgs) == 3
 
+    @pytest.mark.parametrize("session,error", [({}, "not logged in"), ({"user": {"id": "u"}}, "ended early at offset 2")])
+    def test_an_empty_page_after_has_next_page_fails_the_scan(self, monkeypatch, session, error):
+        """A login that expires mid-scan lists [] for the next page; that is a failed scan, never its end."""
+        from ai_convos import cli
+        threads = [{"uuid": u, "title": u, "last_query_datetime": "2026-01-01T00:00:00", "has_next_page": True} for u in ("t1", "t2")]
+        self.fake(monkeypatch, threads, {"t1?limit=100": {"entries": []}, "t2?limit=100": {"entries": []}}, session=session)
+        with pytest.raises(ValueError, match=error): cli.fetch_perplexity("firefox")
+
+    def test_thread_contract_checks(self, monkeypatch):
+        """A next page without a cursor is a broken thread, not its end; an empty thread is no evidence of a finished answer."""
+        from ai_convos import cli
+        thread = {"uuid": "t1", "title": "T", "last_query_datetime": "2026-01-01T00:00:00", "has_next_page": False}
+        self.fake(monkeypatch, [thread], {"t1?limit=100": {"entries": [self.entry("e1", "q", "a", 1)], "has_next_page": True}})
+        with pytest.raises(ValueError, match="next page but no cursor"): cli.fetch_perplexity("firefox")
+        self.fake(monkeypatch, [thread], {"t1?limit=100": {"entries": []}})
+        assert json.loads(cli.fetch_perplexity("firefox").convs[0]["metadata"])["remote_complete"] is False
+
     def test_logged_out_raises_instead_of_empty_list(self, monkeypatch):
         """An expired login lists no threads; that must fail loudly, not sync as '0 new'."""
         from ai_convos import cli
