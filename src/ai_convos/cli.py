@@ -722,7 +722,7 @@ def migrate_provider_ids(db):
     def assign(src,table,old,new,provider=False):
         if old not in existing[table]: return
         target,mapping[table][old]=(target:=new if provider else old),required(old not in mapping[table] or mapping[table][old]==target,ValueError('Conflicting provider identity observations')) and target
-        if target!=new: bindings[(src,new)]=target
+        if target!=new: bindings.setdefault((src,new),target)
     roots=[(src,hook_root(src)) for src in ('codex','claude-code')]+[('codex',hook_root('codex').parent/'archived_sessions')]
     for src,root in roots:
         for path in sorted(root.rglob('*.jsonl')) if root.is_dir() else []:
@@ -737,7 +737,7 @@ def migrate_provider_ids(db):
             for ordinal,(i,e) in enumerate(messages):
                 uid,old=(uid:=e.get('uuid') if src=='claude-code' else e.get('id')),provided.get(uid,stored.get(coordinates[i] if src=='claude-code' else i,gen_id(src,f'{oldcid}:{ordinal if src=="claude-code" else i}')))
                 assign(src,'messages',old,gen_id(src,f'message:{newcid}:{uid}') if uid else gen_id(src,f'{newcid}:{i}'),bool(uid))
-                if old in existing['messages']: patches[old]={'provider_index':i,**({'provider_id':uid} if uid else {})}
+                if old in existing['messages']: patches.setdefault(old,{'provider_index':i,**({'provider_id':uid} if uid else {})})
                 if src=='claude-code':
                     for j,t in enumerate(extract_content(e['message'].get('content',[]))['tools']):
                         if 'name' not in t: continue
@@ -761,10 +761,10 @@ def migrate_provider_ids(db):
                         if old in existing['file_edits']: assign(src,'file_edits',old,gen_id(src,f'edit:{new if call else mapping["tool_calls"].get(gen_id(src,f"custom:{oldcid}:{i}") if custom else gen_id(src,f"tool:{oldcid}:{i}"),new)}:{j}'))
     if patches: db.execute("UPDATE messages m SET metadata=json_merge_patch(COALESCE(m.metadata,'{}'),j.value) FROM json_each(?) j WHERE m.id=j.key",[json.dumps(patches)])
     for table,ids in mapping.items():
-        required(len(set(ids.values()))==len(ids) and not any(new in existing[table] and new!=old and new not in ids for old,new in ids.items()),ValueError(f'Provider identity collision in {table}; archive unchanged'))
-        changed=[(old,new) for old,new in ids.items() if old!=new]
-        if not changed: continue
-        db.execute('CREATE OR REPLACE TEMP TABLE identity_map(old VARCHAR,new VARCHAR)')
+        merged={old for old,new in ids.items() if old!=first[new]} if table=='messages' and (first:={new:old for old,new in reversed(ids.items())}) else set()  # rows of a repeated provider uuid merge into its first line
+        required(len(set(ids.values()))==len(ids)-len(merged) and not any(new in existing[table] and new!=old and new not in ids for old,new in ids.items()),ValueError(f'Provider identity collision in {table}; archive unchanged'))
+        if not (changed:=[(old,new) for old,new in ids.items() if old!=new]): continue
+        (db.execute('CREATE OR REPLACE TEMP TABLE identity_map(old VARCHAR,new VARCHAR)'),merged and db.execute(f'DELETE FROM {table} WHERE id IN (SELECT UNNEST(?))',[list(merged)]))
         _insert_pages(db,'identity_map',changed)
         refs=[(t,column) for t,columns in ARCHIVE_FKS.items() for column,parent in columns if parent==table]+({'conversations':[('provider_sessions','conversation_id'),('provenance.conversation_scopes','conversation')],'tool_calls':[('provenance.file_edit_evidence','tool_call_id')],'attachments':[('attachment_bodies','attachment_id')]}.get(table,[]))
         for target,column in [(table,'id'),*refs]: db.execute(f'UPDATE {target} x SET {column}=m.new FROM identity_map m WHERE x.{column}=m.old')
@@ -875,8 +875,8 @@ def retire_request_blobs(db):
     # Schema <18 parsed Claude Code api-request-blob events as turns: their calls and edits shared ids with the real ones and switched owner on every ingest.
     for cid,sid in db.execute("SELECT DISTINCT p.conversation_id,p.session_id FROM provider_sessions p JOIN messages m ON m.conversation_id=p.conversation_id WHERE p.source='claude-code' AND m.role='api-request-blob'").fetchall():
         if not (path:=next(hook_root("claude-code").rglob(f"*{sid}.jsonl"),None)) or not (s:=parse_claude_code_session(path,session_bindings(db))) or s["conv"]["id"]!=cid: continue
-        attached,blobs,tools,edits=(attached:=lambda table:[r[0] for r in db.execute(f"SELECT id FROM {table} WHERE message_id IN (SELECT UNNEST(?))",[blobs]).fetchall()]),(blobs:=[r[0] for r in db.execute("SELECT id FROM messages WHERE conversation_id=? AND role='api-request-blob'",[cid]).fetchall()]),set(attached("tool_calls")),set(attached("file_edits"))
-        upsert(db,ParseResult(tools=[t for t in s["tools"] if t["id"] in tools],edits=[e for e in s["edits"] if e["id"] in edits],edit_evidence=[v for v in s["edit_evidence"] if v["file_edit_id"] in edits],scopes=[],edit_scopes=[]))
+        attached,blobs,tools,edits,stored=(attached:=lambda table:[r[0] for r in db.execute(f"SELECT id FROM {table} WHERE message_id IN (SELECT UNNEST(?))",[blobs]).fetchall()]),(blobs:=[r[0] for r in db.execute("SELECT id FROM messages WHERE conversation_id=? AND role='api-request-blob'",[cid]).fetchall()]),set(attached("tool_calls")),set(attached("file_edits")),_rows_by_id(db,"messages",[m["id"] for m in s["msgs"]])
+        upsert(db,ParseResult(msgs=[m for m in s["msgs"] if m["id"] not in stored],tools=[t for t in s["tools"] if t["id"] in tools],edits=[e for e in s["edits"] if e["id"] in edits],edit_evidence=[v for v in s["edit_evidence"] if v["file_edit_id"] in edits],scopes=[],edit_scopes=[]))
         doomed={"messages":blobs,**{table:attached(table)+list(_rows_by_id(db,table,[_history_row(table,row,tuple(v for i,v in enumerate(row) if i not in (0,skip)))[0] for row in _rows_by_id(db,table,[r["id"] for r in rows]).values()])) for table,skip,rows in (("tool_calls",7,s["tools"]),("file_edits",5,s["edits"]))}}
         facts,keys=[("edit.observed",e) for e in doomed["file_edits"]]+db.execute("SELECT 'checkpoint.link',sha256(json_object('checkpoint',checkpoint_id,'edit',file_edit_id)) FROM provenance.checkpoint_edits WHERE file_edit_id IN (SELECT UNNEST(?))",[doomed["file_edits"]]).fetchall(),[(table,i) for table,ids in doomed.items() for i in ids]+edit_parents(db,doomed["file_edits"])
         with preserve_fact_heads(db,keys+facts,observed=True): (facts and db.executemany("DELETE FROM provenance.local_facts WHERE kind=? AND entity=?",facts),[_delete_unclaimed_fact(db,*fact) for fact in facts],[db.execute(f"DELETE FROM {table} WHERE {column} IN (SELECT UNNEST(?))",[doomed[parent]]) for table,column,parent in (("provenance.file_edit_scopes","file_edit_id","file_edits"),("provenance.file_edit_evidence","file_edit_id","file_edits"),("file_edits","id","file_edits"),("tool_calls","id","tool_calls"),("messages","id","messages"))])
@@ -1161,9 +1161,9 @@ def parse_claude_code_session(jsonl: Path, bindings=None) -> dict:
     system,root_session,explicit_agent,sidechain=next((e for e in events if e.get("type")=="system"),{}),next((e.get("sessionId") or e.get("session_id") for e in events if e.get("sessionId") or e.get("session_id")),jsonl.stem),next((e["agentId"] for e in events if e.get("agentId")),None),any(e.get("isSidechain") for e in events)
     agent_id,src,kind,parent,cid=(agent_id:=explicit_agent or (jsonl.stem if "subagents" in jsonl.parts else None)),"claude-code","subagent" if agent_id or sidechain else "main",root_session if agent_id and agent_id!=root_session else None,(cid:=(bindings or {}).get(("claude-code",agent_id or root_session),gen_id("claude-code",agent_id or root_session)))
     item_id=lambda recipe:(bindings or {}).get((src,'id',gen_id(src,recipe)),gen_id(src,recipe))
-    event_ids={i:e['uuid'] for i,e in indexed if e.get('uuid')}
+    event_ids,first={i:e['uuid'] for i,e in indexed if e.get('uuid')},{e['uuid']:i for i,e in reversed(indexed) if e.get('uuid')}  # a resumed session re-appends events under their uuid; the first line is the stable one
     message_id=lambda idx,i:provider_message_id(src,cid,i,event_ids.get(i),bindings or {})
-    timestamps,msg_events,tool_results,uuid2id=[ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e],(msg_events:=[(i,e) for i,e in indexed if "message" in e and e["type"] in ("user","human","assistant")]),{t["id"]:t for _,e in msg_events for t in extract_content(e["message"].get("content",[]))["tools"] if "output" in t and t.get("id")},{e["uuid"]:message_id(idx,i) for idx,(i,e) in enumerate(msg_events) if "uuid" in e}  # api-request-blob events copy request history; only these events are turns
+    timestamps,msg_events,tool_results,uuid2id=[ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e],(msg_events:=[(i,e) for i,e in indexed if "message" in e and e["type"] in ("user","human","assistant") and first.get(e.get("uuid"),i)==i]),{t["id"]:t for _,e in msg_events for t in extract_content(e["message"].get("content",[]))["tools"] if "output" in t and t.get("id")},{e["uuid"]:message_id(idx,i) for idx,(i,e) in enumerate(msg_events) if "uuid" in e}  # api-request-blob events copy request history; only these events are turns
 
     turns=[(idx,i,e,extract_content(e["message"].get("content",e["message"].get("text",""))),ts_from_iso(e.get("timestamp")),message_id(idx,i)) for idx,(i,e) in enumerate(msg_events)]
     msgs,(msgs)=(msgs:=[dict(id=mid,conversation_id=cid,role="user" if e["type"] in ("human","user") else e["type"],content=c["text"],thinking=c["thinking"],created_at=ts,model=e["message"].get("model") if e["type"]=="assistant" else None,metadata=json.dumps({"provider_index":i,**({"provider_id":e["uuid"]} if e.get("uuid") else {})}),parent_id=uuid2id.get(e.get("parentUuid"))) for idx,i,e,c,ts,mid in turns]),([{**m,"parent_id":m["parent_id"] if m["parent_id"] in mids else None} for m in msgs] if (mids:={x["id"] for x in msgs}) else [])  # retain every source message, including thinking-only turns

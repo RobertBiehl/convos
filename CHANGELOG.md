@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Import Claude Code sessions continued in Claude Desktop, which re-appends events under their `uuid` (and writes a second file copying the first): a repeated `uuid` is one message, taken from its first line. Fresh imports no longer stop at `divergent provider session in import batch`; schema 17 merges the per-line rows older parsers stored for it instead of raising `Provider identity collision in messages` (#173).
+- Schema 18 also imports the turns a partially imported session lacks, so a request blob's call can move to its real turn instead of raising `parse result reference unavailable: messages:<id>`.
+
 ## 0.11.6b33
 
 - Let sync settle: the own-row retry reports an archive change only for rows whose stored content changed, so retained fork bodies no longer keep `remote watch` running full passes (archive generation +0 per pass on a copy of a real archive, was +6).
