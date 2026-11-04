@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import duckdb, pytest
 from typer.testing import CliRunner
 from ai_convos import cli
-POPEN, TAIL_CUT = subprocess.Popen, cli.tail_cut
+POPEN = subprocess.Popen
 
 def event(i, role, content, parent=None):
     stamp = (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -13,7 +13,7 @@ def turns(start, stop, text="turn"):
     return [event(i, "user" if i % 2 == 0 else "assistant", f"{text} {i}" if i % 2 == 0 else [{"type": "text", "text": f"{text} {i}"}], f"u{i-1}" if i else None) for i in range(start, stop)]
 
 def write(path, events, mode="w"):
-    with path.open(mode) as f: f.writelines(json.dumps(e) + "\n" for e in events)
+    with path.open(mode) as f: f.write(events if isinstance(events, str) else "".join(json.dumps(e) + "\n" for e in events))  # str: raw transcript text
 
 def use(monkeypatch, data):
     for k, v in (("DATA_DIR", data), ("DB_PATH", data/"convos.db"), ("HOOK_DIR", data/"hook_inbox"), ("HOOK_STATE", data/"hook_state.json"), ("HOOK_TAIL", data/"hook_tails.json"), ("HOOK_PROGRESS", data/"hook_progress.json"), ("HOOK_EMBED_DIRTY", data/"hook_embeddings_dirty"), ("HOOK_FTS_DIRTY", data/"hook_fts_dirty")): monkeypatch.setattr(cli, k, v)
@@ -83,8 +83,8 @@ def rows(data):  # every column of every archive table the hook writes
 
 def cols(rows, *names): return [tuple(r[n] for n in names) for r in rows]
 
-def step(monkeypatch, data, path, snapshot, full=False):  # full=True: an archive that always ingests the full parse
-    use(monkeypatch, data); monkeypatch.setattr(cli, "tail_cut", (lambda *a: None) if full else TAIL_CUT)
+def step(monkeypatch, data, path, snapshot, full=False):  # full=True: an archive that keeps no tail, so every drain ingests the full parse
+    use(monkeypatch, data); full and cli.HOOK_TAIL.unlink(missing_ok=True)
     write(path, snapshot); assert drain(path) == 1
     return rows(data)
 
@@ -171,3 +171,68 @@ def test_unfinished_work_whose_retry_coalesces_invalidates_the_tail(session, mon
         monkeypatch.setattr(cli, "hook_result", parse); write(path, OK + MORE); capture(path); return parse(*a)
     monkeypatch.setattr(cli, "hook_result", changing); assert cli.drain_hooks() == 0
     restored(session, monkeypatch)
+
+def resumed(session, monkeypatch, snapshots, path=None):  # replay, recording per drain whether it resumed from a tail and how many messages it parsed
+    seen, parse = [], cli.hook_result
+    monkeypatch.setattr(cli, "hook_result", lambda s, p, b=None, t=None: (r := parse(s, p, b, t), cli.HOOK_TAIL.parent == session[1] and seen.append((t is not None, len(r.msgs))))[0])
+    return replay((path or session[0], *session[1:]), monkeypatch, snapshots), seen
+
+def test_growing_transcript_resumes_and_matches_full_ingests(session, monkeypatch):  # a call completed a turn later, parents before the offset (a message, a system line), a sidechain line
+    base = turns(0, 40) + [call(40, "u39", "e1"), {"type": "system", "uuid": "s1", "parentUuid": "u40", "timestamp": "2026-01-01T00:01:00Z"}]
+    s1 = base + [result(41, "s1", "e1"), *turns(42, 44)]; s2 = s1 + [{**event(44, "user", "side", "u43"), "isSidechain": True, "agentName": "helper"}]; s3 = s2 + [event(45, "user", "late", "s1"), *turns(46, 47)]
+    got, seen = resumed(session, monkeypatch, [base, s1, s2, s3])
+    assert [t for t, _ in seen] == [False, True, True, True] and [n for _, n in seen][1:] == [4, 1, 2], seen  # s1 re-parses the pending call's message
+    assert ("Edit", "complete") in cols(got["tool_calls"], "tool_name", "status") and len(got["file_edits"]) == 1 and '"session_kind": "subagent"' in got["conversations"][0]["metadata"]
+    assert json.loads(cli.HOOK_TAIL.read_text())[cli.gen_id("hook", f"claude-code:{session[0].resolve()}")]["dangling"] == []  # s1 found its parent before the offset
+
+def test_subagent_transcript_resumes_and_matches_full_ingests(session, monkeypatch):
+    path = session[0].parent / "tail-session" / "subagents" / "agent-a1.jsonl"; path.parent.mkdir(parents=True)
+    side = lambda es: [{**e, "isSidechain": True, "agentId": "a1"} for e in es]
+    got, seen = resumed(session, monkeypatch, [side(turns(0, 30)), side(turns(0, 33)), side(turns(0, 35))], path)
+    assert [t for t, _ in seen] == [False, True, True] and json.loads(got["conversations"][0]["metadata"])["parent_session_id"] == "tail-session"
+
+def test_parallel_calls_completing_across_drains_do_not_force_a_full_parse(session, monkeypatch):  # a result re-read below the old end is not new
+    s0 = [event(0, "user", "go"), call(1, "u0", "t1"), call(2, "u1", "t2"), result(3, "u2", "t1")]
+    got, seen = resumed(session, monkeypatch, [s0, s0 + [result(4, "u3", "t2")]])
+    assert seen[1][0] and seen[1][1] == 3 and sorted(cols(got["tool_calls"], "status")) == [("complete",), ("complete",), ("pending",)]
+
+def test_truncated_or_rewritten_transcript_falls_back_to_a_full_parse(session, monkeypatch):  # replaced rows become history stamped with wall time, so this checks a fresh parse is stored
+    path, data, committed = session; parse, seen = cli.hook_result, []
+    monkeypatch.setattr(cli, "hook_result", lambda s, p, b=None, t=None: (seen.append(t is not None), parse(s, p, b, t))[1])
+    for snapshot in (turns(0, 300), turns(0, 300) + turns(300, 302), turns(0, 200), turns(0, 150) + turns(150, 320, "regrown")): write(path, snapshot); assert drain(path) == 1 and current(path, data)
+    assert seen == [False, True, False, False] and [n for n, _ in committed] == [300, 2, 200, 320]
+
+def test_rebinding_the_session_between_drains_matches_full_ingests(session, monkeypatch):  # a provider binding moves the session to another conversation
+    path, data, _ = session; s0, s1 = turns(0, 30), turns(0, 34)
+    for d in (data, data.parent / "full"): step(monkeypatch, d, path, s0, d != data)
+    for d in (data, data.parent / "full"):
+        with duckdb.connect(str(d / "convos.db")) as db: db.execute("INSERT INTO conversations(id,source) VALUES ('moved','claude-code')"); cli.project_provider_bindings(db, "claude-code", "tail-session", "moved", [])
+    assert (got := step(monkeypatch, data, path, s1)) == step(monkeypatch, data.parent / "full", path, s1, True) and sum(m["conversation_id"] == "moved" for m in got["messages"]) == 34
+
+def test_narrow_bindings_are_the_full_bindings_of_that_session(session):
+    path, data, _ = session; other = path.with_name("other.jsonl"); write(path, turns(0, 20)); write(other, [{**e, "sessionId": "other"} for e in turns(0, 10)]); [capture(p) for p in (path, other)]; assert cli.drain_hooks() == 2
+    with duckdb.connect(str(data / "convos.db"), read_only=True) as db: full, narrow = cli.session_bindings(db), cli.session_bindings(db, [("claude-code", "tail-session")])
+    mine = lambda b: {k: v for k, v in b.items() if len(k) < 4 or k[1] == cli.gen_id("claude-code", "tail-session")}
+    assert mine(full) == mine(narrow) == narrow and len(narrow) > 40 and len(full) > len(narrow)
+
+def test_desktop_resume_reappending_uuids_after_the_offset_matches_full_ingests(session, monkeypatch):  # #173: a repeated uuid is one message, from its first line, even when that line is before the offset
+    first = [event(0, "user", "go"), call(1, "u0", "e1"), result(2, "u1", "e1"), *turns(3, 6)]
+    events = first + [{**e, "cwd": "/repo/sub", "slug": "other"} for e in first[1:]] + turns(6, 9)  # Desktop re-appends the same uuids and messages with other metadata
+    got, seen = resumed(session, monkeypatch, [events[:k] for k in range(1, len(events) + 1)])
+    assert len(got["messages"]) == 9 and ("Edit", "complete") in cols(got["tool_calls"], "tool_name", "status") and seen[-2:] == [(True, 1), (True, 1)], seen  # turns after the block resume again
+
+def test_parent_in_another_file_of_the_session_stays_unlinked(session, monkeypatch):  # a full parse of this file cannot see it either
+    path, data, _ = session; other = path.with_name("other.jsonl"); write(other, turns(0, 6))
+    for d in (data, data.parent / "full"): use(monkeypatch, d); assert drain(other) == 1
+    b0 = [event(100, "user", "start"), event(101, "assistant", [{"type": "text", "text": "b"}], "u100")]
+    got, seen = resumed(session, monkeypatch, [b0, b0 + [event(102, "user", "branch", "u5")]])
+    assert seen[1] == (True, 1) and [m["parent_id"] for m in got["messages"] if m["content"] == "branch"] == [None]
+
+def test_last_line_without_newline_keeps_line_indexes(session, monkeypatch):  # the offset stops before a line that may still grow
+    text = "".join(json.dumps(e) + "\n" for e in turns(0, 10))
+    got, seen = resumed(session, monkeypatch, [text[:-1], text + "".join(json.dumps(e) + "\n" for e in turns(10, 14))])
+    assert seen[1][0] and sorted(json.loads(m["metadata"])["provider_index"] for m in got["messages"]) == list(range(14))
+
+def test_call_appended_after_its_logged_result_completes(session, monkeypatch):  # out-of-order records: the result is before the offset
+    got = replay(session, monkeypatch, [[result(0, None, "t1")], [result(0, None, "t1"), call(1, "u0", "t1")]])
+    assert cols(got["tool_calls"], "status", "output") == [("complete", '"ok"')]

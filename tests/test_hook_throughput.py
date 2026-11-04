@@ -17,7 +17,7 @@ def hooks(tmp_path, monkeypatch):  # transcripts, a meter of what each drain did
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(root := tmp_path / "claude"))
     monkeypatch.setattr(cli, "HOOK_DRAIN_SECONDS", 3600)  # a loaded CI runner must not hit the budget where a case does not set it
     meter, lines, parse, commit, save = dict(parsed=[], committed=[], retry=[], path=None), {}, cli.hook_result, cli.commit_result, cli.atomic_json
-    monkeypatch.setattr(cli, "hook_result", lambda s, p, b=None: (r := parse(s, p, b), meter.__setitem__("path", p.stem), meter["parsed"].append((p.stem, len(r.msgs))))[0])
+    monkeypatch.setattr(cli, "hook_result", lambda s, p, *a: (r := parse(s, p, *a), meter.__setitem__("path", p.stem), meter["parsed"].append((p.stem, len(r.msgs))))[0])
     monkeypatch.setattr(cli, "commit_result", lambda r, **k: (meter["committed"].append((meter["path"], len(r.msgs), lines[meter["path"]])), commit(r, **k))[1])
     monkeypatch.setattr(cli, "atomic_json", lambda p, v: (isinstance(v, dict) and v.get("retry") and meter["retry"].append(p.stem), save(p, v))[1])
     def grow(sid, n):
@@ -48,7 +48,6 @@ def test_steady_state_has_no_full_ingest_after_the_first(hooks, monkeypatch):
     grow, meter, full, queue = hooks; warm(grow, meter, ["g0", "g1", "g2"], 300); steady(grow)
     assert (full(), meter["retry"], queue()) == ([], [], []) and all(n <= 24 for _, n, _ in meter["committed"])
 
-@pytest.mark.xfail(strict=True, reason="b34 work item 'read only appended bytes': the hook parses the whole transcript on every drain")
 def test_steady_state_parses_only_new_lines(hooks, monkeypatch):
     grow, meter, full, queue = hooks; warm(grow, meter, ["g0", "g1", "g2"], 300); steady(grow)
     assert all(n <= 24 for _, n in meter["parsed"]), meter["parsed"]

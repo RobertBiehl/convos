@@ -98,3 +98,15 @@ def test_schema_18_retires_request_blob_rows_with_signed_deletes(tmp_path,monkey
     with duckdb.connect(str(path),read_only=True) as source,duckdb.connect(str(receiver),read_only=True) as copy:
         for sql in ("SELECT id,role,content,created_at FROM messages ORDER BY id","SELECT id,message_id,tool_name,input::JSON->>'$.command',input::JSON->>'$.content',output,status,created_at FROM tool_calls ORDER BY id","SELECT id,message_id,content,created_at FROM file_edits ORDER BY id","SELECT file_edit_id FROM provenance.file_edit_files ORDER BY 1"): assert copy.execute(sql).fetchall()==source.execute(sql).fetchall()
         assert not source.execute("SELECT 1 FROM remote.row_conflicts").fetchall() and not copy.execute("SELECT 1 FROM remote.row_conflicts").fetchall()
+
+def test_schema_18_imports_turns_missing_from_a_partial_archive(tmp_path,monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(tmp_path/".claude"))
+    db,cid,legacy=duckdb.connect(),gen_id("claude-code","s1"),tmp_path/"legacy.jsonl"; core.init_schema(db); write(legacy,events(tmp_path,"assistant")); ingest(db,legacy)
+    blobs,turns=[gen_id("claude-code",f"{cid}:{i}") for i in (3,4,5)],[gen_id("claude-code",f"message:{cid}:{u}") for u in ("u1","a1","u2")]
+    # The archive holds the blob copies of a1's calls but not a1 itself: it saw only part of the transcript.
+    db.execute("UPDATE messages SET role='api-request-blob' WHERE id IN (SELECT UNNEST(?))",[blobs]); db.execute("DELETE FROM messages WHERE id IN (SELECT UNNEST(?))",[turns]); db.execute("UPDATE messages SET parent_id=NULL")
+    assert db.execute("SELECT count(*) FROM tool_calls WHERE message_id IN (SELECT UNNEST(?))",[blobs]).fetchone()==(2,)
+    write(core.hook_root("claude-code")/"-repo"/"s1.jsonl",events(tmp_path)); db.execute("UPDATE core_schema SET version=17"); core.init_schema(db)
+    assert not db.execute("SELECT 1 FROM messages WHERE role='api-request-blob'").fetchall()
+    assert db.execute("SELECT DISTINCT message_id FROM tool_calls UNION ALL SELECT DISTINCT message_id FROM file_edits").fetchall()==[(turns[1],)]*2
+    assert not core.archive_relationships(db)
