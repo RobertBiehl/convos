@@ -1149,8 +1149,8 @@ def parse_claude(path: Path) -> ParseResult:
 
 def iter_jsonl(path: Path, offset=0, line=0):  # line: the index of the line that starts at byte offset
     for i, raw in enumerate((f:=path.open("rb"),f.seek(offset))[0], start=line):
-        if raw.strip():
-            try: yield i,json.loads(raw)
+        if (text:=raw.decode()).strip():  # undecodable bytes fail the whole file, as text mode did
+            try: yield i,json.loads(text)
             except Exception as e: log_parse_error(f"jsonl {path} line {i+1}", e)
 def jsonl_mark(path,offset,line=0,cut=0):  # the byte offset of line cut, counted from a known (offset,line), and a digest of the first and last 4 KiB before it that a rewrite or truncation changes
     with path.open("rb") as f: return dict(offset=(end:=offset+sum(map(len,itertools.islice((f.seek(offset),f)[1],cut-line)))),digest=hashlib.sha256(b"".join((f.seek(0),f.read(min(end,4096)),f.seek(max(end-4096,0)),f.read(end-max(end-4096,0)))[1::2])).hexdigest())
