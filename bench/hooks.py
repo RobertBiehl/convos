@@ -36,7 +36,7 @@ def probe():  # runs in every spawned `drain-hooks` (sitecustomize): logs per-ev
         return wrapped
     def cut(r, tail):
         before = len(r.msgs)
-        return (out := tail_cut(r, tail), ev.update(rows=len(r.msgs), full=len(r.msgs) == before > 0, tail=tail is not None, end=now()))[0]
+        return (out := tail_cut(r, tail), ev.update(rows=len(r.msgs), full=len(r.msgs) == before > 0, tail=tail is not None, end=now()), ev["full"] and log(kind="full", key=ev["key"], rows=before))[0]
     close, tail_cut, drain = cli._LockedDB.close, cli.tail_cut, cli.drain_hooks
     def closing(self):
         purpose, ro, opened, start = *self.audit, now()
@@ -46,6 +46,7 @@ def probe():  # runs in every spawned `drain-hooks` (sitecustomize): logs per-ev
     cli.hook_result = timed(cli.hook_result, lambda s, r, src, path, *a: ev.update(size=path.stat().st_size, parsed=len(r.msgs), parse=now() - s, end=now()))
     cli.commit_result = timed(cli.commit_result, lambda s, out, *a: (ev.update(commit=now() - s, committed=True, end=now()), log(kind="commit", key=ev["key"], size=ev["size"])))
     cli.retry_hook = timed(cli.retry_hook, lambda s, out, work, force=False: log(kind="retry" if force else "requeue", key=work.stem))
+    cli.log_parse_error = timed(cli.log_parse_error, lambda s, out, context, error: log(kind="error", error=type(error).__name__, key=Path(context.split()[-1]).stem))
     cli.drain_hooks = timed(drain, lambda s, n, *a, **k: (flush(), log(kind="drain", start=s, processed=n)))
 
 def pct(xs, q): return sorted(xs)[min(len(xs) - 1, int(q * len(xs)))] if xs else None
@@ -177,7 +178,7 @@ def report(out, cli, a, copies, fired, rs, t0, t1, holds, drained, aborted, disk
     v = dict(latency=latency, tail_event=[r["end"] - r["start"] for r in done if r["rows"] <= 100], all_event=[r["end"] - r["start"] for r in done],
              hold=[r["hold"] for r in closes], close=[r["close"] for r in closes], parsed_mb=[r["size"] / 1e6 for r in done], appended_mb=[x / 1e6 for x in appended],
              rows=[r["rows"] for r in done], bindings=[r["bindings"] for r in events if "bindings" in r], sync=holds)
-    full, retry, requeue = sum(bool(r.get("full")) for r in done), sum(r["kind"] == "retry" for r in rs), sum(r["kind"] == "requeue" for r in rs)
+    full, retry, requeue, errors = (sum(r["kind"] == k for r in rs) for k in ("full", "retry", "requeue", "error"))  # a full ingest counts when it starts: a long one may not finish
     git = subprocess.run(["git", "-C", Path(cli.__file__).parent, "describe", "--always", "--dirty"], capture_output=True, text=True).stdout.strip()
     row = lambda name, xs, unit, *extra: "| " + " | ".join([name, fmt(pct(xs, .5), unit), fmt(pct(xs, .95), unit), str(len(xs)), *extra]) + " |"
     lines = [f"# Hook ingest bench: convos {version('convos')} ({git})", "",
@@ -185,12 +186,12 @@ def report(out, cli, a, copies, fired, rs, t0, t1, holds, drained, aborted, disk
              f"Transcripts: {', '.join(f'{c['size'] / 1e6:.0f} MB' for c in copies)}; Stop events fired {len(fired)}, not committed at the end {pending}{'; drain-out timed out' if not drained else ''}{'; ABORTED: ' + aborted if aborted else ''}", "",
              "| Metric | p50 | p95 | n | Target | Result |", "|---|---|---|---|---|---|",
              *[row(name, v[key], unit, f"< {limit} {unit}", "PASS" if v[key] and pct(v[key], .95) < limit else "FAIL" if v[key] else "n/a") for name, key, limit, unit in TARGETS],
-             f"| full ingests | {full} | | {len(done)} | 0 | {'PASS' if full == 0 else 'FAIL'} |",
+             f"| full ingests started | {full} | | {len(events)} | 0 | {'PASS' if full == 0 else 'FAIL'} |",
              f"| retry flags | {retry} | | | 0 | {'PASS' if retry == 0 else 'FAIL'} |", "",
              "| Context | p50 | p95 | n | Note |", "|---|---|---|---|---|",
              row("drain time per committed event, all", v["all_event"], "s", ""), row("rows committed per event", v["rows"], "rows", ""), row("appended per event", v["appended_mb"], "MB", "parsed should be about this"),
              row("session_bindings per drain", v["bindings"], "s", ""), row("sync writer batch hold", v["sync"], "s", "emulated, 15 s per batch"),
-             f"| events requeued (transcript grew during the parse) | {requeue} | | | |", f"| free disk start / end | {disk[0] / 2**30:.1f} GiB | {disk[-1] / 2**30:.1f} GiB | | |", ""]
+             f"| events requeued (grew during the parse, or failed) | {requeue} | | | |", f"| events failed (tail dropped): {', '.join(sorted({r['error'] for r in rs if r['kind'] == 'error'})) or '-'} | {errors} | | | |", f"| free disk start / end | {disk[0] / 2**30:.1f} GiB | {disk[-1] / 2**30:.1f} GiB | | |", ""]
     (out / "report.md").write_text("\n".join(lines))
 
 if __name__ == "__main__": main()
