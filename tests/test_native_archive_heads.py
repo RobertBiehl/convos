@@ -188,7 +188,7 @@ def test_signed_chatgpt_timestamp_repair_preserves_original(tmp_path,monkeypatch
     with core.open_db(path,purpose='test.native.legacy') as db,core._transaction(db):
         core.project_archive_rows(db,'conversations',core.ARCHIVE_COLUMNS['conversations'],[(list(result.convs[0].values()),None)])
     records=scanned(path,state); before=archive_row(records,'conversations'); assert attest_rows(path,cfg,'w',records)>0
-    for key,value in [('DATA_DIR',tmp_path),('STATE_PATH',tmp_path/'sync_state.json'),('HOOK_DIR',tmp_path/'hooks'),('HOOK_STATE',tmp_path/'hook_state.json'),('HOOK_PROGRESS',tmp_path/'hook_progress.json')]: monkeypatch.setattr(core,key,value)
+    for key,value in [('DATA_DIR',tmp_path),('STATE_PATH',tmp_path/'sync_state.json'),('HOOK_DIR',tmp_path/'hooks'),('HOOK_STATE',tmp_path/'hook_state.json'),('HOOK_TAIL',tmp_path/'hook_tails.json'),('HOOK_PROGRESS',tmp_path/'hook_progress.json')]: monkeypatch.setattr(core,key,value)
     monkeypatch.delenv('CONVOS_IMPORT_PATHS',raising=False)
     core.sync(False,300,False,False,False,False,True)
     assert before in [v['row'] for v in retained(path,cfg)]
