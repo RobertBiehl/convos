@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import duckdb
-from ai_convos.cli import archive_state, atomic_json, capture_provenance, init_schema, operation_lock
+from ai_convos.cli import _open_db, archive_state, atomic_json, capture_provenance, init_schema, operation_lock
 
 USERS={"fresh":("convos-fresh-a","convos-fresh-b"),"canary":("convos-canary-a","convos-canary-b")}
 STATE=Path("/var/lib/convos-testbed")
@@ -143,7 +143,7 @@ def seed(client,cid,title,prompt,cwd=None,edit=None):
 def seed_archive(root,cid,title,prompt,cwd=None,edit=None,content=None,old_content=None):
     path=root/"data/convos.db"
     path.parent.mkdir(parents=True,exist_ok=True)
-    db=duckdb.connect(str(path))
+    db=_open_db(path)
     init_schema(db)
     db.execute("INSERT INTO conversations (id,source,title,created_at,updated_at,cwd,metadata) VALUES (?,?,?,'2026-01-01','2026-01-01',?,'{}')",(cid,"testbed",title,str(cwd) if cwd else None))
     db.execute("INSERT INTO messages (id,conversation_id,role,content,created_at,metadata) VALUES (?,?, 'user',?,'2026-01-01 00:00:00','{}'),(?,?, 'assistant','done','2026-01-01 00:00:01','{}')",(f"u-{cid}",cid,prompt,f"a-{cid}",cid))

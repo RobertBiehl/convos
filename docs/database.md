@@ -244,6 +244,24 @@ migration; a symlinked body still refuses. Manual `convos backup`
 uses the same complete format without silently migrating the live archive. Relay and
 `state.db` remain rebuildable and are not migrated during this clean cutover.
 
+Schema 20 copies the whole archive once into a new file with row groups of 4,096 rows
+(`COPY FROM DATABASE`: every table, index, view and the FTS index, rows in order) and drops
+the rows DuckDB still kept for deleted and replaced versions. DuckDB never shrinks a file, so
+the copy goes to `<database>.v20` beside the archive and replaces it; the old file is not
+copied but kept as `<database>.pre-v20.bak` (a hard link made just before the swap, with the
+usual attachment bundle). The migration needs free space for the new file only, counted as
+1.25x the archive's used blocks (4,096-row groups of incompressible text took up to 1.22x;
+the rows of deleted versions still count as used, so on a real archive this is about its
+file size), and
+refuses up front, unchanged, when there is less; a failed copy deletes its partial file. A
+kill before the swap leaves the schema-19
+archive and a partial `<database>.v20` that the next attempt deletes; a kill between the link
+and the swap leaves the archive with two names, and the next open removes the backup name.
+An archive migrated from schema 18 or older already has its earlier backup, so the old file
+is dropped. Only an archive attached through `_open_db` is rewritten; on any other connection
+(in-memory, or a plain `duckdb.connect` in tests) schema 20 only records the version, since
+such a connection would merge the small row groups back anyway. See `database-connections.md` for why every connection sets the row group size.
+
 ## Full-Text Search
 
 FTS index on `messages` covering `content` and `thinking`. The singleton

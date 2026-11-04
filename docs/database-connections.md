@@ -70,6 +70,16 @@ the queue remains the durable input record.
    requires exclusion: schema migration and its pre-migration backup, manual backup, FTS
    rebuild, and an embedding-profile reset. They must have a `maintenance.*` or `schema.*`
    purpose, remain local, and provide command-level progress or a completion message.
+9. `_open_db` attaches the archive to an in-memory DuckDB with `ROW_GROUP_SIZE 4096`
+   (`ROW_GROUP_ROWS`) and spills to `<database>.tmp`. A checkpoint rewrites the whole last row
+   group of every table appended to, so with DuckDB's default of 122,880 rows one hook drain
+   rewrote ~240 MB of `tool_calls`. DuckDB does not store the size in the file: a connection
+   without it merges small row groups back to 122,880 rows at its next write checkpoint, so
+   every write path must open through `_open_db`. Schema 20 keeps builds without it out; its
+   rewrite needs the archive attached as `convos`, detaches it and attaches the new file in
+   the same connection.
+   Within one process the archive can be open in only one connection at a time, and a
+   `cursor()` of it starts in the in-memory catalog until it runs `USE convos`.
 
 The only direct `duckdb.connect` outside the gateway opens a detached backup candidate in
 read-only mode to validate it. It is not the live archive and takes no archive lock.
