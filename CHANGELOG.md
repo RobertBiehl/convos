@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Schema 19 drops each index before rebuilding its table: on Python 3.15, where DuckDB 1.5.6 is built from source (no wheel), a dropped table kept its index, so the migration failed with `Index with name "edit_dependency_key" already exists` and the archive stayed at schema 18. Found by Michael Leigsnering.
+
 ## 0.11.6b33
 
 - Let sync settle: the own-row retry reports an archive change only for rows whose stored content changed, so retained fork bodies no longer keep `remote watch` running full passes (archive generation +0 per pass on a copy of a real archive, was +6).
