@@ -444,8 +444,9 @@ If you prefer not to grant it, use Chrome cookies with `-b chrome`.
 On Linux, Chrome and Chromium cookies are read from `$XDG_CONFIG_HOME` (default
 `~/.config`), snap Chromium and Flatpak Chrome/Chromium. Chrome's profiles keep
 their names (`Default`); the others are prefixed (`chromium/Default`,
-`snap-chromium/Default`, ...), and without `CONVOS_CHROME_PROFILE` the first
-`Default` holding the site's cookies is used. Keyring-encrypted cookies need
+`snap-chromium/Default`, ...). A bare name (`CONVOS_CHROME_PROFILE`, default
+`Default`) takes the first install's profile of that name holding the site's
+cookies, a prefixed one only that install's. Keyring-encrypted cookies need
 `secret-tool` (`apt install libsecret-tools`) and an unlocked keyring; otherwise
 sync and `doctor` report `Chrome keyring unavailable`. Firefox needs no
 keyring; it reads `~/.mozilla/firefox`, `$XDG_CONFIG_HOME/mozilla/firefox`

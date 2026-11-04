@@ -23,10 +23,13 @@ def safari_cookie_domains(): return {host for host,_,_ in _safari_records() or (
 
 def _root(root): return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home()/".config")/root[5:] if root[:5]=="$XDG/" else Path.home()/root
 def _chrome_roots(): return [(_root(root),app,tag) for root,(app,tag) in _CHROME_ROOTS.get(PLATFORM,{}).items()]
-def _chrome_found():  # an install whose folder cannot be listed is left out, not the others with it
+def _cookie_db(folder):  # a profile folder that cannot be probed is left out, not its siblings
+    with contextlib.suppress(OSError): return next((p for p in (folder/"Cookies",folder/"Network/Cookies") if p.exists()),None)
+def _chrome_found(errors):  # an install that exists but cannot be listed goes to errors, for when no other install works
     for root,app,tag in _chrome_roots():
-        with contextlib.suppress(OSError): yield from [(f"{tag}/{d.name}" if tag else d.name,path,app) for d in sorted(root.iterdir()) if d.is_dir() and (path:=next((p for p in (d/"Cookies",d/"Network/Cookies") if p.exists()),None))]
-def _chrome_paths(profile=None): return (lambda want,found:[f for f in found if f[0]==want] or [f for f in found if f[0].rpartition("/")[2]==(want or "Default")])(profile or os.environ.get("CONVOS_CHROME_PROFILE"),list(_chrome_found()))  # a bare name matches that profile in every install
+        try: yield from [(f"{tag}/{d.name}" if tag else d.name,path,app) for d in sorted(root.iterdir()) if (path:=_cookie_db(d))]
+        except OSError as e: isinstance(e,FileNotFoundError) or errors.append(str(e))  # a missing install is no error
+def _chrome_paths(profile,errors): return (lambda want:[f for f in _chrome_found(errors) if (f[0] if "/" in want else f[0].rpartition("/")[2])==want])(profile or os.environ.get("CONVOS_CHROME_PROFILE") or "Default")  # an install-qualified name matches exactly, a bare one that profile in every install
 def _keyring(command):
     with contextlib.suppress(OSError,subprocess.SubprocessError):
         if not (result:=subprocess.run(command,capture_output=True,text=True,timeout=10)).returncode and result.stdout.strip(): return result.stdout.strip().encode()
@@ -46,16 +49,18 @@ _KEYRING_ERROR="Chrome keyring unavailable: no secret from `secret-tool lookup a
 
 def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, str]:  # the first install whose matching cookies all decrypt; the others' failures count only when none does
     errors,secrets=[],{}
-    for pid,path,app in _chrome_paths(profile):
+    for pid,path,app in _chrome_paths(profile,errors):
         try:
             if rows:=_chrome_cookies(path,app,secrets,domain): return {name:value for _,name,value in rows}
         except (ValueError,sqlite3.Error) as e: errors.append(f"{pid}: {e}")
     if errors: raise ValueError(" | ".join(errors))
     return {}
 def chrome_cookie_domains(profile: str | None = None):  # every row must decrypt, so a readable cookie cannot hide a locked one of the same host
-    try: return {host for secrets in [{}] for _,path,app in _chrome_paths(profile) for host,*_ in _chrome_cookies(path,app,secrets)}
+    try:
+        if (found:=_chrome_paths(profile,errors:=[])) or not errors: return {host for secrets in [{}] for _,path,app in found for host,*_ in _chrome_cookies(path,app,secrets)}
     except (ValueError,sqlite3.Error) as e: raise PermissionError(str(e)) from e
-def chrome_profiles() -> list[str]: return [profile for profile,_,_ in _chrome_found()]
+    raise PermissionError(" | ".join(errors))
+def chrome_profiles() -> list[str]: return [profile for profile,_,_ in _chrome_found([])]
 
 def _firefox_profiles():  # (cookies.sqlite, is a profile Firefox starts with) for profiles.ini's profiles and any profile folder
     for base in map(_root,_FIREFOX_ROOTS.get(PLATFORM,())):

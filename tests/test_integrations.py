@@ -543,7 +543,7 @@ class TestCookieExtraction:
         self.chrome_store(tmp_path / ".config/chromium/Profile 1", [("sessionKey", b"v10", b"peanuts", b"token", ".perplexity.ai", ".evil.example")])
         cookies, _ = self.linux(monkeypatch, tmp_path, b"new-keyring-secret")
         assert cookies.read_chrome_cookies("perplexity.ai") == {"sessionKey": "chromium-token", "empty": ""}
-        with pytest.raises(ValueError, match="does not decrypt"): cookies.read_chrome_cookies("perplexity.ai", "Default")
+        with pytest.raises(PermissionError, match="does not decrypt"): cookies.chrome_cookie_domains("Default")
         with pytest.raises(ValueError, match="does not decrypt"): cookies.read_chrome_cookies("perplexity.ai", "chromium/Profile 1")
 
     def test_cookie_bytes_that_are_not_utf8_are_kept(self, tmp_path, monkeypatch):
@@ -553,13 +553,18 @@ class TestCookieExtraction:
         assert (got := cookies.read_chrome_cookies("claude.ai")) == {"sessionKey": "token", "pref": "caf\xe9", "name": "café"} and got["pref"].encode("latin-1") == b"caf\xe9"
         assert cookies.chrome_cookie_domains() == {".claude.ai"}
 
-    def test_an_install_that_cannot_be_listed_does_not_hide_the_others(self, tmp_path, monkeypatch):
+    def test_an_install_or_profile_that_cannot_be_listed_does_not_hide_the_others(self, tmp_path, monkeypatch):
+        """A profile folder that cannot be probed (Python < 3.14 raises there) or an install that cannot be listed is left out, not the others with it; when no other install works, the listing error is reported, not taken for 'no cookies'."""
         import os
         self.chrome_store(tmp_path / ".config/google-chrome/Default", [("sessionKey", b"v10", b"peanuts", b"token", ".claude.ai")])
-        (locked := tmp_path / ".config/chromium").mkdir(parents=True); os.chmod(locked, 0)
+        (tmp_path / ".config/google-chrome/Profile 1").mkdir(); (locked := tmp_path / ".config/chromium").mkdir(parents=True); os.chmod(locked, 0)
         try:
-            cookies, _ = self.linux(monkeypatch, tmp_path)
-            assert cookies.read_chrome_cookies("claude.ai") == {"sessionKey": "token"} and cookies.chrome_profiles() == ["Default"]
+            cookies, _ = self.linux(monkeypatch, tmp_path); exists = cookies.Path.exists
+            monkeypatch.setattr(cookies.Path, "exists", lambda path, **k: (_ for _ in ()).throw(PermissionError(13, "Permission denied", str(path))) if "Profile 1" in path.parts else exists(path, **k))
+            assert cookies.read_chrome_cookies("claude.ai") == {"sessionKey": "token"} and cookies.chrome_profiles() == ["Default"] and cookies.chrome_cookie_domains() == {".claude.ai"}
+            with pytest.raises(ValueError, match="Permission denied: .*chromium"): cookies.read_chrome_cookies("example.com")
+            (tmp_path / ".config/google-chrome/Default/Cookies").unlink()
+            with pytest.raises(PermissionError, match="Permission denied: .*chromium"): cookies.chrome_cookie_domains()
         finally: os.chmod(locked, 0o700)
 
     def test_paths_with_uri_characters(self, tmp_path, monkeypatch):
@@ -586,13 +591,14 @@ class TestCookieExtraction:
         with pytest.raises(PermissionError, match="keyring unavailable"): cookies.chrome_cookie_domains()
 
     def test_chromium_is_reachable_next_to_chrome(self, tmp_path, monkeypatch):
-        """Both installs have a Default profile: each is its own profile, and the default lookup falls through to the one holding the domain."""
+        """Both installs have a Default profile: each is its own profile; the default lookup and the bare name fall through to the one holding the domain, an install-qualified name does not."""
         from ai_convos import cookies
         self.chrome_store(tmp_path / ".config/google-chrome/Default", [("other", b"v10", b"peanuts", b"chrome-token", ".example.com")])
         self.chrome_store(tmp_path / ".config/chromium/Default", [("sessionKey", b"v10", b"peanuts", b"chromium-token", ".claude.ai")])
         monkeypatch.setattr(cookies, "PLATFORM", "linux"); monkeypatch.setattr(cookies.Path, "home", classmethod(lambda cls: tmp_path)); monkeypatch.setattr(cookies, "_keyring", lambda command: None)
         assert cookies.chrome_profiles() == ["Default", "chromium/Default"] and cookies.get_cookies("claude.ai", "chrome") == {"sessionKey": "chromium-token"}
-        assert cookies.get_cookies("claude.ai", "chrome", "Default") == {} and cookies.get_cookies("claude.ai", "chrome", "chromium/Default") == {"sessionKey": "chromium-token"}
+        assert cookies.get_cookies("claude.ai", "chrome", "Default") == {"sessionKey": "chromium-token"} and cookies.get_cookies("claude.ai", "chrome", "chromium/Default") == {"sessionKey": "chromium-token"}
+        assert cookies.get_cookies("example.com", "chrome", "chromium/Default") == {} and cookies.get_cookies("example.com", "chrome", "Default") == {"other": "chrome-token"}
         assert cookies.chrome_cookie_domains() == {".example.com", ".claude.ai"}
 
     @pytest.mark.parametrize("root,app", [("xdg/google-chrome", "chrome"), ("snap/chromium/common/chromium", "chromium"), (".var/app/com.google.Chrome/config/google-chrome", "chrome"), (".var/app/org.chromium.Chromium/config/chromium", "chromium")])
