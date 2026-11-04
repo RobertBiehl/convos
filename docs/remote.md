@@ -448,7 +448,9 @@ association; independent conflicting facts remain retained. Authorization and
 signature failures still fail closed. A retry of this account's retained
 revisions reports an archive change only for rows whose stored content or edit
 metadata actually changed, so retained fork bodies, which never retire, do not
-keep an otherwise idle sync running.
+keep an otherwise idle sync running. A retried row is retried again only after
+one of its inputs changes: the local base, a proof in its row's history, or a
+local change to that row; `state.db` records the inputs of its last retry.
 
 Unchanged blocked aliases do not by themselves force an archive-wide sync.
 `doctor` continues reporting them; relevant changes or explicit repair retry them.

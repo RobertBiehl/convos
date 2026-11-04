@@ -1,12 +1,14 @@
 """The own-row retry must let a sync settle: retained fork bodies never retire, so re-applying them each pass advanced the archive generation and kept the watcher running full passes."""
 import json, duckdb, pytest
 from ai_convos import cli as core
-from ai_convos_remote.projection import apply_row_replicas, retry_own_replicas
+from ai_convos_remote import projection
+from ai_convos_remote.projection import apply_row_replicas, connect, retry_own_replicas
 from ai_convos_remote.protocol import digest, row_proof
 from tests.test_source_device_cutover import signed_graph
 
 
-def test_retry_does_not_rewrite_an_applied_sibling_fork(tmp_path):
+def forked(tmp_path):
+    # Seen from the peer: the author's two fork tips with the same content, both bodies retained.
     user,device,peer,control,bodies=signed_graph()
     msg=bodies[1]
     changed={**msg['row'],'data':{**msg['row']['data'],'content':'changed'}}
@@ -14,11 +16,30 @@ def test_retry_does_not_rewrite_an_applied_sibling_fork(tmp_path):
     fork=dict(row=changed,proof=row_proof(device,user,'w',1,changed))
     path=tmp_path/'peer.db'
     for batch in (bodies,[side],[dict(row=msg['row'],proof=row_proof(device,user,'w',1,msg['row'],side['proof']['revision']))],[fork],[dict(row=msg['row'],proof=row_proof(device,user,'w',1,msg['row'],fork['proof']['revision']))]): apply_row_replicas(path,batch,'w',[control],local_user=user,local_device=peer['id'])
+    return path,user,device,peer,control,changed
+
+
+def test_retry_does_not_rewrite_an_applied_sibling_fork(tmp_path):
+    path,user,device,peer,control,changed=forked(tmp_path)
     state=lambda:duckdb.connect(str(path),read_only=True).execute('SELECT generation,(SELECT count(*) FROM remote.row_conflicts),(SELECT content FROM messages) FROM archive_state').fetchone()
     before=state()
     assert before[1:]==(2,'done')  # both fork tips stay retained
-    for _ in range(2): retry_own_replicas(path,user,peer['id'])
+    for _ in range(2): retry_own_replicas(path,connect(tmp_path/'state.db'),user,peer['id'])
     assert state()==before  # b32: generation +1 per pass, so the next sync was never settled
+
+@pytest.mark.parametrize('change,again',[(None,0),('unrelated',0),('entity',1),('base',1),('proof',2)])
+def test_retry_waits_for_a_changed_input(tmp_path,monkeypatch,change,again):
+    path,user,device,peer,control,changed=forked(tmp_path)
+    state,real,retried=connect(tmp_path/'state.db'),apply_row_replicas,[]
+    monkeypatch.setattr(projection,'apply_row_replicas',lambda *a,**k:(retried.extend(k['retry']),real(*a,**k))[-1])
+    retry=lambda:(retried.clear(),retry_own_replicas(path,state,user,peer['id']),len(retried))[-1]
+    assert retry()==1
+    with duckdb.connect(str(path)) as db:
+        if change in ('unrelated','entity'): core._archive_touch(db,[('messages','other' if change=='unrelated' else 'm')])  # hook ingests touch other rows constantly
+        if change=='base': db.execute("INSERT INTO remote.local_row_bases VALUES ('messages','m',?,'local')",[user])
+    if change=='proof': real(path,[dict(proof=row_proof(device,user,'w',1,third:={**changed,'data':{**changed['data'],'content':'third'}}),row=third)],'w',[control],local_user=user,local_device=peer['id'])
+    assert retry()==again  # b34: both settled tips re-applied on every pass, ~17 s on a real archive
+    assert retry()==0
 
 @pytest.mark.parametrize('base',['A','B'])
 def test_retry_advances_a_stale_native_base_to_the_retained_head(tmp_path,base):
@@ -34,7 +55,7 @@ def test_retry_advances_a_stale_native_base_to_the_retained_head(tmp_path,base):
     with duckdb.connect(str(path)) as db:
         db.execute("UPDATE remote.local_row_bases SET revision=? WHERE kind='messages' AND entity='m'",[stale])
         db.execute("INSERT OR IGNORE INTO remote.row_conflicts VALUES (?,?)",[digest(c['proof']),json.dumps(c['row'],sort_keys=True,separators=(',',':'))])
-    retry_own_replicas(path,user,device['id'])
+    retry_own_replicas(path,connect(tmp_path/'state.db'),user,device['id'])
     with duckdb.connect(str(path),read_only=True) as db:
         assert db.execute("SELECT revision FROM remote.local_row_bases WHERE kind='messages' AND entity='m'").fetchone()[0]==c['proof']['revision']
         assert db.execute("SELECT count(*) FROM remote.row_conflicts WHERE proof_id=?",[digest(c['proof'])]).fetchone()[0]==1

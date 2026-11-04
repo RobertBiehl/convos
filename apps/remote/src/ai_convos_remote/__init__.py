@@ -1049,7 +1049,7 @@ def sync_once(root=None,repair=False,manual=False):
             baseline=archive_info(root)
             bound={r[0] for r in state.execute("SELECT DISTINCT workspace FROM origin_bindings").fetchall()}
             failures.update({ws:value["error"] for ws,value in pull(cfg,state,root,True,True,server=server).items() if "error" in value})
-            retry_own_replicas(core_path(root),cfg['user'],cfg['device']['id'],_progress)
+            retry_own_replicas(core_path(root),state,cfg['user'],cfg['device']['id'],_progress)
             retry_edit_replicas(core_path(root),cfg['user'],cfg['device']['id'],root,_progress)
             converge_own_rows(core_path(root),state,cfg['user'],cfg['device']['id'],_progress)
             ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}
