@@ -15,10 +15,12 @@ def turns(start, stop, text="turn"):
 def write(path, events, mode="w"):
     with path.open(mode) as f: f.writelines(json.dumps(e) + "\n" for e in events)
 
+def use(monkeypatch, data):
+    for k, v in (("DATA_DIR", data), ("DB_PATH", data/"convos.db"), ("HOOK_DIR", data/"hook_inbox"), ("HOOK_STATE", data/"hook_state.json"), ("HOOK_TAIL", data/"hook_tails.json"), ("HOOK_PROGRESS", data/"hook_progress.json"), ("HOOK_EMBED_DIRTY", data/"hook_embeddings_dirty"), ("HOOK_FTS_DIRTY", data/"hook_fts_dirty")): monkeypatch.setattr(cli, k, v)
+
 @pytest.fixture
 def session(tmp_path, monkeypatch):
-    data = tmp_path / "data"
-    for k, v in (("DATA_DIR", data), ("DB_PATH", data/"convos.db"), ("HOOK_DIR", data/"hook_inbox"), ("HOOK_STATE", data/"hook_state.json"), ("HOOK_TAIL", data/"hook_tails.json"), ("HOOK_PROGRESS", data/"hook_progress.json"), ("HOOK_EMBED_DIRTY", data/"hook_embeddings_dirty"), ("HOOK_FTS_DIRTY", data/"hook_fts_dirty")): monkeypatch.setattr(cli, k, v)
+    use(monkeypatch, data := tmp_path / "data")
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: None if a[0][1:4] == ["-m", "ai_convos", "drain-hooks"] else POPEN(*a, **k))
     root = tmp_path / "claude"; path = root / "projects" / "-repo" / "tail-session.jsonl"; path.parent.mkdir(parents=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(root)); committed = []; commit = cli.commit_result
@@ -55,12 +57,47 @@ def test_tool_result_arriving_after_the_anchor_completes_the_call(session):
     write(path, [event(5001, "user", [{"type": "tool_result", "tool_use_id": "t1", "content": "done"}], "u5000")] + turns(5002, 5004), "a"); assert drain(path) == 1
     assert committed[-1][0] < 40 and current(path, data) and sorted(t[1] for t in archive(data)[1]) == ["complete", "pending"]  # the pending version stays as history
 
-def test_rewritten_history_goes_back_to_the_last_matching_chunk(session):
+def test_rewritten_history_falls_back_to_a_full_ingest(session):
     path, data, committed = session; write(path, turns(0, 5000)); assert drain(path) == 1
     write(path, turns(0, 3000) + turns(3000, 5100, "rewritten")); assert drain(path) == 1
-    assert 2000 < committed[-1][0] < 5100, committed  # resumes at the chunk boundary before the rewrite, not at the end and not at zero
+    assert committed[-1][0] == 5100, committed  # a tool row before any cut can depend on a rewritten result line
     assert current(path, data) and any(m[2] == "rewritten 3001" for m in archive(data)[0])
 
 def test_unchanged_prefix_is_never_reparsed_into_the_archive_twice(session):
     path, data, committed = session; write(path, turns(0, 3000)); assert drain(path) == 1; write(path, turns(3000, 3002), "a"); assert drain(path) == 1; write(path, turns(3002, 3004), "a"); assert drain(path) == 1
     assert [c[0] for c in committed][1:] == [committed[1][0]] * 2 and committed[1][0] < 40 and current(path, data) and len(archive(data)[0]) == 3004
+
+def rows(data):  # archive state a tail drain must share with a full ingest
+    db = duckdb.connect(str(data / "convos.db"), read_only=True)
+    try: return {k: sorted(db.execute(q).fetchall()) for k, q in (("messages", "SELECT id, role, content, parent_id FROM messages"), ("tools", "SELECT id, message_id, tool_name, status, output FROM tool_calls"), ("edits", "SELECT id, message_id, file_path, content FROM file_edits"), ("evidence", "SELECT * FROM provenance.file_edit_evidence"))}
+    finally: db.close()
+
+def replay(session, monkeypatch, snapshots):  # drain each transcript snapshot into the tail archive, then into a second archive that always ingests the full parse
+    path, data, committed = session
+    for s in snapshots: write(path, s); assert drain(path) == 1
+    use(monkeypatch, full := data.parent / "full"); monkeypatch.setattr(cli, "tail_cut", lambda r, path, tail: None)
+    for s in snapshots: write(path, s); assert drain(path) == 1
+    assert (tail := rows(data)) == rows(full)
+    return tail
+
+def call(i, parent, *tools): return event(i, "assistant", [{"type": "tool_use", "id": t, "name": "Edit" if t.startswith("e") else "Bash", "input": {"file_path": "/repo/x.py", "old_string": "a", "new_string": t} if t.startswith("e") else {"command": "ls"}} for t in tools], parent)
+def result(i, parent, tool, out="ok", error=False): return event(i, "user", [{"type": "tool_result", "tool_use_id": tool, "content": out, **({"is_error": True} if error else {})}], parent)
+
+def test_partial_tool_results_keep_the_other_call_pending(session, monkeypatch):
+    base = [event(0, "user", "go"), call(1, "u0", "t1", "e2")]
+    got = replay(session, monkeypatch, [base, base + [result(2, "u1", "t1")], base + [result(2, "u1", "t1"), result(3, "u2", "e2")]])
+    assert {("Bash", "complete"), ("Edit", "complete")} <= {t[2:4] for t in got["tools"]} and len(got["edits"]) == 1 and [v[1:3] for v in got["evidence"]] == [("confirmed", "provider_success")]
+
+def test_result_for_an_earlier_call_arriving_after_later_prompts_completes_it(session, monkeypatch):
+    base = [event(0, "user", "go"), call(1, "u0", "e1")] + turns(2, 60)
+    got = replay(session, monkeypatch, [base, base + [result(60, "u59", "e1"), *turns(61, 63)]])
+    assert ("Edit", "complete") in [t[2:4] for t in got["tools"]] and len(got["edits"]) == 1 and [v[1:3] for v in got["evidence"]] == [("confirmed", "provider_success")]
+
+def test_rewritten_result_reaches_the_tool_call_before_the_cut(session, monkeypatch):
+    got = replay(session, monkeypatch, [[call(0, None, "t1"), result(1, "u0", "t1", "old")], [call(0, None, "t1"), result(1, "u0", "t1", "new")]])
+    assert '"new"' in [t[4] for t in got["tools"]]
+
+def test_failed_edit_evidence_reaches_the_archive(session, monkeypatch):
+    base = [event(0, "user", "go"), call(1, "u0", "e1")]
+    got = replay(session, monkeypatch, [base + [result(2, "u1", "e1")], base + [result(2, "u1", "e1", "boom", True)]])
+    assert ("Edit", "failed") in [t[2:4] for t in got["tools"]] and [v[1:3] for v in got["evidence"]] == [("invalid", "provider_failure")]

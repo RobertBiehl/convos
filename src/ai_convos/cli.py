@@ -1348,14 +1348,14 @@ def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home
 def hook_result(source,path,bindings=None):
     session=(parse_claude_code_session if source=="claude-code" else parse_muse_session if source=="muse" else parse_codex_session)(path,bindings)
     return ParseResult(convs=[session["conv"]],msgs=session["msgs"],tools=session["tools"],attachs=session["attachs"],edits=session["edits"],edit_evidence=session["edit_evidence"]) if session else ParseResult()
-def tail_cut(r,path,tail):  # keep only rows after the last transcript anchor that still matches (and from tool calls awaiting a result); returns the anchors for the next drain
+def tail_cut(r,path,tail):  # keep only rows after the previous drain's end (and from tool calls awaiting a result); any changed or missing anchor means a full ingest; returns the anchors for the next drain
     if not r.msgs: return None
     at,old=(at:={m["id"]:json.loads(m["metadata"])["provider_index"] for m in r.msgs}),dict(tail["marks"]) if tail else {}
-    end,resume=max(at.values()),min([at[t["message_id"]] for t in r.tools if t["status"]=="pending" and at[t["message_id"]]>max((at[m["id"]] for m in r.msgs if m["role"]=="user"),default=-1)],default=1<<60)
+    end,resume=max(at.values()),min([at[t["message_id"]] for t in r.tools if t["status"]=="pending"],default=1<<60)
     with path.open("rb") as f: marks={i:hashlib.sha1(l).hexdigest() for i,l in enumerate(itertools.islice(f,end+1)) if i%2048==0 or i==end or i in old}
-    cut=min(max(itertools.takewhile(lambda i:marks.get(i)==old[i],sorted(old)),default=-1)+1,tail["resume"] if tail else 0)
+    cut=min(max(old)+1,tail["resume"]) if old and all(marks.get(i)==h for i,h in old.items()) else 0
     r.msgs,r.tools,r.attachs,r.edits=[[x for x in rows if at[x.get("message_id",x["id"])]>=cut] for rows in (r.msgs,r.tools,r.attachs,r.edits)]
-    r.edit_evidence=[v for v in r.edit_evidence if v["file_edit_id"] in {e["id"] for e in r.edits}]
+    r.edit_evidence=[v for v in r.edit_evidence if v["tool_call_id"] in {t["id"] for t in r.tools}]
     return dict(marks=sorted(marks.items()),resume=resume)
 def wake_hooks(attempt=None,root=None):
     with operation_lock((Path(root)/"data/hook_inbox" if root is not None else HOOK_DIR)/".drain.lock","hooks.dispatch",0,mandatory=False) as available: pass
