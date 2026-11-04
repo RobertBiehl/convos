@@ -9,6 +9,7 @@
 - `bench/hooks.py OUT_DIR [--sync] [--minutes N]` measures hook ingest on an APFS clone of the local archive: four real transcripts (2 to 350 MB) grow at their recorded rates through `capture claude-code` and the spawned drains, and the report gives p50/p95 capture-to-commit latency, drain time per event, write-lock hold, checkpoint on close and bytes parsed, each against a target. `tests/test_hook_throughput.py` counts full ingests and retry flags for repeated budget breaks, steady growth, a crash mid-commit and a sync holding the archive.
 - Import Claude Code sessions continued in Claude Desktop, which re-appends events under their `uuid` (and writes a second file copying the first): a repeated `uuid` is one message, taken from its first line. Fresh imports no longer stop at `divergent provider session in import batch`; schema 17 merges the per-line rows older parsers stored for it instead of raising `Provider identity collision in messages` (#173).
 - Schema 18 also imports the turns a partially imported session lacks, so a request blob's call can move to its real turn instead of raising `parse result reference unavailable: messages:<id>`.
+- Schema 19 drops each index before rebuilding its table: on Python 3.15, where DuckDB 1.5.6 is built from source (no wheel), a dropped table kept its index, so the migration failed with `Index with name "edit_dependency_key" already exists` and the archive stayed at schema 18. Found by Michael Leigsnering.
 
 ## 0.11.6b33
 
