@@ -445,7 +445,10 @@ the referenced edit/turn/file arrives, capped at 500 affected facts per receive
 page. Larger backlogs remain retained and can be replayed by explicit repull.
 A verified causal successor can update the
 association; independent conflicting facts remain retained. Authorization and
-signature failures still fail closed.
+signature failures still fail closed. A retry of this account's retained
+revisions reports an archive change only for rows whose stored content or edit
+metadata actually changed, so retained fork bodies, which never retire, do not
+keep an otherwise idle sync running.
 
 Unchanged blocked aliases do not by themselves force an archive-wide sync.
 `doctor` continues reporting them; relevant changes or explicit repair retry them.
