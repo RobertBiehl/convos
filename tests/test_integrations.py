@@ -722,6 +722,18 @@ class TestCookieExtraction:
         assert {k: v[0] for k, v in cookies.get_cookies("perplexity.ai", "firefox").items()} == {"a": "2", "b": "3", "c": "3"} and reused == [True]
         writer.close()
 
+    def test_a_firefox_db_symlinked_alone_keeps_its_wal(self, tmp_path, monkeypatch):
+        """Only cookies.sqlite is symlinked elsewhere: its WAL lies next to the target, so that WAL is copied with it and tells when the profile was written last."""
+        import os
+        root = tmp_path / ".mozilla/firefox"; other = self.firefox_store(root / "a.default", [("session", "other", ".perplexity.ai", "", 1)], (5, 5))
+        writer = self.firefox_store(tmp_path / "elsewhere", [("session", "old", ".perplexity.ai", "", 1)])
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)"); writer.execute("PRAGMA locking_mode=EXCLUSIVE"); writer.execute("UPDATE moz_cookies SET value='fresh'"); writer.commit()
+        (root / "b.default").mkdir(); (root / "b.default/cookies.sqlite").symlink_to(tmp_path / "elsewhere/cookies.sqlite")
+        [os.utime(tmp_path / "elsewhere" / name, (t, t)) for name, t in (("cookies.sqlite", 1), ("cookies.sqlite-wal", 9))]
+        cookies, _ = self.linux(monkeypatch, tmp_path)
+        assert cookies.get_cookies("perplexity.ai", "firefox", "b.default") == {"session": "fresh"} and cookies.get_cookies("perplexity.ai", "firefox") == {"session": "fresh"}
+        other.close(); writer.close()
+
     @pytest.mark.parametrize("xdg", [True, False])
     def test_firefox_xdg_profiles_are_found(self, tmp_path, monkeypatch, xdg):
         """Firefox 147+ keeps new profiles under $XDG_CONFIG_HOME/mozilla/firefox (default ~/.config)."""

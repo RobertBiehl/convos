@@ -68,20 +68,21 @@ def _firefox_profiles():  # (cookies.sqlite, is a profile Firefox starts with) f
         (ini:=configparser.RawConfigParser(strict=False)).read(base/"profiles.ini")
         default={base/s["Default"] for n,s in ini.items() if n.startswith("Install") and "Default" in s} or {base/s["Path"] for n,s in ini.items() if n.startswith("Profile") and s.get("Default")=="1"}
         yield from ((path,path.parent in default) for path in dict.fromkeys([*(base/s["Path"]/"cookies.sqlite" for n,s in ini.items() if n.startswith("Profile") and "Path" in s),*base.glob("*/cookies.sqlite"),*base.glob("Profiles/*/cookies.sqlite")]) if path.exists())
-def _firefox_path(profile=None): return (lambda want:max(((path,default) for path,default in _firefox_profiles() if not want or path.parent.name==want),key=lambda c:(c[1],max(f.stat().st_mtime for f in (c[0],c[0].with_name(f"{c[0].name}-wal")) if f.exists())),default=(None,))[0])(profile or os.environ.get("CONVOS_FIREFOX_PROFILE"))  # a named profile, else profiles.ini's default, else the one whose db or WAL was written last
+def _firefox_path(profile=None): return (lambda want:max(((path,default) for path,default in _firefox_profiles() if not want or path.parent.name==want),key=lambda c:(c[1],max(f.stat().st_mtime for f in _db_wal(c[0].resolve()) if f.exists())),default=(None,))[0])(profile or os.environ.get("CONVOS_FIREFOX_PROFILE"))  # a named profile, else profiles.ini's default, else the one whose db or WAL was written last
 def _backup(source,db):  # Python's backup would retry a lock that Firefox never releases, forever
     with contextlib.closing(sqlite3.connect(source,uri=True,timeout=0)) as src: src.backup(db,progress=lambda status,*_:status in (sqlite3.SQLITE_BUSY,sqlite3.SQLITE_LOCKED) and (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")))
-def _stamp(path): return [(f.stat().st_mtime_ns,f.stat().st_size,f.read_bytes()[:32]) if f.exists() else None for f in (path,path.with_name(f"{path.name}-wal"))]  # the WAL header holds its salts and checkpoint sequence
+def _db_wal(path): return path,path.with_name(f"{path.name}-wal")
+def _stamp(path): return [(f.stat().st_mtime_ns,f.stat().st_size,f.read_bytes()[:32]) if f.exists() else None for f in _db_wal(path)]  # the WAL header holds its salts and checkpoint sequence
 def _snapshot(path,db):  # SQLite's online backup is consistent; while Firefox holds the file exclusively, back up a copy of db and WAL during which neither changed
     with contextlib.suppress(sqlite3.OperationalError): return _backup(f"{path.as_uri()}?mode=ro",db)
     for _ in range(3):
         with tempfile.TemporaryDirectory() as tmp,contextlib.suppress(FileNotFoundError):  # the WAL can vanish in a checkpoint between exists() and the copy
-            stamp,_=_stamp(path),[shutil.copy2(src,Path(tmp)/src.name) for src in (path,path.with_name(f"{path.name}-wal")) if src.exists()]
+            stamp,_=_stamp(path),[shutil.copy2(src,Path(tmp)/src.name) for src in _db_wal(path) if src.exists()]
             if stamp==_stamp(path): return _backup((Path(tmp)/path.name).as_uri(),db)
     raise ValueError("Firefox cookies kept changing while being copied; retry")
 def _firefox_rows(sql, args=(), profile=None):
     if not (path:=_firefox_path(profile)): return []
-    with contextlib.closing(sqlite3.connect(":memory:")) as db: return (_snapshot(path,db),db.execute(sql,args).fetchall())[1]
+    with contextlib.closing(sqlite3.connect(":memory:")) as db: return (_snapshot(path.resolve(),db),db.execute(sql,args).fetchall())[1]  # a db symlinked alone keeps its WAL next to the target
 def read_firefox_cookies(domain: str, profile: str | None = None) -> dict[str, str]: return {name:value for name,value,host in _firefox_rows("SELECT name,value,host FROM moz_cookies WHERE originAttributes='' ORDER BY lastAccessed",(),profile) if host_match(host,domain)}  # the default container only
 def firefox_cookie_domains(profile: str | None = None): return {host for host, in _firefox_rows("SELECT DISTINCT host FROM moz_cookies WHERE originAttributes=''",(),profile)}
 
