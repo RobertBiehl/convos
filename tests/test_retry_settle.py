@@ -1,7 +1,8 @@
 """The own-row retry must let a sync settle: retained fork bodies never retire, so re-applying them each pass advanced the archive generation and kept the watcher running full passes."""
-import duckdb
+import json, duckdb, pytest
+from ai_convos import cli as core
 from ai_convos_remote.projection import apply_row_replicas, retry_own_replicas
-from ai_convos_remote.protocol import row_proof
+from ai_convos_remote.protocol import digest, row_proof
 from tests.test_source_device_cutover import signed_graph
 
 
@@ -18,11 +19,6 @@ def test_retry_does_not_rewrite_an_applied_sibling_fork(tmp_path):
     assert before[1:]==(2,'done')  # both fork tips stay retained
     for _ in range(2): retry_own_replicas(path,user,peer['id'])
     assert state()==before  # b32: generation +1 per pass, so the next sync was never settled
-
-
-
-import json, pytest
-from ai_convos_remote.protocol import digest
 
 @pytest.mark.parametrize('base',['A','B'])
 def test_retry_advances_a_stale_native_base_to_the_retained_head(tmp_path,base):
@@ -42,3 +38,20 @@ def test_retry_advances_a_stale_native_base_to_the_retained_head(tmp_path,base):
     with duckdb.connect(str(path),read_only=True) as db:
         assert db.execute("SELECT revision FROM remote.local_row_bases WHERE kind='messages' AND entity='m'").fetchone()[0]==c['proof']['revision']
         assert db.execute("SELECT count(*) FROM remote.row_conflicts WHERE proof_id=?",[digest(c['proof'])]).fetchone()[0]==1
+
+
+def test_quiet_retry_reports_a_repaired_attachment_body_once(tmp_path):
+    # The attachment row is unchanged; only its body association differs, which scans read as the attachment's body_hash.
+    user,device,peer,control,bodies=signed_graph()
+    attachment=core.logical_row('attachments',[*core.ARCHIVE_COLUMNS['attachments'],'body_hash'],['a','m','a.txt',None,3,None,None,None,'h'])
+    signed=[*bodies,dict(row=attachment,proof=row_proof(device,user,'w',1,attachment))]
+    path=tmp_path/'peer.db'
+    apply_row_replicas(path,signed,'w',[control],local_user=user,local_device=peer['id'])
+    with duckdb.connect(str(path)) as db: (db.execute("INSERT OR IGNORE INTO remote.row_conflicts VALUES (?,?)",[digest(signed[-1]['proof']),json.dumps(attachment,sort_keys=True,separators=(',',':'))]),db.execute("UPDATE attachment_bodies SET content_hash='stale'"))
+    retry=lambda:apply_row_replicas(path,[],None,[],local_user=user,local_device=peer['id'],ready=False,retry=[(digest(signed[-1]['proof']),'')])
+    state=lambda:duckdb.connect(str(path),read_only=True).execute('SELECT generation,(SELECT content_hash FROM attachment_bodies) FROM archive_state').fetchone()
+    start=state()[0]
+    retry()
+    assert state()==(start+1,'h')  # c2c52c4: repaired silently, generation unchanged
+    retry()
+    assert state()==(start+1,'h')
