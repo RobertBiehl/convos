@@ -254,7 +254,9 @@ refuses up front, unchanged, when there is less. A kill before the swap leaves t
 archive and a partial `<database>.v20` that the next attempt deletes; a kill between the link
 and the swap leaves the archive with two names, and the next open removes the backup name.
 An archive migrated from schema 18 or older already has its earlier backup, so the old file
-is dropped. See `database-connections.md` for why every connection sets the row group size.
+is dropped. Only an archive attached through `_open_db` is rewritten; on any other connection
+(in-memory, or a plain `duckdb.connect` in tests) schema 20 only records the version, since
+such a connection would merge the small row groups back anyway. See `database-connections.md` for why every connection sets the row group size.
 
 ## Full-Text Search
 
