@@ -133,6 +133,7 @@ Result of tool execution:
 - Assistant messages from `assistant` events
 - `thinking` column populated from thinking blocks
 - Legacy `human` roles normalize to `user`
+- A `uuid` repeated in one transcript (a session continued in Claude Desktop re-appends events with the same `message` and other metadata) is one message, taken from its first line
 - Assistant `model` retains the exact provider model
 
 ### Tool Calls
