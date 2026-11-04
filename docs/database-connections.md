@@ -75,7 +75,9 @@ the queue remains the durable input record.
    group of every table appended to, so with DuckDB's default of 122,880 rows one hook drain
    rewrote ~240 MB of `tool_calls`. DuckDB does not store the size in the file: a connection
    without it merges small row groups back to 122,880 rows at its next write checkpoint, so
-   every write path must open through `_open_db`. Schema 20 keeps builds without it out.
+   every write path must open through `_open_db`. Schema 20 keeps builds without it out; its
+   rewrite needs the archive attached as `convos`, detaches it and attaches the new file in
+   the same connection.
    Within one process the archive can be open in only one connection at a time, and a
    `cursor()` of it starts in the in-memory catalog until it runs `USE convos`.
 
