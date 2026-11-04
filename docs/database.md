@@ -250,7 +250,9 @@ the rows DuckDB still kept for deleted and replaced versions. DuckDB never shrin
 the copy goes to `<database>.v20` beside the archive and replaces it; the old file is not
 copied but kept as `<database>.pre-v20.bak` (a hard link made just before the swap, with the
 usual attachment bundle). The migration needs free space for the new file only, counted as
-1.5x the archive's used blocks (4,096-row groups of incompressible text take up to 1.2x), and
+1.25x the archive's used blocks (4,096-row groups of incompressible text took up to 1.22x;
+the rows of deleted versions still count as used, so on a real archive this is about its
+file size), and
 refuses up front, unchanged, when there is less; a failed copy deletes its partial file. A
 kill before the swap leaves the schema-19
 archive and a partial `<database>.v20` that the next attempt deletes; a kill between the link
