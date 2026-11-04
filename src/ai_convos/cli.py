@@ -1383,7 +1383,7 @@ def drain_hooks(embed=False, local_only=False,block=False,provenance=False):
         with operation_lock(HOOK_DIR/".lock","hooks.queue"):
             state,tails,previous=json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {},json.loads(HOOK_TAIL.read_text()) if HOOK_TAIL.exists() else {},json.loads(HOOK_PROGRESS.read_text()) if HOOK_PROGRESS.exists() else {}
             attempted=previous.get("failed_claims",{}) if previous.get("attempt")==attempt else {}
-            [(done.append((work,work.stem,event["snap"],set(event["changed"]))),tails.__setitem__(work.stem,event.get("tail"))) if "changed" in event else retry_hook(work,True) for work in HOOK_DIR.glob("*.work") for event in [json.loads(work.read_text())]]
+            [(done.append((work,work.stem,event["snap"],set(event["changed"]))),tails.__setitem__(work.stem,event.get("tail"))) if "changed" in event else (tails.pop(work.stem,None),atomic_json(HOOK_TAIL,tails),retry_hook(work,True)) for work in HOOK_DIR.glob("*.work") for event in [json.loads(work.read_text())]]
             queued,(claims)=(queued:={p:_hook_stamp(p) for p in HOOK_DIR.glob("*.json")}),([(work,queued[queue]) for queue in [p for p in sorted(queued,key=lambda p:(queued[p][0],p.name)) if attempted.get(p.stem)!=queued[p]][:HOOK_DRAIN_EVENTS] for work in [queue.with_suffix(".work")] if not work.exists() and os.replace(queue,work) is None])
         bindings=None
         for n,(work,stamp) in enumerate(claims):
