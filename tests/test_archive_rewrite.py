@@ -35,6 +35,12 @@ def test_v20_refuses_up_front_when_free_space_is_short(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match=r"needs [\d.]+ GB free .* 0\.0 GB available"): migrate(path)
     assert (path.stat().st_size, state(path)) == before and sorted(p.name for p in tmp_path.iterdir()) == ["convos.db"]
 
+def test_v20_failed_copy_leaves_no_partial_file(tmp_path, monkeypatch):  # e.g. the disk filled up anyway
+    v19(path := tmp_path / "convos.db"); kept, attach = state(path), cli._attach
+    monkeypatch.setattr(cli, "_attach", lambda db, p, name="convos", read_only=False: (attach(db, p, name, read_only), (_ for _ in ()).throw(duckdb.IOException("No space left on device")) if name == "core_rewrite" else None)[0])
+    with pytest.raises(duckdb.IOException): migrate(path)
+    monkeypatch.setattr(cli, "_attach", attach); assert state(path) == kept and sorted(p.name for p in tmp_path.iterdir()) == ["convos.db", "convos.db.pre-v20.bak.attachments"]
+
 def test_v20_killed_while_writing_the_new_file_keeps_the_v19_archive(tmp_path):
     v19(path := tmp_path / "convos.db"); kept = state(path)
     child = subprocess.Popen([sys.executable, "-c", "import sys; from ai_convos import cli; cli.init_schema(cli.open_db(sys.argv[1],purpose='test.rewrite'))", str(path)])

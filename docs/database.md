@@ -249,8 +249,10 @@ Schema 20 copies the whole archive once into a new file with row groups of 4,096
 the rows DuckDB still kept for deleted and replaced versions. DuckDB never shrinks a file, so
 the copy goes to `<database>.v20` beside the archive and replaces it; the old file is not
 copied but kept as `<database>.pre-v20.bak` (a hard link made just before the swap, with the
-usual attachment bundle). The migration needs free space for one archive-sized file and
-refuses up front, unchanged, when there is less. A kill before the swap leaves the schema-19
+usual attachment bundle). The migration needs free space for the new file only, counted as
+1.5x the archive's used blocks (4,096-row groups of incompressible text take up to 1.2x), and
+refuses up front, unchanged, when there is less; a failed copy deletes its partial file. A
+kill before the swap leaves the schema-19
 archive and a partial `<database>.v20` that the next attempt deletes; a kill between the link
 and the swap leaves the archive with two names, and the next open removes the backup name.
 An archive migrated from schema 18 or older already has its earlier backup, so the old file
