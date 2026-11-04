@@ -20,7 +20,8 @@ def isolated_product_state(tmp_path,monkeypatch):
     [monkeypatch.setenv(name,str(path)) for name,path in _paths(root).items()]
     monkeypatch.setenv("CONVOS_TEST_ROOT",str(root))
     [monkeypatch.delenv(name,raising=False) for name in ("CONVOS_IMPORT_PATHS","CONVOS_CODEX_MEMORY_ROOT","CONVOS_CLAUDE_PROJECTS_ROOT","CONVOS_MEMORY_DB")]
-    from ai_convos import cli
+    from ai_convos import cli, cookies
+    monkeypatch.setattr(cookies,"PLATFORM","sandbox")  # no Chrome/Firefox roots or keyring: doctor and sync never read this machine's browsers; cookie tests pick a platform
     data=root/"archive/data"
     for name,path in (("PROJECT_ROOT",root/"archive"),("DATA_DIR",data),("DB_PATH",data/"convos.db"),("STATE_PATH",data/"sync_state.json"),("HOOK_DIR",data/"hook_inbox"),("HOOK_STATE",data/"hook_state.json"),("HOOK_PROGRESS",data/"hook_progress.json"),("HOOK_EMBED_DIRTY",data/"hook_embeddings_dirty"),("HOOK_FTS_DIRTY",data/"hook_fts_dirty")): monkeypatch.setattr(cli,name,path)
     assert all(path.is_relative_to(root) for path in (cli.PROJECT_ROOT,cli.DATA_DIR,cli.DB_PATH,cli.STATE_PATH,cli.HOOK_DIR,cli.HOOK_STATE,cli.HOOK_PROGRESS,cli.HOOK_EMBED_DIRTY,cli.HOOK_FTS_DIRTY))
