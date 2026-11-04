@@ -797,16 +797,17 @@ class TestHTTPErrors:
         assert error.value.code == 403
 
     def test_browser_requests_keep_the_system_proxy(self, monkeypatch):
-        """urllib reads macOS's system proxy settings; curl-cffi only reads the environment, so the system's proxies are passed on, and the environment's left to curl."""
+        """urllib reads macOS's system proxy settings and bypass list; curl-cffi only reads the environment, so the system's proxies are passed on unless the host is bypassed, and the environment's left to curl."""
         from ai_convos import cli
         import curl_cffi.requests
         sent = []
         monkeypatch.setattr(curl_cffi.requests, "request", lambda method, url, **k: sent.append(k.get("proxies")) or MagicMock(status_code=200, json=lambda: {}))
         monkeypatch.setattr(cli.urllib.request, "getproxies_environment", lambda: {}); monkeypatch.setattr(cli.urllib.request, "getproxies", lambda: {"https": "http://proxy.corp:3128"})
-        cli.fetch_json("https://claude.ai/api", {}, browser="chrome")
+        monkeypatch.setattr(cli.urllib.request, "proxy_bypass", lambda host: host == "www.perplexity.ai")
+        cli.fetch_json("https://claude.ai/api", {}, browser="chrome"); cli.fetch_json("https://www.perplexity.ai/x", {}, browser="chrome")
         monkeypatch.setattr(cli.urllib.request, "getproxies_environment", lambda: {"https": "http://env:8080"})
         cli.fetch_json("https://claude.ai/api", {}, browser="chrome")
-        assert sent == [{"https": "http://proxy.corp:3128"}, None]
+        assert sent == [{"https": "http://proxy.corp:3128"}, None, None]
 
     @pytest.mark.parametrize("headers,delay", [({},300),({"Retry-After":"420"},420)])
     def test_429_uses_visible_long_backoff(self, headers, delay):

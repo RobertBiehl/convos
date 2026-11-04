@@ -82,7 +82,8 @@ browser the cookies came from (TLS fingerprint and User-Agent), on every OS.
   decrypted); the switch to curl-cffi there is not yet verified by a live
   `convos sync` with Safari and Chrome (maintainer run before merge).
 - curl-cffi reads proxies only from the environment; when it sets none, convos
-  passes the proxies urllib would use (macOS system settings).
+  passes the proxies urllib would use (macOS system settings), unless
+  `urllib.request.proxy_bypass` exempts the request's host.
 
 ## Implications
 

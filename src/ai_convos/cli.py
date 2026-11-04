@@ -986,7 +986,7 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
             if not browser:
                 with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=timeout) as resp: return json.loads(resp.read())
             from curl_cffi import requests as curl  # the cookies' browser's TLS fingerprint and User-Agent: Cloudflare challenges Python's own; curl reads proxies from the environment only, urllib also macOS's settings
-            if (resp:=curl.request(req.get_method(),url,headers={k:v for k,v in hdrs.items() if k!="User-Agent"},data=req.data,impersonate=browser,timeout=timeout,proxies=None if urllib.request.getproxies_environment() else urllib.request.getproxies() or None)).status_code>=400: raise urllib.error.HTTPError(url,resp.status_code,resp.reason,resp.headers,None)
+            if (resp:=curl.request(req.get_method(),url,headers={k:v for k,v in hdrs.items() if k!="User-Agent"},data=req.data,impersonate=browser,timeout=timeout,proxies=None if urllib.request.getproxies_environment() or urllib.request.proxy_bypass(urllib.parse.urlsplit(url).hostname) else urllib.request.getproxies() or None)).status_code>=400: raise urllib.error.HTTPError(url,resp.status_code,resp.reason,resp.headers,None)
             return resp.json()
         except Exception as e:
             if i == retries: raise
