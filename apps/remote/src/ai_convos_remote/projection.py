@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, OPEN_INGEST_STALE, PROVENANCE_KINDS as PROVENANCE, _archive_touch, _insert_pages, _migration_backup, _transaction, archive_relationships, archive_waiting, archive_yield, edit_parents, claim_row_owners, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, migration_memory, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, ARCHIVE_FKS as FKS, OPEN_INGEST_STALE, PROVENANCE_KINDS as PROVENANCE, _archive_touch, _insert_pages, _migration_backup, _transaction, archive_relationships, attachment_index, archive_waiting, archive_yield, edit_parents, claim_row_owners, captured_edit_paths, gen_id, index_attachment_body, init_schema, matching_logical_row, migration_memory, open_db, operation_lock, preserve_fact_heads, project_attested_rows, project_edit_dependencies, project_logical_rows, project_provenance, project_provider_bindings, project_row_proofs, project_workspace_controls, provider_session_key, provenance_records, record_local_row_bases, required, retire_row_bodies, set_attachment_path, typed_logical_rows, wake_hooks
 from .control import verify_state
 from .migrations import migrate_state
 from .protocol import _seal, canon, digest, fingerprint, logical_fact, logical_row, replica_compression, row_proof, row_signing_key, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
@@ -619,22 +619,16 @@ def converge_own_rows(db_path,state,local_user,local_device,progress=lambda stag
             with contextlib.closing(open_db(db_path,purpose='remote.rows.converge.mark')) as db,_transaction(db): _archive_touch(db,torn)
         after=rows[-1][0] if len(rows)==page else 'done'
         (state.execute("INSERT OR REPLACE INTO meta VALUES ('retained_rows_checked',?)",(after,)),state.commit(),progress(f"checking retained rows {len(rows)}"),archive_yield(db_path))
-def retry_own_replicas(db_path,local_user,local_device=None,progress=lambda stage:None):
-    # A head whose base is a sibling leaf with the same content is applied already; that fork's bodies never retire.
-    after=''
-    while True:
-        with contextlib.closing(open_db(db_path,True,purpose='remote.rows.retry-own')) as db:
-            rows=db.execute("SELECT p.id,'' FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id LEFT JOIN remote.local_row_bases b ON (b.kind,b.entity,b.author)=(p.row_kind,p.source_row_id,p.author_user_id) WHERE p.author_user_id=? AND p.state='active' AND p.id>? AND b.revision IS DISTINCT FROM p.revision AND NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs q WHERE (q.row_kind,q.source_row_id,q.author_user_id,q.revision,q.content_hash)=(p.row_kind,p.source_row_id,p.author_user_id,b.revision,p.content_hash) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(q.row_kind,q.source_row_id,q.author_user_id,q.revision))) ORDER BY p.id LIMIT 500",[local_user,after]).fetchall()
-        if not rows: return
-        apply_row_replicas(db_path,[],None,[],local_user=local_user,local_device=local_device,ready=False,retry=rows)
-        after=rows[-1][0]
-        progress('retrying retained own updates')
-        archive_yield(db_path)
+def retry_own_replicas(db_path,state,local_user,local_device=None,progress=lambda stage:None):
+    # A head whose base is a sibling leaf with the same content is applied already; that fork's bodies never retire. A row whose inputs (local base, its scope's proofs, local changes to its entity) are as at its last retry keeps its outcome, so it waits for them to change.
+    with contextlib.closing(open_db(db_path,True,purpose='remote.rows.retry-own')) as db: rows=db.execute("WITH r AS MATERIALIZED (SELECT p.*,b.revision base FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id LEFT JOIN remote.local_row_bases b ON (b.kind,b.entity,b.author)=(p.row_kind,p.source_row_id,p.author_user_id) WHERE p.author_user_id=? AND p.state='active' AND b.revision IS DISTINCT FROM p.revision AND NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(p.row_kind,p.source_row_id,p.author_user_id,p.revision)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs q WHERE (q.row_kind,q.source_row_id,q.author_user_id,q.revision,q.content_hash)=(p.row_kind,p.source_row_id,p.author_user_id,b.revision,p.content_hash) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs n WHERE (n.row_kind,n.source_row_id,n.author_user_id,n.previous_revision)=(q.row_kind,q.source_row_id,q.author_user_id,q.revision)))) SELECT r.id,md5(concat_ws('|',(SELECT archive_id FROM archive_state),r.base,(SELECT count(*) FROM remote.row_proofs s WHERE (s.row_kind,s.source_row_id,s.author_user_id)=(r.row_kind,r.source_row_id,r.author_user_id)),(SELECT max(a.generation) FROM archive_changes a WHERE a.entity=r.source_row_id))) FROM r ORDER BY r.id",[local_user]).fetchall()
+    settled=json.loads((state.execute("SELECT value FROM meta WHERE key='retry_settled'").fetchone() or ['{}'])[0])
+    for at in range(0,len(todo:=[(pid,'') for pid,inputs in rows if settled.get(pid)!=inputs]),500): (apply_row_replicas(db_path,[],None,[],local_user=local_user,local_device=local_device,ready=False,retry=todo[at:at+500]),progress('retrying retained own updates'),archive_yield(db_path))
+    (state.execute("INSERT OR REPLACE INTO meta VALUES ('retry_settled',?)",(json.dumps(dict(rows)),)),state.commit())
 def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None,root=None,ready=True,local_device=None,retry=False):
     if not bodies and not retry: return []
     if len(bodies)>500: return [value for at in range(0,len(bodies),500) for value in apply_row_replicas(db_path,bodies[at:at+500],workspace,controls,recover,local_user,db,root,ready,local_device)]
     values=[verified_replica(body,workspace,controls,local_user) for body in bodies]
-    from ai_convos.cli import attachment_index
     attachment_paths={key:path for key in {(r['data']['body_hash'],r['data']['size']) for r,p,*_ in values if r['kind']=='attachments' and r['state']=='active' and r['data']['body_hash']} for path in [Path(db_path).parent/'attachments'/key[0]] if attachment_index(path,key[1])==key}
     if ready and Path(db_path).is_file() and any(value[1]["kind"]=="semantic.proof" for value in values):
         with contextlib.closing(open_db(db_path,purpose="schema.remote.rows")) as schema: ready=(init_schema(schema),False)[-1]

@@ -111,9 +111,9 @@ def test_duplicate_classified_claims_bind_to_one_parent_and_converge(tmp_path):
     with duckdb.connect(str(path), read_only=True) as db: assert db.execute("SELECT id FROM tool_calls ORDER BY id").fetchall() == [('t',), ('t2',)]
     assert retained(path, winner) == 0 and retained(path, loser) == 1  # the losing parent still lists the edit: retained as a variant
     assert audit_rows(path, local_user=user)['tables']['tool_calls'] | dict(projection_mismatch=1, retained_variants=1, unavailable=0) == audit_rows(path, local_user=user)['tables']['tool_calls']
-    retry_own_replicas(path, user, peer['id'])  # the author's own retained variant re-applies alone: a same-author move (R1), then nothing is left to retry
+    retry_own_replicas(path, projection.connect(tmp_path / 'state.db'), user, peer['id'])  # the author's own retained variant re-applies alone: a same-author move (R1), then nothing is left to retry
     assert edits(path) == [('e', 'confirmed', loser, 'tool_calls', loser)] and retained(path, loser) == 0 and not parked(path)
-    retry_own_replicas(path, user, peer['id'])
+    retry_own_replicas(path, projection.connect(tmp_path / 'state.db'), user, peer['id'])
     assert apply([*bodies, second]) == [False, False, False, False]  # re-receiving the batch keeps the current holder
     assert edits(path) == [('e', 'confirmed', loser, 'tool_calls', loser)] and not parked(path)
 
@@ -131,7 +131,7 @@ def test_received_parent_naming_a_native_edit_parks_with_an_ownership_reason(tmp
         assert not db.execute("SELECT id FROM tool_calls").fetchall() and db.execute("SELECT content FROM file_edits").fetchall() == [('mine',)]
         assert db.execute("SELECT count(*) FROM remote.row_proofs WHERE source_row_id='t'").fetchone() == (0,)  # 3c162af: proof stored, body retained in row_conflicts, which a rolled-back b25 retries and fails on
     assert retained(path, 't') == 0
-    retry_own_replicas(path, user, peer['id'])
+    retry_own_replicas(path, projection.connect(tmp_path / 'state.db'), user, peer['id'])
     assert parked(path) == [('tool_calls', 't', 'Derived edit ownership conflict')] and edits(path) == [('e', 'confirmed', None, None, None)]
 
 

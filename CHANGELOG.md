@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `convos remote sync` no longer re-applies the same retained rows of this account on every pass (~17 s per pass on a 6.5 GB archive with 997 such rows): a retried row waits until its local base, its row's proofs or the local row change.
+
 ## 0.11.6b34
 
 - Claude Code hook drains read only the bytes appended since the last drain (byte offset kept in the tail record; any doubt about the skipped part means a full parse) and look up session bindings for the session's own conversation only: a normal turn's drain went from 25.6 s on b33 to 0.97 s at load ~90 on 10 cores, parsing 0.02 MB instead of 42.8 MB per turn.
