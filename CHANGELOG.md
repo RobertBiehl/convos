@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.6b36
+
+- Two devices of one account no longer re-sign each other's `file.version` and `git.checkpoint` facts on every pass when each recorded a different `observed_at`: within one account the earliest observation wins, so both devices settle after one exchange (on a real archive 56 facts per pass, ~9 s of each pass's relay pull) (#184).
+- A settled `convos remote sync` skips the retained-row retry query until one of its inputs changes (0.54 → 0.11 s per pass on a real archive) (#182).
+- `convos remote sync --background` runs one scheduled pass like `remote watch`: no `state.db` integrity check (3.7 s on a 2 M-receipt state) and it steps aside when another sync runs; plain `remote sync`, `--repair` and `remote doctor` still check (#183).
+
 ## 0.11.6b35
 
 - `convos remote sync` no longer re-applies the same ~1,000 retained rows of this account on every pass (~17 s per pass on a real archive): a retried row waits until its local base, its proofs or the row itself change (#178).
