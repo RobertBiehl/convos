@@ -49,7 +49,7 @@ _DUCKDB_PID=re.compile(r"(?:\(PID |PID )(\d+)\)?")
 def _duckdb_owner(path,error):
     text,pid,root=str(error),(int(found.group(1)) if (found:=_DUCKDB_PID.search(str(error))) else None),path.parent.parent if path.parent.name=="data" else path.parent
     return (lambda base:max([value for directory in (path.parent,path.parent/"hook_inbox",root/"remote") if directory.is_dir() for item in directory.glob("*.lock") if item!=path.with_name(f".{path.name}.lock") and (value:=_lock_read(item)) and value.get("pid")==pid and value.get("stage")!="finished"],key=lambda value:value.get("heartbeat_at",0),default=base))(dict(pid=pid,process=(Path(found.group(1)).name if (found:=re.search(r"held in (.+?) \(PID",text)) else "unknown"),os_user=(found.group(1) if (found:=re.search(r"by user ([^.\n]+)",text)) else "unknown"),host=os.uname().nodename,purpose="external DuckDB access",stage="unknown"))
-def _waiter(path): return (lambda directory,lock:(os.chmod(directory,0o700),os.chmod(lock.name,0o600),fcntl.flock(lock,fcntl.LOCK_EX),lock)[-1])((directory:=path.with_name(f".{path.name}.waiters")),(directory.mkdir(exist_ok=True) or directory/f"{os.uname().nodename}.{os.getpid()}.{time.time_ns()}.lock").open("a+"))
+def _waiter(path): return (directory:=path.with_name(f".{path.name}.waiters")).mkdir(exist_ok=True) or os.chmod(directory,0o700) or open(directory/f"{os.uname().nodename}.{os.getpid()}.{time.time_ns()}.lock","a+",opener=lambda name,flags:(fd:=os.open(staged:=f"{name}.new",flags,0o600),fcntl.flock(fd,fcntl.LOCK_EX),os.rename(staged,name),fd)[-1])  # *.lock appears only once flocked
 def _waiter_close(lock): return (Path(lock.name).unlink(missing_ok=True),lock.close())[-1] if lock else None
 def _waiting(marker):
     lock=marker.open("a+")
