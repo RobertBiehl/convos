@@ -41,6 +41,25 @@ def test_retry_waits_for_a_changed_input(tmp_path,monkeypatch,change,again):
     assert retry()==again  # b34: both settled tips re-applied on every pass, ~17 s on a real archive
     assert retry()==0
 
+@pytest.mark.parametrize('change,query',[(None,0),('unrelated',0),('entity',1),('base',1),('proof',1),('state',1),('conflict',1)])
+def test_settled_retry_skips_its_query_until_an_input_changes(tmp_path,monkeypatch,change,query):
+    path,user,device,peer,control,changed=forked(tmp_path)
+    state,real_open,ran=connect(tmp_path/'state.db'),projection.open_db,[]
+    class Spy:
+        def __init__(self,db): self.db=db
+        def execute(self,sql,*a): return (ran.append(sql) if sql.startswith('WITH r AS') else None,self.db.execute(sql,*a))[1]
+        def __getattr__(self,name): return getattr(self.db,name)
+    monkeypatch.setattr(projection,'open_db',lambda *a,**k:Spy(real_open(*a,**k)))
+    retry=lambda:(ran.clear(),retry_own_replicas(path,state,user,peer['id']),len(ran))[-1]
+    assert [retry(),retry(),retry()]==[1,1,0]  # applies, finds nothing left, then skips the ~1.4 s query of a real archive
+    with duckdb.connect(str(path)) as db:
+        if change in ('unrelated','entity'): core._archive_touch(db,[('messages','other' if change=='unrelated' else 'm')])  # hook ingests touch unrelated rows every turn
+        if change=='base': db.execute("INSERT INTO remote.local_row_bases VALUES ('messages','m',?,'local')",[user])
+        if change=='state': db.execute("UPDATE remote.row_proofs SET state='retired' WHERE id=(SELECT min(proof_id) FROM remote.row_conflicts)")
+        if change=='conflict': db.execute("DELETE FROM remote.row_conflicts WHERE proof_id=(SELECT min(proof_id) FROM remote.row_conflicts)")
+    if change=='proof': projection.apply_row_replicas(path,[dict(proof=row_proof(device,user,'w',1,third:={**changed,'data':{**changed['data'],'content':'third'}}),row=third)],'w',[control],local_user=user,local_device=peer['id'])
+    assert retry()==query
+
 @pytest.mark.parametrize('base',['A','B'])
 def test_retry_advances_a_stale_native_base_to_the_retained_head(tmp_path,base):
     # A(done) -> B(changed) -> C(done); the archive already holds C. Base A: C has the base's content but is its successor. Base B: the archive matches C, but the base must still advance before C's body may retire.
