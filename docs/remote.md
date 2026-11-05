@@ -368,6 +368,7 @@ convos remote repull --from-backup /absolute/path/convos.db.pre-remote-repull.ba
 convos remote fetch                 # materialize deferred large events
 convos remote sync                  # run one foreground incremental sync
 convos remote sync --repair         # verify and restore the full retained replica set
+convos remote sync --background     # scheduled pass: like remote watch, skips while another sync runs
 ```
 
 After one full successful cycle, an unchanged client completes ordinary sync with

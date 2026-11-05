@@ -1436,8 +1436,11 @@ def compact_cmd(space:Optional[str]=typer.Argument(None),restart:bool=False):
     except (ConnectionError,ValueError,RuntimeError) as error: cli_error(error)
     typer.echo(json.dumps(results[spaces[0]] if space is not None else {"workspaces":results}))
 @remote.command("sync")
-def sync_cmd(repair:bool=False):
-    try: result=sync_once(repair=repair,manual=True)
+def sync_cmd(repair:bool=False,background:bool=False):
+    try: result=sync_once(repair=repair,manual=not background)
+    except (LockBusy,InterruptedError) as e:
+        if not background: cli_error(e)
+        return typer.echo(f"Remote sync skipped: {e}")
     except ConnectionError as e: cli_error(f"{e}. Local sync progress was preserved; retry `convos remote sync`.")
     except (ValueError,RuntimeError,duckdb.InterruptException) as e: cli_error(e)
     typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else "")+recovery_notice())
