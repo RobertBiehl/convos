@@ -89,3 +89,32 @@ def test_self_author_receive_requires_source_capture_before_ownership(tmp_path):
     exported={digest(body['proof']):body['row'] for env in row_replicas(path,cfg,'w',[],{1:bytes(32)}) for body in [open_replica(env,bytes(32))]}
     assert exported=={digest(body['proof']):body['row'] for body in bodies}
     assert audit_rows(path,local_user=users[0])['totals']['unavailable']==0
+
+
+@pytest.mark.parametrize('earlier_first',[True,False])
+def test_one_accounts_devices_converge_on_the_earliest_observation(tmp_path,earlier_first):
+    # Both devices of one account observed the same facts; keeping each its own observation re-signed them on every sync, in turn, forever.
+    root,devices=identity('root'),[identity(f'device-{i}') for i in (0,1)]
+    user=public_id(root['sign_public'])
+    control={'workspace':'w','revision':1,'epoch':1,'devices':{d['id']:{'user':user,'root_public':root['sign_public'],'device':public(d),'certificate':certificate(root,user,d),'history':True} for d in devices}}
+    path,checkout,foreign=fixture(tmp_path); paths=[path,tmp_path/'other.db']; paths[1].write_bytes(path.read_bytes())
+    [core.capture_provenance(p) for p in paths]
+    kinds=('file.version','git.checkpoint'); facts=[(r['kind'],r['id']) for r in foreign if r['kind'] in kinds]
+    def device(i): return dict(path=paths[i],state=tmp_path/f'state{i}.db',cfg={'user':user,'device':devices[i],'workspaces':{'w':{'kind':'personal','epoch':1}},'controls':{'w':control},'server_state':{'workspaces':[{'id':'w','controls':[control]}]}})
+    def observed(d):
+        with duckdb.connect(str(d['path']),read_only=True) as db: return [db.execute(f"SELECT observed_at FROM provenance.{core._FACT_TABLES[k][0]} WHERE id=?",[e]).fetchone()[0] for k,e in facts]
+    def sync(sender,receiver):
+        records=scanned(sender['path'],sender['state']); attest_rows(sender['path'],sender['cfg'],'w',records)
+        bodies=[body for env in row_replicas(sender['path'],sender['cfg'],'w',records,{1:bytes(32)}) for body in [open_replica(env,bytes(32))] if body['row']['kind'] in kinds]
+        apply_row_replicas(receiver['path'],bodies,'w',[control],local_user=user,local_device=receiver['cfg']['device']['id'])
+    def signed(d):
+        with duckdb.connect(str(d['path']),read_only=True) as db: return db.execute(f"SELECT count(*) FROM remote.row_proofs WHERE row_kind IN ('file.version','git.checkpoint')").fetchone()[0]
+    a,b=device(0),device(1); earliest=min(observed(a)[0],observed(b)[0])
+    first,second=(a,b) if earlier_first==(observed(a)[0]<observed(b)[0]) else (b,a)
+    sync(first,second); sync(second,first); sync(first,second)
+    proofs=signed(a),signed(b)
+    sync(second,first); sync(first,second)
+    assert (signed(a),signed(b))==proofs
+    assert observed(a)==observed(b) and observed(a)[0]==earliest
+    core.capture_provenance(paths[0],source='sync'); core.capture_provenance(paths[1],source='sync')
+    assert observed(a)==observed(b) and observed(a)[0]==earliest
