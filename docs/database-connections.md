@@ -28,7 +28,9 @@ Manual Remote sync and repull hold a priority lease: background syncs yield at t
 next request or phase boundary, and the manual command waits until the background process yields
 or stops reporting progress; a stalled holder is reported after five seconds of inactivity. Tests
 inventory every production `flock` call. Contention-only waiter notices also use `flock`, solely so
-a crashed waiter is distinguishable from a live one and its stale notice can be removed safely.
+a crashed waiter is distinguishable from a live one and its stale notice can be removed safely. A
+notice is created under a staging name and renamed to its `*.lock` name only once its owner holds
+the `flock`, so a scan never mistakes a notice still being created for a stale one.
 
 Hook workers retain separate completed claims and newer captures for the same transcript.
 Automatic worker handoffs share one attempt token: each unchanged failed queue entry is

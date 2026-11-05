@@ -142,6 +142,14 @@ def test_native_waiter_notice_exists_only_during_actual_contention(tmp_path):
     cli.archive_yield(path)
     assert child.wait(5)==0 and not list(directory.glob("*.lock"))
 
+def test_waiter_marker_is_visible_only_once_its_owner_holds_the_lock(tmp_path,monkeypatch):
+    path,flock,seen=tmp_path/"archive.db",cli.fcntl.flock,[]  # another process's scan runs between marker creation and the owner's flock
+    monkeypatch.setattr(cli.fcntl,"flock",lambda fd,op:(op==cli.fcntl.LOCK_EX and seen.append(cli.archive_waiting(path)),flock(fd,op))[-1])
+    lock=cli._waiter(path); monkeypatch.undo()
+    try: assert seen==[False] and cli.archive_waiting(path) and len(list(path.with_name(".archive.db.waiters").iterdir()))==1
+    finally: cli._waiter_close(lock)
+    assert not cli.archive_waiting(path) and not list(path.with_name(".archive.db.waiters").iterdir())
+
 def test_cooperative_multi_writer_pages_complete_without_starvation(tmp_path):
     path=tmp_path/"archive.db"; db=cli.open_db(path,purpose="fixture"); db.execute("CREATE TABLE turns(actor INT,page INT,PRIMARY KEY(actor,page))"); db.close(); code="""import sys
 from ai_convos.cli import archive_yield,open_db
