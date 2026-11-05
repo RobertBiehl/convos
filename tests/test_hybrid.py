@@ -1,7 +1,6 @@
 """Tests for the hybrid BM25 + vector RRF search pipeline."""
 import json
 import duckdb, pytest
-from pathlib import Path
 from typer.testing import CliRunner
 from ai_convos import cli
 
