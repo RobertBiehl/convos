@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A process waiting for the archive no longer crashes with `FileNotFoundError` (or waits unseen) when another process checks for waiters while its waiter notice is being created: the notice becomes visible only once its owner holds the lock.
 - A `convos remote sync` pass with nothing new on the relay no longer runs Git, pulls or reopens the archive needlessly: bound checkouts resolve from a `state.db` cache stamped with the files Git reads (6 Git subprocesses per checkout before), a channel whose cursor already equals the relay's advertised tail is not pulled (18 relay requests on such a pass in the test setup, now 2), and the archive is opened 7 times instead of 12. The sync lock's stage now names the step that runs after the own-row retry.
 - `convos remote sync` no longer re-applies the same retained rows of this account on every pass (~17 s per pass on a 6.5 GB archive with 997 such rows): a retried row waits until its local base, its row's proofs or the local row change.
 
