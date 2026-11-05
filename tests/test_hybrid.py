@@ -238,7 +238,7 @@ def test_db_waits_for_writer(tmp_path, monkeypatch, read_only):
 
 def test_db_retry_notices_are_per_archive_and_fast_path_has_none(tmp_path,monkeypatch):
     events=[]; [p.touch() for p in (tmp_path/"a.db",tmp_path/"b.db")]
-    monkeypatch.setattr(cli.fcntl,"flock",lambda lock,op:events.append(Path(lock.name)))
+    monkeypatch.setattr(cli.fcntl,"flock",lambda lock,op:events.append(lock))
     calls={}
     def connect(path,read_only=False):
         calls[path]=calls.get(path,0)+1
@@ -246,7 +246,7 @@ def test_db_retry_notices_are_per_archive_and_fast_path_has_none(tmp_path,monkey
         return type("Connection",(),{"close":lambda _:None})()
     monkeypatch.setattr(cli,"_open_db",connect); monkeypatch.setattr(cli.time,"sleep",lambda _:None)
     cli.get_db(path=tmp_path/"a.db").close(); cli.get_db(path=tmp_path/"b.db").close()
-    assert len(events)==1 and events[0].parent==tmp_path/".a.db.waiters" and not (tmp_path/".b.db.waiters").exists()
+    assert len(events)==1 and (tmp_path/".a.db.waiters").is_dir() and not (tmp_path/".b.db.waiters").exists()
 
 
 def test_db_symlink_alias_uses_canonical_database_path(tmp_path,monkeypatch):
