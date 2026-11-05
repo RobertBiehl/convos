@@ -46,3 +46,16 @@ def test_idle_pass_skips_relay_pulls_git_and_archive_reopens(tmp_path,monkeypatc
     assert {name:stage for name,stage in stages}=={"converge_own_rows":"checking retained rows","settle_sharing":"applying sharing policies","reconcile_replicas":"reconciling replicas"}  # b34: still "retrying retained own updates" or older
     counted.clear(); ops.clear(); remote.sync_once(a)
     assert dict(ops)=={"state":2} and counted["git"]==0 and counted["connections"]<=7  # b34: 18 relay calls, 12 git runs, 12 archive connections
+
+
+def test_scheduled_sync_skips_the_state_integrity_check_and_yields_when_busy(tmp_path,monkeypatch):
+    from typer.testing import CliRunner
+    server,checks=server_connect(tmp_path/"server.db"),[]
+    monkeypatch.setattr(remote,"request",transport(server)); monkeypatch.setattr(remote,"drain_hooks",lambda:None); monkeypatch.setattr(remote,"MANUAL_WAIT",0)
+    a=tmp_path/"a"; monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); remote.setup_client("http://server","alice",root=a); write_archive(a/"data/convos.db","first")
+    monkeypatch.setattr(remote,"inspect_state",(lambda real:lambda path,verify=False:(checks.append(verify),real(path,verify))[-1])(remote.inspect_state))
+    sync=lambda *args:CliRunner().invoke(remote.remote,["sync",*args],terminal_width=500)
+    assert sync("--background").exit_code==0 and checks==[False]  # b35: a timer pass ran PRAGMA quick_check over every receipt (3.7 s at 2 M rows)
+    assert sync().exit_code==0 and checks==[False,True]  # a person's sync still verifies state.db
+    with remote.sync_run(a): busy,manual=sync("--background"),sync()
+    assert busy.exit_code==0 and "Remote sync skipped" in busy.output and manual.exit_code==1
