@@ -1,11 +1,11 @@
 [project]
 name = "convos-orchestrate"
-version = "0.11.6b36"
+version = "0.11.6b37"
 description = "Agentic IDE for Convos: a durable home for agent sessions, their work items, results, and conversations"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["convos>=0.11.6b36,<0.12", "typer>=0.12.0"]
+dependencies = ["convos>=0.11.6b37,<0.12", "typer>=0.12.0"]
 
 [project.urls]
 Documentation = "https://github.com/RobertBiehl/convos/blob/master/docs/orchestrate.md"
