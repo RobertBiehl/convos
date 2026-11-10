@@ -141,7 +141,7 @@ reaches the running session; start, stop, and resume headless sessions from the
 board.
 
 ```bash
-uv tool install convos --with convos-orchestrate
+uv tool install convos --with convos-orchestrate --prerelease allow   # beta: only pre-releases exist
 convos orchestrate install   # /orchestrate for Claude Code, $orchestrate for Codex
 convos orchestrate open      # the IDE, served on 127.0.0.1 only
 ```

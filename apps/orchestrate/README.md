@@ -5,7 +5,7 @@ session reports items with statuses, results, threads, and questions; you steer 
 board in your browser.
 
 ```bash
-uv tool install convos --with convos-orchestrate
+uv tool install convos --with convos-orchestrate --prerelease allow   # beta: only pre-releases exist
 convos orchestrate install   # /orchestrate for Claude Code, $orchestrate for Codex
 convos orchestrate open      # the IDE in your browser
 ```
