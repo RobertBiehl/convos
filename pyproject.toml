@@ -23,7 +23,7 @@ Repository = "https://github.com/RobertBiehl/convos"
 [project.optional-dependencies]
 semantic = ["llama-cpp-python>=0.3.0", "huggingface-hub>=0.20.0"]
 redact = ["convos-redact>=0.11.6b36,<0.12"]
-dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "huggingface-hub>=0.20.0", "convos-changegraph", "convos-explore", "convos-memory", "convos-redact", "convos-resume", "convos-remote", "convos-remote-server"]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "huggingface-hub>=0.20.0", "convos-changegraph", "convos-explore", "convos-memory", "convos-orchestrate", "convos-redact", "convos-resume", "convos-remote", "convos-remote-server"]
 
 [project.scripts]
 convos = "ai_convos:app"
@@ -51,6 +51,7 @@ members = ["apps/*"]
 convos-changegraph = { workspace = true }
 convos-explore = { workspace = true }
 convos-memory = { workspace = true }
+convos-orchestrate = { workspace = true }
 convos-redact = { workspace = true }
 convos-resume = { workspace = true }
 convos-remote-server = { workspace = true }
