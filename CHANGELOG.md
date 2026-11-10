@@ -2,7 +2,7 @@
 
 ## 0.11.6b37
 
-- New product, in beta: **Orchestrate** (`convos-orchestrate`, on PyPI). It is a local, keyboard-first IDE in your browser for your Claude Code and Codex sessions, installed with `uv tool install convos --with convos-orchestrate`. Each session publishes a board of items with statuses, a live activity line, results (images, videos, PDFs, markdown, files, links), threads and questions. You comment on any row, with images; your comments reach the running session. You also answer questions, archive finished work, and start, stop or resume headless sessions. Every board change is a versioned event written through the core writer, so boards are searchable and survive restarts. `convos orchestrate install` adds the `/orchestrate` and `$orchestrate` skills. See `docs/orchestrate.md` (#187).
+- New product, in beta: **Orchestrate** (`convos-orchestrate`, on PyPI). It is a local, keyboard-first IDE in your browser for your Claude Code and Codex sessions, installed with `uv tool install convos --with convos-orchestrate --prerelease allow` (only pre-releases exist yet). Each session publishes a board of items with statuses, a live activity line, results (images, videos, PDFs, markdown, files, links), threads and questions. You comment on any row, with images; your comments reach the running session. You also answer questions, archive finished work, and start, stop or resume headless sessions. Every board change is a versioned event written through the core writer, so boards are searchable and survive restarts. `convos orchestrate install` adds the `/orchestrate` and `$orchestrate` skills. See `docs/orchestrate.md` (#187).
 
 ## 0.11.6b36
 

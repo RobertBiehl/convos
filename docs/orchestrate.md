@@ -15,7 +15,7 @@ item, and **questions** the user answers. People read the board instead of termi
 comment on any row, and the agent decides how to act on it.
 
 ```sh
-uv tool install convos --with convos-orchestrate
+uv tool install convos --with convos-orchestrate --prerelease allow   # beta: only pre-releases exist
 convos orchestrate install     # the /orchestrate and $orchestrate skills
 convos orchestrate open        # open the IDE (starts its local server)
 ```
