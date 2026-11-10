@@ -737,7 +737,7 @@ function Composer({ s, target, label }) {
       <textarea ref=${ref} rows="1" placeholder=${target ? "Comment on this item: ask, redirect, add context… # to reference, ⌘V an image" : "Message the session… # to reference, ⌘V an image"} onFocus=${() => setFocus(true)} onBlur=${() => { setFocus(false); setPick(null); }}
         onInput=${(e) => { S.drafts[key] = e.target.value; grow(); watch(e.target); }}
         onKeyDown=${keys} onPaste=${paste} />
-      <span class="send">${K("⌘", "↵")} send · ${K("↵")} line · ${K("Esc")}</span>
+      <span class="send">${K("⌘", "↵")} send · ${K("Esc")}</span>
     </div>
   </div>`;
 }
