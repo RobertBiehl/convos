@@ -106,6 +106,10 @@ The AST ledger has 79 archive acquisition sites and 22 SQLite constructor sites.
 
 | A99 | `src/ai_convos/cli.py::reset_archive_sync` | `sync.cutover` | Exclusive | One-time backed-up archive reset and identity migration | Temporarily blocks archive access during upgrade | Idempotent marker and atomic rollback; local conversations and attachment backup preserved |
 | A109 | `src/ai_convos/cli.py::retire_sync_identity` | `sync.identity.retire` | Exclusive | Backed-up removal of a retired sync identity's local proof metadata when `remote setup` creates a new identity | Temporarily blocks archive access during setup | Runs after the backup in one transaction; refuses, unchanged, when the archive holds rows received from the old identity's other devices |
+| A110 | `apps/orchestrate/src/ai_convos_orchestrate/store.py::emit` | `schema.orchestrate` | Exclusive | Schema readiness once when a session opens; archive-sized only during migration | Migration can block every archive client | Opening a session is a rare explicit action; later events skip schema initialization |
+| A111 | `apps/orchestrate/src/ai_convos_orchestrate/store.py::_append` | `orchestrate.append` | Exclusive | One board event: one message, its comment or result attachment rows, and the conversation row on open, meta, close, or reopen | Briefly blocks all archive clients per board change | Blob hashing and validation precede acquisition; one bounded commit; the projection is marked dirty first, so a failed commit rebuilds from the archive |
+| A112 | `apps/orchestrate/src/ai_convos_orchestrate/store.py::rebuild` | `orchestrate.rebuild` | Shared | One session's events in pages of 500, each page its own connection | A long board delays a writer briefly per page | Runs only when a projection is missing or dirty; closes between pages |
+| A113 | `apps/orchestrate/src/ai_convos_orchestrate/store.py::recover` | `orchestrate.sessions` | Shared | IDs of every orchestrate conversation | Briefly delays a writer | Once per server start; rebuilds run after the connection closes |
 
 ## Direct DuckDB constructors
 

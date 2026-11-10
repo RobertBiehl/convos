@@ -8,6 +8,7 @@ members = [
     "convos-changegraph",
     "convos-explore",
     "convos-memory",
+    "convos-orchestrate",
     "convos-redact",
     "convos-remote",
     "convos-remote-server",
@@ -161,6 +162,7 @@ dev = [
     { name = "convos-changegraph" },
     { name = "convos-explore" },
     { name = "convos-memory" },
+    { name = "convos-orchestrate" },
     { name = "convos-redact" },
     { name = "convos-remote" },
     { name = "convos-remote-server" },
@@ -183,6 +185,7 @@ requires-dist = [
     { name = "convos-changegraph", marker = "extra == 'dev'", editable = "apps/changegraph" },
     { name = "convos-explore", marker = "extra == 'dev'", editable = "apps/explore" },
     { name = "convos-memory", marker = "extra == 'dev'", editable = "apps/memory" },
+    { name = "convos-orchestrate", marker = "extra == 'dev'", editable = "apps/orchestrate" },
     { name = "convos-redact", marker = "extra == 'dev'", editable = "apps/redact" },
     { name = "convos-redact", marker = "extra == 'redact'", editable = "apps/redact" },
     { name = "convos-remote", marker = "extra == 'dev'", editable = "apps/remote" },
@@ -238,6 +241,21 @@ requires-dist = [
 name = "convos-memory"
 version = "0.11.6b36"
 source = { editable = "apps/memory" }
+dependencies = [
+    { name = "convos" },
+    { name = "typer" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "convos", editable = "." },
+    { name = "typer", specifier = ">=0.12.0" },
+]
+
+[[package]]
+name = "convos-orchestrate"
+version = "0.11.6b36"
+source = { editable = "apps/orchestrate" }
 dependencies = [
     { name = "convos" },
     { name = "typer" },

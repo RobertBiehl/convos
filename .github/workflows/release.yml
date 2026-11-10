@@ -45,11 +45,12 @@ jobs:
       - run: bash scripts/smoke-wheel.sh dist/convos-*.whl
       - name: Stage public distributions
         run: |
-          mkdir -p publish/convos publish/convos-redact publish/convos-remote publish/convos-remote-server
+          mkdir -p publish/convos publish/convos-redact publish/convos-remote publish/convos-remote-server publish/convos-orchestrate
           cp dist/convos-*.whl dist/convos-*.tar.gz publish/convos/
           cp dist/convos_redact-*.whl dist/convos_redact-*.tar.gz publish/convos-redact/
           cp dist/convos_remote-*.whl dist/convos_remote-*.tar.gz publish/convos-remote/
           cp dist/convos_remote_server-*.whl dist/convos_remote_server-*.tar.gz publish/convos-remote-server/
+          cp dist/convos_orchestrate-*.whl dist/convos_orchestrate-*.tar.gz publish/convos-orchestrate/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-dists
@@ -134,4 +135,24 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: dist/convos-remote-server/
+          skip-existing: true
+
+  publish-orchestrate:
+    needs: publish-remote-server
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-orchestrate
+      url: https://pypi.org/project/convos-orchestrate/
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dists
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: dist/convos-orchestrate/
           skip-existing: true
