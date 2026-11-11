@@ -307,6 +307,7 @@ convos search "one-line fix" -s claude-code -d 30   # BM25 only
 convos search "CI was green" --cwd /path/to/repo   # exact project scope
 convos query "why did the third agent reopen this?" --conversation f2b9c5a9
 convos search "this should be safe" --thinking
+convos search "shadow pass" --flat                # one row per conversation instead of per root session
 convos read f2b9c5a9 -n 20 -f jsonl              # bounded recent context from one result
 convos embed --limit 1000                         # explicitly backfill a bounded batch
 convos query "the quick fix that needed a migration" # hybrid: BM25 + embeddings + RRF

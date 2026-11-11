@@ -14,7 +14,7 @@ click=getattr(typer,"_click",click)
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, Codex, Muse, and Perplexity", pretty_exceptions_show_locals=False)
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT,DATA_DIR,DB_PATH,STATE_PATH=(root:=find_root()),(data:=root/"data"),data/"convos.db",data/"sync_state.json"
-HOOK_DIR,HOOK_STATE,HOOK_TAIL,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF,OPEN_INGEST_STALE,ROW_GROUP_ROWS=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_tails.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,12,20,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest(),300,4096  # conservative web pacing stays below the observed ~200-detail failure point
+HOOK_DIR,HOOK_STATE,HOOK_TAIL,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF,OPEN_INGEST_STALE,ROW_GROUP_ROWS=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_tails.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,13,20,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest(),300,4096  # conservative web pacing stays below the observed ~200-detail failure point
 _PERPLEXITY,_CHATGPT_HOSTS,_CLAUDE_HEADERS="https://www.perplexity.ai",(("https://chatgpt.com",("chatgpt.com",)),("https://chat.openai.com",("chat.openai.com","openai.com"))),{"Origin":"https://claude.ai","Referer":"https://claude.ai/","Accept":"application/json","Accept-Language":"en-US,en;q=0.9","anthropic-client-sha":"unknown","anthropic-client-version":"unknown"}
 _INJECTED_RE,MESSAGE_ORDER,MESSAGE_ORDER_DESC=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*","m.created_at NULLS FIRST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) NULLS LAST,m.id","m.created_at DESC NULLS LAST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) DESC NULLS LAST,m.id DESC"
 
@@ -1191,6 +1191,8 @@ def _parse_sessions(paths,parser,bindings):
     return ParseResult(convs=[s["conv"] for s in sessions],msgs=[m for s in sessions for m in s["msgs"]],tools=[t for s in sessions for t in s["tools"]],attachs=[a for s in sessions for a in s["attachs"]],edits=[e for s in sessions for e in s["edits"]],edit_evidence=[v for s in sessions for v in s["edit_evidence"]],failed_inputs=[path for path,result in attempts if result is None],input_sessions={path:next((json.loads(s["conv"]["metadata"]).get("session_id") for s in result if s),None) for path,result in attempts if result is not None})
 def parse_claude_code(projects_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult: return _parse_sessions(files or projects_dir.rglob("*.jsonl"),parse_claude_code_session,bindings)
 
+@lru_cache(maxsize=64)
+def _codex_turns(path,size): return frozenset(e["payload"].get("turn_id") for _,e in iter_jsonl(path) if e.get("type")=="turn_context")
 def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
     events,timestamps=[],{}
     for i,e in iter_jsonl(jsonl):
@@ -1198,6 +1200,7 @@ def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
         if e.get("type") in ("session_meta","turn_context") or e.get("type")=="response_item" and isinstance(e.get("payload"),dict) and e["payload"].get("type") in ("message","function_call","function_call_output","custom_tool_call","custom_tool_call_output"): events.append((i,e))
     if not events: return None
     meta,contexts,subagent,spawn,provider_id,src,items,cid=(meta:=next((e["payload"] for _,e in events if e.get("type")=="session_meta"),{})),(contexts:=[(i,e["payload"].get("model")) for i,e in events if e.get("type")=="turn_context" and e.get("payload",{}).get("model")]),(subagent:=(meta.get("source") or {}).get("subagent") if isinstance(meta.get("source"),dict) else None),(spawn:=subagent.get("thread_spawn",{}) if isinstance(subagent,dict) else {}),(provider_id:=meta.get("id")),"codex",[(i,e["payload"]) for i,e in events if e.get("type")=="response_item"],((bindings or {}).get(("codex",provider_id)) if provider_id else None) or gen_id("codex",provider_id or jsonl.stem)
+    fork_turns=_codex_turns(pf,pf.stat().st_size) if (fork:=meta.get("forked_from_id")) and (home:=next((d for d in jsonl.parents if d.name=="sessions"),None)) and (pf:=next(home.rglob(f"*{fork}.jsonl"),None)) else None  # exact: replayed items keep the parent's turn ids
     item_id=lambda recipe:(bindings or {}).get((src,'id',gen_id(src,recipe)),gen_id(src,recipe))
     message_ids={i:p['id'] for i,p in items if p.get('type')=='message' and p.get('id')}
     message_id=lambda i:provider_message_id(src,cid,i,message_ids.get(i),bindings or {})
@@ -1249,7 +1252,7 @@ def parse_codex_session(jsonl: Path, bindings=None) -> dict | None:
 
     candidates,evidence,edits=(candidates:=[(i,p,item_id(f"tool:{cid}:{p.get('call_id') or i}"),edit_result(p.get("call_id"),function_out),patch_edits(args)) for i,p in items if p.get("type")=="function_call" and p.get("name") in ("exec_command","shell_command","shell") and (args:=norm_args(p))]+[(i,p,(item_id(f"tool:{cid}:{p['call_id']}") if p.get("call_id") else item_id(f"custom:{cid}:{i}")),edit_result(p.get("call_id"),custom_out,p.get("status")),custom_edits(p)) for i,p in items if p.get("type")=="custom_tool_call"]),[dict(file_edit_id=item_id(f"edit:{tool}:{j}"),status=status,reason=reason,tool_call_id=tool) for i,p,tool,(status,reason),rows in candidates for j,row in enumerate(rows)],[dict(id=item_id(f"edit:{tool}:{j}"),message_id=anchor(i),file_path=fp,edit_type=op,content=c,created_at=timestamps.get(i),old_content=o) for i,p,tool,(status,reason),rows in candidates if status=="confirmed" for j,(fp,op,c,o) in enumerate(rows)]
 
-    return {"conv":dict(id=cid,source=src,title=(bindings or {}).get((src,cid,'title'),meta.get("cwd") or jsonl.stem),created_at=min(timestamps.values(),default=None),updated_at=max(timestamps.values(),default=None),model=next((m["model"] for m in msgs if m["role"]=="assistant" and m["model"]),None),cwd=meta.get("cwd"),git_branch=(meta.get("git") or {}).get("branch"),project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":provider_id,"parent_session_id":spawn.get("parent_thread_id") or meta.get("parent_thread_id"),"session_kind":"subagent" if subagent is not None else "main","session_kind_evidence":"exact" if subagent is not None else "inferred","agent_name":spawn.get("agent_nickname") or meta.get("agent_nickname"),"agent_role":spawn.get("agent_role") or (subagent if isinstance(subagent,str) else meta.get("agent_role")),"agent_depth":spawn.get("depth"),"originator":meta.get("originator"),"client_version":meta.get("cli_version"),"capture_mode":"transcript","timestamp_basis":"utc","git_repository":(meta.get("git") or {}).get("repository_url"),"git_commit":(meta.get("git") or {}).get("commit_hash"),"forked_from_id":meta.get("forked_from_id"),"thread_source":meta.get("thread_source")}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")],"edits":edits,"edit_evidence":evidence}
+    return {"conv":dict(id=cid,source=src,title=(bindings or {}).get((src,cid,'title'),meta.get("cwd") or jsonl.stem),created_at=min(timestamps.values(),default=None),updated_at=max(timestamps.values(),default=None),model=next((m["model"] for m in msgs if m["role"]=="assistant" and m["model"]),None),cwd=meta.get("cwd"),git_branch=(meta.get("git") or {}).get("branch"),project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":provider_id,"parent_session_id":spawn.get("parent_thread_id") or meta.get("parent_thread_id"),"session_kind":"subagent" if subagent is not None else "main","session_kind_evidence":"exact" if subagent is not None else "inferred","agent_name":spawn.get("agent_nickname") or meta.get("agent_nickname"),"agent_role":spawn.get("agent_role") or (subagent if isinstance(subagent,str) else meta.get("agent_role")),"agent_depth":spawn.get("depth"),"originator":meta.get("originator"),"client_version":meta.get("cli_version"),"capture_mode":"transcript","timestamp_basis":"utc","git_repository":(meta.get("git") or {}).get("repository_url"),"git_commit":(meta.get("git") or {}).get("commit_hash"),"forked_from_id":meta.get("forked_from_id"),"fork_boundary":next((i for i,e in events if e.get("type")=="turn_context" and e["payload"].get("turn_id") not in fork_turns),events[-1][0]+1) if fork_turns is not None else None,"thread_source":meta.get("thread_source")}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")],"edits":edits,"edit_evidence":evidence}
 
 def parse_codex(codex_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult: return _parse_sessions(files or sessions_dir.rglob("*.jsonl"),parse_codex_session,bindings) if (sessions_dir:=codex_dir/"sessions").exists() else ParseResult()
 def parse_muse_session(jsonl: Path, bindings=None) -> dict | None:
@@ -1519,23 +1522,30 @@ def _filt(source, days, role, cwd=None, conversation=None):
     w,p=map(list,zip(*pairs)) if (pairs:=[(q,v) for v,q in ((source,"c.source = ?"),(datetime.now(timezone.utc).replace(tzinfo=None)-timedelta(days=days) if days else None,"m.created_at > ?"),(role,"m.role = ?")) if v]) else ([],[])
     if cwd: raw,resolved,w,p=(raw:=str(Path(cwd).expanduser().absolute())),(resolved:=str(Path(cwd).expanduser().resolve())),[*w,"(c.cwd=? OR starts_with(c.cwd,?) OR c.cwd=? OR starts_with(c.cwd,?))"],[*p,raw,raw.rstrip("/")+"/",resolved,resolved.rstrip("/")+"/"]
     conversation and (w.append("starts_with(c.id,?)"),p.append(conversation))
-    return w, p
+    return [*w,"NOT coalesce(TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT)<TRY_CAST(json_extract_string(c.metadata,'$.fork_boundary') AS BIGINT),false)",*([] if role else ["m.role NOT IN ('developer','system')"])],p
 def _clip(s, n): return (s or "")[:n] + ("..." if s and len(s) > n else "")
-def _lexical_ids(conn,q,w,p,mode,n=50):
+_PARENT="p.source=c.source AND json_extract_string(p.metadata,'$.session_id')=json_extract_string(c.metadata,'$.parent_session_id')"  # exact provider parent link: conversation p is the parent session of c
+def _families(scored):  # rank root sessions (provider parent links); keep the best hit of up to 3 conversations per family
+    return f"WITH RECURSIVE up(id,cur,d) AS (SELECT id,id,0 FROM conversations UNION ALL SELECT up.id,p.id,d+1 FROM up JOIN conversations c ON c.id=up.cur JOIN conversations p ON NOT ? AND {_PARENT} WHERE d<8),roots AS (SELECT id,arg_max(cur,d) root FROM up GROUP BY id),scored AS ({scored}),best AS (SELECT s.id,s.score,r.root,ROW_NUMBER() OVER (PARTITION BY s.conversation_id ORDER BY s.score DESC,s.id) pick FROM scored s JOIN roots r ON r.id=s.conversation_id WHERE s.score IS NOT NULL),fam AS (SELECT *,ROW_NUMBER() OVER (PARTITION BY root ORDER BY score DESC,id) k,max(score) OVER (PARTITION BY root) top FROM best WHERE pick=1) SELECT id,score,root FROM fam WHERE k<=3 AND root IN (SELECT root FROM fam WHERE k=1 ORDER BY score DESC,root LIMIT ?) ORDER BY top DESC,root,k"
+def _group(rows): return [(next(s for _,s,x in rows if x==root),root,[m for m,_,x in rows if x==root]) for root in dict.fromkeys(r for *_,r in rows)]
+def _lexical_ids(conn,q,w,p,mode,n=50,flat=False):
     where=f"json_extract_string(m.metadata,'$.history_of') IS NULL AND (m.content IS NOT NULL OR m.thinking IS NOT NULL){_NOISE}{' AND ' + ' AND '.join(w) if w else ''}"
     if mode=="bm25":
-        rows=conn.execute(f"WITH scored AS (SELECT m.id,m.conversation_id,fts_main_messages.match_bm25(m.id,?) score FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE {where}),ranked AS (SELECT *,ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY score DESC,id) pick FROM scored WHERE score IS NOT NULL) SELECT id,score FROM ranked WHERE pick=1 ORDER BY score DESC LIMIT ?",[q]+p+[n]).fetchall()
-        return (rows,"bm25") if rows else _lexical_ids(conn,q,w,p,"scan",n)
+        rows=conn.execute(_families(f"SELECT m.id,m.conversation_id,fts_main_messages.match_bm25(m.id,?) score FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE {where}"),[flat,q,*p,n]).fetchall()
+        return (rows,"bm25") if rows else _lexical_ids(conn,q,w,p,"scan",n,flat)
     terms,(contains)=(terms:=list(dict.fromkeys(re.findall(r"\w+",q.lower())))),(" AND contains(lower(coalesce(m.content,'')||' '||coalesce(m.thinking,'')),?)"*len(terms))
-    return (conn.execute(f"SELECT id,score FROM (SELECT m.id,m.conversation_id,CAST(1 AS DOUBLE) score,ROW_NUMBER() OVER (PARTITION BY m.conversation_id ORDER BY m.created_at DESC NULLS LAST,m.id) pick FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE {where}{contains}) WHERE pick=1 ORDER BY id LIMIT ?",p+terms+[n]).fetchall() if terms else []),"scan"
-def _hit_rows(conn,ranked,limit):
-    order,scores,rows=(order:={mid:i for i,(mid,_) in enumerate(ranked)}),dict(ranked),conn.execute("SELECT m.id,m.role,m.content,m.thinking,m.created_at,c.title,c.source,c.id,c.cwd FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id IN (SELECT UNNEST(?))",([*order],)).fetchall() if order else []
-    seen=set()
-    return [(scores[mid],mid,role,content,thinking,created,title,source,cid,cwd) for mid,role,content,thinking,created,title,source,cid,cwd in sorted(rows,key=lambda r:order[r[0]]) if cid not in seen and not seen.add(cid)][:limit]
-def _fmt_hit(content, ts, role, title, src, cid, cwd, q, ctx, meta):
-    p = _clip(content, ctx)
+    return (conn.execute(_families(f"SELECT m.id,m.conversation_id,CAST(1 AS DOUBLE) score FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE {where}{contains}"),[flat,*p,*terms,n]).fetchall() if terms else []),"scan"
+def _hit_rows(conn,groups):
+    rows,titles=({r[0]:r for r in conn.execute("SELECT m.id,m.role,m.content,m.thinking,m.created_at,c.id,c.source,c.cwd,json_extract_string(c.metadata,'$.session_kind'),json_extract_string(c.metadata,'$.agent_name'),json_extract_string(c.metadata,'$.agent_role') FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id IN (SELECT UNNEST(?))",[[m for *_,ms in groups for m in ms]]).fetchall()},dict(conn.execute("SELECT id,title FROM conversations WHERE id IN (SELECT UNNEST(?))",[[r for _,r,_ in groups]]).fetchall())) if groups else ({},{})
+    hit=lambda mid,role,content,thinking,created,cid,source,cwd,kind,name,arole:dict(message_id=mid,role=role,content=content,thinking=thinking,created_at=created,conversation_id=cid,source=source,cwd=cwd,agent=(" ".join(filter(None,(name,arole and f"({arole})"))) or "subagent") if kind=="subagent" else None)
+    return [{**hit(*rows[ms[0]]),"score":score,"title":titles[root],"root_id":root,"related":[hit(*rows[m]) for m in ms[1:]]} for score,root,ms in groups]
+def _emit_hits(hits,fmt,ctx,thinking=None):  # thinking=None: the command has no thinking field (query)
+    clip=lambda x:{**{k:v for k,v in x.items() if k!="thinking"},"content":_clip(x["content"],ctx)}
+    return emit([{**clip(h),**({} if thinking is None else {"thinking":_clip(h["thinking"],ctx) if thinking and h["thinking"] else None}),"related":[clip(x) for x in h["related"]]} for h in hits],fmt)
+def _fmt_hit(h, q, ctx, meta):
+    p = _clip(h["content"], ctx)
     for w in q.split(): p = re.sub(f"({re.escape(w)})", r"\033[1;33m\1\033[0m", p, flags=re.I)
-    typer.echo(f"\n{'='*60}\n[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid[:8]})\n{role} @ {ts or '?'} ({meta})\n{'-'*40}\n{p}")
+    typer.echo(f"\n{'='*60}\n[{h['source']}] {h['title'] or 'Untitled'}{f' @ {h['cwd']}' if h['cwd'] else ''} ({h['root_id'][:8]})\n{f'-> {h['agent']} ({h['conversation_id'][:8]}) ' if h['agent'] else ''}{h['role']} @ {h['created_at'] or '?'} ({meta})\n{'-'*40}\n{p}"+"".join(f"\n  -> {x['agent'] or 'root'} ({x['conversation_id'][:8]}) {x['role']}: {_clip(' '.join((x['content'] or '').split()),ctx//2)}" for x in h["related"]))
 
 def emit(data,fmt): [typer.echo(json.dumps(row,default=str)) for row in data if fmt=="jsonl" and isinstance(data,list)] if fmt=="jsonl" and isinstance(data,list) else typer.echo(json.dumps(data,default=str))
 
@@ -1553,15 +1563,15 @@ def fts():
     with _core(ready=True,purpose="maintenance.fts") as conn: rebuild_fts_index(conn)
     (HOOK_FTS_DIRTY.unlink(missing_ok=True),typer.echo("FTS index ready"))
 
-def search(query: str, source: str|None = typer.Option(None, "-s"), days: int|None = typer.Option(None, "-d"), role: str|None = typer.Option(None, "-r"), cwd: Path|None = typer.Option(None, "--cwd", "-w"), conversation: str|None = typer.Option(None, "--conversation"), thinking: bool = typer.Option(False, "--thinking", "-t"), limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
+def search(query: str, source: str|None = typer.Option(None, "-s"), days: int|None = typer.Option(None, "-d"), role: str|None = typer.Option(None, "-r"), cwd: Path|None = typer.Option(None, "--cwd", "-w"), conversation: str|None = typer.Option(None, "--conversation"), thinking: bool = typer.Option(False, "--thinking", "-t"), limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format"), flat: bool = typer.Option(False, "--flat", help="Rank every conversation separately instead of grouping subagents under their root session")):
     conn,mode=_fts_ro()
     with contextlib.closing(conn):
         w,p=_filt(source,days,role,cwd,conversation)
-        results,mode=(lambda ranked:(_hit_rows(conn,ranked[0],limit),ranked[1]))(_lexical_ids(conn,query,w,p,mode,limit))
+        results,mode=(lambda ranked:(_hit_rows(conn,_group(ranked[0])),ranked[1]))(_lexical_ids(conn,query,w,p,mode,limit,flat))
     if mode=="scan": typer.echo("FTS index is stale; using a complete lexical scan. Run `convos fts` to restore BM25 ranking.",err=True)
-    if fmt!="text": return emit([dict(message_id=mid,role=r,content=_clip(content,context),thinking=_clip(think,context) if thinking and think else None,created_at=ts,score=score,title=title,source=src,conversation_id=cid,cwd=cwd) for score,mid,r,content,think,ts,title,src,cid,cwd in results],fmt)
+    if fmt!="text": return _emit_hits(results,fmt,context,thinking)
     if not results: return typer.echo("No results")
-    [(_fmt_hit(content,ts,role,title,source,cid,cwd,query,context,f"score: {score:.2f}; lexical: {mode}"),thinking and think and typer.echo(f"\n[THINKING]\n{_clip(think,context)}")) for score,_,role,content,think,ts,title,source,cid,cwd in results]
+    [(_fmt_hit(h,query,context,f"score: {h['score']:.2f}; lexical: {mode}"),thinking and h["thinking"] and typer.echo(f"\n[THINKING]\n{_clip(h['thinking'],context)}")) for h in results]
     typer.echo(f"\n{len(results)} results")
 
 def read_cmd(conversation: str, limit: int = typer.Option(20, "-n", min=1), context: int = typer.Option(2000, "-c", min=1), around: str|None = typer.Option(None, "--around", "-a"), thinking: bool = typer.Option(False, "--thinking", "-t"), fmt: str = typer.Option("text", "-f", "--format")):
@@ -1573,13 +1583,14 @@ def read_cmd(conversation: str, limit: int = typer.Option(20, "-n", min=1), cont
         base=f"SELECT m.id,m.role,m.content,m.thinking,m.created_at,ROW_NUMBER() OVER (ORDER BY {MESSAGE_ORDER}) pos FROM messages m WHERE m.conversation_id=? AND json_extract_string(m.metadata,'$.history_of') IS NULL AND (COALESCE(m.content,'')!='' OR COALESCE(m.thinking,'')!='')"
         if around and len(mids:=conn.execute("SELECT id FROM messages WHERE conversation_id=? AND starts_with(id,?) AND json_extract_string(metadata,'$.history_of') IS NULL LIMIT 2",[cid,around]).fetchall())!=1: raise typer.Exit(typer.echo("No matching message" if not mids else "Ambiguous message prefix: "+", ".join(m[0] for m in mids),err=True) or 1)
         rows=conn.execute(f"WITH b AS ({base}),t AS (SELECT pos FROM b WHERE id=?) SELECT id,role,content,thinking,created_at FROM (SELECT b.*,abs(b.pos-t.pos) d FROM b,t ORDER BY d,b.pos LIMIT ?) ORDER BY pos",[cid,mids[0][0],limit]).fetchall() if around else conn.execute(f"SELECT id,role,content,thinking,created_at FROM ({base}) ORDER BY pos DESC LIMIT ?",[cid,limit]).fetchall()[::-1]
+        family=conn.execute(" UNION ALL ".join(f"SELECT '{k}',{x}.id,json_extract_string({x}.metadata,'$.agent_name'),json_extract_string({x}.metadata,'$.agent_role'),{x}.created_at FROM conversations c JOIN conversations p ON {_PARENT} WHERE {y}.id=?" for k,x,y in (("subagent of","p","c"),("subagents","c","p")))+" ORDER BY 1,5,2",[cid,cid]).fetchall()
     data = [dict(id=mid, role=role, content=_clip(content, context), thinking=_clip(think, context) if thinking and think else None, created_at=ts) for mid, role, content, think, ts in rows]
     if fmt!="text": return emit(data,fmt)
-    typer.echo(f"[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid})")
+    typer.echo(f"[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid})"+"".join(f"\n{k}: "+", ".join([" ".join(filter(None,(i[:8],n,r and f"({r})"))) for _,i,n,r,_ in g][:12])+(f", +{len(g)-12} more" if len(g)>12 else "") for k,g in ((k,list(g)) for k,g in itertools.groupby(family,key=lambda f:f[0]))))
     for message in data: typer.echo("\n{} @ {}\n{}{}".format(message["role"],message["created_at"] or "?",message["content"],"\n[THINKING]\n{}".format(message["thinking"]) if message["thinking"] else ""))
     typer.echo(f"\n{len(data)} messages")
 
-def hybrid_hits(q,source=None,days=None,role=None,limit=10,local_only=False,cwd=None,conversation=None,status=None,require_complete=False):
+def hybrid_hits(q,source=None,days=None,role=None,limit=10,local_only=False,cwd=None,conversation=None,status=None,require_complete=False,flat=False):
     w,p=_filt(source,days,role,cwd,conversation)
     profile,stored,error=None,None,None
     try: profile=embedding_profile()
@@ -1602,21 +1613,22 @@ def hybrid_hits(q,source=None,days=None,role=None,limit=10,local_only=False,cwd=
         stored,eligible=(conn.execute("SELECT CAST(profile AS VARCHAR) FROM embedding_state WHERE singleton").fetchone() or [None])[0],conn.execute(f"SELECT COUNT(*) {where}",p).fetchone()[0]
         valid=conn.execute(f"SELECT COUNT(*) {where} AND m.embedding IS NOT NULL AND len(m.embedding)=?",p+[profile["dimensions"]]).fetchone()[0] if profile and stored and json.loads(stored)==profile else 0
     with contextlib.closing(conn):
-        lexical,mode=_lexical_ids(conn,q,w,p,mode,limit)
-        vectors,(mids)=(vectors:=conn.execute(f"WITH scored AS (SELECT m.id,m.conversation_id,list_cosine_similarity(m.embedding,?::FLOAT[]) score {where} AND m.embedding IS NOT NULL AND len(m.embedding)=?),ranked AS (SELECT *,ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY score DESC,id) pick FROM scored) SELECT id,score FROM ranked WHERE pick=1 ORDER BY score DESC LIMIT ?",[qv]+p+[len(qv),limit]).fetchall() if qv and valid else []),([x[0] for ranked in (lexical,vectors) for x in ranked])
-        conversations,(scores)=(conversations:=dict(conn.execute("SELECT id,conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[mids]).fetchall()) if mids else {}),({cid:sum(1/(60+rank) for ranked in (lexical,vectors) for rank,(mid,_) in enumerate(ranked,1) if conversations[mid]==cid) for cid in set(conversations.values())})
-        ranked,(rows)=(ranked:=[(min((mid for source in (lexical,vectors) for mid,_ in source if conversations[mid]==cid),key=lambda mid:min(i for source in (lexical,vectors) for i,(candidate,_) in enumerate(source) if candidate==mid)),score) for cid,score in sorted(scores.items(),key=lambda x:-x[1])]),(_hit_rows(conn,ranked,limit))
+        lexical,mode=_lexical_ids(conn,q,w,p,mode,limit,flat)
+        vectors=conn.execute(_families(f"SELECT m.id,m.conversation_id,list_cosine_similarity(m.embedding,?::FLOAT[]) score {where} AND m.embedding IS NOT NULL AND len(m.embedding)=?"),[flat,qv,*p,len(qv),limit]).fetchall() if qv and valid else []
+        ranks=[{root:i for i,root in enumerate(dict.fromkeys(r for *_,r in ranked),1)} for ranked in (lexical,vectors)]  # reciprocal-rank fusion over root sessions
+        scores=sorted(((sum(1/(60+rank[root]) for rank in ranks if root in rank),root) for root in ranks[0]|ranks[1]),key=lambda x:(-x[0],x[1]))[:limit]
+        rows=_hit_rows(conn,[(score,root,list(dict.fromkeys(m for ranked in (lexical,vectors) for m,_,r in ranked if r==root))[:3]) for score,root in scores])
     meta=dict(lexical_mode=mode,semantic_eligible=eligible,semantic_valid=valid,semantic_coverage=valid/eligible if eligible else 1.0,semantic_error=error)
     status is not None and status.update(meta)
     if require_complete and (mode!="bm25" or valid<eligible or error): raise ValueError(f"Retrieval is incomplete: lexical={mode}, semantic={valid}/{eligible}")
-    return [dict(score=score,message_id=mid,role=role,content=content,created_at=created,title=title,source=source,conversation_id=cid,cwd=cwd) for score,mid,role,content,_,created,title,source,cid,cwd in rows]
-def query_cmd(q: str, source: str|None = typer.Option(None, "-s"), days: int|None = typer.Option(None, "-d"), role: str|None = typer.Option(None, "-r"), cwd: Path|None = typer.Option(None, "--cwd", "-w"), conversation: str|None = typer.Option(None, "--conversation"), limit: int = typer.Option(10, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format"), require_complete: bool = typer.Option(False,"--require-complete")):
-    try: rows = hybrid_hits(q,source,days,role,limit,cwd=cwd,conversation=conversation,status=(status:={}),require_complete=require_complete)
+    return rows
+def query_cmd(q: str, source: str|None = typer.Option(None, "-s"), days: int|None = typer.Option(None, "-d"), role: str|None = typer.Option(None, "-r"), cwd: Path|None = typer.Option(None, "--cwd", "-w"), conversation: str|None = typer.Option(None, "--conversation"), limit: int = typer.Option(10, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format"), require_complete: bool = typer.Option(False,"--require-complete"), flat: bool = typer.Option(False, "--flat", help="Rank every conversation separately instead of grouping subagents under their root session")):
+    try: rows = hybrid_hits(q,source,days,role,limit,cwd=cwd,conversation=conversation,status=(status:={}),require_complete=require_complete,flat=flat)
     except ValueError as e: raise typer.Exit(typer.echo(str(e),err=True) or 1)
     [typer.echo(message,err=True) for condition,message in ((status["lexical_mode"]=="scan","FTS index is stale; using a complete lexical scan. Run `convos fts` to restore BM25 ranking."),(status["semantic_valid"]<status["semantic_eligible"],f"Semantic coverage is partial ({status['semantic_valid']}/{status['semantic_eligible']}); lexical recall remains complete. Run `convos embed` for full hybrid ranking."),(status["semantic_error"],status["semantic_error"])) if condition]
-    if fmt!="text": return emit([{**r,"content":_clip(r["content"],context)} for r in rows],fmt)
+    if fmt!="text": return _emit_hits(rows,fmt,context)
     if not rows: return typer.echo("No results")
-    for x in rows: _fmt_hit(x["content"], x["created_at"], x["role"], x["title"], x["source"], x["conversation_id"], x["cwd"], q, context, f"score: {x['score']:.4f}")
+    for x in rows: _fmt_hit(x, q, context, f"score: {x['score']:.4f}")
     typer.echo(f"\n{len(rows)} results")
 
 def embed_cmd(batch: int = typer.Option(32, "-b",min=1),limit: int|None = typer.Option(None,"--limit",min=1)):

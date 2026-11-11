@@ -9,7 +9,7 @@ Retrieve with these commands:
 
 ```bash
 convos query "natural language question" -n 8 -f jsonl   # conceptual/paraphrased discovery; default when wording is uncertain
-convos search "exact terms" -n 8 -c 160 -f jsonl         # known terms, quotes, ids, filenames; one hit/conversation
+convos search "exact terms" -n 8 -c 160 -f jsonl         # known terms, quotes, ids, filenames; one row/root session
 convos read abc123 -n 20 -c 2000 -f jsonl                 # bounded recent context from one known conversation
 convos read abc123 --around MESSAGE_ID -n 20 -f jsonl      # bounded context around an exact discovery hit
 convos related MESSAGE_ID -n 5 -c 160 -f jsonl             # semantic neighbors of one exact turn
@@ -47,8 +47,8 @@ convos sql "SELECT source, COUNT(*) FROM conversations GROUP BY source" -f json
 Behavior:
 
 - Discover first with `query` for concepts/paraphrases or `search` for known literal text, then use `read` on the strongest conversation candidates. Use `sql` for structured questions.
-- Both discovery commands return at most one strongest message per conversation, so `-n` budgets distinct conversation candidates.
-- Discovery JSON includes `conversation_id` and `message_id`. `read` returns the newest `-n` messages chronologically, or a bounded neighborhood around `--around MESSAGE_ID`; raise `-n` or `-c` when more context is required.
+- Both discovery commands return one row per root session: subagent conversations are grouped under the session that spawned them, so `-n` budgets distinct session families. Each row carries `root_id`, its best hit (`agent` names the subagent when the hit came from one), and up to two more family hits in `related`. Use `--flat` for one row per conversation. Fork-replayed parent history and injected developer prompts are not ranked; `-r developer` searches the latter.
+- Discovery JSON includes `conversation_id` and `message_id` (also on each `related` hit); `read` lists a conversation's parent and subagents. `read` returns the newest `-n` messages chronologically, or a bounded neighborhood around `--around MESSAGE_ID`; raise `-n` or `-c` when more context is required.
 - When one exact turn is useful but related work may use different wording, use `related MESSAGE_ID` to pivot without inventing another query. Use `trail` only for a broader history map; keep its normal agent budget at depth 2, width 3, and at most 20 nodes, then read only the evidence-bearing branches that matter.
 - `related` returns one exact evidence turn per neighboring conversation. `trail` carries the evidence message on every edge, excludes cycles and exact duplicate turns, and supports JSON for agents; neither command generates text or uses the network.
 - Use `redact scan` when the user asks whether the archive contains high-confidence credentials or before a sensitive team link. It reports only secret kinds and exact record locations, never values. The encrypted remote requires the same policy and scrubs every team event before signing or encryption while leaving personal sync lossless; team attachments are omitted. `redact status` audits those automatic removals. Do not claim this detects unknown, encoded, split, or ordinary-prose secrets, and do not treat it as retroactive erasure of already shared history or backups.
