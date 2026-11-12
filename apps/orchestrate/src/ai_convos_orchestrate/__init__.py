@@ -63,12 +63,12 @@ def board(s):
     def reason(i): return f" · {i['why']}" if i.get("why") else ""
     def mark(i): return " (archived)" if i.get("archived") else " · unseen by the user" if i["id"] in new else " · archivable" if not i["parent"] and not store.blocked(s, i["id"], marks) else ""
     def tree(parent, depth): return [line for i in s["items"].values() if i["parent"] == parent for line in [f"{'  '*depth}  {i['id']:<4} [{eff[i['id']]}] {i['title']}{who(i)}{reason(i)}{due(i)}{mark(i)}", *results(i["id"], depth+2), *tree(i["id"], depth+1)]]
-    asks = [f"  {a['id']} on {a['target'] or 'session'}: {a['text']}{' -> ' + ' | '.join(a['options']) if a['options'] else ''}" for a in store.open_asks(s)]
+    asks = [f"  {a['id']} on {a['target'] or 'session'}: {store.LEAD[a['kind']]} {a['text']}{' -> ' + ' | '.join(a['options']) if a['options'] else ''}" for a in store.open_asks(s)]
     waiting = [store.describe(s, p) for p in store.pending(s)]
     return "\n".join([f"{meta['id']} {meta['title']!r} [{store.status(s)}] {meta['provider']} {meta['cwd']}",
                       *([f"now: {s['activity']['text']}"] if s["activity"] else []),
                       *(tree(None, 0) or ["  (no items yet: convos orchestrate add 'TITLE')"]), *(["session results:", *results(None, 0)] if results(None, 0) else []),
-                      *(["open questions:", *asks] if asks else []), *(["undelivered user messages (run inbox):", *waiting] if waiting else [])])
+                      *(["waiting on the user:", *asks] if asks else []), *(["undelivered user messages (run inbox):", *waiting] if waiting else [])])
 
 def ident(ctx):
     sid = store.resolve(ctx.obj["session"])
@@ -193,9 +193,19 @@ def ask(ctx: typer.Context, question: str, option: list[str] = typer.Option([], 
         multi: bool = typer.Option(False, "--multi"), on: str = typer.Option(None, "--on"), detail: str = typer.Option("", "--detail", help="Markdown context shown under the question"),
         wait: float = typer.Option(0, "--wait", help="Block up to SECONDS for the answer")):
     """Ask the user a question (optionally multiple choice). The item shows 'needs you' until answered."""
+    pose(ctx, "question", question, option, multi, on, detail, wait)
+
+@cmd
+def need(ctx: typer.Context, action: str = typer.Argument(..., help="What the user has to do, as an instruction to them"), on: str = typer.Option(None, "--on"),
+         detail: str = typer.Option("", "--detail", help="Markdown: how to do it, where things are"), wait: float = typer.Option(0, "--wait", help="Block up to SECONDS for the user")):
+    """Ask the user to do something only they can (run a test on their machines, sign in, approve). The item shows 'needs you' until they mark it Done or Can't."""
+    pose(ctx, "action", action, store.NEEDED, False, on, detail, wait)
+
+def pose(ctx, kind, text, options, multi, on, detail, wait):
     sid = ident(ctx)
-    s, e = store.emit(sid, "ask", ctx.obj["actor"], question, scope=ctx.obj["scope"], target=on or ctx.obj["scope"], options=option, multi=multi, ask_kind="question", detail=text_arg(detail))
-    if wait <= 0: return report(ctx, dict(ask=e["ask"]), f"{e['ask']} asked on {e['target'] or 'session'}; the answer arrives via inbox (or pass --wait)")
+    s, e = store.emit(sid, "ask", ctx.obj["actor"], text, scope=ctx.obj["scope"], target=on or ctx.obj["scope"], options=options, multi=multi, ask_kind=kind, detail=text_arg(detail))
+    verb, reply = ("asked", "the answer") if kind == "question" else ("put to the user", "their Done or Can't")
+    if wait <= 0: return report(ctx, dict(ask=e["ask"]), f"{e['ask']} {verb} on {e['target'] or 'session'}; {reply} arrives via inbox (or pass --wait)")
     s, done = store.wait_for(sid, lambda s: s["asks"][e["ask"]]["answer"] or s["asks"][e["ask"]]["cancelled"], wait)
     if done is None: return report(ctx, dict(ask=e["ask"], answer=None), f"{e['ask']}: no answer yet; it will arrive via inbox")
     store.emit(sid, "deliver", ctx.obj["actor"], ids=[e["ask"]])

@@ -26,12 +26,13 @@ Any Claude Code session joins with `/orchestrate`, any Codex session with
 ## Statuses
 
 Items are `planned`, `working`, `blocked`, `done`, `failed`, or `skipped`. An item with
-an open question shows **needs you**. A session's status is derived from its items with
+an open question, or an open need (an action only the user can take), shows **needs you**. A session's status is derived from its items with
 this precedence: needs you, working, blocked, failed, planned, done (idle when empty,
 closed when closed).
 
 A row's status can carry a one-line reason (`--why`). An agent's blocked row must have one, saying
-what it waits for and on whom; failed and skipped rows may. The board row shows the reason in place
+what it waits for; failed and skipped rows may. A row that waits on the user to do something is not
+blocked: the agent puts the action to the user with `need`, which shows the row as needs you. The board row shows the reason in place
 of the description's first line, the item view shows it under the status, its history keeps it with
 the status change, and a blocked session shows its newest reason in the session list. A new status
 drops the old reason. Rows the user blocks need none.
@@ -49,7 +50,8 @@ install`) documents the tools; how an agent uses them is left to the agent.
 | `attach FILE_OR_URL --on ITEM`, `attach --text MD --on ITEM` | Append a result. |
 | `say TEXT [--on ITEM] [--reply C]` | Write in a thread: answers to the user, not status recaps (changed rows already show as unread). A `say` that is not a reply ends with that reminder. |
 | `ask Q [-o A -o B] [--multi] [--on ITEM] [--detail MD] [--wait S]` | Ask the user. The card shows the results the question names and the results on its item. |
-| `withdraw Q...` | Take back open questions that no longer need an answer. |
+| `need ACTION [--on ITEM] [--detail MD] [--wait S]` | Ask the user to do something only they can (run a test on their hardware, sign in). The card reads **Your action** and offers Done and Can't with an optional note; the reply reaches the agent like an answer (`Action: ... -> Done`). |
+| `withdraw Q...` | Take back open questions or needs that no longer apply. |
 | `inbox [--wait S]` | Pull undelivered comments, answers, and notices. |
 | `spawn PROMPT --on ITEM` | Start a child session working for this item. |
 | `archive ITEM...` | Archive finished top-level rows the user has read (see below). |

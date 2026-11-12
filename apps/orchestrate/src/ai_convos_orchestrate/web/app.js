@@ -409,7 +409,9 @@ async function resolveAsk(ask, body, okText) {
   await act(body, okText);
   S.askPick[ask.id] = [];
 }
-const answer = (ask, choices, text = "") => resolveAsk(ask, { kind: "answer", ask: ask.id, choices, text }, ask.kind === "permission" ? `${choices[0]}` : "Answer sent");
+const answer = (ask, choices, text = "") => resolveAsk(ask, { kind: "answer", ask: ask.id, choices, text }, ask.kind === "permission" ? `${choices[0]}` : ask.kind === "action" ? (choices[0] === "Done" ? "Marked done; the agent is told" : "Sent to the agent") : "Answer sent");
+// what the agent waits on you for: a question, a permission, or an action only you can take (the agent's need)
+const ASK_LABEL = { permission: "Permission", action: "Your action", question: "Question" };
 // a question the conversation has moved past: it leaves the board, and the agent is told it was dismissed unanswered
 const dismiss = (ask) => ask.kind !== "permission" && resolveAsk(ask, { kind: "dismiss", ask: ask.id }, `${ask.id} dismissed; the agent is told`);
 // what a question rests on: the results it names, then the other results on its row; pictures first, as they decide most
@@ -543,7 +545,7 @@ function Sidebar() {
             <div class="sub">${s.limit ? html`<span class="lim" title=${s.limit.text}>${limitOf(s).short}</span>` : s.status === "working" && s.activity ? html`<span class="act">${s.activity.text}</span>` : s.status === "blocked" && s.why ? html`<span class="why" title=${s.why}>${s.why}</span>` : html`<span>${base(s.cwd)}</span><span>·</span><span>${ago(s.updated)}</span>`}</div>
             ${s.items ? html`<div class="mini"><${Progress} counts=${s.counts} /></div>` : null}
           </div>
-          <div class="right">${i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${s.asks ? html`<button class="badge" title="Go to the question" onClick=${(e) => { e.stopPropagation(); needYou(s.id); }}>${s.asks}</button>` : unread ? html`<span class="unread" />` : null}${s.live ? html`<span class="dot live" title="live" />` : null}</div>
+          <div class="right">${i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${s.asks ? html`<button class="badge" title="Go to what needs you" onClick=${(e) => { e.stopPropagation(); needYou(s.id); }}>${s.asks}</button>` : unread ? html`<span class="unread" />` : null}${s.live ? html`<span class="dot live" title="live" />` : null}</div>
         </div>`;
       })}
       ${!rows.length ? html`<div class="empty">No sessions yet.<br />Press ${K("n")} to start one, or type <code>/orchestrate</code> in any Claude Code or Codex session.</div>` : null}
@@ -564,7 +566,7 @@ function Crumbs({ s }) {
 function SessionBar({ s }) {
   return html`<header class="shead slim">
     <${Crumbs} s=${s} />
-    <h1><span class="t">${s.title}</span>${s.status === "input" ? html`<button class="pillbtn" title="Go to the question" onClick=${() => needYou(s.id)}><${Pill} s="input" /><${Hot} k="a">answer<//></button>` : html`<${Pill} s=${s.status} />`}<${LimitPill} s=${s} /></h1>
+    <h1><span class="t">${s.title}</span>${s.status === "input" ? html`<button class="pillbtn" title="Go to what needs you" onClick=${() => needYou(s.id)}><${Pill} s="input" /><${Hot} k="a">answer<//></button>` : html`<${Pill} s=${s.status} />`}<${LimitPill} s=${s} /></h1>
   </header>`;
 }
 // who this session works with: its collab rooms and teammates, each a jump to their board when they are on orchestrate
@@ -621,16 +623,16 @@ function Question({ a, d, here }) {
   const focus = S.askFocus === a.id, pick = S.askPick[a.id] || [], target = a.target && d.items[a.target];
   const note = useRef(), ev = evidence(d, a).filter((x) => x.target !== here), pics = ev.filter(isPic), docs = ev.filter((r) => !isPic(r)), r = repliedSince(d, a), many = openAsks(d).length > 1;
   const peek = (x) => (e) => { e?.stopPropagation(); lookEvidence(a, ev, ev.indexOf(x)); };
-  return html`<div class="qcard ${focus ? "focus" : ""}" data-ask=${a.id} onClick=${() => !focus && set({ askFocus: a.id })}>
-    <div class="qh"><${SI} s="input" sm />${a.kind === "permission" ? "Permission" : "Question"} <code>${a.id}</code> · ${a.actor !== "agent" ? html`<span class="who">${a.actor}</span>` : null}${target ? html`on <b style="color:var(--dim)">${target.id} ${target.title}</b>` : "for the session"}<span style="margin-left:auto">${ago(a.at)}</span>${!focus ? html`<span>${K("a")} answer</span>` : null}
-      ${a.kind !== "permission" ? html`<button class="qx" title="Dismiss without answering (⌫): the agent is told" onClick=${(e) => { e.stopPropagation(); dismiss(a); }}>×</button>` : null}</div>
+  return html`<div class="qcard ${a.kind} ${focus ? "focus" : ""}" data-ask=${a.id} onClick=${() => !focus && set({ askFocus: a.id })}>
+    <div class="qh"><${SI} s="input" sm />${ASK_LABEL[a.kind]} <code>${a.id}</code> · ${a.actor !== "agent" ? html`<span class="who">${a.actor}</span>` : null}${target ? html`on <b style="color:var(--dim)">${target.id} ${target.title}</b>` : "for the session"}<span style="margin-left:auto">${ago(a.at)}</span>${!focus ? html`<span>${K("a")} answer</span>` : null}
+      ${a.kind !== "permission" ? html`<button class="qx" title=${a.kind === "action" ? "No longer needed (⌫): the agent is told" : "Dismiss without answering (⌫): the agent is told"} onClick=${(e) => { e.stopPropagation(); dismiss(a); }}>×</button>` : null}</div>
     ${r ? html`<div class="qsince">You commented on ${a.target || "the session"} after this was asked (${ago(r.at)}). If that settled it, dismiss it.</div>` : null}
     <div class="qt md" dangerouslySetInnerHTML=${{ __html: refs(esc(a.text)) }} />
     ${pics.length ? html`<div class="qpics">${pics.map((x) => html`<button key=${x.id} class="qpic" title=${`${x.id} · ${x.caption || x.name}`} onClick=${peek(x)}><span class="th">${thumbOf(x, x.name)}</span><span class="cp"><b>${x.id}</b> ${x.caption || x.name}</span></button>`)}</div>` : null}
     ${docs.length ? html`<div class="rrow">${docs.map((x) => html`<${ResultChip} key=${x.id} a=${x} tag onOpen=${peek(x)} />`)}</div>` : null}
     ${a.detail ? html`<${Md} text=${a.detail} cls="qd" />` : null}
     ${a.options.length ? html`<div class="opts">${a.options.map((o, i) => html`<button class="opt ${pick.includes(o) ? "on" : ""}" onClick=${(e) => { e.stopPropagation(); if (!a.multi) return answer(a, [o], note.current?.value || ""); S.askPick[a.id] = pick.includes(o) ? pick.filter((x) => x !== o) : [...pick, o]; paint(); }}>${focus && i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${o}</button>`)}</div>` : null}
-    ${focus || !a.options.length ? html`<div class="note"><input ref=${note} placeholder=${a.options.length ? "Optional note" : "Your answer"} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); answer(a, pick, e.target.value); } if (e.key === "Escape") { e.target.blur(); set({ askFocus: null }); } }} /><button class="abtn primary" onClick=${(e) => { e.stopPropagation(); answer(a, pick, note.current?.value || ""); }}>Send ${K("↵")}</button></div>` : null}
+    ${focus || !a.options.length ? html`<div class="note"><input ref=${note} placeholder=${a.kind === "action" ? "Optional note: what you saw, why you can't" : a.options.length ? "Optional note" : "Your answer"} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); answer(a, pick, e.target.value); } if (e.key === "Escape") { e.target.blur(); set({ askFocus: null }); } }} /><button class="abtn primary" onClick=${(e) => { e.stopPropagation(); answer(a, pick, note.current?.value || ""); }}>Send ${K("↵")}</button></div>` : null}
     ${focus ? html`<div style="margin-top:8px;color:var(--faint);font-size:11.5px;display:flex;flex-wrap:wrap;gap:6px 14px"><${Hot} k=${a.options.length ? ["1", "…", String(Math.min(9, a.options.length))] : "Tab"}>${a.multi ? "toggle" : "choose"}<//><${Hot} k="Tab">note<//><${Hot} k="↵">send<//>${ev.some((x) => x.kind !== "link") ? html`<${Hot} k="Space">results<//>` : null}${many ? html`<${Hot} k="a">next question<//>` : null}${a.kind !== "permission" ? html`<${Hot} k="⌫">dismiss<//>` : null}<${Hot} k="Esc">later<//></div>` : null}
   </div>`;
 }

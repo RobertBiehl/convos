@@ -16,6 +16,8 @@ ARCHIVE = threading.RLock()
 STATUSES = ("planned", "working", "blocked", "done", "failed", "skipped")
 # statuses a row can carry a reason for (--why); blocked rows set by an agent must
 EXPLAINED = ("blocked", "failed", "skipped")
+# what the agent waits on the user for: a question or permission to answer, or an action only the user can take (need)
+LEAD, NEEDED = {"question": "Q:", "permission": "Q:", "action": "Action:"}, ["Done", "Can't"]
 # Session status precedence: anything that needs the user wins, then live work, then trouble.
 PRECEDENCE = ("input", "working", "blocked", "failed", "planned")
 STATUS_LABEL = {"input": "waiting for the user", "done": "done", "failed": "failed", "closed": "closed"}
@@ -89,7 +91,7 @@ def check(s, e):
         after = changes["status"] if "status" in changes else s["items"][e["item"]]["status"]
         if changes.get("why") and after not in EXPLAINED: raise ValueError(f"--why explains a {', '.join(EXPLAINED[:-1])} or {EXPLAINED[-1]} row, not a {after} one")
         # the user knows why they blocked a row; an agent's blocked row must tell the user what it waits for
-        if changes.get("status") == "blocked" and not changes.get("why") and e["actor"] != "user": raise ValueError("Say why it is blocked: --why 'what it waits for, and on whom'")
+        if changes.get("status") == "blocked" and not changes.get("why") and e["actor"] != "user": raise ValueError("Say why it is blocked: --why 'what it waits for'. If it waits on the user to do something, use need instead: convos orchestrate need 'WHAT THEY DO' --on ITEM")
     if kind == "comment" and e["reply_to"] is not None and e["reply_to"] not in s["comments"]: raise ValueError(f"Comment {e['reply_to']} does not exist")
     if kind == "comment" and not all(body_path(f["hash"]).is_file() for f in e.get("files", [])): raise ValueError("A comment image is missing from the archive")
     if kind in ("answer", "cancel"):
@@ -269,7 +271,7 @@ def reminders(s, scope=None):
     # finished an hour ago or more and read by the user since: the agent may take them off Current
     tidy = [i for i in mine if not s["items"][i]["parent"] and not s["items"][i].get("archived") and secs(changed(s, i)) >= 3600 and not blocked(s, i, marks)]
     return [*(f"{x['id']} is {span(secs(x['eta']))} past its ETA ({clock(x['eta'])}): finish it, or give it a new one: convos orchestrate set {x['id']} --eta 30m" for x in late),
-            *(f"{i} is blocked without a reason the user can see: convos orchestrate set {i} --why 'what it waits for, and on whom'" for i in unexplained),
+            *(f"{i} is blocked without a reason the user can see. If it waits on the user to do something: convos orchestrate need 'WHAT THEY DO' --on {i}. Otherwise: convos orchestrate set {i} --why 'what it waits for'" for i in unexplained),
             *([f"Working with no news for 30+ min: {', '.join(f'{i} ({span(secs(changed(s, i)))})' for i in idle)}. Set the real status of any that finished, stalled, or stopped; give the rest an --eta"] if idle else []),
             *(f"{a['id']} on {a['target'] or 'the session'}: the user commented there after you asked. If that settled it: convos orchestrate withdraw {a['id']}" for a in settled),
             *([f"{len(waiting)} user message(s) have not reached you yet: convos orchestrate inbox"] if waiting else []),
@@ -297,8 +299,8 @@ def describe(s, entry):
     if entry["type"] == "answer":
         a = entry["answer"]
         note = f" | note: {a['text']!r}" if a["text"] else ""
-        return f"- {entry['id']} answered on {where}: Q: {entry['text']!r} -> {', '.join(a['choices']) or '(no choice)'}{note}"
-    if entry["type"] == "dismissed": return f"- {entry['id']} dismissed by the user on {where} without an answer: Q: {entry['text']!r}. Do not wait for it; ask again only if you still need it"
+        return f"- {entry['id']} answered on {where}: {LEAD[entry['kind']]} {entry['text']!r} -> {', '.join(a['choices']) or '(no choice)'}{note}"
+    if entry["type"] == "dismissed": return f"- {entry['id']} dismissed by the user on {where} without an answer: {LEAD[entry['kind']]} {entry['text']!r}. Do not wait for it; ask again only if you still need it"
     if entry["actor"] == "orchestrate": return f"- {entry['id']} orchestrate notice on {where}: {entry['text']}"
     reply = f"convos orchestrate say{f' --on {t}' if t else ''} --reply {entry['id']} 'TEXT'"
     cid, sid = entry["id"], s["session"]["id"]

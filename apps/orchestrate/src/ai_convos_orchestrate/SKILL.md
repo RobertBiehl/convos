@@ -30,7 +30,8 @@ detected, pass `-s SESSION` on every later command.
 | `attach --text MARKDOWN --on ITEM --name NAME.md` | Append an inline markdown result. |
 | `say "TEXT" [--on ITEM] [--reply COMMENT]` | Write in the session chat, or in an item's thread. |
 | `ask "QUESTION" [-o A -o B] [--multi] [--on ITEM] [--detail MD] [--wait SEC]` | Ask the user. The item shows *needs you* until answered. |
-| `withdraw QUESTION...` | Take back open questions that no longer need an answer. |
+| `need "WHAT THE USER DOES" [--on ITEM] [--detail MD] [--wait SEC]` | Ask the user to do something only they can. The item shows *needs you* until they mark it Done or Can't. |
+| `withdraw QUESTION...` | Take back open questions or needs that no longer apply. |
 | `inbox [--wait SEC]` | Receive user comments and answers not yet delivered to you. |
 | `show` | Your board as the user sees it. Rows are marked `· unseen by the user`, `· archivable`, or `(archived)`. |
 | `archive ITEM...` | Move finished top-level rows, with everything under them, off the Current board. |
@@ -40,10 +41,13 @@ detected, pass `-s SESSION` on every later command.
 duplicating it. Statuses: `planned`, `working`, `blocked`, `done`, `failed`, `skipped`. An open question
 on an item makes it show as *needs you*. The session status is derived from its items.
 
-A blocked row must say why, in one line the user reads on the row itself: what it waits for, and on
-whom (`set i4 --status blocked --why "Waits for you: run the LAN test on both Macs"`). Failed and
-skipped rows take a `--why` too. A new status drops the old reason. If the user has to decide
-something, ask instead: a question puts the row in their *needs you* list.
+A row that waits on the user to do something (run a test on their machines, sign in, plug in a
+device) is not blocked; say what they do: `need "Run the LAN test on the Air and the M2 Pro" --on i4
+--detail "HOW-TO-LAN.md in the bundle on your Desktop"`. The row shows *needs you* with that action,
+and the user's Done or Can't (with an optional note) reaches you like an answer. A decision is a
+question (`ask`). Blocked is for blockers outside the user's hands, and a blocked row must say why in
+one line the user reads on the row itself: `set i4 --status blocked --why "Waits for the CI runner"`.
+Failed and skipped rows take a `--why` too. A new status drops the old reason.
 
 Give a row an ETA when you start work that takes a while: `--eta 45m`, `2h`, `18:30`, or an ISO
 time (`--eta none` clears it). The user sees it on the row, and it turns overdue once it passes;

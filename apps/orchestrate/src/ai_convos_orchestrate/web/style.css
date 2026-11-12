@@ -502,3 +502,4 @@ button.badge { cursor: pointer; }
 .whyline.s-skipped { background: color-mix(in srgb, var(--skipped) 10%, transparent); border: 1px solid color-mix(in srgb, var(--skipped) 30%, transparent); }
 .timeline .ev > span { flex: none; white-space: nowrap; } .timeline .ev > .hwhy { flex: 0 1 auto; color: var(--faint); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .side .sub .why { color: var(--blocked); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qcard.action .qh { color: var(--input); }
