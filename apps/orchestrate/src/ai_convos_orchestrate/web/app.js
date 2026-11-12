@@ -582,7 +582,7 @@ function WorksWith({ s }) {
 }
 function SessionInfo({ s, d }) {
   const kids = childrenOf(s.id), counts = s.counts || {}, lim = limitOf(s);
-  const runtime = s.origin === "gui" ? (s.live ? (s.busy ? "running a turn" : "live, idle") : (d.runtime?.state === "failed" ? `failed (exit ${d.runtime.code})` : "stopped")) : s.provider === "codex" ? (s.live ? "joined · Codex running (messages arrive at its next turn)" : "joined · Codex not running (messages wait until it is)") : (s.live ? "joined · reachable" : "joined · offline (messages wait in its inbox)");
+  const runtime = s.origin === "gui" ? (s.live ? (s.busy ? "running a turn" : "live, idle") : (d.runtime?.state === "failed" ? `failed (exit ${d.runtime.code})` : "stopped")) : s.provider === "codex" ? (s.wake?.startsWith("collab") ? `joined · run by ${s.wake}: a message asks collab for a turn` : s.wake === "daemon" ? "joined · a message wakes the thread through Codex's daemon" : s.live ? "joined · Codex running (messages arrive at its next turn)" : "joined · driven by codex exec (messages wait for its next turn)") : (s.live ? "joined · reachable" : "joined · offline (messages wait in its inbox)");
   return html`<div class="sinfo">
     <div class="actions">
       ${s.origin === "gui" && s.live ? html`<button class="abtn" onClick=${() => act({ kind: "stop" }, "Stopping…")}>${K("x")} Stop</button>` : null}
@@ -747,7 +747,7 @@ function deliveryNote(c, s, d) {
   // ✓ sent: handed to the session's channel; ✓✓ received: the agent's own transcript shows it, so it is in the agent's context
   if (c.delivered && d.received?.includes(c.id)) return html`<span class="state d" title="The agent has it: its transcript shows it">✓✓ received</span>`;
   // codex queue parks a message until the thread's next turn
-  if (c.delivered && d.received && s.provider === "codex") return html`<span class="state q" title="Handed to codex queue; the thread takes it at its next turn. Codex ${s.live ? "is running" : "is not running: reopen the thread"}.">queued in Codex${s.live ? " · arrives after its current turn" : " · Codex is not running"}</span>`;
+  if (c.delivered && d.received && s.provider === "codex") return html`<span class="state q" title="Handed to codex queue; the thread takes it at its next turn">queued in Codex · ${s.wake?.startsWith("collab") ? `${s.wake} takes it at its next turn` : s.wake === "daemon" ? "waking the thread" : s.live ? "arrives after its current turn" : "waits for its next turn"}</span>`;
   if (c.delivered) return html`<span class="state s" title=${d.received ? "Handed to the session; ✓✓ once the agent has it in its context" : "Handed to the session"}>✓ sent</span>`;
   const l = limitOf(s);
   if (l?.wait) return html`<span class="state q" title=${l.title}>waits for the usage limit to reset (${l.at})</span>`;

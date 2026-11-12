@@ -82,7 +82,7 @@ available channel. Whatever cannot be pushed stays pending for `inbox`.
 |---|---|
 | Started in the IDE (headless Claude Code) | `stream-json` on the process's stdin; resumed with `--resume` after a restart |
 | Joined Claude Code | the session's inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), recorded by the agent's own CLI calls |
-| Joined Codex | `codex queue --thread ID --message TEXT`, while a Codex process runs; the thread takes it at its next turn, and the comment shows *queued in Codex* until then |
+| Joined Codex | `codex queue --thread ID --message TEXT`; the thread takes it at its next turn, and the comment shows *queued in Codex* until then. Orchestrate also gets the thread that turn: a thread collab runs as a managed worker gets a collab wake (one turn with collab's own model and sandbox), and an interactive thread (started by the Codex TUI) is resumed by Codex's local daemon (`codex queue --resume`, after `codex app-server daemon start`). A thread another program drives with `codex exec` is not resumed, because the daemon keeps a resumed thread's write lock and would lock that program out; its messages wait for its next turn |
 
 **Received.** Your comment shows *✓ sent* once its channel has it, and *✓✓ received* once the agent
 has it in its context: the session's own provider transcript shows it (a message Claude Code queues
