@@ -60,8 +60,9 @@ def board(s):
     new = store.unread(s, marks)
     # what the user has read, so the agent knows what it may archive: unseen rows stay, finished rows the user has read may go
     def due(i): return "" if not i.get("eta") or i["status"] not in store.OPEN else f" · {store.span(store.secs(i['eta']))} past its ETA" if i["eta"] < store.now() else f" · ETA {store.clock(i['eta'])}"
+    def reason(i): return f" · {i['why']}" if i.get("why") else ""
     def mark(i): return " (archived)" if i.get("archived") else " · unseen by the user" if i["id"] in new else " · archivable" if not i["parent"] and not store.blocked(s, i["id"], marks) else ""
-    def tree(parent, depth): return [line for i in s["items"].values() if i["parent"] == parent for line in [f"{'  '*depth}  {i['id']:<4} [{eff[i['id']]}] {i['title']}{who(i)}{due(i)}{mark(i)}", *results(i["id"], depth+2), *tree(i["id"], depth+1)]]
+    def tree(parent, depth): return [line for i in s["items"].values() if i["parent"] == parent for line in [f"{'  '*depth}  {i['id']:<4} [{eff[i['id']]}] {i['title']}{who(i)}{reason(i)}{due(i)}{mark(i)}", *results(i["id"], depth+2), *tree(i["id"], depth+1)]]
     asks = [f"  {a['id']} on {a['target'] or 'session'}: {a['text']}{' -> ' + ' | '.join(a['options']) if a['options'] else ''}" for a in store.open_asks(s)]
     waiting = [store.describe(s, p) for p in store.pending(s)]
     return "\n".join([f"{meta['id']} {meta['title']!r} [{store.status(s)}] {meta['provider']} {meta['cwd']}",
@@ -104,30 +105,35 @@ def show(ctx: typer.Context):
 @cmd
 def add(ctx: typer.Context, title: str, description: str = typer.Option("", "--description", "-d", help="Markdown; '-' reads stdin"),
         status: str = typer.Option("planned", "--status"), parent: str = typer.Option(None, "--parent", "-p"),
-        eta: str = typer.Option(None, "--eta", help="When you expect it done: 45m, 2h, 18:30, or an ISO time"), again: bool = typer.Option(False, "--again", help="Add it even if a row with this title already sits under the same parent")):
+        eta: str = typer.Option(None, "--eta", help="When you expect it done: 45m, 2h, 18:30, or an ISO time"), again: bool = typer.Option(False, "--again", help="Add it even if a row with this title already sits under the same parent"),
+        why: str = typer.Option(None, "--why", help="Why it is blocked, failed, or skipped; a blocked row needs one")):
     """Add an item (one unit of work) to the board. Re-adding a title that is already under the same parent returns that row."""
     body, parent, title = text_arg(description), parent or ctx.obj["scope"], title.strip()
     # a re-run setup script must not grow a second board: the existing row's id comes back and nothing is written
     if not again and (twin := next((i for i, x in store.load(ident(ctx))["items"].items() if x["parent"] == parent and x["title"] == title), None)):
         return report(ctx, dict(item=twin, existing=True), f"{twin} already on the board: {title} (nothing added; --again adds another)")
-    s, e = emit(ctx, "item", body, parent=parent, title=title, status=status, eta=eta_at(eta) if eta else None)
-    report(ctx, dict(item=e["item"]), f"{e['item']} [{status}] {title}")
+    s, e = emit(ctx, "item", body, parent=parent, title=title, status=status, eta=eta_at(eta) if eta else None, **({"why": why.strip()} if why and why.strip() else {}))
+    report(ctx, dict(item=e["item"]), f"{e['item']} [{status}] {title}{f' · {why.strip()}' if why and why.strip() else ''}")
 
 @cmd(name="set")
 def set_(ctx: typer.Context, item: str, status: str = typer.Option(None, "--status"), title: str = typer.Option(None, "--title"),
         description: str = typer.Option(None, "--description", "-d", help="Markdown; '-' reads stdin"),
-        eta: str = typer.Option(None, "--eta", help="When you expect it done: 45m, 2h, 18:30, an ISO time; 'none' clears")):
-    """Change an item's status, title, ETA, or description."""
-    changes = {k: v for k, v in dict(status=status, title=title).items() if v is not None} | ({"eta": eta_at(eta)} if eta is not None else {})
-    if not changes and description is None: raise ValueError("Nothing to change: pass --status, --title, --eta, or --description")
+        eta: str = typer.Option(None, "--eta", help="When you expect it done: 45m, 2h, 18:30, an ISO time; 'none' clears"),
+        why: str = typer.Option(None, "--why", help="Why it is blocked, failed, or skipped: what it waits for, and on whom")):
+    """Change an item's status, title, ETA, reason, or description."""
+    changes = {k: v for k, v in dict(status=status, title=title, why=why and why.strip()).items() if v} | ({"eta": eta_at(eta)} if eta is not None else {})
+    if not changes and description is None: raise ValueError("Nothing to change: pass --status, --title, --eta, --why, or --description")
     # only real changes are written, so repeating a command neither adds history nor brings an archived row back
     body, now = text_arg(description) if description is not None else "", store.load(ident(ctx))["items"].get(item)
-    if now: changes, description = {k: v for k, v in changes.items() if now.get(k) != v}, None if description is None or now["description"] == body else description
+    if now:
+        # a new status drops the old reason, so a reason given with it stays even when it repeats the old one
+        moved = changes.get("status", now["status"]) != now["status"]
+        changes, description = {k: v for k, v in changes.items() if now.get(k) != v or k == "why" and moved}, None if description is None or now["description"] == body else description
     if now and not changes and description is None: return report(ctx, dict(item=item, changes={}), f"{item} [{now['status']}] {now['title']} (unchanged)")
     s, e = emit(ctx, "update", body, item=item, changes=changes, description=description is not None)
     x = s["items"][item]
-    due = f" (ETA {store.clock(x['eta'])})" if x.get("eta") else ""
-    report(ctx, dict(item=item, changes=changes), f"{item} [{x['status']}] {x['title']}{due}")
+    due, reason = f" (ETA {store.clock(x['eta'])})" if x.get("eta") else "", f" · {x['why']}" if x.get("why") else ""
+    report(ctx, dict(item=item, changes=changes), f"{item} [{x['status']}] {x['title']}{reason}{due}")
 
 @cmd
 def archive(ctx: typer.Context, items: list[str] = typer.Argument(..., help="Top-level rows")):

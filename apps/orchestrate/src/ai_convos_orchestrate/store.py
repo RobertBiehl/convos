@@ -14,6 +14,8 @@ V = 1
 # serialize threads, so the server's threads take turns here (always before a session lock).
 ARCHIVE = threading.RLock()
 STATUSES = ("planned", "working", "blocked", "done", "failed", "skipped")
+# statuses a row can carry a reason for (--why); blocked rows set by an agent must
+EXPLAINED = ("blocked", "failed", "skipped")
 # Session status precedence: anything that needs the user wins, then live work, then trouble.
 PRECEDENCE = ("input", "working", "blocked", "failed", "planned")
 STATUS_LABEL = {"input": "waiting for the user", "done": "done", "failed": "failed", "closed": "closed"}
@@ -42,11 +44,12 @@ def apply(s, e, body):
     if kind == "open": s.update(session={**e["session"], "created": at}, prompt=body)
     elif kind == "meta": s["session"].update(e["changes"])
     elif kind == "activity": s["activity"] = dict(text=body, actor=actor, at=at) if body else None
-    elif kind == "item": s["items"][e["item"]] = dict(id=e["item"], parent=e["parent"], title=e["title"], status=e["status"], eta=e.get("eta"), description=body, actor=actor, created=at, updated=at, history=[dict(status=e["status"], actor=actor, at=at)])
+    elif kind == "item": s["items"][e["item"]] = dict(id=e["item"], parent=e["parent"], title=e["title"], status=e["status"], eta=e.get("eta"), why=e.get("why"), description=body, actor=actor, created=at, updated=at, history=[dict(status=e["status"], actor=actor, at=at, why=e.get("why"))])
     elif kind == "update":
         item = s["items"][e["item"]]
-        item.update({**e["changes"], **({"description": body} if e["description"] else {}), "updated": at})
-        if "status" in e["changes"]: item["history"].append(dict(status=e["changes"]["status"], actor=actor, at=at))
+        # a reason belongs to the status it explains, so a new status without one drops the old reason
+        item.update({**({"why": None} if "status" in e["changes"] else {}), **e["changes"], **({"description": body} if e["description"] else {}), "updated": at})
+        if "status" in e["changes"]: item["history"].append(dict(status=e["changes"]["status"], actor=actor, at=at, why=e["changes"].get("why")))
     elif kind == "comment": s["comments"][e["comment"]] = dict(id=e["comment"], target=e["target"], reply_to=e["reply_to"], actor=actor, text=body, files=e.get("files", []), at=at, delivered=None if actor in ("user", "orchestrate") else at)
     elif kind == "attach": s["attachments"][e["attachment"]] = dict(id=e["attachment"], target=e["target"], actor=actor, caption=body, at=at, **e["file"])
     elif kind == "ask": s["asks"][e["ask"]] = dict(id=e["ask"], target=e["target"], options=e["options"], multi=e["multi"], kind=e["ask_kind"], detail=e["detail"], text=body, actor=actor, at=at, answer=None, delivered=None, cancelled=None)
@@ -81,6 +84,12 @@ def check(s, e):
     if kind == "item": item(e["parent"] if e["parent"] is not None or scope is None else scope, "Parent")
     if kind in ("update", "attach", "comment", "ask"): item(e.get("item", e.get("target")))
     if kind in ("item", "update") and e.get("status", e.get("changes", {}).get("status", "planned")) not in STATUSES: raise ValueError(f"Status must be one of {', '.join(STATUSES)}")
+    if kind in ("item", "update"):
+        changes = e if kind == "item" else e["changes"]
+        after = changes["status"] if "status" in changes else s["items"][e["item"]]["status"]
+        if changes.get("why") and after not in EXPLAINED: raise ValueError(f"--why explains a {', '.join(EXPLAINED[:-1])} or {EXPLAINED[-1]} row, not a {after} one")
+        # the user knows why they blocked a row; an agent's blocked row must tell the user what it waits for
+        if changes.get("status") == "blocked" and not changes.get("why") and e["actor"] != "user": raise ValueError("Say why it is blocked: --why 'what it waits for, and on whom'")
     if kind == "comment" and e["reply_to"] is not None and e["reply_to"] not in s["comments"]: raise ValueError(f"Comment {e['reply_to']} does not exist")
     if kind == "comment" and not all(body_path(f["hash"]).is_file() for f in e.get("files", [])): raise ValueError("A comment image is missing from the archive")
     if kind in ("answer", "cancel"):
@@ -255,9 +264,12 @@ def reminders(s, scope=None):
     idle = [i for i in mine if s["items"][i]["status"] == "working" and not s["items"][i].get("eta") and secs(changed(s, i)) >= 1800]
     settled = [a for a in open_asks(s) if a["kind"] != "permission" and within(s, a["target"], scope) and any(c["actor"] == "user" and c["target"] == a["target"] and c["at"] > a["at"] for c in s["comments"].values())]
     waiting = pending(s, scope)
+    # rows an agent blocked before reasons existed: the user cannot tell what they wait for
+    unexplained = [i for i in mine if (x := s["items"][i])["status"] == "blocked" and not x.get("why") and not x.get("archived") and x["history"][-1]["actor"] != "user"]
     # finished an hour ago or more and read by the user since: the agent may take them off Current
     tidy = [i for i in mine if not s["items"][i]["parent"] and not s["items"][i].get("archived") and secs(changed(s, i)) >= 3600 and not blocked(s, i, marks)]
     return [*(f"{x['id']} is {span(secs(x['eta']))} past its ETA ({clock(x['eta'])}): finish it, or give it a new one: convos orchestrate set {x['id']} --eta 30m" for x in late),
+            *(f"{i} is blocked without a reason the user can see: convos orchestrate set {i} --why 'what it waits for, and on whom'" for i in unexplained),
             *([f"Working with no news for 30+ min: {', '.join(f'{i} ({span(secs(changed(s, i)))})' for i in idle)}. Set the real status of any that finished, stalled, or stopped; give the rest an --eta"] if idle else []),
             *(f"{a['id']} on {a['target'] or 'the session'}: the user commented there after you asked. If that settled it: convos orchestrate withdraw {a['id']}" for a in settled),
             *([f"{len(waiting)} user message(s) have not reached you yet: convos orchestrate inbox"] if waiting else []),

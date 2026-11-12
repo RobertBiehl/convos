@@ -540,7 +540,7 @@ function Sidebar() {
           <${SI} s=${s.status} />
           <div style="min-width:0">
             <div class="title">${s.title}</div>
-            <div class="sub">${s.limit ? html`<span class="lim" title=${s.limit.text}>${limitOf(s).short}</span>` : s.status === "working" && s.activity ? html`<span class="act">${s.activity.text}</span>` : html`<span>${base(s.cwd)}</span><span>·</span><span>${ago(s.updated)}</span>`}</div>
+            <div class="sub">${s.limit ? html`<span class="lim" title=${s.limit.text}>${limitOf(s).short}</span>` : s.status === "working" && s.activity ? html`<span class="act">${s.activity.text}</span>` : s.status === "blocked" && s.why ? html`<span class="why" title=${s.why}>${s.why}</span>` : html`<span>${base(s.cwd)}</span><span>·</span><span>${ago(s.updated)}</span>`}</div>
             ${s.items ? html`<div class="mini"><${Progress} counts=${s.counts} /></div>` : null}
           </div>
           <div class="right">${i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${s.asks ? html`<button class="badge" title="Go to the question" onClick=${(e) => { e.stopPropagation(); needYou(s.id); }}>${s.asks}</button>` : unread ? html`<span class="unread" />` : null}${s.live ? html`<span class="dot live" title="live" />` : null}</div>
@@ -663,7 +663,7 @@ function ItemRow({ i, depth, d, s }) {
     <div class="ind"><${SI} s=${eff} /></div>
     <div class="body">
       <div class="tt"><span class="name">${i.title}</span>${!["agent", "user"].includes(i.actor) ? html`<span class="who"><span class="avatar sub" style="width:12px;height:12px;font-size:7px">${initials(i.actor)}</span>${i.actor}</span>` : null}</div>
-      ${i.description ? html`<div class="desc">${i.description.split("\n").find((l) => l.trim()).replace(/\*\*|__|`|^#+\s*|^[-*]\s+/g, "")}</div>` : null}
+      ${i.why ? html`<div class="why s-${i.status}" title=${i.why}>${i.why}</div>` : i.description ? html`<div class="desc">${i.description.split("\n").find((l) => l.trim()).replace(/\*\*|__|`|^#+\s*|^[-*]\s+/g, "")}</div>` : null}
       ${results.length || kids.length ? html`<div class="rrow">
         ${results.map((a, n) => html`<${ResultChip} key=${a.id} a=${a} on=${n === ri} onOpen=${() => open(n)} />`)}
         ${kids.map((k) => html`<button class="rchip k-session" title=${k.title} onClick=${(e) => { e.stopPropagation(); go(k.id); }}><${SI} s=${k.status} sm /><span>${k.title}</span></button>`)}
@@ -843,13 +843,14 @@ function Detail({ s, d }) {
       <h2>${it.title}</h2>
       <div class="row"><button onClick=${() => set({ overlay: { kind: "status", item: it.id } })}><${Pill} s=${eff} /></button><${Hot} k="s">change<//><${Eta} it=${it} />
         <button class="ghostbtn" style="margin-left:auto" onClick=${() => archive(false, it.id)}>${d.items[rootOf(d, it.id)].archived ? G.unarchive : G.archive}${d.items[rootOf(d, it.id)].archived ? "Bring back" : "Archive"}${it.parent ? ` ${rootOf(d, it.id)}` : ""}</button><${Hot} k="e" /></div>
+      ${it.why ? html`<div class="whyline s-${it.status}"><${SI} s=${it.status} sm /><div>${it.why}</div></div>` : null}
     </div>
     <div class="dscroll">
       ${it.description ? html`<section class="dsec"><${Md} text=${it.description} /></section>` : null}
       ${asks.length ? html`<section class="dsec"><h5>Needs you</h5><${Questions} list=${asks} d=${d} here=${it.id} /></section>` : null}
       <${Results} d=${d} target=${it.id} />
       ${kids.length ? html`<section class="dsec"><h5>Child sessions</h5><div class="children" style="margin-top:0">${kids.map((k) => html`<button class="chip" onClick=${() => go(k.id)}><${SI} s=${k.status} sm /><span class="ell">${k.title}</span></button>`)}</div></section>` : null}
-      <section class="dsec"><h5>History</h5><div class="timeline">${it.history.map((h) => html`<div class="ev"><${SI} s=${h.status} sm />${STATUS[h.status]}<span style="color:var(--faint)">by ${h.actor === "user" ? "you" : h.actor}</span><time>${ago(h.at)}</time></div>`)}</div></section>
+      <section class="dsec"><h5>History</h5><div class="timeline">${it.history.map((h) => html`<div class="ev"><${SI} s=${h.status} sm />${STATUS[h.status]}<span style="color:var(--faint)">by ${h.actor === "user" ? "you" : h.actor}</span>${h.why ? html`<span class="hwhy" title=${h.why}>${h.why}</span>` : null}<time>${ago(h.at)}</time></div>`)}</div></section>
       <section class="dsec"><h5>Thread</h5><${Thread} d=${d} s=${s} target=${it.id} /></section>
     </div>
     <${Composer} s=${s} target=${it.id} label=${`${it.id} · ${it.title}`} />

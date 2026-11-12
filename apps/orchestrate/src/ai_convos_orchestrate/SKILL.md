@@ -23,8 +23,8 @@ detected, pass `-s SESSION` on every later command.
 
 | Command | Purpose |
 |---|---|
-| `add TITLE [-d MARKDOWN] [--status S] [--eta WHEN] [-p PARENT] [--again]` | Add an item (a unit of work). Prints its id, e.g. `i3`. A title already under the same parent returns that row and adds nothing; `--again` adds another. |
-| `set ITEM [--status S] [--eta WHEN] [--title T] [-d MARKDOWN]` | Update an item. `-d -` reads stdin. Only real changes are written. |
+| `add TITLE [-d MARKDOWN] [--status S] [--why REASON] [--eta WHEN] [-p PARENT] [--again]` | Add an item (a unit of work). Prints its id, e.g. `i3`. A title already under the same parent returns that row and adds nothing; `--again` adds another. |
+| `set ITEM [--status S] [--why REASON] [--eta WHEN] [--title T] [-d MARKDOWN]` | Update an item. `-d -` reads stdin. Only real changes are written. |
 | `now "TEXT"` | One-line live activity for the session ("Running the test suite"). `now ""` clears. |
 | `attach FILE_OR_URL --on ITEM [--caption C]` | Append a result: image, video, PDF, markdown, any file, or a link. |
 | `attach --text MARKDOWN --on ITEM --name NAME.md` | Append an inline markdown result. |
@@ -39,6 +39,11 @@ detected, pass `-s SESSION` on every later command.
 `add` and `set` are safe to repeat, so a script that builds your board can run again without
 duplicating it. Statuses: `planned`, `working`, `blocked`, `done`, `failed`, `skipped`. An open question
 on an item makes it show as *needs you*. The session status is derived from its items.
+
+A blocked row must say why, in one line the user reads on the row itself: what it waits for, and on
+whom (`set i4 --status blocked --why "Waits for you: run the LAN test on both Macs"`). Failed and
+skipped rows take a `--why` too. A new status drops the old reason. If the user has to decide
+something, ask instead: a question puts the row in their *needs you* list.
 
 Give a row an ETA when you start work that takes a while: `--eta 45m`, `2h`, `18:30`, or an ISO
 time (`--eta none` clears it). The user sees it on the row, and it turns overdue once it passes;

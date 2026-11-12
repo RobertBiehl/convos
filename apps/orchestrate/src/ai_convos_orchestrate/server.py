@@ -29,7 +29,8 @@ def summary(s):
     meta, eff = s["session"], store.effective(s)
     return dict(id=meta["id"], title=meta["title"], provider=meta["provider"], model=meta.get("model"), effort=meta.get("effort"), cwd=meta["cwd"], origin=meta["origin"], parent=meta.get("parent"), skills=meta.get("skills", []),
                 status=store.status(s), counts=dict(collections.Counter(eff.values())), items=len(s["items"]), asks=len(store.open_asks(s)), pending=len(store.pending(s)),
-                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=transcripts.limit(meta), heard=len(transcripts.arrived(meta) or ()), wake=channels.waking(meta))
+                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=transcripts.limit(meta), heard=len(transcripts.arrived(meta) or ()), wake=channels.waking(meta),
+                why=next((x["why"] for x in sorted(s["items"].values(), key=lambda x: x["updated"], reverse=True) if x["status"] == "blocked" and x.get("why") and not x.get("archived")), None))
 
 def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], received=None if (heard := transcripts.arrived(s["session"])) is None else sorted(heard), unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
 

@@ -30,6 +30,12 @@ an open question shows **needs you**. A session's status is derived from its ite
 this precedence: needs you, working, blocked, failed, planned, done (idle when empty,
 closed when closed).
 
+A row's status can carry a one-line reason (`--why`). An agent's blocked row must have one, saying
+what it waits for and on whom; failed and skipped rows may. The board row shows the reason in place
+of the description's first line, the item view shows it under the status, its history keeps it with
+the status change, and a blocked session shows its newest reason in the session list. A new status
+drops the old reason. Rows the user blocks need none.
+
 ## Agent tools
 
 Agents talk to orchestrate only through the CLI. The skill (`convos orchestrate
@@ -38,7 +44,7 @@ install`) documents the tools; how an agent uses them is left to the agent.
 | Command | Effect |
 |---|---|
 | `join --title T` | Register the session (idempotent per provider session). |
-| `add`, `set` | Create and update items; `--eta 45m`, `2h`, `18:30`, or an ISO time sets when the agent expects the row done (`none` clears). Both are safe to repeat: re-adding a title under the same parent returns that row (`--again` adds another), and a `set` that changes nothing writes nothing, so it cannot bring an archived row back. |
+| `add`, `set` | Create and update items; `--why REASON` says why a row is blocked, failed, or skipped; `--eta 45m`, `2h`, `18:30`, or an ISO time sets when the agent expects the row done (`none` clears). Both are safe to repeat: re-adding a title under the same parent returns that row (`--again` adds another), and a `set` that changes nothing writes nothing, so it cannot bring an archived row back. |
 | `now TEXT` | Live activity line. |
 | `attach FILE_OR_URL --on ITEM`, `attach --text MD --on ITEM` | Append a result. |
 | `say TEXT [--on ITEM] [--reply C]` | Write in a thread: answers to the user, not status recaps (changed rows already show as unread). A `say` that is not a reply ends with that reminder. |
@@ -50,7 +56,7 @@ install`) documents the tools; how an agent uses them is left to the agent.
 | `show`, `ls`, `close`, `reopen` | Inspect and close. `show` marks rows `· unseen by the user`, `· archivable`, `(archived)`. |
 
 **Board check.** Every agent command ends with what needs tidying, when anything does: a lapsed ETA,
-a row left *working* with no news for half an hour (and no ETA), an open question on a row the user
+a row the agent blocked without a reason, a row left *working* with no news for half an hour (and no ETA), an open question on a row the user
 commented on after it was asked, user messages that have not reached the agent, and rows finished an
 hour ago that the user has read (which the agent may archive). `--json` carries them as `reminders`.
 
