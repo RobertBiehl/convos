@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.6b38
+
+- Orchestrate: headless agents survive a server restart, and a session never runs two agents: an agent's stdin is a named pipe it also holds open and its output goes to a file, so a restarted server picks it up again, even mid-turn. The IDE keeps serving while another process holds the archive; a refused write says which process holds it. (#191)
+- Orchestrate: HTML results render in Quick Look with their scripts, in a sandbox without access to the IDE. Questions stack with the results they rest on, can be dismissed, and agents `withdraw` the ones a comment settled. Rows take ETAs (`--eta 45m`), and every agent command ends with a Board check of what to tidy. (#191)
+- Orchestrate: a Convos chip next to *live* (`i` for details) shows whether the archive holds every local session file, the last sync and hook batch, the relay, and the disk, and starts `convos sync`. (#191)
+- Orchestrate skill: the board is the report (no status recaps in chat), replies stay short, HTML pages are attached as pages, and subagents running as their own agent join as child sessions. Reinstall with `convos orchestrate install`. (#191)
+
 ## 0.11.6b37
 
 - New product, in beta: **Orchestrate** (`convos-orchestrate`, on PyPI). It is a local, keyboard-first IDE in your browser for your Claude Code and Codex sessions, installed with `uv tool install convos --with convos-orchestrate --prerelease allow` (only pre-releases exist yet). Each session publishes a board of items with statuses, a live activity line, results (images, videos, PDFs, markdown, files, links), threads and questions. You comment on any row, with images; your comments reach the running session. You also answer questions, archive finished work, and start, stop or resume headless sessions. Every board change is a versioned event written through the core writer, so boards are searchable and survive restarts. `convos orchestrate install` adds the `/orchestrate` and `$orchestrate` skills. See `docs/orchestrate.md` (#187).

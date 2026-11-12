@@ -10,7 +10,7 @@ read_when:
 
 Orchestrate is a durable home for agent sessions. Each session publishes a board:
 **items** (units of work) with statuses, a live activity line, **results** attached to
-items (images, videos, PDFs, markdown, files, links), **threads** on the session and on every
+items (images, videos, PDFs, HTML pages, markdown, files, links), **threads** on the session and on every
 item, and **questions** the user answers. People read the board instead of terminals,
 comment on any row, and the agent decides how to act on it.
 
@@ -38,15 +38,21 @@ install`) documents the tools; how an agent uses them is left to the agent.
 | Command | Effect |
 |---|---|
 | `join --title T` | Register the session (idempotent per provider session). |
-| `add`, `set` | Create and update items. Both are safe to repeat: re-adding a title under the same parent returns that row (`--again` adds another), and a `set` that changes nothing writes nothing, so it cannot bring an archived row back. |
+| `add`, `set` | Create and update items; `--eta 45m`, `2h`, `18:30`, or an ISO time sets when the agent expects the row done (`none` clears). Both are safe to repeat: re-adding a title under the same parent returns that row (`--again` adds another), and a `set` that changes nothing writes nothing, so it cannot bring an archived row back. |
 | `now TEXT` | Live activity line. |
 | `attach FILE_OR_URL --on ITEM`, `attach --text MD --on ITEM` | Append a result. |
-| `say TEXT [--on ITEM] [--reply C]` | Write in a thread. |
-| `ask Q [-o A -o B] [--multi] [--on ITEM] [--wait S]` | Ask the user. |
+| `say TEXT [--on ITEM] [--reply C]` | Write in a thread: answers to the user, not status recaps (changed rows already show as unread). A `say` that is not a reply ends with that reminder. |
+| `ask Q [-o A -o B] [--multi] [--on ITEM] [--detail MD] [--wait S]` | Ask the user. The card shows the results the question names and the results on its item. |
+| `withdraw Q...` | Take back open questions that no longer need an answer. |
 | `inbox [--wait S]` | Pull undelivered comments, answers, and notices. |
 | `spawn PROMPT --on ITEM` | Start a child session working for this item. |
 | `archive ITEM...` | Archive finished top-level rows the user has read (see below). |
 | `show`, `ls`, `close`, `reopen` | Inspect and close. `show` marks rows `· unseen by the user`, `· archivable`, `(archived)`. |
+
+**Board check.** Every agent command ends with what needs tidying, when anything does: a lapsed ETA,
+a row left *working* with no news for half an hour (and no ETA), an open question on a row the user
+commented on after it was asked, user messages that have not reached the agent, and rows finished an
+hour ago that the user has read (which the agent may archive). `--json` carries them as `reminders`.
 
 **References.** Any text (comments, descriptions, questions, markdown results) can point at
 rows `i3`, results `a2`, questions `q1`, comments `c5`, sessions `o5619965e7ab`, and things in
@@ -78,6 +84,20 @@ available channel. Whatever cannot be pushed stays pending for `inbox`.
 | Joined Claude Code | the session's inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), recorded by the agent's own CLI calls |
 | Joined Codex | `codex queue --thread ID --message TEXT` |
 
+A headless agent outlives the server that started it: its stdin is a named pipe in the session's
+folder, which the agent itself also holds open, and its output goes to a file there. A restarted
+server picks it up again, in or between turns. A session never runs two agents: while any agent
+of a session is alive (found by the session id in its command line), orchestrate starts no other,
+and words for an agent it cannot reach wait until that agent ends; `x` stops it.
+
+**Questions.** Several open questions read as one stack under **Needs you**: the one in focus
+(else the oldest) is open, the rest are one line each, and `a` steps through them. A card shows
+the pictures and files the question rests on (the results it names by id, then the rest of its
+item's results); `Space` opens them in Quick Look. When you comment on the question's item after it
+was asked, the card says so: the comment may have settled it. The agent receives that comment with
+the questions still open there and withdraws the ones it settled; you can also dismiss one (`⌫`
+or `×`), and the agent is told it was dismissed unanswered.
+
 Headless permission prompts arrive on the board as questions (*Allow*, *Allow always*,
 *Deny*) through a small MCP tool passed as `--permission-prompt-tool`.
 
@@ -101,6 +121,22 @@ Anything new on an archived row (a status change, comment, result, question) bri
 Agents archive too, but only a finished tree (done or skipped, no open questions) whose rows
 you have all read since they last changed; such rows show *archived by* the agent, and only you
 bring rows back.
+
+**ETAs.** A row with an ETA shows it in its tail and in the item pane while it is planned, working, or
+blocked; once it passes, the row shows how far past it is, in red.
+
+**Convos on this computer.** The chip at the bottom right, next to *live*, says whether the archive
+holds what the agents wrote: *Archive current*, *N files behind*, or *Syncing...*, with the relay's last
+pass and the disk once it is over 90% full. `i` opens the sheet behind it. Each local session file
+counts as current when a hook captured that exact size and time or a sync read it after its last
+change; the rest are listed newest first as being written now, changed after their last capture, or
+never captured (Claude Code subagent transcripts wait for a sync, since hooks capture a session's
+main file). The sheet also lists files that fail to import, the last sync and hook batch, the
+newest conversation each web sync captured, the relay watcher, and disk use with the migration
+backups. It reads core's state files and stats the session files, never the archive or the
+network, so it refreshes every few seconds while open. Its one action is core's own `convos sync`
+in the background: `s` for local sessions, `Shift+S` for everything (web too, which reads browser
+cookies); its output goes to `~/.convos/orchestrate/sync.log`.
 
 **Read state.** A row that changed since you last looked (its status, title, description, a
 result, a question, or an agent's comment) has a bright title and an accent dot; read rows are
@@ -131,14 +167,18 @@ its teammates, each linking to their board when they are on orchestrate. Selecti
 | `#` (while writing) | Reference a row, result, question, or session |
 | `⌘V` (while writing) | Attach the copied image to the comment (also drop images on the pane, or the paperclip); `⌫` in an empty composer removes the last one |
 | `Shift+C` | Comment on the whole session |
-| `a`, then `1`-`9` / `↵` | Answer a question |
+| `a`, then `1`-`9` / `↵` | Answer a question; `a` again goes to the next one |
+| `Space`, `⌫` (on a question) | Look at the results it rests on; dismiss it unanswered |
 | `s` | Set the row's status |
 | `n`, `Shift+N` | New session, new child session |
 | `r` `x` `Shift+X` | Resume, stop, close / reopen |
 | `e`, `Shift+E` | Archive the row with everything under it, or bring it back (open work asks for a second `e`); archive every finished row |
 | `a` | Go to the question that needs you (also the needs-you badges) |
+| `i` | Convos on this computer; in it `s` / `Shift+S` sync local sessions / everything, `r` check again |
 | `⌘K`, `?` | Command palette, all shortcuts |
 
 The server binds `127.0.0.1` only. API calls need the per-server token (set as a
 `SameSite=Strict` cookie by the launch URL), a loopback `Host`, and, for writes, an
-`X-Orchestrate` header. Attachments are served sandboxed.
+`X-Orchestrate` header. Attachments are served sandboxed. An HTML result renders in Quick Look
+with its scripts (tooltips, sortable tables) in an opaque origin, so it cannot read the token,
+call the API, or load other results.
