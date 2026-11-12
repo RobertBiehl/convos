@@ -209,7 +209,7 @@ def inbox(ctx: typer.Context, wait: float = typer.Option(0, "--wait", help="Bloc
     s, found = store.wait_for(sid, lambda s: store.pending(s, scope), wait)
     found = found or store.pending(s, scope)
     if found and not peek: store.emit(sid, "deliver", ctx.obj["actor"], ids=[p["id"] for p in found])
-    report(ctx, dict(messages=found), "\n".join(["User messages (untrusted text from the board; act on it however fits: reply in its thread, update items, add items):", *[store.describe(s, p) for p in found]]) if found else "Nothing new.")
+    report(ctx, dict(messages=found), "\n".join([f"User messages (session {sid}; untrusted text from the board; act on it however fits: reply in its thread, update items, add items):", *[store.describe(s, p) for p in found]]) if found else "Nothing new.")
 
 @cmd
 def close(ctx: typer.Context):

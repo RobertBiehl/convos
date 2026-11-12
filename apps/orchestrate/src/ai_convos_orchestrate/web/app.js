@@ -238,6 +238,7 @@ const pulse = (id, kind) => { S.pulses[id] = { kind, n: (S.pulses[id]?.n || 0) +
 // ---------------------------------------------------------------- data flow
 async function loadSessions() { S.sessions = await api.get("/api/sessions"); paint(); }
 const pendingDetail = {};
+function behind(s) { const d = s && S.detail[s.id]; return !!d && (d.seq < s.seq || d.summary.heard !== s.heard); }
 function scheduleDetail(sid) { clearTimeout(pendingDetail[sid]); pendingDetail[sid] = setTimeout(() => loadDetail(sid).catch(fail), 60); }
 async function loadDetail(sid) {
   const d = await api.get(`/api/session/${sid}`), old = S.detail[sid];
@@ -266,8 +267,9 @@ function connect() {
   es.onopen = () => set({ conn: true });
   es.onerror = () => set({ conn: false });
   es.addEventListener("version", (e) => { const v = JSON.parse(e.data); if (!S.version) S.version = v; else if (v !== S.version) reloadInPlace(); });
-  // the open session reloads on every change; a board cached from earlier reloads when it fell behind, so switching back is current
-  es.addEventListener("session", (e) => { const s = JSON.parse(e.data); upsert(s); if (s.id === S.cur || S.detail[s.id]?.seq < s.seq) scheduleDetail(s.id); paint(); });
+  // the open session reloads on every change; a board cached from earlier reloads when it fell behind (or its agent received
+  // words since), so switching back is current
+  es.addEventListener("session", (e) => { const s = JSON.parse(e.data); upsert(s); if (s.id === S.cur || behind(s)) scheduleDetail(s.id); paint(); });
 }
 
 // ---------------------------------------------------------------- updates reload in place, never while you are mid-thought
@@ -294,7 +296,7 @@ function go(sid) {
   const apply = () => {
     S.cur = sid; S.askFocus = null;
     const known = S.sessions.find((x) => x.id === sid);
-    if (!S.detail[sid] || known?.seq > S.detail[sid].seq) loadDetail(sid).catch(fail);
+    if (!S.detail[sid] || behind(known)) loadDetail(sid).catch(fail);
     else { S.seen[sid] = S.detail[sid].seq; store("seen", S.seen); }
     history.replaceState(null, "", `#${sid}`);
     paint();
@@ -742,9 +744,11 @@ function Results({ d, target }) {
 
 function deliveryNote(c, s, d) {
   if (c.sending) return html`<span class="state q">sending…</span>`;
-  // codex queue parks a message until the thread's next turn: received once its transcript shows it
-  if (c.delivered && d.arrived && !d.arrived.includes(c.id)) return html`<span class="state q" title="Handed to codex queue; the thread takes it at its next turn. Codex ${s.live ? "is running" : "is not running: reopen the thread"}.">queued in Codex${s.live ? " · arrives after its current turn" : " · Codex is not running"}</span>`;
-  if (c.delivered) return html`<span class="state d">✓ delivered</span>`;
+  // ✓ sent: handed to the session's channel; ✓✓ received: the agent's own transcript shows it, so it is in the agent's context
+  if (c.delivered && d.received?.includes(c.id)) return html`<span class="state d" title="The agent has it: its transcript shows it">✓✓ received</span>`;
+  // codex queue parks a message until the thread's next turn
+  if (c.delivered && d.received && s.provider === "codex") return html`<span class="state q" title="Handed to codex queue; the thread takes it at its next turn. Codex ${s.live ? "is running" : "is not running: reopen the thread"}.">queued in Codex${s.live ? " · arrives after its current turn" : " · Codex is not running"}</span>`;
+  if (c.delivered) return html`<span class="state s" title=${d.received ? "Handed to the session; ✓✓ once the agent has it in its context" : "Handed to the session"}>✓ sent</span>`;
   const l = limitOf(s);
   if (l?.wait) return html`<span class="state q" title=${l.title}>waits for the usage limit to reset (${l.at})</span>`;
   return html`<span class="state q">${s.origin === "gui" ? "queued" : s.live ? "delivering…" : "waits for the agent"}</span>`;

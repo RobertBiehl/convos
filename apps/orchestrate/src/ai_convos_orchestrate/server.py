@@ -29,9 +29,9 @@ def summary(s):
     meta, eff = s["session"], store.effective(s)
     return dict(id=meta["id"], title=meta["title"], provider=meta["provider"], model=meta.get("model"), effort=meta.get("effort"), cwd=meta["cwd"], origin=meta["origin"], parent=meta.get("parent"), skills=meta.get("skills", []),
                 status=store.status(s), counts=dict(collections.Counter(eff.values())), items=len(s["items"]), asks=len(store.open_asks(s)), pending=len(store.pending(s)),
-                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=transcripts.limit(meta))
+                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=transcripts.limit(meta), heard=len(transcripts.arrived(meta) or ()))
 
-def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], arrived=sorted(transcripts.arrived(s["session"])) if s["session"]["provider"] == "codex" else None, unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
+def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], received=None if (heard := transcripts.arrived(s["session"])) is None else sorted(heard), unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
 
 def skills(cwd):
     roots = [Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"skills", *([Path(cwd)/".claude"/"skills"] if cwd else [])]
@@ -189,11 +189,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for sid in store.session_ids():
                 try: mtime = (store.sdir(sid)/"view.json").stat().st_mtime_ns
                 except OSError: continue
-                # a session changes with its board, or when its provider's usage limit stops or releases it
-                if seen.get(sid) != (mtime, sid in metas and transcripts.limit(metas[sid])) and (s := store.peek(sid)):
+                # a session changes with its board, when its provider's usage limit stops or releases it, and when its agent
+                # receives the user's words (its transcript shows them)
+                meta = metas.get(sid)
+                if seen.get(sid) != (mtime, meta and transcripts.limit(meta), meta and len(transcripts.arrived(meta) or ())) and (s := store.peek(sid)):
                     metas[sid] = s["session"]
                     events.append(("session", out := summary(s)))
-                    seen[sid] = (mtime, out["limit"])
+                    seen[sid] = (mtime, out["limit"], out["heard"])
             if not events and time.monotonic()-beat > 15: events.append(("ping", {}))
             if events:
                 self.wfile.write("".join(f"event: {k}\ndata: {json.dumps(v, separators=(',', ':'))}\n\n" for k, v in events).encode())

@@ -5,7 +5,7 @@ Claude Code keeps projects/*/SESSION.jsonl under its config dir; Codex keeps ses
 For limits the latest turn decides: a session stays interrupted until it replies again. Nothing is stored; a transcript
 is read again only when it changes.
 """
-import datetime as dt, json, os, re, time, zoneinfo
+import datetime as dt, json, os, re, threading, time, zoneinfo
 from pathlib import Path
 
 MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
@@ -14,9 +14,11 @@ CLAUDE = re.compile(r"resets (?:([A-Z][a-z]{2}) (\d{1,2}),? (?:at )?)?(\d{1,2})(
 # "try again at 2:59 AM.", "try again at Sep 7th, 2026 7:41 AM." (this machine's local time)
 CODEX = re.compile(r"try again at (?:([A-Z][a-z]{2}) (\d{1,2})(?:st|nd|rd|th)?,? (\d{4}),? )?(\d{1,2}):(\d{2})\s*([AP]M)")
 GRACE = 60  # the provider shows its reset to the minute; held words go out a minute after it
-FOUND, STATE, SEEN = {}, {}, {}
-# how the user's words read wherever they reach an agent: a queued message, inbox output, hook context
-WORDS = re.compile(rb'(?:^|\\n|")- ([cq]\d+) (?:user comment|answered on|dismissed by the user|orchestrate notice)')
+FOUND, STATE, SEEN, LOCK = {}, {}, {}, threading.Lock()
+# how the user's words read wherever they reach an agent (a pushed message, inbox output, hook context): a line of the
+# message starting "- c5 user comment". A literal start keeps the scan at gigabytes per second.
+WORDS = re.compile(rb'- ([cq]\d+) (?:user comment|answered on|dismissed by the user|orchestrate notice)')
+QUEUED = b'{"type":"queue-operation"'  # Claude Code logs a message it queues mid-turn before the agent sees it
 
 def wall(tz, y, m, d, h, mi): return dt.datetime(y, m, d, h, mi, tzinfo=tz) if tz else dt.datetime(y, m, d, h, mi).astimezone()
 
@@ -99,17 +101,32 @@ def holding(meta):
     """Words for an interrupted session wait until its limit resets, so they reach an agent that can act on them."""
     return bool((v := limit(meta)) and v["resets"] and dt.datetime.fromisoformat(v["resets"]).timestamp()+GRACE > time.time())
 
+def heard(data, i, sid):
+    """The word at i starts a line of a message (in JSON, after an escaped newline or the opening quote) for this session:
+    the nearest "(session o...)" header on its transcript line names it, so an agent quoting another session's words does
+    not count (inbox output from before it had that header does). Claude Code's queue bookkeeping does not count either."""
+    start = data.rfind(b"\n", 0, i)+1
+    head = data.rfind(b"(session o", start, i)
+    return (data[i-1:i] == b'"' or data[i-2:i] == b"\\n") and not data.startswith(QUEUED, start) and (head < 0 or data.startswith(sid, head+9))
+
 def arrived(meta):
-    """Ids of the user's words that reached this Codex thread. `codex queue` only parks a message until the thread takes
-    its next turn, so a queued comment counts as received once the thread's transcript shows it."""
-    if meta["provider"] != "codex" or not (path := transcript(meta)): return set()
-    offset, ids = SEEN.get(path, (0, set()))
-    try:
-        with path.open("rb") as f:
-            f.seek(offset)
-            data = f.read()
-    except OSError: return ids
-    whole = data[:data.rfind(b"\n")+1]
-    ids = ids | {m.decode() for m in WORDS.findall(whole)}
-    SEEN[path] = (offset+len(whole), ids)
-    return ids
+    """Ids of the user's words this session's agent has in its context: its own transcript shows them. Codex logs a queued
+    message only once a turn takes it; Claude Code logs a message it queues mid-turn twice, and only the second time is the
+    agent's. Read incrementally, so a long transcript is read whole once; None when there is no transcript to read."""
+    if not (path := transcript(meta)): return None
+    sid = meta["id"].encode()
+    with LOCK:
+        offset, ids = SEEN.get(path, (0, frozenset()))
+        try:
+            if path.stat().st_size <= offset: return ids
+            with path.open("rb") as f:
+                f.seek(offset)
+                rest, found = b"", set()
+                while chunk := f.read(1 << 24):
+                    data = rest+chunk
+                    end = data.rfind(b"\n")+1
+                    found |= {m[1].decode() for m in WORDS.finditer(data, 0, end) if heard(data, m.start(), sid)}
+                    offset, rest = offset+end, data[end:]
+        except OSError: return ids
+        SEEN[path] = (offset, ids := ids | found)
+        return ids

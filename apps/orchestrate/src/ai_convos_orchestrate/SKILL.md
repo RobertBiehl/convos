@@ -74,6 +74,10 @@ named target. Respond however fits: answer in that item's thread with
 `say --on ITEM --reply COMMENT`, update the item, add new items, change course, or ask
 back. Reply where the user spoke so the conversation stays attached to its item.
 
+When the user asks you something, answer in that thread first, before longer work: they are
+waiting for it. An instruction needs no reply; just do it. The board shows the user ✓✓ on
+their comment once it is in your context, so there's no need to acknowledge it.
+
 Questions are decisions, so put what they rest on in front of the user: attach the evidence
 (screenshots, comparison sheets, notes) before you ask. The question card shows the results
 on its item and every result the question names by id, so name the ones that decide it.

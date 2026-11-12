@@ -313,6 +313,7 @@ button.badge { cursor: pointer; }
 .msg .state { display: inline-flex; gap: 4px; align-items: center; }
 .msg .state.q { color: var(--input); }
 .msg .state.d { color: var(--done); }
+.msg .state.s { color: var(--dim); }
 .avatar { width: 16px; height: 16px; border-radius: 5px; display: inline-grid; place-items: center; font: 700 9px/1 var(--sans); color: white; background: var(--accent); flex: none; }
 .avatar.agent { background: linear-gradient(135deg, #8b5cf6, #4fb3ff); }
 .avatar.sub { background: linear-gradient(135deg, #3ecf8e, #4fb3ff); }

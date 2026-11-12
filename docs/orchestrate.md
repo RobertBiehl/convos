@@ -82,7 +82,13 @@ available channel. Whatever cannot be pushed stays pending for `inbox`.
 |---|---|
 | Started in the IDE (headless Claude Code) | `stream-json` on the process's stdin; resumed with `--resume` after a restart |
 | Joined Claude Code | the session's inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), recorded by the agent's own CLI calls |
-| Joined Codex | `codex queue --thread ID --message TEXT`, while a Codex process runs; the thread takes it at its next turn, and the comment shows *queued in Codex* until the thread's transcript has it |
+| Joined Codex | `codex queue --thread ID --message TEXT`, while a Codex process runs; the thread takes it at its next turn, and the comment shows *queued in Codex* until then |
+
+**Received.** Your comment shows *✓ sent* once its channel has it, and *✓✓ received* once the agent
+has it in its context: the session's own provider transcript shows it (a message Claude Code queues
+mid-turn counts only when the agent takes it, a queued Codex message when a turn takes it). Agents
+spend nothing on this, so they reply to questions and just act on instructions. The transcript is
+read incrementally, and words count only under their own session's header.
 
 A headless agent outlives the server that started it: its stdin is a named pipe in the session's
 folder, which the agent itself also holds open, and its output goes to a file there. A restarted
