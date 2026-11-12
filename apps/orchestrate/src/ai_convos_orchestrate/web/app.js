@@ -42,6 +42,15 @@ function etaOf(it) {
   return { late: left < 0, at, text: left < 0 ? `${span(-left)} past ETA` : `ETA ${at}`, title: left < 0 ? `ETA was ${t.toLocaleString()}` : `ETA ${t.toLocaleString()}, in ${span(left)}` };
 }
 const Eta = ({ it }) => { const e = etaOf(it); return e ? html`<span class="eta ${e.late ? "late" : ""}" title=${e.title}>${G.clock}${e.text}</span>` : null; };
+// the provider's usage limit stopped this session's last turn: words wait until a minute after the reset, then go out
+const clock = (t) => t.toLocaleString([], t.toDateString() === new Date().toDateString() ? { hour: "2-digit", minute: "2-digit" } : { weekday: "short", hour: "2-digit", minute: "2-digit" });
+function limitOf(s) {
+  const l = s.limit;
+  if (!l) return null;
+  const t = l.resets && new Date(l.resets), wait = !!t && t - Date.now() + 60000 > 0, hit = clock(new Date(l.at));
+  return { wait, hit, at: t && clock(t), go: t && clock(new Date(+t + 60000)), title: l.text, short: !t ? "Usage limit · no reset time" : wait ? `Usage limit · resets ${clock(t)}` : `Usage limit reset ${clock(t)} · not resumed` };
+}
+const LimitPill = ({ s }) => { const l = limitOf(s); return l ? html`<span class="pill limit" title=${l.title}>${G.clock}${l.short}</span>` : null; };
 const initials = (a) => a === "user" ? "you" : a === "agent" ? "A" : a === "orchestrate" ? "O" : a.slice(0, 2).toUpperCase();
 const K = (...keys) => keys.map((k) => html`<kbd>${k}</kbd>`);
 const Hot = ({ k, children }) => html`<span class="hot">${[].concat(k).map((x) => html`<kbd>${x}</kbd>`)}${children}</span>`;
@@ -529,7 +538,7 @@ function Sidebar() {
           <${SI} s=${s.status} />
           <div style="min-width:0">
             <div class="title">${s.title}</div>
-            <div class="sub">${s.status === "working" && s.activity ? html`<span class="act">${s.activity.text}</span>` : html`<span>${base(s.cwd)}</span><span>·</span><span>${ago(s.updated)}</span>`}</div>
+            <div class="sub">${s.limit ? html`<span class="lim" title=${s.limit.text}>${limitOf(s).short}</span>` : s.status === "working" && s.activity ? html`<span class="act">${s.activity.text}</span>` : html`<span>${base(s.cwd)}</span><span>·</span><span>${ago(s.updated)}</span>`}</div>
             ${s.items ? html`<div class="mini"><${Progress} counts=${s.counts} /></div>` : null}
           </div>
           <div class="right">${i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${s.asks ? html`<button class="badge" title="Go to the question" onClick=${(e) => { e.stopPropagation(); needYou(s.id); }}>${s.asks}</button>` : unread ? html`<span class="unread" />` : null}${s.live ? html`<span class="dot live" title="live" />` : null}</div>
@@ -553,7 +562,7 @@ function Crumbs({ s }) {
 function SessionBar({ s }) {
   return html`<header class="shead slim">
     <${Crumbs} s=${s} />
-    <h1><span class="t">${s.title}</span>${s.status === "input" ? html`<button class="pillbtn" title="Go to the question" onClick=${() => needYou(s.id)}><${Pill} s="input" /><${Hot} k="a">answer<//></button>` : html`<${Pill} s=${s.status} />`}</h1>
+    <h1><span class="t">${s.title}</span>${s.status === "input" ? html`<button class="pillbtn" title="Go to the question" onClick=${() => needYou(s.id)}><${Pill} s="input" /><${Hot} k="a">answer<//></button>` : html`<${Pill} s=${s.status} />`}<${LimitPill} s=${s} /></h1>
   </header>`;
 }
 // who this session works with: its collab rooms and teammates, each a jump to their board when they are on orchestrate
@@ -570,7 +579,7 @@ function WorksWith({ s }) {
   </div>`)}</div>`;
 }
 function SessionInfo({ s, d }) {
-  const kids = childrenOf(s.id), counts = s.counts || {};
+  const kids = childrenOf(s.id), counts = s.counts || {}, lim = limitOf(s);
   const runtime = s.origin === "gui" ? (s.live ? (s.busy ? "running a turn" : "live, idle") : (d.runtime?.state === "failed" ? `failed (exit ${d.runtime.code})` : "stopped")) : (s.live ? "joined · reachable" : "joined · offline (messages wait in its inbox)");
   return html`<div class="sinfo">
     <div class="actions">
@@ -586,6 +595,7 @@ function SessionInfo({ s, d }) {
       <span class="m"><code>${s.id}</code></span>
       ${d.runtime?.cost ? html`<span class="m">$${d.runtime.cost.toFixed(2)}</span>` : null}
     </div>
+    ${lim ? html`<div class="limitline">${G.clock}<div>Stopped by the usage limit at ${lim.hit}. ${lim.wait ? (s.pending ? `${s.pending} message${s.pending === 1 ? " waits" : "s wait"} and go${s.pending === 1 ? "es" : ""} out at ${lim.go}, after it resets.` : `Messages you send wait and go out at ${lim.go}, after it resets.`) : lim.at ? `The limit reset at ${lim.at}; send a message to continue.` : "The notice names no reset time, so messages go out right away."}<div class="notice">${lim.title}</div></div></div>` : null}
     <div class="activity">${s.status === "working" || s.busy ? html`<${SI} s="working" sm />` : null}${s.activity && !["done", "closed"].includes(s.status) ? html`<span class="txt" key=${s.activity.at}>${s.activity.text}</span><span style="color:var(--faint)">· ${ago(s.activity.at)}</span>` : html`<span style="color:var(--faint)">${s.items ? `${counts.done || 0} of ${s.items} done` : "No items yet"}</span>`}</div>
     ${s.items ? html`<div style="margin-top:10px"><${Progress} counts=${counts} big /></div>` : null}
     ${kids.length ? html`<div class="children">${kids.map((k) => html`<button class="chip" onClick=${() => go(k.id)}><${SI} s=${k.status} sm /><span class="ell">${k.title}</span></button>`)}</div>` : null}
@@ -733,6 +743,8 @@ function Results({ d, target }) {
 function deliveryNote(c, s) {
   if (c.sending) return html`<span class="state q">sending…</span>`;
   if (c.delivered) return html`<span class="state d">✓ delivered</span>`;
+  const l = limitOf(s);
+  if (l?.wait) return html`<span class="state q" title=${l.title}>waits for the usage limit to reset (${l.at})</span>`;
   return html`<span class="state q">${s.origin === "gui" ? "queued" : s.live ? "delivering…" : "waits for the agent"}</span>`;
 }
 function Thread({ d, s, target }) {
@@ -755,7 +767,7 @@ function refCandidates(q) {
 }
 function Composer({ s, target, label }) {
   const key = `${s.id}:${target || ""}`, ref = useRef(), [focus, setFocus] = useState(false), [pick, setPick] = useState(null);
-  const pending = S.attach[key] || [], picker = useRef();
+  const pending = S.attach[key] || [], picker = useRef(), lim = limitOf(s);
   const submit = () => { const text = (S.drafts[key] || "").trim(); if (!text && !pending.length) return; S.drafts[key] = ""; S.attach[key] = []; ref.current.value = ""; grow(); sendComment(text, target, ref.current.parentElement, pending); ref.current.blur(); };
   const paste = (e) => { const fs = [...(e.clipboardData?.files || [])]; if (fs.some((f) => f.type.startsWith("image/"))) { e.preventDefault(); attachImages(key, fs); } };
   const grow = () => { const t = ref.current; if (t) { t.style.height = "auto"; t.style.height = Math.min(160, t.scrollHeight) + "px"; } };
@@ -783,6 +795,7 @@ function Composer({ s, target, label }) {
   return html`<div class="composer ${S.drop ? "over" : ""}">
     ${pick && cands.length ? html`<div class="refpick">${cands.map((c, n) => html`<div class=${n === pick.i ? "on" : ""} onMouseDown=${(e) => { e.preventDefault(); insert(c); }}>${c.icon ? html`<${SI} s=${c.icon} sm />` : html`<span class="g">${G[c.kind === "pdf" ? "pdf" : c.kind === "link" ? "link" : "file"]}</span>`}<code>${c.id}</code><span class="ell">${c.label}</span></div>`)}<div class="hint">${K("↑", "↓")} pick · ${K("↵")} insert · ${K("Esc")}</div></div>` : null}
     <div class="target">to <span class="to" key=${key}>${label}</span><span style="margin-left:auto;display:flex;gap:10px"><${Hot} k="#">reference<//><${Hot} k="c">row<//><${Hot} k=${["⇧", "C"]}>session<//></span></div>
+    ${lim?.wait ? html`<div class="limitnote" title=${lim.title}>${G.clock}Usage limit: this goes out at ${lim.go}, after the limit resets.</div>` : null}
     ${pending.length ? html`<div class="pend">${pending.map((f, n) => html`<span class="pimg" key=${f.src}><img src=${f.src} alt=${f.name} title=${f.name} /><button title="Remove (⌫ in an empty composer)" onMouseDown=${(e) => { e.preventDefault(); unattach(key, n); }}>×</button></span>`)}</div>` : null}
     <div class="box ${focus ? "focus" : ""}">
       <button class="clip" title="Attach images: or paste them (⌘V), or drop them here" onMouseDown=${(e) => e.preventDefault()} onClick=${() => picker.current.click()}>${G.clip}</button>

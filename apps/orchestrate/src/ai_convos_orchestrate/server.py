@@ -5,7 +5,7 @@ the launch URL), a loopback Host header, and, for writes, a custom header no cro
 """
 import base64, collections, hashlib, hmac, http.server, json, os, re, secrets, socket, subprocess, sys, threading, time, urllib.parse, webbrowser
 from pathlib import Path
-from . import store, runtime, channels, overview
+from . import store, runtime, channels, overview, limits
 
 WEB = Path(__file__).with_name("web")
 STATIC = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css", "/vendor/preact-htm.js": "vendor/preact-htm.js"}
@@ -29,7 +29,7 @@ def summary(s):
     meta, eff = s["session"], store.effective(s)
     return dict(id=meta["id"], title=meta["title"], provider=meta["provider"], model=meta.get("model"), effort=meta.get("effort"), cwd=meta["cwd"], origin=meta["origin"], parent=meta.get("parent"), skills=meta.get("skills", []),
                 status=store.status(s), counts=dict(collections.Counter(eff.values())), items=len(s["items"]), asks=len(store.open_asks(s)), pending=len(store.pending(s)),
-                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"])
+                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=limits.state(meta))
 
 def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
 
@@ -181,7 +181,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         for k, v in (("Content-Type", "text/event-stream"), ("Cache-Control", "no-store"), ("Connection", "keep-alive")): self.send_header(k, v)
         self.end_headers()
-        seen, beat, current, tick = {}, time.monotonic(), None, 0
+        seen, metas, beat, current, tick = {}, {}, time.monotonic(), None, 0
         while True:
             events = []
             if tick % 4 == 0 and (v := version()) != current: (events.append(("version", v)), current := v)
@@ -189,9 +189,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for sid in store.session_ids():
                 try: mtime = (store.sdir(sid)/"view.json").stat().st_mtime_ns
                 except OSError: continue
-                if seen.get(sid) != mtime and (s := store.peek(sid)):
-                    seen[sid] = mtime
-                    events.append(("session", summary(s)))
+                # a session changes with its board, or when its provider's usage limit stops or releases it
+                if seen.get(sid) != (mtime, sid in metas and limits.state(metas[sid])) and (s := store.peek(sid)):
+                    metas[sid] = s["session"]
+                    events.append(("session", out := summary(s)))
+                    seen[sid] = (mtime, out["limit"])
             if not events and time.monotonic()-beat > 15: events.append(("ping", {}))
             if events:
                 self.wfile.write("".join(f"event: {k}\ndata: {json.dumps(v, separators=(',', ':'))}\n\n" for k, v in events).encode())
@@ -255,7 +257,9 @@ def pump():
                 if s["session"].get("parent") and state in NOTIFY and sid in last: background(notify_parent, s, state)
                 last[sid] = state
             if s and s["closed"] and runtime.alive(sid) and not runtime.busy(sid): runtime.stop(sid)
-            if s and not s["closed"] and s["session"]["origin"] != "gui" and store.pending(s) and channels.reachable(s):
+            # words held for a usage limit go out once it resets; joined sessions get every word their channel can take
+            gui = s and s["session"]["origin"] == "gui"
+            if s and not s["closed"] and store.pending(s) and not limits.holding(s["session"]) and (limits.state(s["session"]) if gui else channels.reachable(s)):
                 try: runtime.deliver(sid)
                 except (ValueError, OSError, subprocess.SubprocessError, store.core.LockBusy) as error: print(f"orchestrate: deliver {sid}: {error}", file=sys.stderr)
 

@@ -90,6 +90,13 @@ server picks it up again, in or between turns. A session never runs two agents: 
 of a session is alive (found by the session id in its command line), orchestrate starts no other,
 and words for an agent it cannot reach wait until that agent ends; `x` stops it.
 
+**Usage limits.** When the provider's usage limit stops a session's turn, the IDE shows it on the
+session (in the list, the header, and the session panel, with the provider's own notice) until the
+session replies again. Orchestrate reads this from the provider's transcript of the session (Claude
+Code's `projects/*/SESSION.jsonl`, Codex's `rollout-*-THREAD.jsonl`) and stores nothing. Your
+comments and answers to a stopped session wait and go out a minute after the limit resets, so they
+reach an agent that can act on them; a notice without a reset time (out of credits) holds nothing.
+
 **Questions.** Several open questions read as one stack under **Needs you**: the one in focus
 (else the oldest) is open, the rest are one line each, and `a` steps through them. A card shows
 the pictures and files the question rests on (the results it names by id, then the rest of its

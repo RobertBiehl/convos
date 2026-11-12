@@ -483,3 +483,13 @@ button.badge { cursor: pointer; }
 /* bottom-anchored board: oldest on top, the newest and what needs you sit at the bottom */
 .scroll.anchored { display: flex; flex-direction: column; }
 .scroll.anchored > .stack { margin-top: auto; }
+
+/* the provider's usage limit stopped a session */
+.side .sub .lim { color: var(--blocked); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pill.limit { color: var(--blocked); background: color-mix(in srgb, var(--blocked) 14%, transparent); margin-left: 8px; font-weight: 500; }
+.pill.limit svg { width: 12px; height: 12px; }
+.limitline { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; padding: 8px 10px; border-radius: 8px; color: var(--text); background: color-mix(in srgb, var(--blocked) 10%, transparent); border: 1px solid color-mix(in srgb, var(--blocked) 30%, transparent); font-size: 12.5px; }
+.limitline > svg { color: var(--blocked); width: 14px; height: 14px; flex: none; margin-top: 2px; }
+.limitline .notice { color: var(--faint); margin-top: 2px; }
+.composer .limitnote { display: flex; gap: 6px; align-items: center; color: var(--blocked); font-size: 12px; margin: 0 2px 6px; }
+.composer .limitnote svg { width: 12px; height: 12px; }
