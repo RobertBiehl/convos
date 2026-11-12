@@ -58,6 +58,7 @@ const Hot = ({ k, children }) => html`<span class="hot">${[].concat(k).map((x) =
 const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const inline = (s) => s.split(/(`[^`\n]+`)/g).map((part, i) => i % 2 ? `<code>${esc(part.slice(1, -1))}</code>` : esc(part)
   .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<em>$2</em>")
+  .replace(/\[([^\]\n]+)\]\((o[0-9a-f]{11}(?::[icqa][1-9]\d*)?|[icqa][1-9]\d*)\)/g, (m, text, ref) => refLink(ref[0] === "o" ? ref.split(":")[0] : S.cur, ref[0] === "o" ? ref.split(":")[1] : ref, text, "ref inl") || text)
   .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
   .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>')).join("");
 function md(src) {
@@ -96,16 +97,16 @@ function refTarget(sid, id) {
   const x = { i: d.items, a: d.attachments, q: d.asks, c: d.comments }[id[0]][id];
   if (!x) return null;
   const label = id[0] === "i" ? x.title : id[0] === "a" ? x.caption || x.name || x.url : id[0] === "q" ? x.text : `${x.actor === "user" ? "you" : x.actor}: ${x.text}`;
-  return (sid === S.cur ? "" : `${clip(s.title, 16)} › `) + clip(label);
+  return (sid === S.cur ? "" : `${s.title} › `) + clip(label, 90);
 }
+// the pill's own text stays short: the id here, another session by the part of its title before any colon
+const refName = (sid, id) => sid === S.cur && id ? id : [clip(S.sessions.find((x) => x.id === sid).title.split(":")[0], 18), id].filter(Boolean).join(" ");
+const refLink = (sid, id, text, cls = "ref") => { const label = sid && refTarget(sid, id); return label ? `<a class="${cls}" href="#${sid}" data-ref="${sid}:${id || ""}" title="${esc(label)}">${text ?? esc(refName(sid, id))}</a>` : null; };
 function refs(text) {
   let skip = 0;
   return text.split(/(<[^>]+>)/g).map((p) => {
     if (p.startsWith("<")) { if (/^<(a|code)[\s>]/.test(p)) skip++; else if (/^<\/(a|code)>/.test(p)) skip--; return p; }
-    return skip ? p : p.replace(REF, (m, pre, sid, sub, local) => {
-      const at = sid || S.cur, id = sid ? sub : local, label = at && refTarget(at, id);
-      return label ? `${pre}<a class="ref" href="#${at}" data-ref="${at}:${id || ""}"><b>${id || "session"}</b>${esc(label)}</a>` : m;
-    });
+    return skip ? p : p.replace(REF, (m, pre, sid, sub, local) => { const link = refLink(sid || S.cur, sid ? sub : local); return link ? pre + link : m; });
   }).join("");
 }
 async function follow(ref) {
@@ -749,7 +750,7 @@ function deliveryNote(c, s, d) {
   // ✓ sent: handed to the session's channel; ✓✓ received: the agent's own transcript shows it, so it is in the agent's context
   if (c.delivered && d.received?.includes(c.id)) return html`<span class="state d" title="The agent has it: its transcript shows it">✓✓ received</span>`;
   // codex queue parks a message until the thread's next turn
-  if (c.delivered && d.received && s.provider === "codex") return html`<span class="state q" title="Handed to codex queue; the thread takes it at its next turn">queued in Codex · ${s.wake?.startsWith("collab") ? `${s.wake} takes it at its next turn` : s.wake === "daemon" ? "waking the thread" : s.live ? "arrives after its current turn" : "waits for its next turn"}</span>`;
+  if (c.delivered && d.received && s.provider === "codex") return html`<span class="state q" title="In Codex's queue: the thread takes it when its next turn starts">queued</span>`;
   if (c.delivered) return html`<span class="state s" title=${d.received ? "Handed to the session; ✓✓ once the agent has it in its context" : "Handed to the session"}>✓ sent</span>`;
   const l = limitOf(s);
   if (l?.wait) return html`<span class="state q" title=${l.title}>waits for the usage limit to reset (${l.at})</span>`;
@@ -852,7 +853,6 @@ function Detail({ s, d }) {
       ${asks.length ? html`<section class="dsec"><h5>Needs you</h5><${Questions} list=${asks} d=${d} here=${it.id} /></section>` : null}
       <${Results} d=${d} target=${it.id} />
       ${kids.length ? html`<section class="dsec"><h5>Child sessions</h5><div class="children" style="margin-top:0">${kids.map((k) => html`<button class="chip" onClick=${() => go(k.id)}><${SI} s=${k.status} sm /><span class="ell">${k.title}</span></button>`)}</div></section>` : null}
-      <section class="dsec"><h5>History</h5><div class="timeline">${it.history.map((h) => html`<div class="ev"><${SI} s=${h.status} sm />${STATUS[h.status]}<span style="color:var(--faint)">by ${h.actor === "user" ? "you" : h.actor}</span>${h.why ? html`<span class="hwhy" title=${h.why}>${h.why}</span>` : null}<time>${ago(h.at)}</time></div>`)}</div></section>
       <section class="dsec"><h5>Thread</h5><${Thread} d=${d} s=${s} target=${it.id} /></section>
     </div>
     <${Composer} s=${s} target=${it.id} label=${`${it.id} · ${it.title}`} />

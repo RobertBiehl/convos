@@ -126,6 +126,7 @@ the IDE renders it in Quick Look, scripts included, so do not also attach screen
 Point at anything by its id in any text you write (`say`, `add -d`, `set -d`, `ask`,
 `--detail`, captions, markdown results): rows `i3`, results `a2`, questions `q1`,
 comments `c5`, other sessions `o5619965e7ab`, and rows in other sessions
-`o5619965e7ab:i3`. The IDE turns them into links. `show` lists every id, including each
+`o5619965e7ab:i3`. The IDE turns them into links; `[the LAN test](i3)` links your own words
+instead. Point at the one or two that matter, not every id you touched. `show` lists every id, including each
 row's results. The user references the same way, so read ids in their messages as
 pointers.

@@ -64,8 +64,10 @@ hour ago that the user has read (which the agent may archive). `--json` carries 
 
 **References.** Any text (comments, descriptions, questions, markdown results) can point at
 rows `i3`, results `a2`, questions `q1`, comments `c5`, sessions `o5619965e7ab`, and things in
-other sessions (`o5619965e7ab:i3`). Ids that exist render as links that select the row, open
-the result, focus the question, or highlight the comment. In the IDE composer, `#` opens a
+other sessions (`o5619965e7ab:i3`). Ids that exist render as small pills (the id, or another
+session's short name) with what they point at as the tooltip; `[the LAN test](i3)` links the
+writer's own words instead. Either selects the row, opens the result, focuses the question, or
+highlights the comment. In the IDE composer, `#` opens a
 picker that inserts them. `show` lists every id, including each row's results.
 
 **Images in comments.** A comment can carry images: paste, drop, or pick them in the composer. They are stored as archive attachments of
