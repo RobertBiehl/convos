@@ -5,12 +5,14 @@ the launch URL), a loopback Host header, and, for writes, a custom header no cro
 """
 import base64, collections, hashlib, hmac, http.server, json, os, re, secrets, socket, subprocess, sys, threading, time, urllib.parse, webbrowser
 from pathlib import Path
-from . import store, runtime, channels
+from . import store, runtime, channels, overview
 
 WEB = Path(__file__).with_name("web")
 STATIC = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css", "/vendor/preact-htm.js": "vendor/preact-htm.js"}
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
-SAFE_INLINE = re.compile(r"^(image/(png|jpeg|gif|webp|avif)|application/pdf|text/plain|text/markdown|application/json|video/(mp4|webm|ogg|quicktime)|audio/mpeg)$")
+SAFE_INLINE = re.compile(r"^(image/(png|jpeg|gif|webp|avif)|application/pdf|text/plain|text/markdown|text/html|application/json|video/(mp4|webm|ogg|quicktime)|audio/mpeg)$")
+# an agent's HTML page runs its own scripts (tooltips, tables) in an opaque origin: no cookie, no API, no other result
+PAGE = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox"
 BODY_LIMIT = 96 << 20  # comment images travel base64-encoded in the request
 SERVER = dict(token=None, port=None, boot=secrets.token_hex(4))
 
@@ -29,7 +31,7 @@ def summary(s):
                 status=store.status(s), counts=dict(collections.Counter(eff.values())), items=len(s["items"]), asks=len(store.open_asks(s)), pending=len(store.pending(s)),
                 activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"])
 
-def detail(s): return dict(s, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
+def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
 
 def skills(cwd):
     roots = [Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"skills", *([Path(cwd)/".claude"/"skills"] if cwd else [])]
@@ -65,7 +67,7 @@ def collab():
 def background(fn, *args):
     def run():
         try: fn(*args)
-        except (ValueError, OSError, subprocess.SubprocessError) as error: print(f"orchestrate: {fn.__name__} {args[:1]}: {error}", file=sys.stderr)
+        except (ValueError, OSError, subprocess.SubprocessError, store.core.LockBusy) as error: print(f"orchestrate: {fn.__name__} {args[:1]}: {error}", file=sys.stderr)
     threading.Thread(target=run, daemon=True).start()
 
 def image(f):
@@ -87,6 +89,12 @@ def act(body):
         s, e = store.emit(sid, "answer", "user", body.get("text", "").strip(), ask=body["ask"], choices=body.get("choices", []))
         if t := s["asks"][body["ask"]]["target"]: store.mark_seen(sid, [t])
         if s["asks"][body["ask"]]["kind"] != "permission": background(runtime.deliver, sid)
+        return dict(ask=body["ask"])
+    if kind == "dismiss":
+        if store.load(sid)["asks"][body["ask"]]["kind"] == "permission": raise ValueError("Answer a permission request with Allow or Deny")
+        s, e = store.emit(sid, "cancel", "user", ask=body["ask"])
+        if t := s["asks"][body["ask"]]["target"]: store.mark_seen(sid, [t])
+        background(runtime.deliver, sid)
         return dict(ask=body["ask"])
     if kind == "set":
         store.emit(sid, "update", "user", "", item=body["item"], changes=dict(status=body["status"]), description=False)
@@ -152,7 +160,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             safe = SAFE_INLINE.match(mime)
             name = re.sub(r"[^A-Za-z0-9._ -]", "_", query.get("name", m[1]))[:120]
             ctype, size = mime if safe else "application/octet-stream", blob.stat().st_size
-            headers = [("Content-Security-Policy", "sandbox"), ("Content-Disposition", f"{'inline' if safe else 'attachment'}; filename=\"{name}\""), ("Accept-Ranges", "bytes")]
+            headers = [("Content-Security-Policy", PAGE if mime == "text/html" else "sandbox"), ("Content-Disposition", f"{'inline' if safe else 'attachment'}; filename=\"{name}\""), ("Accept-Ranges", "bytes")]
             # byte ranges, so videos can seek and start before the whole file is read
             if not (r := re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))): return self.send(200, blob.read_bytes(), ctype, headers)
             start, end = (int(r[1]), min(int(r[2] or size-1), size-1)) if r[1] else (max(0, size-int(r[2])), size-1)
@@ -165,6 +173,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/skills": return self.send(200, skills(query.get("cwd")))
         if path == "/api/dirs": return self.send(200, dirs(query.get("prefix", "")))
         if path == "/api/collab": return self.send(200, collab())
+        if path == "/api/convos": return self.send(200, overview.overview(query.get("fresh") == "1"))
         if path == "/api/stream": return self.stream()
         self.send(404, {"error": "not found"})
 
@@ -197,11 +206,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             path = urllib.parse.urlparse(self.path).path
             if path == "/api/act": return self.send(200, act(body))
+            if path == "/api/convos/sync": return self.send(200, overview.start_sync(bool(body.get("local_only"))))
             if path == "/api/seen":
                 store.mark_seen(body["session"], [i for i in body["items"] if i in store.load(body["session"])["items"]])
                 return self.send(200, dict(ok=True))
             if path == "/api/spawn": return self.send(200, dict(session=runtime.spawn(body.get("title", ""), body["cwd"], body["prompt"], body["model"], body.get("effort"), body.get("skills", []), body.get("permission", "default"), body.get("parent"))))
             self.send(404, {"error": "not found"})
+        except store.core.LockBusy as error:
+            # another process has the archive open (DuckDB lets one writer in, and a reader blocks it): name it, keep serving
+            pid = m[1] if (m := re.search(r"PID (\d+)", str(error))) else None
+            what = subprocess.run(["ps", "-o", "command=", "-p", pid], capture_output=True, text=True).stdout.strip()[:90] if pid else ""
+            self.send(503, {"error": f"Nothing was saved: another process has the Convos archive open{f' (PID {pid}: {what})' if what else ''}. Try again once it finishes."})
         except (ValueError, KeyError, OSError) as error: self.send(400, {"error": str(error)})
 
 NOTIFY = ("input", "done", "failed", "closed")
@@ -219,8 +234,20 @@ def notify_parent(s, state):
 
 def pump():
     """Retry delivery to joined sessions, tell parents about their children, and keep managed runtime truthful."""
-    last = {sid: store.status(s) for sid in store.session_ids() if (s := store.peek(sid))}
+    last, recover_at = {sid: store.status(s) for sid in store.session_ids() if (s := store.peek(sid))}, 0
     while True:
+        # startup's archive work runs here, so the IDE serves even while another process holds the archive;
+        # a held archive makes each try wait 30 s, so retry once a minute rather than starve the IDE's own writes
+        if recover_at is not None and time.monotonic() >= recover_at:
+            try:
+                store.recover()
+                recover_at = None
+            except store.core.LockBusy as error:
+                recover_at = time.monotonic()+60
+                print(f"orchestrate: startup waits for the archive: {str(error)[:200]}", file=sys.stderr)
+        # agents outlive a server restart: pick them up again, and record the ones that ended
+        try: runtime.reconcile()
+        except (ValueError, OSError, subprocess.SubprocessError, store.core.LockBusy) as error: print(f"orchestrate: reconcile: {str(error)[:200]}", file=sys.stderr)
         time.sleep(3)
         for sid in store.session_ids():
             s = store.peek(sid)
@@ -230,7 +257,7 @@ def pump():
             if s and s["closed"] and runtime.alive(sid) and not runtime.busy(sid): runtime.stop(sid)
             if s and not s["closed"] and s["session"]["origin"] != "gui" and store.pending(s) and channels.reachable(s):
                 try: runtime.deliver(sid)
-                except (ValueError, OSError, subprocess.SubprocessError) as error: print(f"orchestrate: deliver {sid}: {error}", file=sys.stderr)
+                except (ValueError, OSError, subprocess.SubprocessError, store.core.LockBusy) as error: print(f"orchestrate: deliver {sid}: {error}", file=sys.stderr)
 
 def free_port(preferred, wait=6):
     """The preferred port keeps open tabs working across restarts; wait briefly for a predecessor to release it."""
@@ -249,8 +276,6 @@ def free_port(preferred, wait=6):
 
 def serve(port=7311, open_browser=True):
     store.core.secure_dir(store.root())
-    store.recover()
-    runtime.settle()
     try: token = json.loads(info_path().read_text())["token"]
     except (OSError, ValueError, KeyError): token = secrets.token_urlsafe(24)
     SERVER.update(token=token, port=free_port(port))

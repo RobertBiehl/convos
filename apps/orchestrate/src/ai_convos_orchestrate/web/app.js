@@ -33,10 +33,15 @@ const BAR = ["done", "working", "input", "blocked", "failed", "planned", "skippe
 const num = (id) => parseInt(id.slice(1), 10);
 const base = (p) => (p || "").split("/").filter(Boolean).pop() || p;
 const home = (p) => S.meta && p?.startsWith(S.meta.home) ? "~" + p.slice(S.meta.home.length) : p;
-const ago = (ts) => {
-  if (!ts) return ""; const s = (Date.now() - new Date(ts)) / 1000;
-  return s < 45 ? "now" : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`;
-};
+const span = (s) => s < 45 ? "now" : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`;
+const ago = (ts) => ts ? span((Date.now() - new Date(ts)) / 1000) : "";
+// an agent's estimate for an open row: how long is left, or how far past it the row is (the 30 s repaint keeps it current)
+function etaOf(it) {
+  if (!it.eta || !["planned", "working", "blocked"].includes(it.status)) return null;
+  const t = new Date(it.eta), left = (t - Date.now()) / 1000, at = t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return { late: left < 0, at, text: left < 0 ? `${span(-left)} past ETA` : `ETA ${at}`, title: left < 0 ? `ETA was ${t.toLocaleString()}` : `ETA ${t.toLocaleString()}, in ${span(left)}` };
+}
+const Eta = ({ it }) => { const e = etaOf(it); return e ? html`<span class="eta ${e.late ? "late" : ""}" title=${e.title}>${G.clock}${e.text}</span>` : null; };
 const initials = (a) => a === "user" ? "you" : a === "agent" ? "A" : a === "orchestrate" ? "O" : a.slice(0, 2).toUpperCase();
 const K = (...keys) => keys.map((k) => html`<kbd>${k}</kbd>`);
 const Hot = ({ k, children }) => html`<span class="hot">${[].concat(k).map((x) => html`<kbd>${x}</kbd>`)}${children}</span>`;
@@ -104,7 +109,7 @@ async function follow(ref) {
   if (kind === "a") {
     const a = d.attachments[id];
     S.sel[sid] = a.target || null;
-    S.res[`${sid}:${a.target || ""}`] = resultsFor(d, a.target).findIndex((x) => x.id === id);
+    S.res[`${sid}:${a.target || ""}`] = resultsFor(d, a.target).findIndex((x) => x.id === id || (a.hash && x.hash === a.hash));
     return set({ overlay: { kind: "look" } });
   }
   const x = kind === "i" ? d.items[id] : kind === "c" ? d.comments[id] : kind === "q" ? d.asks[id] : null;
@@ -139,6 +144,7 @@ const SI = ({ s, sm }) => {
 };
 const Pill = ({ s, lg }) => html`<span class="pill ${lg ? "lg" : ""} s-${s}"><${SI} s=${s} sm=${!lg} />${STATUS[s]}</span>`;
 const G = {
+  clock: html`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="5.6"/><path d="M8 5v3.2l2.1 1.4"/></svg>`,
   chat: html`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 3.5h10v7H7l-3 2.5v-2.5H3z" stroke-linejoin="round"/></svg>`,
   clip: html`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M10.5 5.5l-4.6 4.6a1.4 1.4 0 0 0 2 2l5-5a2.8 2.8 0 0 0-4-4l-5 5a4.2 4.2 0 0 0 6 6l4-4" stroke-linecap="round"/></svg>`,
   tree: html`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="4" cy="4" r="1.6"/><circle cx="12" cy="8" r="1.6"/><circle cx="12" cy="13" r="1.6"/><path d="M4 5.6V11a2 2 0 0 0 2 2h4.4M4 8h6.4"/></svg>`,
@@ -146,6 +152,7 @@ const G = {
   play: html`<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="rgba(8,10,14,.62)"/><path d="M10 8l6 4-6 4z" fill="#fff"/></svg>`,
   archive: html`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="2" y="2.8" width="12" height="3.2" rx="1"/><path d="M3.2 6v6.4a1 1 0 0 0 1 1h7.6a1 1 0 0 0 1-1V6M6.4 8.8h3.2"/></svg>`,
   unarchive: html`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"><rect x="2" y="2.8" width="12" height="3.2" rx="1"/><path d="M3.2 6v6.4a1 1 0 0 0 1 1h7.6a1 1 0 0 0 1-1V6M8 12V8.2M6.3 9.8L8 8.1l1.7 1.7"/></svg>`,
+  page: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8.5h18M9.5 12.5 7 15l2.5 2.5M14.5 12.5 17 15l-2.5 2.5"/></svg>`,
   pdf: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 3h8l4 4v14H6z" stroke-linejoin="round"/><path d="M9 13h6M9 16.5h4"/></svg>`,
   link: html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" stroke-linecap="round"/></svg>`,
   logo: html`<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="var(--raise)" stroke="var(--line2)"/><circle cx="10" cy="16" r="3.4" fill="var(--accent)"/><circle cx="22" cy="9" r="3" fill="var(--done)"/><circle cx="22" cy="23" r="3" fill="var(--input)"/><path d="M13 15l6-4.5M13 17l6 4.5" stroke="var(--faint)" stroke-width="1.6"/></svg>`,
@@ -214,7 +221,8 @@ const selected = () => { const d = det(); return d && S.sel[S.cur] && d.items[S.
 const childrenOf = (sid, item) => S.sessions.filter((s) => item ? s.parent === `${sid}:${item}` : s.parent?.split(":")[0] === sid);
 const openAsks = (d) => Object.values(d.asks).filter((a) => !a.answer && !a.cancelled);
 const commentsFor = (d, target) => [...Object.values(d.comments), ...(S.optimistic[S.cur] || [])].filter((c) => (c.target || null) === (target || null)).sort((a, b) => a.at.localeCompare(b.at));
-const resultsFor = (d, target) => Object.values(d.attachments).filter((a) => (a.target || null) === (target || null));
+// the same bytes attached to one row twice (an agent re-attaching a file under a better name) are one result: the first stays
+const resultsFor = (d, target) => Object.values(d.attachments).filter((a) => (a.target || null) === (target || null)).filter((a, n, xs) => !a.hash || xs.findIndex((x) => x.hash === a.hash) === n);
 const blobUrl = (a) => a.src || `/api/blob/${a.hash}?mime=${encodeURIComponent(a.mime || "")}&name=${encodeURIComponent(a.name)}`;
 const pulse = (id, kind) => { S.pulses[id] = { kind, n: (S.pulses[id]?.n || 0) + 1, at: Date.now() }; };
 
@@ -224,6 +232,7 @@ const pendingDetail = {};
 function scheduleDetail(sid) { clearTimeout(pendingDetail[sid]); pendingDetail[sid] = setTimeout(() => loadDetail(sid).catch(fail), 60); }
 async function loadDetail(sid) {
   const d = await api.get(`/api/session/${sid}`), old = S.detail[sid];
+  if (old && d.seq < old.seq) return;  // two loads can overlap and answer out of order; a board never steps back
   d.unread ||= [];  // a server from before read tracking sends none
   if (old) {
     for (const [id, it] of Object.entries(d.items)) { if (!old.items[id]) pulse(id, "new"); else if (old.effective[id] !== d.effective[id]) pulse(id, "status"); }
@@ -248,7 +257,9 @@ function connect() {
   es.onopen = () => set({ conn: true });
   es.onerror = () => set({ conn: false });
   es.addEventListener("version", (e) => { const v = JSON.parse(e.data); if (!S.version) S.version = v; else if (v !== S.version) reloadInPlace(); });
-  es.addEventListener("session", (e) => { const s = JSON.parse(e.data); upsert(s); if (s.id === S.cur) scheduleDetail(s.id); paint(); });}
+  // the open session reloads on every change; a board cached from earlier reloads when it fell behind, so switching back is current
+  es.addEventListener("session", (e) => { const s = JSON.parse(e.data); upsert(s); if (s.id === S.cur || S.detail[s.id]?.seq < s.seq) scheduleDetail(s.id); paint(); });
+}
 
 // ---------------------------------------------------------------- updates reload in place, never while you are mid-thought
 function reloadInPlace() {
@@ -273,7 +284,10 @@ function go(sid) {
   if (!sid) return;
   const apply = () => {
     S.cur = sid; S.askFocus = null;
-    if (!S.detail[sid]) loadDetail(sid).catch(fail); else { S.seen[sid] = S.detail[sid].seq; store("seen", S.seen); }    history.replaceState(null, "", `#${sid}`);
+    const known = S.sessions.find((x) => x.id === sid);
+    if (!S.detail[sid] || known?.seq > S.detail[sid].seq) loadDetail(sid).catch(fail);
+    else { S.seen[sid] = S.detail[sid].seq; store("seen", S.seen); }
+    history.replaceState(null, "", `#${sid}`);
     paint();
   };
   if (document.startViewTransition && S.cur && sid !== S.cur) document.startViewTransition(() => new Promise((r) => { apply(); setTimeout(r, 30); }));
@@ -376,14 +390,32 @@ const dragsFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
 const dropOver = (e) => { if (dragsFiles(e)) { e.preventDefault(); if (!S.drop) set({ drop: true }); } };
 const dropLeave = (e) => !e.currentTarget.contains(e.relatedTarget) && S.drop && set({ drop: false });
 const dropOn = (e, key) => { if (dragsFiles(e)) { e.preventDefault(); set({ drop: false }); attachImages(key, e.dataTransfer.files); } };
-async function answer(ask, choices, text = "") {
+async function resolveAsk(ask, body, okText) {
   const el = document.querySelector(`[data-ask="${ask.id}"]`);
   el?.classList.add("answered");
   S.askFocus = null;
   await new Promise((r) => setTimeout(r, el ? 260 : 0));
-  await act({ kind: "answer", ask: ask.id, choices, text }, ask.kind === "permission" ? `${choices[0]}` : "Answer sent");
+  await act(body, okText);
   S.askPick[ask.id] = [];
 }
+const answer = (ask, choices, text = "") => resolveAsk(ask, { kind: "answer", ask: ask.id, choices, text }, ask.kind === "permission" ? `${choices[0]}` : "Answer sent");
+// a question the conversation has moved past: it leaves the board, and the agent is told it was dismissed unanswered
+const dismiss = (ask) => ask.kind !== "permission" && resolveAsk(ask, { kind: "dismiss", ask: ask.id }, `${ask.id} dismissed; the agent is told`);
+// what a question rests on: the results it names, then the other results on its row; pictures first, as they decide most
+const isPic = (r) => r.kind === "image" || r.kind === "video";
+function evidence(d, a) {
+  const named = [...`${a.text} ${a.detail || ""}`.matchAll(/(?<![\w/#:.=?&-])a[1-9]\d*(?![\w-])/g)].map((m) => d.attachments[m[0]]).filter(Boolean);
+  const all = [...named, ...(a.target ? resultsFor(d, a.target) : [])].filter((r, n, xs) => xs.findIndex((x) => x.id === r.id || (r.hash && x.hash === r.hash)) === n);
+  return [...all.filter(isPic), ...all.filter((r) => !isPic(r))];
+}
+function lookEvidence(a, list, n) {
+  const r = list[n];
+  if (r.kind === "link") return window.open(r.url, "_blank", "noopener,noreferrer");
+  markSeen([...new Set(list.map((x) => x.target).filter(Boolean))]);
+  set({ overlay: { kind: "look", files: list, i: n, label: `What ${a.id} rests on · ${clip(a.text, 80)}` } });
+}
+// the user said something on the question's row (or the session) after it was asked: it may be settled
+const repliedSince = (d, a) => Object.values(d.comments).filter((c) => c.actor === "user" && (c.target || null) === (a.target || null) && c.at > a.at).pop();
 function openResult(target, i) { S.res[resKey(target)] = i; set({ overlay: { kind: "look" } }); if (target) markSeen([target]); }
 
 // ---------------------------------------------------------------- command registry (palette, help, keys)
@@ -415,6 +447,7 @@ function commands() {
     { group: "Sessions", keys: ["x"], label: "Stop session", run: () => act({ kind: "stop" }, "Stopping…"), when: s && s.origin === "gui" && s.live },
     { group: "Sessions", keys: ["⇧", "X"], label: s?.closed ? "Reopen session" : "Close session (keeps its board)", run: () => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed"), when: s },
     { group: "Sessions", keys: ["."], label: S.closed ? "Hide closed sessions" : "Show closed sessions", run: () => set({ closed: !S.closed }) },
+    { group: "View", keys: ["i"], label: "Convos on this computer: is the archive current, sync, relay, disk", run: () => set({ overlay: { kind: "convos" } }) },
     { group: "View", keys: ["⇧", "L"], label: "Toggle light / dark", run: toggleTheme },
     { group: "View", keys: ["⌘", "K"], label: "Command palette", run: () => set({ overlay: { kind: "palette" } }) },
     { group: "View", keys: ["?"], label: "Keyboard shortcuts", run: () => set({ overlay: { kind: "help" } }) },
@@ -431,7 +464,8 @@ async function needYou(sid = S.cur, ask = null) {
   set({ askFocus: a.id });
   requestAnimationFrame(() => document.querySelector(`.center [data-ask="${a.id}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" }));
 }
-const focusAsk = () => needYou();
+// a: the oldest open question; again: the next one
+const focusAsk = () => { const d = det(), list = d ? openAsks(d) : [], i = list.findIndex((a) => a.id === S.askFocus); return needYou(S.cur, list.length ? list[(i + 1) % list.length].id : null); };
 function toggleTheme() { const r = document.documentElement, next = r.dataset.theme === "light" ? "dark" : r.dataset.theme === "dark" ? "light" : matchMedia("(prefers-color-scheme: light)").matches ? "dark" : "light"; r.dataset.theme = next; store("theme", next); }
 
 function onKey(e) {
@@ -457,6 +491,8 @@ function onKey(e) {
     }
     if (k === "Enter" && a) { e.preventDefault(); return answer(a, S.askPick[a.id] || [], document.querySelector(`[data-ask="${a.id}"] input`)?.value || ""); }
     if (k === "Tab" && a) { e.preventDefault(); return document.querySelector(`[data-ask="${a.id}"] input`)?.focus(); }
+    if (k === " " && a) { const ev = evidence(d, a), n = ev.findIndex((r) => r.kind !== "link"); e.preventDefault(); return n >= 0 && lookEvidence(a, ev, n); }
+    if ((k === "Backspace" || k === "Delete") && a && a.kind !== "permission") { e.preventDefault(); return dismiss(a); }
     if (k === "Escape") return set({ askFocus: null });
   }
   if (/^[1-9]$/.test(k)) { const row = ordered()[+k - 1]; if (row) { e.preventDefault(); go(row.s.id); } return; }
@@ -464,7 +500,7 @@ function onKey(e) {
     j: () => move(1), ArrowDown: () => move(1), k: () => move(-1), ArrowUp: () => move(-1), g: top, G: () => move(1e9),
     "[": () => cycle(-1), "]": () => cycle(1), Enter: () => openSelected(), l: () => moveResult(1), ArrowRight: () => moveResult(1), h: () => moveResult(-1), ArrowLeft: () => moveResult(-1),
     " ": look, Escape: () => select(null), e: () => archive(false), E: () => archive(true),
-    c: focusComposer, C: sessionChat, a: focusAsk,
+    c: focusComposer, C: sessionChat, a: focusAsk, i: () => set({ overlay: { kind: "convos" } }),
     s: () => it && set({ overlay: { kind: "status", item: it.id } }), o: () => openSelected(),
     n: () => set({ overlay: { kind: "new" } }), N: () => s && set({ overlay: { kind: "new", parent: it ? `${s.id}:${it.id}` : s.id } }),
     r: () => s?.origin === "gui" && !s.live && !s.closed && act({ kind: "resume" }, "Resuming…"), x: () => s?.origin === "gui" && s.live && act({ kind: "stop" }, "Stopping…"),
@@ -557,16 +593,33 @@ function SessionInfo({ s, d }) {
   </div>`;
 }
 
-function Question({ a, d }) {
+// several open questions read as one stack: the one in focus (else the oldest) is open, the rest are one line each
+function Questions({ list, d, here }) {
+  const open = list.find((a) => a.id === S.askFocus) || list[0];
+  return list.map((a) => a === open ? html`<${Question} key=${a.id} a=${a} d=${d} here=${here} />` : html`<${QuestionLine} key=${a.id} a=${a} d=${d} />`);
+}
+function QuestionLine({ a, d }) {
+  const r = repliedSince(d, a);
+  return html`<button class="qline" data-ask=${a.id} onClick=${() => set({ askFocus: a.id })}>
+    <${SI} s="input" sm /><code>${a.id}</code>${a.target ? html`<span class="on">on ${a.target}</span>` : null}<span class="ell">${a.text}</span>
+    ${r ? html`<span class="since" title="You commented after this was asked; it may be settled">you replied since</span>` : null}<span class="age">${ago(a.at)}</span></button>`;
+}
+// here: the row whose results the pane already shows under the card, so the card leaves them out
+function Question({ a, d, here }) {
   const focus = S.askFocus === a.id, pick = S.askPick[a.id] || [], target = a.target && d.items[a.target];
-  const note = useRef();
+  const note = useRef(), ev = evidence(d, a).filter((x) => x.target !== here), pics = ev.filter(isPic), docs = ev.filter((r) => !isPic(r)), r = repliedSince(d, a), many = openAsks(d).length > 1;
+  const peek = (x) => (e) => { e?.stopPropagation(); lookEvidence(a, ev, ev.indexOf(x)); };
   return html`<div class="qcard ${focus ? "focus" : ""}" data-ask=${a.id} onClick=${() => !focus && set({ askFocus: a.id })}>
-    <div class="qh"><${SI} s="input" sm />${a.kind === "permission" ? "Permission" : "Question"} · ${a.actor !== "agent" ? html`<span class="who">${a.actor}</span>` : null}${target ? html`on <b style="color:var(--dim)">${target.id} ${target.title}</b>` : "for the session"}<span style="margin-left:auto">${ago(a.at)}</span>${!focus ? html`<span>${K("a")} answer</span>` : null}</div>
-    <div class="qt">${a.text}</div>
+    <div class="qh"><${SI} s="input" sm />${a.kind === "permission" ? "Permission" : "Question"} <code>${a.id}</code> · ${a.actor !== "agent" ? html`<span class="who">${a.actor}</span>` : null}${target ? html`on <b style="color:var(--dim)">${target.id} ${target.title}</b>` : "for the session"}<span style="margin-left:auto">${ago(a.at)}</span>${!focus ? html`<span>${K("a")} answer</span>` : null}
+      ${a.kind !== "permission" ? html`<button class="qx" title="Dismiss without answering (⌫): the agent is told" onClick=${(e) => { e.stopPropagation(); dismiss(a); }}>×</button>` : null}</div>
+    ${r ? html`<div class="qsince">You commented on ${a.target || "the session"} after this was asked (${ago(r.at)}). If that settled it, dismiss it.</div>` : null}
+    <div class="qt md" dangerouslySetInnerHTML=${{ __html: refs(esc(a.text)) }} />
+    ${pics.length ? html`<div class="qpics">${pics.map((x) => html`<button key=${x.id} class="qpic" title=${`${x.id} · ${x.caption || x.name}`} onClick=${peek(x)}><span class="th">${thumbOf(x, x.name)}</span><span class="cp"><b>${x.id}</b> ${x.caption || x.name}</span></button>`)}</div>` : null}
+    ${docs.length ? html`<div class="rrow">${docs.map((x) => html`<${ResultChip} key=${x.id} a=${x} tag onOpen=${peek(x)} />`)}</div>` : null}
     ${a.detail ? html`<${Md} text=${a.detail} cls="qd" />` : null}
     ${a.options.length ? html`<div class="opts">${a.options.map((o, i) => html`<button class="opt ${pick.includes(o) ? "on" : ""}" onClick=${(e) => { e.stopPropagation(); if (!a.multi) return answer(a, [o], note.current?.value || ""); S.askPick[a.id] = pick.includes(o) ? pick.filter((x) => x !== o) : [...pick, o]; paint(); }}>${focus && i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${o}</button>`)}</div>` : null}
     ${focus || !a.options.length ? html`<div class="note"><input ref=${note} placeholder=${a.options.length ? "Optional note" : "Your answer"} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); answer(a, pick, e.target.value); } if (e.key === "Escape") { e.target.blur(); set({ askFocus: null }); } }} /><button class="abtn primary" onClick=${(e) => { e.stopPropagation(); answer(a, pick, note.current?.value || ""); }}>Send ${K("↵")}</button></div>` : null}
-    ${focus ? html`<div style="margin-top:8px;color:var(--faint);font-size:11.5px;display:flex;gap:14px"><${Hot} k=${a.options.length ? ["1", "…", String(Math.min(9, a.options.length))] : "Tab"}>${a.multi ? "toggle" : "choose"}<//><${Hot} k="Tab">note<//><${Hot} k="↵">send<//><${Hot} k="Esc">later<//></div>` : null}
+    ${focus ? html`<div style="margin-top:8px;color:var(--faint);font-size:11.5px;display:flex;flex-wrap:wrap;gap:6px 14px"><${Hot} k=${a.options.length ? ["1", "…", String(Math.min(9, a.options.length))] : "Tab"}>${a.multi ? "toggle" : "choose"}<//><${Hot} k="Tab">note<//><${Hot} k="↵">send<//>${ev.some((x) => x.kind !== "link") ? html`<${Hot} k="Space">results<//>` : null}${many ? html`<${Hot} k="a">next question<//>` : null}${a.kind !== "permission" ? html`<${Hot} k="⌫">dismiss<//>` : null}<${Hot} k="Esc">later<//></div>` : null}
   </div>`;
 }
 
@@ -580,11 +633,11 @@ const linkLabel = (url) => {
 // the small preview of a result everywhere: images as themselves, videos as their first frame with a play badge, others as a glyph
 const thumbOf = (a, alt = "") => a.kind === "image" ? html`<img src=${blobUrl(a)} alt=${alt} loading="lazy" />`
   : a.kind === "video" ? html`<span class="vthumb"><video src=${blobUrl(a) + "#t=0.1"} preload="metadata" muted playsinline />${G.play}</span>`
-  : a.kind === "link" ? G.link : a.kind === "pdf" ? G.pdf : G.file;
-function ResultChip({ a, on, onOpen }) {
+  : a.kind === "link" ? G.link : a.kind === "pdf" ? G.pdf : a.kind === "html" ? G.page : G.file;
+function ResultChip({ a, on, onOpen, tag }) {
   const label = a.kind === "link" ? linkLabel(a.url) : a.caption || a.name;
   return html`<button class="rchip k-${a.kind} ${on ? "on" : ""}" title=${a.kind === "link" ? a.url : a.name} onClick=${(e) => { e.stopPropagation(); onOpen(); }}>
-    ${thumbOf(a)}<span>${label}</span></button>`;
+    ${thumbOf(a)}<span>${tag ? html`<b class="tag">${a.id}</b>` : null}${label}</span></button>`;
 }
 
 function ItemRow({ i, depth, d, s }) {
@@ -605,7 +658,7 @@ function ItemRow({ i, depth, d, s }) {
       </div>` : null}
     </div>
     <div class="tail">
-      ${eff === "input" ? html`<span class="pill s-input">needs you</span>` : null}
+      ${eff === "input" ? html`<span class="pill s-input">needs you</span>` : null}<${Eta} it=${i} />
       ${comments ? html`<span class="n">${G.chat}${comments}</span>` : null}
       ${unread ? html`<span class="udot" title="Changed since you last looked" />` : null}${i.archived && i.archived_by && i.archived_by !== "user" ? html`<span title="Archived by ${i.archived_by} after you had read it">archived by ${i.archived_by}</span>` : null}
       <span class="id">${i.id}</span><span>${ago(i.updated)}</span>
@@ -658,7 +711,7 @@ function Board({ s, d }) {
       ${!current.length && archived.length ? html`<div class="empty" style="padding:14px 8px">Nothing current. Archived rows are above.</div>` : null}
       ${!current.length && !archived.length ? html`<div class="empty">The agent has not published items yet.<br />Items appear here as it works: <code>convos orchestrate add "…"</code></div>` : null}
     </section>
-    ${asks.length ? html`<section class="section"><h5><${SI} s="input" sm />Needs you · ${asks.length}</h5>${asks.map((a) => html`<${Question} key=${a.id} a=${a} d=${d} />`)}</section>` : null}
+    ${asks.length ? html`<section class="section"><h5><${SI} s="input" sm />Needs you · ${asks.length}</h5><${Questions} list=${asks} d=${d} /></section>` : null}
   </div></div>
   ${away !== null ? html`<button class="latest ${fresh ? "fresh" : ""}" onClick=${() => { move(1e9); follow(); }}>${fresh ? `${fresh} new ${fresh === 1 ? "row" : "rows"} below` : "Latest"}<span class="arrow">↓</span>${K("⌘", "↓")}</button>` : null}
   </div>`;
@@ -756,7 +809,7 @@ function Detail({ s, d }) {
         <${SessionInfo} s=${s} d=${d} /></div>
       <div class="dscroll" onScroll=${onScroll}>
         ${d.prompt ? html`<section class="dsec"><h5>Starting prompt</h5><div class="bub" style="padding:9px 11px;border-radius:10px;border:1px solid var(--line);background:var(--panel2)"><${Md} text=${d.prompt} /></div></section>` : null}
-        ${asks.length ? html`<section class="dsec"><h5>Questions</h5>${asks.map((a) => html`<${Question} key=${a.id} a=${a} d=${d} />`)}</section>` : null}
+        ${asks.length ? html`<section class="dsec"><h5>Questions</h5><${Questions} list=${asks} d=${d} /></section>` : null}
         <${Results} d=${d} target=${null} />
         <section class="dsec"><h5>Session chat</h5><${Thread} d=${d} s=${s} target=${null} /></section>
       </div>
@@ -769,12 +822,12 @@ function Detail({ s, d }) {
     <div class="dhead ${p && Date.now() - p.at < 1600 ? "receive" : ""}" key=${it.id}>
       <div class="lbl"><code>${it.id}</code>${!["agent", "user"].includes(it.actor) ? html`<span class="who">${it.actor}</span>` : null}<span>created ${ago(it.created)}</span>${it.parent ? html`<span>· under ${it.parent}</span>` : null}<span style="margin-left:auto"><${Hot} k="Esc">session<//></span></div>
       <h2>${it.title}</h2>
-      <div class="row"><button onClick=${() => set({ overlay: { kind: "status", item: it.id } })}><${Pill} s=${eff} /></button><${Hot} k="s">change<//>
+      <div class="row"><button onClick=${() => set({ overlay: { kind: "status", item: it.id } })}><${Pill} s=${eff} /></button><${Hot} k="s">change<//><${Eta} it=${it} />
         <button class="ghostbtn" style="margin-left:auto" onClick=${() => archive(false, it.id)}>${d.items[rootOf(d, it.id)].archived ? G.unarchive : G.archive}${d.items[rootOf(d, it.id)].archived ? "Bring back" : "Archive"}${it.parent ? ` ${rootOf(d, it.id)}` : ""}</button><${Hot} k="e" /></div>
     </div>
     <div class="dscroll">
       ${it.description ? html`<section class="dsec"><${Md} text=${it.description} /></section>` : null}
-      ${asks.length ? html`<section class="dsec"><h5>Needs you</h5>${asks.map((a) => html`<${Question} key=${a.id} a=${a} d=${d} />`)}</section>` : null}
+      ${asks.length ? html`<section class="dsec"><h5>Needs you</h5><${Questions} list=${asks} d=${d} here=${it.id} /></section>` : null}
       <${Results} d=${d} target=${it.id} />
       ${kids.length ? html`<section class="dsec"><h5>Child sessions</h5><div class="children" style="margin-top:0">${kids.map((k) => html`<button class="chip" onClick=${() => go(k.id)}><${SI} s=${k.status} sm /><span class="ell">${k.title}</span></button>`)}</div></section>` : null}
       <section class="dsec"><h5>History</h5><div class="timeline">${it.history.map((h) => html`<div class="ev"><${SI} s=${h.status} sm />${STATUS[h.status]}<span style="color:var(--faint)">by ${h.actor === "user" ? "you" : h.actor}</span><time>${ago(h.at)}</time></div>`)}</div></section>
@@ -964,7 +1017,8 @@ function VideoView({ a, api }) {
 
 // Quick Look: previews whatever is selected and follows the selection; ← → results, ↑ ↓ rows, Space or Esc closes
 function Look() {
-  const o = S.overlay, own = o.files, d = det(), s = cur(), it = selected(), list = own || (d ? resultsFor(d, it?.id) : []), i = Math.min(list.length - 1, own ? o.i : resIdx(it?.id)), a = list[i];
+  // own: a fixed list instead of the selection's results: a comment's images, or what a question rests on
+  const o = S.overlay, own = o.files?.map((f) => f.kind ? f : { ...f, kind: "image" }), d = det(), s = cur(), it = selected(), list = own || (d ? resultsFor(d, it?.id) : []), i = Math.min(list.length - 1, own ? o.i : resIdx(it?.id)), a = list[i];
   const step = (n) => own ? set({ overlay: { ...o, i: Math.max(0, Math.min(list.length - 1, o.i + n)) } }) : moveResult(n), row = (n) => own || move(n), pick = (n) => own ? set({ overlay: { ...o, i: n } }) : (S.res[resKey(it?.id)] = n, paint());
   const [text, setText] = useState(null), zoom = useRef(null);
   useEffect(() => { if (it && !own) markSeen([it.id]); }, [it?.id]);
@@ -981,21 +1035,21 @@ function Look() {
   useLayoutEffect(() => { document.querySelector(".lightbox .card.on")?.scrollIntoView({ block: "nearest", inline: "nearest" }); });
   if (!d || (!a && !it)) return null;
   const close = (e) => e.target === e.currentTarget && set({ overlay: null }), title = (r) => r.caption || (r.kind === "link" ? linkLabel(r.url) : r.name);
-  const thumb = (r) => thumbOf(own ? { ...r, kind: "image" } : r);
   return html`<div class="lightbox" onMouseDown=${close}>
-    <header><div class="grow ttl"><div class="t1">${a ? title(a) : it.title}</div><div class="t2">${own ? `${o.from.id === "…" ? "your comment" : `${o.from.id} · ${o.from.actor === "user" ? "your" : o.from.actor + "'s"} comment`} on ${o.from.target ? `${o.from.target} · ${d?.items[o.from.target]?.title}` : "the session"}` : it ? `${it.id} · ${it.title}` : `Session · ${s.title}`}${a && a.caption && a.kind !== "link" ? ` · ${a.name}` : ""}</div></div>
-      ${list.length ? html`<span>${i + 1} / ${list.length}</span><${Hot} k=${["←", "→"]}>${own ? "image" : "result"}<//>` : null}${own ? null : html`<${Hot} k=${["↑", "↓"]}>row<//>`}${a ? html`<${Hot} k="↵">open<//>` : null}<${Hot} k="Space">close<//></header>
+    <header><div class="grow ttl"><div class="t1">${a ? title(a) : it.title}</div><div class="t2">${own && o.label ? `${a.id} · ${o.label}` : own ? `${o.from.id === "…" ? "your comment" : `${o.from.id} · ${o.from.actor === "user" ? "your" : o.from.actor + "'s"} comment`} on ${o.from.target ? `${o.from.target} · ${d?.items[o.from.target]?.title}` : "the session"}` : it ? `${it.id} · ${it.title}` : `Session · ${s.title}`}${a && a.caption && a.kind !== "link" ? ` · ${a.name}` : ""}</div></div>
+      ${list.length ? html`<span>${i + 1} / ${list.length}</span><${Hot} k=${["←", "→"]}>${own && !o.label ? "image" : "result"}<//>` : null}${own ? null : html`<${Hot} k=${["↑", "↓"]}>row<//>`}${a ? html`<${Hot} k="↵">open<//>` : null}<${Hot} k="Space">close<//></header>
     <div class="stage" onMouseDown=${close} key=${a?.id || a?.hash || a?.src || it?.id}>
       ${!a ? html`<div class="doc"><div style="display:flex;gap:10px;align-items:center;margin-bottom:12px"><${Pill} s=${d.effective[it.id]} /><span style="color:var(--faint)">${it.id} · updated ${ago(it.updated)}</span></div><h2 style="margin:0 0 10px">${it.title}</h2>${it.description ? html`<${Md} text=${it.description} />` : html`<p style="color:var(--faint)">No description and no results on this row.</p>`}</div>`
-        : a.kind === "image" || own ? html`<${ImageView} key=${a.id || a.hash || a.src} a=${a} api=${zoom} />`
+        : a.kind === "image" ? html`<${ImageView} key=${a.id || a.hash || a.src} a=${a} api=${zoom} />`
         : a.kind === "video" ? html`<${VideoView} key=${a.id} a=${a} api=${zoom} />`
         : a.kind === "pdf" ? html`<iframe src=${blobUrl(a)} title=${a.name} />`
+        : a.kind === "html" ? html`<iframe class="page" src=${blobUrl(a)} title=${a.name} sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" />`
         : a.kind === "link" ? html`<div class="doc" style="height:auto"><div style="color:var(--faint);margin-bottom:6px">${linkLabel(a.url)}</div><h2 style="margin:0 0 10px">${a.caption || a.name}</h2><a href=${a.url} target="_blank" rel="noopener noreferrer" style="word-break:break-all">${a.url}</a><p style="color:var(--faint);margin-top:14px">${K("↵")} opens it in your browser.</p></div>`
         : a.kind === "markdown" ? html`<div class="doc">${text === null ? "…" : html`<${Md} text=${text} />`}</div>`
         : a.kind === "text" ? html`<div class="doc"><pre style="white-space:pre-wrap;font:12px var(--mono)">${text}</pre></div>`
         : html`<div class="doc" style="height:auto"><h2 style="margin:0 0 10px">${a.name}</h2><a href=${blobUrl(a)} download=${a.name}>Download</a></div>`}
     </div>
-    ${list.length ? html`<div class="strip" onMouseDown=${close}>${list.map((r, n) => html`<button class="card ${n === i ? "on" : ""}" key=${r.id || n} onClick=${() => pick(n)}><div class="th">${thumb(r)}</div><div class="tl">${title(r)}</div></button>`)}</div>` : null}
+    ${list.length ? html`<div class="strip" onMouseDown=${close}>${list.map((r, n) => html`<button class="card ${n === i ? "on" : ""}" key=${r.id || n} onClick=${() => pick(n)}><div class="th">${thumbOf(r)}</div><div class="tl">${title(r)}</div></button>`)}</div>` : null}
   </div>`;
 }
 
@@ -1007,7 +1061,64 @@ function Overlay() {
   if (o.kind === "help") return html`<${Help} />`;
   if (o.kind === "status") return html`<${StatusPicker} item=${o.item} />`;
   if (o.kind === "look") return html`<${Look} />`;
+  if (o.kind === "convos") return html`<${ConvosSheet} />`;
   return null;
+}
+
+// ---------------------------------------------------------------- Convos on this computer (bottom right, i)
+// is the archive current, is capture running, the relay, the disk: read-only, from /api/convos
+const loadConvos = (fresh) => api.get(`/api/convos${fresh ? "?fresh=1" : ""}`).then((c) => set({ convos: c })).catch(() => {});
+const when = (sec) => { if (!sec) return "never"; const t = new Date(sec * 1000), today = t.toDateString() === new Date().toDateString(); return today ? t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : t.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); };
+const gib = (b) => `${(b / 2 ** 30).toFixed(1)} GiB`;
+function convosHealth(c) {
+  const behind = c.sources.reduce((n, s) => n + s.after.length + s.never.length, 0), used = 1 - c.disk.free / c.disk.total;
+  const bad = c.failed.length || c.hooks.failed || c.relay?.failures || used > 0.97, warn = behind || used > 0.9;
+  return { behind, used, level: bad ? "failed" : warn ? "input" : "done" };
+}
+function ConvosChip() {
+  const c = S.convos;
+  if (!c) return null;
+  const h = convosHealth(c), syncing = c.sync?.running;
+  return html`<button class="cchip l-${h.level}" title="Convos on this computer (i)" onClick=${() => set({ overlay: { kind: "convos" } })}>
+    <span class="dot" />${syncing ? html`<b>Syncing…</b>` : h.behind ? html`<b>${h.behind} file${h.behind === 1 ? "" : "s"} behind</b>` : html`<b>Archive current</b>`}
+    ${c.relay ? html`<span>· relay ${c.relay.failures ? `${c.relay.failures} failures` : when(c.relay.succeeded)}</span>` : null}
+    ${h.used > 0.9 ? html`<span>· disk ${Math.round(h.used * 100)}%</span>` : null}${K("i")}</button>`;
+}
+function FileLines({ files, note }) {
+  const shown = files.slice(0, 8);
+  return html`${shown.map((f) => html`<div class="cfile" title=${f.path}><time>${when(f.changed)}</time><span class="ell">${f.label}</span><span class="cap">${note(f)}</span></div>`)}
+    ${files.length > shown.length ? html`<div class="cfile more">+ ${files.length - shown.length} more</div>` : null}`;
+}
+function ConvosSheet() {
+  const c = S.convos, sync = (local_only) => api.post("/api/convos/sync", { local_only }).then(() => { toast(local_only ? "Syncing local sessions" : "Syncing everything, web too"); loadConvos(true); }).catch(fail);
+  useEffect(() => { loadConvos(true); const t = setInterval(() => loadConvos(), 4000); return () => clearInterval(t); }, []);
+  useKeys((e) => {
+    const run = { Escape: () => set({ overlay: null }), i: () => set({ overlay: null }), r: () => loadConvos(true), s: () => sync(true), S: () => sync(false) }[e.key];
+    if (run && !e.metaKey && !e.ctrlKey) { e.preventDefault(); run(); }
+    return true;
+  });
+  if (!c) return html`<${Modal} title="Convos" wide onClose=${() => set({ overlay: null })}><div class="mbody"><div class="empty">Checking…</div></div><//>`;
+  const h = convosHealth(c), row = (s, title, sub, extra) => html`<div class="crow"><${SI} s=${s} sm /><div><div class="ct">${title}</div>${sub ? html`<div class="cs">${sub}</div>` : null}${extra || null}</div></div>`;
+  const parts = (s) => [s.writing.length && `${s.writing.length} being written now`, s.after.length && `${s.after.length} changed after their last capture`, s.never.length && `${s.never.length} never captured`].filter(Boolean).join(" · ");
+  const sub = c.sources.flatMap((s) => s.never).some((f) => f.label.endsWith("subagent"));
+  const foot = html`<span class="grow">Read-only: nothing here opens the archive or the network. A sync runs core's own <code>convos sync</code>.</span>`;
+  return html`<${Modal} title="Convos on this computer" wide footer=${foot} onClose=${() => set({ overlay: null })}><div class="mbody convos">
+    <div class="chead l-${h.level}">${h.behind ? `${h.behind} session file${h.behind === 1 ? " is" : "s are"} newer than the archive` : "The archive has every local session at its latest state"}<span>checked ${new Date(c.at * 1000).toLocaleTimeString()}</span></div>
+    <h5>Local sessions</h5>
+    ${c.sources.map((s) => row(s.after.length || s.never.length ? "input" : "done", `${s.name}: ${s.current.toLocaleString()} of ${s.total.toLocaleString()} session files current`, parts(s) || "every file matches its last capture",
+      s.after.length || s.never.length || s.writing.length ? html`<div class="cfiles"><${FileLines} files=${[...s.after, ...s.never, ...s.writing]} note=${(f) => f.writing ? "being written" : f.captured ? `captured ${when(f.captured)}` : "never captured"} /></div>` : null))}
+    ${sub ? html`<div class="cnote">Hooks capture a session's main file when a turn ends; subagent transcripts wait for the next sync.</div>` : null}
+    ${c.failed.length ? html`<h5>Fail to import · ${c.failed.length}</h5>${row("failed", `${c.failed.length} session file${c.failed.length === 1 ? "" : "s"} fail to import; every sync retries them`, null, html`<div class="cfiles">${c.failed.map((f) => html`<div class="cfile" title=${f.path}><time>${c.sources.find((s) => s.source === f.source)?.name || f.source}</time><span class="ell">${f.label}</span><span class="cap">retried every sync</span></div>`)}</div>`)}` : null}
+    <h5>Sync and capture</h5>
+    ${c.sync ? row(c.sync.running ? "working" : "done", c.sync.running ? `Syncing now: ${c.sync.stage}` : `Last sync: ${when(c.sync.started)} to ${when(c.sync.beat)}`, c.sync.running ? `started ${when(c.sync.started)}` : `ended at stage “${c.sync.stage}”`) : row("idle", "No sync has run yet")}
+    ${row(c.hooks.failed ? "failed" : c.hooks.pending ? "working" : "done", `Hooks: ${c.hooks.pending} pending · last batch ${when(c.hooks.last)}`, `${c.hooks.processed} captured, ${c.hooks.failed} failed in the last batch${c.hooks.error ? ` · ${c.hooks.error}` : ""}`)}
+    ${c.web.map((w) => row("idle", `${w.name}: newest conversation ${w.newest ? when(Date.parse(w.newest) / 1000) : "unknown"}`, `checked only by a full sync, through ${w.browser}`))}
+    <div class="cacts"><button class="abtn" onClick=${() => sync(true)} disabled=${c.sync?.running}>${K("s")} Sync local sessions</button><button class="abtn" onClick=${() => sync(false)} disabled=${c.sync?.running}>${K("⇧", "S")} Sync everything (web too)</button><button class="abtn" onClick=${() => loadConvos(true)}>${K("r")} Check again</button></div>
+    ${c.relay ? html`<h5>Relay</h5>${row(c.relay.failures ? "failed" : c.relay.pid ? "done" : "blocked", `Last pass ${when(c.relay.succeeded)}${c.relay.failures ? ` · ${c.relay.failures} failures since` : ""}`, c.relay.pid ? `watcher running (pid ${c.relay.pid})` : "watcher not running", c.relay.error ? html`<div class="cs">${c.relay.error}</div>` : null)}` : null}
+    <h5>Disk</h5>
+    ${row(h.used > 0.9 ? "input" : "done", `${gib(c.disk.free)} free of ${gib(c.disk.total)} (${Math.round(h.used * 100)}% used)`, `archive ${gib(c.disk.archive)} · ${c.disk.backups.length} migration backups ${gib(c.disk.backups.reduce((n, b) => n + b.size, 0))}`,
+      c.disk.backups.length ? html`<details class="cback"><summary>Backups</summary>${[...c.disk.backups].reverse().map((b) => html`<div class="cfile"><time>${when(b.at)}</time><span class="ell">${b.name}</span><span class="cap">${gib(b.size)}</span></div>`)}</details>` : null)}
+  </div><//>`;
 }
 
 function Footer() {
@@ -1015,7 +1126,7 @@ function Footer() {
   return html`<footer class="foot">
     <${Hot} k=${["1", "…", "9"]}>sessions<//><${Hot} k=${["j", "k"]}>items<//><${Hot} k="c">${it ? `comment ${it.id}` : "comment session"}<//><${Hot} k=${["⇧", "C"]}>session chat<//>${it ? html`<${Hot} k="Esc">session<//>` : null}<${Hot} k="Space">preview<//>
     ${d && openAsks(d).length ? html`<${Hot} k="a">answer<//>` : null}<${Hot} k="n">new<//><${Hot} k=${["⌘", "K"]}>commands<//><${Hot} k="?">all keys<//>
-    <span class="conn"><span class="dot ${S.conn ? "on" : ""}" />${S.conn ? "live" : "reconnecting…"}</span>
+    <span class="fright"><${ConvosChip} /><span class="conn"><span class="dot ${S.conn ? "on" : ""}" />${S.conn ? "live" : "reconnecting…"}</span></span>
   </footer>`;
 }
 
@@ -1059,5 +1170,6 @@ function App() {
     if (r?.composer) setTimeout(focusComposer, 300);
     if (r) setTimeout(() => toast("Orchestrate updated"), 400);
   } catch (e) { fail(e); }
-  setInterval(paint, 30000);
+  loadConvos();
+  setInterval(() => { paint(); loadConvos(); }, 30000);
 })();
