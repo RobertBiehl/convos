@@ -580,7 +580,7 @@ function WorksWith({ s }) {
 }
 function SessionInfo({ s, d }) {
   const kids = childrenOf(s.id), counts = s.counts || {}, lim = limitOf(s);
-  const runtime = s.origin === "gui" ? (s.live ? (s.busy ? "running a turn" : "live, idle") : (d.runtime?.state === "failed" ? `failed (exit ${d.runtime.code})` : "stopped")) : (s.live ? "joined · reachable" : "joined · offline (messages wait in its inbox)");
+  const runtime = s.origin === "gui" ? (s.live ? (s.busy ? "running a turn" : "live, idle") : (d.runtime?.state === "failed" ? `failed (exit ${d.runtime.code})` : "stopped")) : s.provider === "codex" ? (s.live ? "joined · Codex running (messages arrive at its next turn)" : "joined · Codex not running (messages wait until it is)") : (s.live ? "joined · reachable" : "joined · offline (messages wait in its inbox)");
   return html`<div class="sinfo">
     <div class="actions">
       ${s.origin === "gui" && s.live ? html`<button class="abtn" onClick=${() => act({ kind: "stop" }, "Stopping…")}>${K("x")} Stop</button>` : null}
@@ -740,8 +740,10 @@ function Results({ d, target }) {
   return html`<section class="dsec"><h5>Results · ${list.length}<span style="margin-left:auto;display:flex;gap:12px;text-transform:none;letter-spacing:0;font-weight:500"><${Hot} k=${["←", "→"]}>select<//><${Hot} k="Space">preview<//></span></h5><div class="results">${list.map((a, i) => html`<${Result} key=${a.id} a=${a} target=${target} i=${i} on=${i === on} />`)}</div></section>`;
 }
 
-function deliveryNote(c, s) {
+function deliveryNote(c, s, d) {
   if (c.sending) return html`<span class="state q">sending…</span>`;
+  // codex queue parks a message until the thread's next turn: received once its transcript shows it
+  if (c.delivered && d.arrived && !d.arrived.includes(c.id)) return html`<span class="state q" title="Handed to codex queue; the thread takes it at its next turn. Codex ${s.live ? "is running" : "is not running: reopen the thread"}.">queued in Codex${s.live ? " · arrives after its current turn" : " · Codex is not running"}</span>`;
   if (c.delivered) return html`<span class="state d">✓ delivered</span>`;
   const l = limitOf(s);
   if (l?.wait) return html`<span class="state q" title=${l.title}>waits for the usage limit to reset (${l.at})</span>`;
@@ -751,7 +753,7 @@ function Thread({ d, s, target }) {
   const list = commentsFor(d, target), byId = Object.fromEntries(Object.values(d.comments).map((c) => [c.id, c]));
   if (!list.length) return html`<div class="empty" style="padding:16px 8px">No messages yet. ${K(target ? "c" : "⇧", ...(target ? [] : ["C"]))} to write one.</div>`;
   return html`<div class="thread">${list.map((c) => html`<div class="msg ${c.actor === "user" ? "user" : ""}" key=${c.id + c.at} data-c=${c.id}>
-    <div class="mh">${c.actor !== "user" ? html`<span class="avatar ${c.actor === "agent" ? "agent" : c.actor === "orchestrate" ? "sys" : "sub"}">${initials(c.actor)}</span>` : null}<span>${c.actor === "user" ? "you" : c.actor}</span><span>· ${ago(c.at)}</span>${c.actor === "user" ? deliveryNote(c, s) : null}</div>
+    <div class="mh">${c.actor !== "user" ? html`<span class="avatar ${c.actor === "agent" ? "agent" : c.actor === "orchestrate" ? "sys" : "sub"}">${initials(c.actor)}</span>` : null}<span>${c.actor === "user" ? "you" : c.actor}</span><span>· ${ago(c.at)}</span>${c.actor === "user" ? deliveryNote(c, s, d) : null}</div>
     <div class="bub">${c.reply_to && byId[c.reply_to] ? html`<div class="quote">${byId[c.reply_to].text}</div>` : null}${c.text ? html`<${Md} text=${c.text} />` : null}
       ${c.files?.length ? html`<div class="cimgs">${c.files.map((f, n) => html`<button key=${n} title=${f.name} onClick=${() => set({ overlay: { kind: "look", files: c.files, i: n, from: c } })}><img src=${blobUrl(f)} alt=${f.name} loading="lazy" /></button>`)}</div>` : null}</div>
   </div>`)}</div>`;

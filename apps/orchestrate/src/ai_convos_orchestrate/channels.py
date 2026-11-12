@@ -3,9 +3,10 @@
 Claude Code: each session binds an inbox socket and exports its path and token only to its own hooks and
 Bash commands. The agent's own `convos orchestrate` calls record them here as local working state
 (never in the archive), so orchestrate can post `{"type":"user",...}` lines the session treats as its own
-child's. Codex: `codex queue --thread ID --message TEXT` queues for the thread.
+child's. Codex: `codex queue --thread ID --message TEXT` parks the message until the thread takes its next turn,
+so it is handed over only while Codex runs, and counts as received once the thread's transcript shows it.
 """
-import json, os, shutil, socket, subprocess
+import json, os, shutil, socket, subprocess, time
 from pathlib import Path
 from . import store
 
@@ -31,11 +32,18 @@ def endpoint(s):
     except PermissionError: pass
     return value if Path(value["socket"]).is_socket() else None
 
+RUNNING = dict(at=-10.0, up=False)
+
+def codex_running():
+    """Whether any Codex process (the TUI or its app server) runs on this machine; checked at most every 3 s."""
+    if time.monotonic()-RUNNING["at"] > 3: RUNNING.update(at=time.monotonic(), up=subprocess.run(["pgrep", "-x", "codex"], capture_output=True).returncode == 0)
+    return RUNNING["up"]
+
 def reachable(s):
     meta = s["session"]
     if meta["origin"] == "gui": return False
     if meta["provider"] == "claude-code": return endpoint(s) is not None
-    return meta["provider"] == "codex" and bool(meta.get("provider_session")) and shutil.which("codex") is not None
+    return meta["provider"] == "codex" and bool(meta.get("provider_session")) and shutil.which("codex") is not None and codex_running()
 
 def push(sid, meta, text):
     s = store.load(sid)

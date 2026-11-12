@@ -82,7 +82,7 @@ available channel. Whatever cannot be pushed stays pending for `inbox`.
 |---|---|
 | Started in the IDE (headless Claude Code) | `stream-json` on the process's stdin; resumed with `--resume` after a restart |
 | Joined Claude Code | the session's inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), recorded by the agent's own CLI calls |
-| Joined Codex | `codex queue --thread ID --message TEXT` |
+| Joined Codex | `codex queue --thread ID --message TEXT`, while a Codex process runs; the thread takes it at its next turn, and the comment shows *queued in Codex* until the thread's transcript has it |
 
 A headless agent outlives the server that started it: its stdin is a named pipe in the session's
 folder, which the agent itself also holds open, and its output goes to a file there. A restarted

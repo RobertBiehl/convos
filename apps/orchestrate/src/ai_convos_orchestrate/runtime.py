@@ -6,7 +6,7 @@ whatever cannot be delivered stays pending for the agent's `inbox`.
 """
 import collections, json, os, re, signal, subprocess, sys, threading, time, uuid
 from pathlib import Path
-from . import store, channels, limits
+from . import store, channels, transcripts
 
 PROVIDERS = {"claude-code": dict(label="Claude Code", models=["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"], efforts=["low", "medium", "high", "xhigh", "max"], permissions=["default", "acceptEdits", "plan", "bypassPermissions"])}
 INHERITED = ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_PID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_EFFORT", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CONVOS_ORCHESTRATE_SCOPE", "CONVOS_ORCHESTRATE_AS")
@@ -187,7 +187,7 @@ def deliver(sid):
         if not (found := store.pending(s)): return None
         text, meta = message(s, found), s["session"]
         # an agent stopped by its usage limit cannot act on them; they go out once the limit resets
-        if limits.holding(meta): return "pending"
+        if transcripts.holding(meta): return "pending"
         if meta["origin"] == "gui":
             try: start(sid, text)
             except Unreachable: return "pending"

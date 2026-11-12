@@ -5,7 +5,7 @@ the launch URL), a loopback Host header, and, for writes, a custom header no cro
 """
 import base64, collections, hashlib, hmac, http.server, json, os, re, secrets, socket, subprocess, sys, threading, time, urllib.parse, webbrowser
 from pathlib import Path
-from . import store, runtime, channels, overview, limits
+from . import store, runtime, channels, overview, transcripts
 
 WEB = Path(__file__).with_name("web")
 STATIC = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css", "/vendor/preact-htm.js": "vendor/preact-htm.js"}
@@ -29,9 +29,9 @@ def summary(s):
     meta, eff = s["session"], store.effective(s)
     return dict(id=meta["id"], title=meta["title"], provider=meta["provider"], model=meta.get("model"), effort=meta.get("effort"), cwd=meta["cwd"], origin=meta["origin"], parent=meta.get("parent"), skills=meta.get("skills", []),
                 status=store.status(s), counts=dict(collections.Counter(eff.values())), items=len(s["items"]), asks=len(store.open_asks(s)), pending=len(store.pending(s)),
-                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=limits.state(meta))
+                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=transcripts.limit(meta))
 
-def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
+def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], arrived=sorted(transcripts.arrived(s["session"])) if s["session"]["provider"] == "codex" else None, unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
 
 def skills(cwd):
     roots = [Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"skills", *([Path(cwd)/".claude"/"skills"] if cwd else [])]
@@ -190,7 +190,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try: mtime = (store.sdir(sid)/"view.json").stat().st_mtime_ns
                 except OSError: continue
                 # a session changes with its board, or when its provider's usage limit stops or releases it
-                if seen.get(sid) != (mtime, sid in metas and limits.state(metas[sid])) and (s := store.peek(sid)):
+                if seen.get(sid) != (mtime, sid in metas and transcripts.limit(metas[sid])) and (s := store.peek(sid)):
                     metas[sid] = s["session"]
                     events.append(("session", out := summary(s)))
                     seen[sid] = (mtime, out["limit"])
@@ -259,7 +259,7 @@ def pump():
             if s and s["closed"] and runtime.alive(sid) and not runtime.busy(sid): runtime.stop(sid)
             # words held for a usage limit go out once it resets; joined sessions get every word their channel can take
             gui = s and s["session"]["origin"] == "gui"
-            if s and not s["closed"] and store.pending(s) and not limits.holding(s["session"]) and (limits.state(s["session"]) if gui else channels.reachable(s)):
+            if s and not s["closed"] and store.pending(s) and not transcripts.holding(s["session"]) and (transcripts.limit(s["session"]) if gui else channels.reachable(s)):
                 try: runtime.deliver(sid)
                 except (ValueError, OSError, subprocess.SubprocessError, store.core.LockBusy) as error: print(f"orchestrate: deliver {sid}: {error}", file=sys.stderr)
 

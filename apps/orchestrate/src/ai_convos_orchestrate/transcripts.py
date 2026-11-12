@@ -1,8 +1,9 @@
-"""Usage-limit interruptions: when the provider's usage limit stopped a session's turn, and when the limit resets.
+"""What the provider's own transcript of a session says: whether its usage limit stopped it, and which of the user's
+words have reached it.
 
-Read from the provider's own transcript of the session (Claude Code: projects/*/SESSION.jsonl under its config dir;
-Codex: sessions/YYYY/MM/DD/rollout-*-THREAD.jsonl). The latest turn decides: a session stays interrupted until it
-replies again. Nothing is stored; a transcript is read again only when it changes.
+Claude Code keeps projects/*/SESSION.jsonl under its config dir; Codex keeps sessions/YYYY/MM/DD/rollout-*-THREAD.jsonl.
+For limits the latest turn decides: a session stays interrupted until it replies again. Nothing is stored; a transcript
+is read again only when it changes.
 """
 import datetime as dt, json, os, re, time, zoneinfo
 from pathlib import Path
@@ -13,7 +14,9 @@ CLAUDE = re.compile(r"resets (?:([A-Z][a-z]{2}) (\d{1,2}),? (?:at )?)?(\d{1,2})(
 # "try again at 2:59 AM.", "try again at Sep 7th, 2026 7:41 AM." (this machine's local time)
 CODEX = re.compile(r"try again at (?:([A-Z][a-z]{2}) (\d{1,2})(?:st|nd|rd|th)?,? (\d{4}),? )?(\d{1,2}):(\d{2})\s*([AP]M)")
 GRACE = 60  # the provider shows its reset to the minute; held words go out a minute after it
-FOUND, STATE = {}, {}
+FOUND, STATE, SEEN = {}, {}, {}
+# how the user's words read wherever they reach an agent: a queued message, inbox output, hook context
+WORDS = re.compile(rb'(?:^|\\n|")- ([cq]\d+) (?:user comment|answered on|dismissed by the user|orchestrate notice)')
 
 def wall(tz, y, m, d, h, mi): return dt.datetime(y, m, d, h, mi, tzinfo=tz) if tz else dt.datetime(y, m, d, h, mi).astimezone()
 
@@ -80,7 +83,7 @@ def transcript(meta):
     FOUND[key] = (found[-1] if found else None, time.monotonic()+60)
     return FOUND[key][0]
 
-def state(meta):
+def limit(meta):
     """This session's usage-limit interruption ({text, at, resets} with resets None when the notice names no time), or None."""
     if not (path := transcript(meta)): return None
     try: mark = ((st := path.stat()).st_mtime_ns, st.st_size)
@@ -94,4 +97,19 @@ def state(meta):
 
 def holding(meta):
     """Words for an interrupted session wait until its limit resets, so they reach an agent that can act on them."""
-    return bool((v := state(meta)) and v["resets"] and dt.datetime.fromisoformat(v["resets"]).timestamp()+GRACE > time.time())
+    return bool((v := limit(meta)) and v["resets"] and dt.datetime.fromisoformat(v["resets"]).timestamp()+GRACE > time.time())
+
+def arrived(meta):
+    """Ids of the user's words that reached this Codex thread. `codex queue` only parks a message until the thread takes
+    its next turn, so a queued comment counts as received once the thread's transcript shows it."""
+    if meta["provider"] != "codex" or not (path := transcript(meta)): return set()
+    offset, ids = SEEN.get(path, (0, set()))
+    try:
+        with path.open("rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError: return ids
+    whole = data[:data.rfind(b"\n")+1]
+    ids = ids | {m.decode() for m in WORDS.findall(whole)}
+    SEEN[path] = (offset+len(whole), ids)
+    return ids
