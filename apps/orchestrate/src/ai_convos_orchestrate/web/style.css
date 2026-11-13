@@ -270,6 +270,9 @@ button.badge { cursor: pointer; }
 .rchip.k-link svg { color: var(--accent); }
 .rchip.k-pdf svg { color: var(--failed); }
 .rchip.k-session { padding-left: 7px; border-style: dashed; }
+.irow > .rrow.line { grid-column: 2 / -1; grid-row: 2; margin-top: -4px; min-width: 0; flex-wrap: nowrap; overflow: hidden; }
+.rrow.line .rchip { flex: none; max-width: var(--each); }
+.rrow.line .rchip.more { max-width: none; padding: 0 9px; color: var(--faint); font-weight: 600; }
 .rhint { color: var(--faint); display: inline-flex; gap: 3px; align-items: center; margin-left: 2px; }
 .who { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; padding: 0 6px; border-radius: 5px; background: var(--panel2); border: 1px solid var(--line); color: var(--dim); }
 .irow .flash { position: absolute; inset: 0; border-radius: 9px; pointer-events: none; animation: flash 1.1s var(--ease) forwards; }

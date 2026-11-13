@@ -96,7 +96,7 @@ function refTarget(sid, id) {
   if (!d) return sid === S.cur ? null : `${clip(s.title, 20)} › ${id}`;
   const x = { i: d.items, a: d.attachments, q: d.asks, c: d.comments }[id[0]][id];
   if (!x) return null;
-  const label = id[0] === "i" ? x.title : id[0] === "a" ? x.caption || x.name || x.url : id[0] === "q" ? x.text : `${x.actor === "user" ? "you" : x.actor}: ${x.text}`;
+  const label = id[0] === "i" ? x.title : id[0] === "a" ? (x.replaced_by ? `replaced by ${x.replaced_by}: ` : "") + (x.caption || x.name || x.url) : id[0] === "q" ? x.text : `${x.actor === "user" ? "you" : x.actor}: ${x.text}`;
   return (sid === S.cur ? "" : `${s.title} › `) + clip(label, 90);
 }
 // the pill's own text stays short: the id here, another session by the part of its title before any colon
@@ -117,9 +117,10 @@ async function follow(ref) {
   const d = S.detail[sid], kind = id?.[0];
   if (kind === "q" && !d.asks[id].answer && !d.asks[id].cancelled) return needYou(sid, id);
   if (kind === "a") {
-    const a = d.attachments[id];
+    let a = d.attachments[id];
+    while (a.replaced_by) a = d.attachments[a.replaced_by];
     S.sel[sid] = a.target || null;
-    S.res[`${sid}:${a.target || ""}`] = resultsFor(d, a.target).findIndex((x) => x.id === id || (a.hash && x.hash === a.hash));
+    S.res[`${sid}:${a.target || ""}`] = resultsFor(d, a.target).findIndex((x) => x.id === a.id || (a.hash && x.hash === a.hash));
     return set({ overlay: { kind: "look" } });
   }
   const x = kind === "i" ? d.items[id] : kind === "c" ? d.comments[id] : kind === "q" ? d.asks[id] : null;
@@ -234,7 +235,8 @@ const childrenOf = (sid, item) => S.sessions.filter((s) => item ? s.parent === `
 const openAsks = (d) => Object.values(d.asks).filter((a) => !a.answer && !a.cancelled);
 const commentsFor = (d, target) => [...Object.values(d.comments), ...(S.optimistic[S.cur] || [])].filter((c) => (c.target || null) === (target || null)).sort((a, b) => a.at.localeCompare(b.at));
 // the same bytes attached to one row twice (an agent re-attaching a file under a better name) are one result: the first stays
-const resultsFor = (d, target) => Object.values(d.attachments).filter((a) => (a.target || null) === (target || null)).filter((a, n, xs) => !a.hash || xs.findIndex((x) => x.hash === a.hash) === n);
+// a row's current results, newest first: a result replaced by a newer version leaves the row (its id still leads to the newer one)
+const resultsFor = (d, target) => Object.values(d.attachments).filter((a) => (a.target || null) === (target || null) && !a.replaced_by).filter((a, n, xs) => !a.hash || xs.findIndex((x) => x.hash === a.hash) === n).reverse();
 const blobUrl = (a) => a.src || `/api/blob/${a.hash}?mime=${encodeURIComponent(a.mime || "")}&name=${encodeURIComponent(a.name)}`;
 const pulse = (id, kind) => { S.pulses[id] = { kind, n: (S.pulses[id]?.n || 0) + 1, at: Date.now() }; };
 
@@ -657,6 +659,21 @@ function ResultChip({ a, on, onOpen, tag }) {
     ${thumbOf(a)}<span>${tag ? html`<b class="tag">${a.id}</b>` : null}${label}</span></button>`;
 }
 
+// a row's results on one line, newest first: as many as fit, the picked one always among them, +N for the rest
+const CHIP_MIN = 180, GAP = 6, MORE_W = 52;
+function RowResults({ results, kids, ri, open }) {
+  const box = useRef(), [w, setW] = useState(0);
+  useLayoutEffect(() => { const ro = new ResizeObserver(() => setW(box.current.clientWidth)); ro.observe(box.current); return () => ro.disconnect(); }, []);
+  const slots = (room) => Math.floor((room + GAP) / (CHIP_MIN + GAP)) - kids.length;
+  const n = results.length <= slots(w) ? results.length : Math.max(1, slots(w - MORE_W - GAP)), first = [...Array(n).keys()];
+  const shown = ri < n ? first : [...first.slice(0, -1), ri], more = results.length - shown.length, chips = shown.length + kids.length;
+  const each = Math.min(320, Math.floor((w - (more ? MORE_W + GAP : 0) - GAP * (chips - 1)) / chips));
+  return html`<div class="rrow line" ref=${box} style=${{ "--each": `${each}px` }}>
+    ${kids.map((k) => html`<button class="rchip k-session" title=${k.title} onClick=${(e) => { e.stopPropagation(); go(k.id); }}><${SI} s=${k.status} sm /><span>${k.title}</span></button>`)}
+    ${shown.map((k) => html`<${ResultChip} key=${results[k].id} a=${results[k]} on=${k === ri} onOpen=${() => open(k)} />`)}
+    ${more ? html`<button class="rchip more" title="${more} more: select the row, then → or Space" onClick=${(e) => { e.stopPropagation(); open(ri >= n ? n - 1 : n); }}>+${more}</button>` : null}
+  </div>`;
+}
 function ItemRow({ i, depth, d, s }) {
   const eff = d.effective[i.id], p = S.pulses[i.id], fresh = p && Date.now() - p.at < 1600, sel = S.sel[S.cur] === i.id;
   const comments = Object.values(d.comments).filter((c) => c.target === i.id).length, results = resultsFor(d, i.id), kids = childrenOf(s.id, i.id), ri = sel ? resIdx(i.id) : -1;
@@ -669,11 +686,8 @@ function ItemRow({ i, depth, d, s }) {
     <div class="body">
       <div class="tt"><span class="name">${i.title}</span>${!["agent", "user"].includes(i.actor) ? html`<span class="who"><span class="avatar sub" style="width:12px;height:12px;font-size:7px">${initials(i.actor)}</span>${i.actor}</span>` : null}</div>
       ${i.why ? html`<div class="why s-${i.status}" title=${i.why}>${i.why}</div>` : i.description ? html`<div class="desc">${i.description.split("\n").find((l) => l.trim()).replace(/\*\*|__|`|^#+\s*|^[-*]\s+/g, "")}</div>` : null}
-      ${results.length || kids.length ? html`<div class="rrow">
-        ${results.map((a, n) => html`<${ResultChip} key=${a.id} a=${a} on=${n === ri} onOpen=${() => open(n)} />`)}
-        ${kids.map((k) => html`<button class="rchip k-session" title=${k.title} onClick=${(e) => { e.stopPropagation(); go(k.id); }}><${SI} s=${k.status} sm /><span>${k.title}</span></button>`)}
-      </div>` : null}
     </div>
+    ${results.length || kids.length ? html`<${RowResults} results=${results} kids=${kids} ri=${ri} open=${open} />` : null}
     <div class="tail">
       ${eff === "input" ? html`<span class="pill s-input">needs you</span>` : null}<${Eta} it=${i} />
       ${comments ? html`<span class="n">${G.chat}${comments}</span>` : null}

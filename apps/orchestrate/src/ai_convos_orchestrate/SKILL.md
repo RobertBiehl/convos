@@ -26,7 +26,7 @@ detected, pass `-s SESSION` on every later command.
 | `add TITLE [-d MARKDOWN] [--status S] [--why REASON] [--eta WHEN] [-p PARENT] [--again]` | Add an item (a unit of work). Prints its id, e.g. `i3`. A title already under the same parent returns that row and adds nothing; `--again` adds another. |
 | `set ITEM [--status S] [--why REASON] [--eta WHEN] [--title T] [-d MARKDOWN]` | Update an item. `-d -` reads stdin. Only real changes are written. |
 | `now "TEXT"` | One-line live activity for the session ("Running the test suite"). `now ""` clears. |
-| `attach FILE_OR_URL --on ITEM [--caption C]` | Append a result: image, video, PDF, markdown, any file, or a link. |
+| `attach FILE_OR_URL --on ITEM [--caption C] [--replaces aN]` | Append a result: image, video, PDF, markdown, any file, or a link. `--replaces` puts a newer version in place of an older result on the same row. |
 | `attach --text MARKDOWN --on ITEM --name NAME.md` | Append an inline markdown result. |
 | `say "TEXT" [--on ITEM] [--reply COMMENT]` | Write in the session chat, or in an item's thread. |
 | `ask "QUESTION" [-o A -o B] [--multi] [--on ITEM] [--detail MD] [--wait SEC]` | Ask the user. The item shows *needs you* until answered. |
@@ -120,6 +120,11 @@ session under that row, with its own board.
 Prefer attaching the real artifact (a screenshot, a screen recording, the generated PDF,
 the report file) over describing it. Attach an HTML page as the page itself (`attach proposal.html`):
 the IDE renders it in Quick Look, scripts included, so do not also attach screenshots of it. Videos play in the IDE as MP4 (H.264) or WebM. Links to PRs, commits, and dashboards are results too.
+
+A row shows its results on one line, newest first, so keep each row to a handful. A newer version of a
+result (a revised design, a re-run measurement) replaces the old one: `attach design-v2.md --on i4 --replaces a7`.
+The old one leaves the row, and its id leads to the new one. Work that keeps producing results belongs in
+child rows (`add TITLE -p i4`), each with its own.
 
 ## References
 

@@ -53,7 +53,10 @@ def apply(s, e, body):
         item.update({**({"why": None} if "status" in e["changes"] else {}), **e["changes"], **({"description": body} if e["description"] else {}), "updated": at})
         if "status" in e["changes"]: item["history"].append(dict(status=e["changes"]["status"], actor=actor, at=at, why=e["changes"].get("why")))
     elif kind == "comment": s["comments"][e["comment"]] = dict(id=e["comment"], target=e["target"], reply_to=e["reply_to"], actor=actor, text=body, files=e.get("files", []), at=at, delivered=None if actor in ("user", "orchestrate") else at)
-    elif kind == "attach": s["attachments"][e["attachment"]] = dict(id=e["attachment"], target=e["target"], actor=actor, caption=body, at=at, **e["file"])
+    elif kind == "attach":
+        s["attachments"][e["attachment"]] = dict(id=e["attachment"], target=e["target"], actor=actor, caption=body, at=at, replaces=e.get("replaces"), replaced_by=None, **e["file"])
+        # a newer version of a result takes its place on the row; the old one stays reachable by its id
+        if e.get("replaces"): s["attachments"][e["replaces"]]["replaced_by"] = e["attachment"]
     elif kind == "ask": s["asks"][e["ask"]] = dict(id=e["ask"], target=e["target"], options=e["options"], multi=e["multi"], kind=e["ask_kind"], detail=e["detail"], text=body, actor=actor, at=at, answer=None, delivered=None, cancelled=None)
     elif kind == "answer": s["asks"][e["ask"]]["answer"] = dict(choices=e["choices"], text=body, actor=actor, at=at)
     elif kind == "cancel": s["asks"][e["ask"]].update(cancelled=at, cancelled_by=actor)
@@ -106,6 +109,10 @@ def check(s, e):
         for i in e["items"]:
             if item(i) is None or s["items"][i]["parent"] is not None: raise ValueError(f"Only top-level rows are archived; {i} is not one")
             if marks is not None and (why := blocked(s, i, marks)): raise ValueError(why)
+    if kind == "attach" and (old := e.get("replaces")):
+        if old not in s["attachments"]: raise ValueError(f"Result {old} does not exist")
+        if (a := s["attachments"][old])["target"] != e["target"]: raise ValueError(f"{old} is on {a['target'] or 'the session'}; a result replaces one on the same row")
+        if a.get("replaced_by"): raise ValueError(f"{old} was already replaced by {a['replaced_by']}; replace that one")
     if kind == "deliver" and not all(i in (s["comments"] if i[0] == "c" else s["asks"]) for i in e["ids"]): raise ValueError("Unknown delivery id")
 
 def _conv(s, sid, at):

@@ -47,7 +47,7 @@ install`) documents the tools; how an agent uses them is left to the agent.
 | `join --title T` | Register the session (idempotent per provider session). |
 | `add`, `set` | Create and update items; `--why REASON` says why a row is blocked, failed, or skipped; `--eta 45m`, `2h`, `18:30`, or an ISO time sets when the agent expects the row done (`none` clears). Both are safe to repeat: re-adding a title under the same parent returns that row (`--again` adds another), and a `set` that changes nothing writes nothing, so it cannot bring an archived row back. |
 | `now TEXT` | Live activity line. |
-| `attach FILE_OR_URL --on ITEM`, `attach --text MD --on ITEM` | Append a result. |
+| `attach FILE_OR_URL --on ITEM`, `attach --text MD --on ITEM` | Append a result. `--replaces aN` puts a newer version in place of a result on the same row; the old id then leads to the new one. Past 8 results on a row, `attach` suggests child rows. |
 | `say TEXT [--on ITEM] [--reply C]` | Write in a thread: answers to the user, not status recaps (changed rows already show as unread). A `say` that is not a reply ends with that reminder. |
 | `ask Q [-o A -o B] [--multi] [--on ITEM] [--detail MD] [--wait S]` | Ask the user. The card shows the results the question names and the results on its item. |
 | `need ACTION [--on ITEM] [--detail MD] [--wait S]` | Ask the user to do something only they can (run a test on their hardware, sign in). The card reads **Your action** and offers Done and Can't with an optional note; the reply reaches the agent like an answer (`Action: ... -> Done`). |
@@ -177,13 +177,16 @@ The pane scrolls as one: the session opens at its newest chat, a row at its head
 conversation, not record (what lasts belongs in rows and results), so a thread shows its newest
 10 messages; **Show earlier** pages back, and following a link to an older comment reveals it.
 
+A row shows its results on one line, newest first: as many as fit, the selected one always among
+them, and `+N` for the rest. The right pane and Quick Look list them in the same order.
+
 | Keys | Action |
 |---|---|
 | `1`-`9`, `[` `]` | Switch session |
 | `j` `k`, `↑` `↓` | Select a row (from the session: the most relevant one) |
 | `⌘↑` / `⌘↓` | First current row (press again for the archive) / last row, following new rows |
 | `Esc` | Leave the row: back to the session, following new rows |
-| `←` `→` | Select a result in the row (the first by default; each row remembers its pick) |
+| `←` `→` | Select a result in the row (the newest by default; each row remembers its pick) |
 | `Space` | Quick Look: preview the result or row; `←` `→` results, `↑` `↓` rows |
 | `+` `−` `0` (in Quick Look) | Zoom an image (also pinch, ⌘-scroll), fit it again; a click toggles fit and 100%; drag, scroll, or `Shift+arrows` pan; the minimap shows and moves the visible part. Zoomed views always draw from the full-resolution original |
 | `p` `m` `⇧←` `⇧→` (in Quick Look) | Video: play/pause, mute, seek 5 s (videos start playing when they open) |

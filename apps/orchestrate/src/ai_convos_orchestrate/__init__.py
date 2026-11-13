@@ -55,7 +55,7 @@ def board(s):
     """Plain-text board: the agent's own view of what the user sees."""
     eff, meta = store.effective(s), s["session"]
     def who(i): return f" ({i['actor']})" if i["actor"] not in ("agent", "user") else ""
-    def results(target, depth): return [f"{'  '*depth}  {a['id']:<4} {a['kind']}: {a['caption'] or a['name']}" for a in s["attachments"].values() if a["target"] == target]
+    def results(target, depth): return [f"{'  '*depth}  {a['id']:<4} {a['kind']}: {a['caption'] or a['name']}" for a in s["attachments"].values() if a["target"] == target and not a.get("replaced_by")]
     marks = store.seen(meta["id"])
     new = store.unread(s, marks)
     # what the user has read, so the agent knows what it may archive: unseen rows stay, finished rows the user has read may go
@@ -161,10 +161,12 @@ def say(ctx: typer.Context, text: str, on: str = typer.Option(None, "--on", help
 KINDS = {"image/": "image", "video/": "video", "application/pdf": "pdf", "text/markdown": "markdown", "text/html": "html", "text/": "text"}
 def kind_of(name, mime): return "markdown" if name.lower().endswith((".md", ".markdown")) else next((k for prefix, k in KINDS.items() if mime.startswith(prefix)), "file")
 
+MANY = 8
 @cmd
 def attach(ctx: typer.Context, source: str = typer.Argument(None, help="File path or URL"), on: str = typer.Option(None, "--on", help="Item; omit for the session"),
            text: str = typer.Option(None, "--text", help="Inline markdown result instead of a file; '-' reads stdin"),
-           name: str = typer.Option(None, "--name"), caption: str = typer.Option("", "--caption")):
+           name: str = typer.Option(None, "--name"), caption: str = typer.Option("", "--caption"),
+           replaces: str = typer.Option(None, "--replaces", help="A result on the same row this one supersedes (a newer version); it leaves the row")):
     """Append a result to an item: image, PDF, markdown, any file, or a link."""
     if (source is None) == (text is None): raise ValueError("Pass exactly one of SOURCE or --text")
     target = on or ctx.obj["scope"]
@@ -185,8 +187,11 @@ def attach(ctx: typer.Context, source: str = typer.Argument(None, help="File pat
         mime = mimetypes.guess_type(data_name)[0] or ("text/markdown" if text is not None else "application/octet-stream")
         meta = dict(kind=kind_of(data_name, mime), name=data_name, mime=mime, size=size, hash=blob.name, url=None)
         if text is not None: path.unlink()
-    s, e = emit(ctx, "attach", caption, blob=blob, target=target, file=meta)
-    report(ctx, dict(attachment=e["attachment"], kind=meta["kind"]), f"{e['attachment']} {meta['kind']} {meta['name']} attached to {target or 'session'}")
+    s, e = emit(ctx, "attach", caption, blob=blob, target=target, file=meta, **({"replaces": replaces} if replaces else {}))
+    # a row is read at a glance: past a handful of results, new work belongs in child rows
+    count = sum(1 for a in s["attachments"].values() if a["target"] == target and not a.get("replaced_by"))
+    crowded = f"\n{target} now holds {count} results. Put further work in child rows (convos orchestrate add 'TITLE' -p {target}) and attach there; a newer version of a result replaces it: --replaces aN" if target and count > MANY and not replaces else ""
+    report(ctx, dict(attachment=e["attachment"], kind=meta["kind"], replaces=replaces, results=count), f"{e['attachment']} {meta['kind']} {meta['name']} attached to {target or 'session'}{f', replacing {replaces}' if replaces else ''}{crowded}")
 
 @cmd
 def ask(ctx: typer.Context, question: str, option: list[str] = typer.Option([], "--option", "-o", help="Repeat for each choice; omit for free text"),
