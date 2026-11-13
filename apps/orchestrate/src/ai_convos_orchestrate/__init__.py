@@ -254,13 +254,14 @@ def ls(ctx: typer.Context, all_: bool = typer.Option(False, "--all", "-a", help=
 @cmd
 def spawn(ctx: typer.Context, prompt: str = typer.Argument(..., help="Starting prompt; '-' reads stdin"), title: str = typer.Option("", "--title", "-t"),
           on: str = typer.Option(None, "--on", help="Your item the child session works for"), cwd: str = typer.Option(".", "--cwd"),
-          model: str = typer.Option("claude-opus-5-5", "--model"), effort: str = typer.Option(None, "--effort"),
-          skill: list[str] = typer.Option([], "--skill", help="Repeat; orchestrate is always on"), permission: str = typer.Option("default", "--permission")):
+          provider: str = typer.Option("claude-code", "--provider", help="claude-code, codex or muse"), model: str = typer.Option(None, "--model", help="Default: the provider's first current model"),
+          effort: str = typer.Option(None, "--effort"), skill: list[str] = typer.Option([], "--skill", help="Repeat; orchestrate is always on"),
+          permission: str = typer.Option(None, "--permission", help="Default: the provider's first mode")):
     """Start a child session (headless, managed by the IDE) working for this session. Needs the IDE server running."""
     from .server import request
     sid = ident(ctx)
     if on: store.load(sid)["items"][on]
-    child = request("/api/spawn", dict(title=title, cwd=str(Path(cwd).resolve()), prompt=text_arg(prompt), model=model, effort=effort, skills=skill, permission=permission, parent=f"{sid}:{on}" if on else sid))["session"]
+    child = request("/api/spawn", dict(title=title, cwd=str(Path(cwd).resolve()), prompt=text_arg(prompt), provider=provider, model=model, effort=effort, skills=skill, permission=permission, parent=f"{sid}:{on}" if on else sid))["session"]
     out(ctx, dict(session=child), f"Started child session {child}. Watch it with: convos orchestrate -s {child} show")
 
 @cmd(name="open")

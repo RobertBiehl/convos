@@ -461,7 +461,7 @@ function commands() {
     { group: "Items", keys: ["↵"], label: "Open the selected result (or o)", run: () => openSelected(), when: d },
     { group: "Sessions", keys: ["n"], label: "New session", run: () => set({ overlay: { kind: "new" } }) },
     { group: "Sessions", keys: ["⇧", "N"], label: it ? `New child session for ${it.id}` : "New child session", run: () => s && set({ overlay: { kind: "new", parent: it ? `${s.id}:${it.id}` : s.id } }), when: s },
-    { group: "Sessions", keys: ["r"], label: "Resume session", run: () => act({ kind: "resume" }, "Resuming…"), when: s && s.origin === "gui" && !s.live && !s.closed },
+    { group: "Sessions", keys: ["r"], label: "Resume session", run: () => act({ kind: "resume" }, "Resuming…"), when: s && s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" },
     { group: "Sessions", keys: ["x"], label: "Stop session", run: () => act({ kind: "stop" }, "Stopping…"), when: s && s.origin === "gui" && s.live },
     { group: "Sessions", keys: ["⇧", "X"], label: s?.closed ? "Reopen session" : "Close session (keeps its board)", run: () => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed"), when: s },
     { group: "Sessions", keys: ["."], label: S.closed ? "Hide closed sessions" : "Show closed sessions", run: () => set({ closed: !S.closed }) },
@@ -521,7 +521,7 @@ function onKey(e) {
     c: focusComposer, C: sessionChat, a: focusAsk, i: () => set({ overlay: { kind: "convos" } }),
     s: () => it && set({ overlay: { kind: "status", item: it.id } }), o: () => openSelected(),
     n: () => set({ overlay: { kind: "new" } }), N: () => s && set({ overlay: { kind: "new", parent: it ? `${s.id}:${it.id}` : s.id } }),
-    r: () => s?.origin === "gui" && !s.live && !s.closed && act({ kind: "resume" }, "Resuming…"), x: () => s?.origin === "gui" && s.live && act({ kind: "stop" }, "Stopping…"),
+    r: () => s?.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" && act({ kind: "resume" }, "Resuming…"), x: () => s?.origin === "gui" && s.live && act({ kind: "stop" }, "Stopping…"),
     X: () => s && act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed · its board stays here"),
     p: () => s?.parent && go(s.parent.split(":")[0]), ".": () => set({ closed: !S.closed }),
     L: toggleTheme, "?": () => set({ overlay: { kind: "help" } }), "/": () => set({ overlay: { kind: "palette" } }),
@@ -589,11 +589,11 @@ function WorksWith({ s }) {
 }
 function SessionInfo({ s, d }) {
   const kids = childrenOf(s.id), counts = s.counts || {}, lim = limitOf(s);
-  const runtime = s.origin === "gui" ? (s.live ? (s.busy ? "running a turn" : "live, idle") : (d.runtime?.state === "failed" ? `failed (exit ${d.runtime.code})` : "stopped")) : s.provider === "codex" ? (s.wake?.startsWith("collab") ? `joined · run by ${s.wake}: a message asks collab for a turn` : s.wake === "daemon" ? "joined · a message wakes the thread through Codex's daemon" : s.live ? "joined · Codex running (messages arrive at its next turn)" : "joined · driven by codex exec (messages wait for its next turn)") : (s.live ? "joined · reachable" : "joined · offline (messages wait in its inbox)");
+  const runtime = s.origin === "gui" ? (s.live ? (s.busy ? "running a turn" : "live, idle") : (d.runtime?.state === "failed" ? `failed (exit ${d.runtime.code})` : d.runtime?.state === "idle" ? "ready · your next message starts a turn" : "stopped")) : s.provider === "codex" ? (s.wake?.startsWith("collab") ? `joined · run by ${s.wake}: a message asks collab for a turn` : s.wake === "daemon" ? "joined · a message wakes the thread through Codex's daemon" : s.live ? "joined · Codex running (messages arrive at its next turn)" : "joined · driven by codex exec (messages wait for its next turn)") : (s.live ? "joined · reachable" : "joined · offline (messages wait in its inbox)");
   return html`<div class="sinfo">
     <div class="actions">
       ${s.origin === "gui" && s.live ? html`<button class="abtn" onClick=${() => act({ kind: "stop" }, "Stopping…")}>${K("x")} Stop</button>` : null}
-      ${s.origin === "gui" && !s.live && !s.closed ? html`<button class="abtn" onClick=${() => act({ kind: "resume" }, "Resuming…")}>${K("r")} Resume</button>` : null}
+      ${s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" ? html`<button class="abtn" onClick=${() => act({ kind: "resume" }, "Resuming…")}>${K("r")} Resume</button>` : null}
       <button class="abtn" onClick=${() => set({ overlay: { kind: "new", parent: s.id } })}>${K("⇧", "N")} Child</button>
       <button class="abtn" onClick=${() => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed")}>${K("⇧", "X")} ${s.closed ? "Reopen" : "Close"}</button>
     </div>
@@ -892,24 +892,30 @@ function Modal({ title, onClose, children, footer, wide }) {
   return html`<div class="scrim" onMouseDown=${(e) => e.target === e.currentTarget && onClose()}><div class="modal" style=${wide ? "width:min(760px,94vw)" : ""}><header><span class="grow">${title}</span><${Hot} k="Esc">close<//></header>${children}${footer ? html`<footer>${footer}</footer>` : null}</div></div>`;
 }
 
-function Seg({ options, value, onChange, label }) {
+function Seg({ options, value, onChange, label, names = {} }) {
   return html`<div class="seg" tabIndex="0" aria-label=${label} onKeyDown=${(e) => { const i = options.indexOf(value); if (e.key === "ArrowRight" || e.key === "l") { e.preventDefault(); onChange(options[(i + 1) % options.length]); } if (e.key === "ArrowLeft" || e.key === "h") { e.preventDefault(); onChange(options[(i - 1 + options.length) % options.length]); } }}>
-    ${options.map((o) => html`<button type="button" tabIndex="-1" class=${o === value ? "on" : ""} onClick=${() => onChange(o)}>${o}</button>`)}
+    ${options.map((o) => html`<button type="button" tabIndex="-1" class=${o === value ? "on" : ""} onClick=${() => onChange(o)}>${names[o] || o}</button>`)}
   </div>`;
 }
 
+// each provider brings its current models (the newest of each class), the efforts each model takes, and its permission modes
+const effortFor = (m, want) => !m?.efforts.length ? null : m.efforts.includes(want) ? want : m.efforts.includes("high") ? "high" : m.effort || m.efforts[0];
 function NewSession({ parent }) {
-  const prov = S.meta.providers["claude-code"], ps = parent && S.sessions.find((s) => s.id === parent.split(":")[0]);
-  const [f, setF] = useState({ cwd: home(ps?.cwd || cur()?.cwd || S.meta.recent[0] || S.meta.home), title: "", model: prov.models[0], effort: "high", permission: "default", skills: ["orchestrate"], prompt: "" });
+  const provs = S.meta.providers, ps = parent && S.sessions.find((s) => s.id === parent.split(":")[0]);
+  const choose = (provider, effort) => { const p = provs[provider], m = p.models[0]; return { provider, model: m?.id, effort: effortFor(m, effort), permission: p.permissions[0] }; };
+  const last = (() => { try { return localStorage.getItem("orch.provider"); } catch { return null; } })();
+  const [f, setF] = useState({ cwd: home(ps?.cwd || cur()?.cwd || S.meta.recent[0] || S.meta.home), title: "", ...choose(provs[last] ? last : Object.keys(provs)[0], "high"), skills: ["orchestrate"], prompt: "" });
+  const prov = provs[f.provider], model = prov.models.find((m) => m.id === f.model);
   const [sugg, setSugg] = useState([]), [si, setSi] = useState(-1), [skills, setSkills] = useState([]), [ki, setKi] = useState(0), [busy, setBusy] = useState(false);
   const up = (patch) => setF((x) => ({ ...x, ...patch }));
   const abs = (p) => p.startsWith("~") ? S.meta.home + p.slice(1) : p;
-  useEffect(() => { const t = setTimeout(() => api.get(`/api/skills?cwd=${encodeURIComponent(abs(f.cwd))}`).then(setSkills).catch(() => {}), 150); return () => clearTimeout(t); }, [f.cwd]);
+  useEffect(() => { const t = setTimeout(() => api.get(`/api/skills?cwd=${encodeURIComponent(abs(f.cwd))}&provider=${f.provider}`).then(setSkills).catch(() => {}), 150); return () => clearTimeout(t); }, [f.cwd, f.provider]);
   const complete = (v) => api.get(`/api/dirs?prefix=${encodeURIComponent(abs(v))}`).then((r) => { setSugg(r.map(home)); setSi(-1); }).catch(() => {});
   const submit = async () => {
     if (!f.prompt.trim()) return toast("Write a starting prompt", true);
+    if (!f.model) return toast(`${prov.label} has no model to run`, true);
     setBusy(true);
-    try { const r = await api.post("/api/spawn", { ...f, cwd: abs(f.cwd), parent }); set({ overlay: null }); await loadSessions(); go(r.session); toast("Session started"); }
+    try { const r = await api.post("/api/spawn", { ...f, cwd: abs(f.cwd), parent }); try { localStorage.setItem("orch.provider", f.provider); } catch {} set({ overlay: null }); await loadSessions(); go(r.session); toast("Session started"); }
     catch (e) { fail(e); setBusy(false); }
   };
   useKeys((e) => {
@@ -919,7 +925,7 @@ function NewSession({ parent }) {
   });
   const toggle = (name) => name !== "orchestrate" && up({ skills: f.skills.includes(name) ? f.skills.filter((x) => x !== name) : [...f.skills, name] });
   return html`<${Modal} title=${parent ? html`New child session <span style="color:var(--faint);font-weight:400">of ${ps?.title || parent}${parent.includes(":") ? ` › ${parent.split(":")[1]}` : ""}</span>` : "New session"} onClose=${() => set({ overlay: null })}
-    footer=${html`<span class="grow">Runs headless; you steer it from this board. ${K("Tab")} next field</span><button class="abtn" onClick=${() => set({ overlay: null })}>Cancel</button><button class="abtn primary" disabled=${busy} onClick=${submit}>${busy ? "Starting…" : "Start"} ${K("⌘", "↵")}</button>`}>
+    footer=${html`<span class="grow">${f.provider === "claude-code" ? "Runs headless" : "Runs headless, one turn per message"}; you steer it from this board. ${K("Tab")} next field</span><button class="abtn" onClick=${() => set({ overlay: null })}>Cancel</button><button class="abtn primary" disabled=${busy} onClick=${submit}>${busy ? "Starting…" : "Start"} ${K("⌘", "↵")}</button>`}>
     <div class="mbody">
       <div class="field"><label>Path<span class="hint">${K("Tab")} complete · ${K("↑", "↓")} pick</span></label>
         <input type="text" class="mono" autoFocus value=${f.cwd} onInput=${(e) => { up({ cwd: e.target.value }); complete(e.target.value); }}
@@ -931,9 +937,10 @@ function NewSession({ parent }) {
           }} onBlur=${() => setTimeout(() => setSugg([]), 120)} />
         ${sugg.length ? html`<div class="sugg">${sugg.map((p, i) => html`<div class=${i === si ? "on" : ""} onMouseDown=${() => { up({ cwd: p }); setSugg([]); }}>${p}</div>`)}</div>` : null}
       </div>
-      <div class="field"><label>Model<span class="hint">${K("←", "→")}</span></label><${Seg} label="Model" options=${prov.models} value=${f.model} onChange=${(model) => up({ model })} /></div>
+      ${Object.keys(provs).length > 1 ? html`<div class="field"><label>Agent<span class="hint">${K("←", "→")}</span></label><${Seg} label="Agent" options=${Object.keys(provs)} names=${Object.fromEntries(Object.entries(provs).map(([k, v]) => [k, v.label]))} value=${f.provider} onChange=${(provider) => up({ ...choose(provider, f.effort), skills: ["orchestrate"] })} /></div>` : null}
+      <div class="field"><label>Model<span class="hint">${K("←", "→")}</span></label>${prov.models.length ? html`<${Seg} label="Model" options=${prov.models.map((m) => m.id)} value=${f.model} onChange=${(id) => up({ model: id, effort: effortFor(prov.models.find((m) => m.id === id), f.effort) })} />` : html`<div class="empty" style="padding:4px 0">${prov.label} lists no models yet; run it once to fetch them.</div>`}</div>
       <div style="display:flex;gap:18px;flex-wrap:wrap">
-        <div class="field"><label>Effort<span class="hint">${K("←", "→")}</span></label><${Seg} label="Effort" options=${prov.efforts} value=${f.effort} onChange=${(effort) => up({ effort })} /></div>
+        ${model?.efforts.length ? html`<div class="field"><label>Effort<span class="hint">${K("←", "→")}</span></label><${Seg} label="Effort" options=${model.efforts} value=${f.effort} onChange=${(effort) => up({ effort })} /></div>` : null}
         <div class="field"><label>Permissions<span class="hint">${K("←", "→")}</span></label><${Seg} label="Permissions" options=${prov.permissions} value=${f.permission} onChange=${(permission) => up({ permission })} /></div>
       </div>
       <div class="field"><label>Skills<span class="hint">${K("↑", "↓")} move · ${K("Space")} toggle · orchestrate is always on</span></label>

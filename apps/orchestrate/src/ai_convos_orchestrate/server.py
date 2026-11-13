@@ -34,12 +34,14 @@ def summary(s):
 
 def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], received=None if (heard := transcripts.arrived(s["session"])) is None else sorted(heard), unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
 
-def skills(cwd):
-    roots = [Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"skills", *([Path(cwd)/".claude"/"skills"] if cwd else [])]
+def skills(cwd, provider="claude-code"):
+    # Codex reads its own skills; Claude Code's are also what Muse loads as personal skills
+    home, project = (Path(os.environ.get("CODEX_HOME", Path.home()/".codex")), ".codex") if provider == "codex" else (Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude")), ".claude")
+    roots = [home/"skills", *([Path(cwd)/project/"skills"] if cwd else [])]
     def meta(path):
         head = path.read_text(errors="replace")[:2000].split("---")
         fields = dict(re.findall(r"^(name|description):\s*(.+)$", head[1], re.M)) if len(head) > 2 else {}
-        return dict(name=fields.get("name", path.parent.name).strip(), description=fields.get("description", "").strip()[:240], scope="project" if cwd and str(path).startswith(str(Path(cwd))) else "user")
+        return dict(name=fields.get("name", path.parent.name).strip(), description=fields.get("description", "").strip()[:240], scope="user" if home/"skills" in path.parents else "project")
     found = {m["name"]: m for r in roots if r.is_dir() for p in sorted(r.glob("*/SKILL.md")) for m in [meta(p)]}
     return sorted(found.values(), key=lambda m: (m["name"] != "orchestrate", m["name"]))
 
@@ -170,8 +172,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f.seek(start)
                 data = f.read(end-start+1)
             return self.send(206, data, ctype, [*headers, ("Content-Range", f"bytes {start}-{end}/{size}")])
-        if path == "/api/meta": return self.send(200, dict(providers=runtime.PROVIDERS, home=str(Path.home()), image_limit=store.core.ATTACHMENT_LIMIT, body_limit=BODY_LIMIT, recent=sorted({store.peek(i)["session"]["cwd"] for i in store.session_ids() if store.peek(i)})[:30]))
-        if path == "/api/skills": return self.send(200, skills(query.get("cwd")))
+        if path == "/api/meta": return self.send(200, dict(providers=runtime.providers(), home=str(Path.home()), image_limit=store.core.ATTACHMENT_LIMIT, body_limit=BODY_LIMIT, recent=sorted({store.peek(i)["session"]["cwd"] for i in store.session_ids() if store.peek(i)})[:30]))
+        if path == "/api/skills": return self.send(200, skills(query.get("cwd"), query.get("provider") or "claude-code"))
         if path == "/api/dirs": return self.send(200, dirs(query.get("prefix", "")))
         if path == "/api/collab": return self.send(200, collab())
         if path == "/api/convos": return self.send(200, overview.overview(query.get("fresh") == "1"))
@@ -215,7 +217,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == "/api/seen":
                 store.mark_seen(body["session"], [i for i in body["items"] if i in store.load(body["session"])["items"]])
                 return self.send(200, dict(ok=True))
-            if path == "/api/spawn": return self.send(200, dict(session=runtime.spawn(body.get("title", ""), body["cwd"], body["prompt"], body["model"], body.get("effort"), body.get("skills", []), body.get("permission", "default"), body.get("parent"))))
+            if path == "/api/spawn": return self.send(200, dict(session=runtime.spawn(body.get("title", ""), body["cwd"], body["prompt"], body.get("model"), body.get("effort"), body.get("skills", []), body.get("permission"), body.get("parent"), body.get("provider") or "claude-code")))
             self.send(404, {"error": "not found"})
         except store.core.LockBusy as error:
             # another process has the archive open (DuckDB lets one writer in, and a reader blocks it): name it, keep serving

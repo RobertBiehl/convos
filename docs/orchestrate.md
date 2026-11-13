@@ -21,7 +21,12 @@ convos orchestrate open        # open the IDE (starts its local server)
 ```
 
 Any Claude Code session joins with `/orchestrate`, any Codex session with
-`$orchestrate`. Sessions started from the IDE run headless and are owned by it.
+`$orchestrate`. Sessions started from the IDE (`n`, or `Shift+N` for a child) run headless and are
+owned by it. The dialog offers every agent installed on this Mac: Claude Code, Codex and Muse. Each
+comes with its current models, the newest of each class, read from the tool itself: the model ids
+the installed Claude Code binary knows, Codex's `models_cache.json`, and Muse's model catalog.
+Efforts follow the chosen model, and permissions the agent (Claude Code's permission modes, Codex's
+sandbox, Muse sandboxed or `--yolo`).
 
 ## Statuses
 
@@ -53,7 +58,7 @@ install`) documents the tools; how an agent uses them is left to the agent.
 | `need ACTION [--on ITEM] [--detail MD] [--wait S]` | Ask the user to do something only they can (run a test on their hardware, sign in). The card reads **Your action** and offers Done and Can't with an optional note; the reply reaches the agent like an answer (`Action: ... -> Done`). |
 | `withdraw Q...` | Take back open questions or needs that no longer apply. |
 | `inbox [--wait S]` | Pull undelivered comments, answers, and notices. |
-| `spawn PROMPT --on ITEM` | Start a child session working for this item. |
+| `spawn PROMPT --on ITEM [--provider claude-code\|codex\|muse] [--model M]` | Start a child session working for this item. |
 | `archive ITEM...` | Archive finished top-level rows the user has read (see below). |
 | `show`, `ls`, `close`, `reopen` | Inspect and close. `show` marks rows `· unseen by the user`, `· archivable`, `(archived)`. |
 
@@ -90,7 +95,8 @@ available channel. Whatever cannot be pushed stays pending for `inbox`.
 
 | Session | Channel |
 |---|---|
-| Started in the IDE (headless Claude Code) | `stream-json` on the process's stdin; resumed with `--resume` after a restart |
+| Started in the IDE, Claude Code | `stream-json` on the process's stdin; resumed with `--resume` after a restart |
+| Started in the IDE, Codex or Muse | one process per turn (`codex exec`, then `codex exec resume THREAD`; `muse exec --session-id`), the prompt from a file. Words that arrive during a turn wait and start the next one, so the session shows *ready* between turns. A Codex agent's sandbox may write to the Convos root, where its board lives |
 | Joined Claude Code | the session's inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), recorded by the agent's own CLI calls |
 | Joined Codex | `codex queue --thread ID --message TEXT`; the thread takes it at its next turn, and the comment shows *queued in Codex* until then. Orchestrate also gets the thread that turn: a thread collab runs as a managed worker gets a collab wake (one turn with collab's own model and sandbox), and an interactive thread (started by the Codex TUI) is resumed by Codex's local daemon (`codex queue --resume`, after `codex app-server daemon start`). A thread another program drives with `codex exec` is not resumed, because the daemon keeps a resumed thread's write lock and would lock that program out; its messages wait for its next turn |
 
@@ -102,7 +108,7 @@ read incrementally, and words count only under their own session's header.
 
 A headless agent outlives the server that started it: its stdin is a named pipe in the session's
 folder, which the agent itself also holds open, and its output goes to a file there. A restarted
-server picks it up again, in or between turns. A session never runs two agents: while any agent
+server picks it up again, in or between turns; a Codex or Muse turn is followed to its end the same way. A session never runs two agents: while any agent
 of a session is alive (found by the session id in its command line), orchestrate starts no other,
 and words for an agent it cannot reach wait until that agent ends; `x` stops it.
 
