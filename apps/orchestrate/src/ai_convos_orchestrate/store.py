@@ -52,7 +52,7 @@ def apply(s, e, body):
         # a reason belongs to the status it explains, so a new status without one drops the old reason
         item.update({**({"why": None} if "status" in e["changes"] else {}), **e["changes"], **({"description": body} if e["description"] else {}), "updated": at})
         if "status" in e["changes"]: item["history"].append(dict(status=e["changes"]["status"], actor=actor, at=at, why=e["changes"].get("why")))
-    elif kind == "comment": s["comments"][e["comment"]] = dict(id=e["comment"], target=e["target"], reply_to=e["reply_to"], actor=actor, text=body, files=e.get("files", []), at=at, delivered=None if actor in ("user", "orchestrate") else at)
+    elif kind == "comment": s["comments"][e["comment"]] = dict(id=e["comment"], target=e["target"], reply_to=e["reply_to"], actor=actor, text=body, files=e.get("files", []), at=at, delivered=None if actor in ("user", "orchestrate") else at, notice=e.get("notice"))
     elif kind == "attach":
         s["attachments"][e["attachment"]] = dict(id=e["attachment"], target=e["target"], actor=actor, caption=body, at=at, replaces=e.get("replaces"), replaced_by=None, **e["file"])
         # a newer version of a result takes its place on the row; the old one stays reachable by its id
@@ -261,6 +261,10 @@ def open_asks(s): return [a for a in s["asks"].values() if a["answer"] is None a
 # an agent's estimate for an open row; rows created before ETAs existed carry none
 OPEN = ("planned", "working", "blocked")
 def overdue(s): return [i for i, x in s["items"].items() if x.get("eta") and x["status"] in OPEN and x["eta"] < now()]
+def lapsed(s):
+    """Rows whose ETA passed within the hour and whose agent has not been told: one notice per ETA, none for long-lapsed ones."""
+    told = {c.get("notice") for c in s["comments"].values()}
+    return [i for i in overdue(s) if not s["items"][i].get("archived") and secs(s["items"][i]["eta"]) < 3600 and f"eta:{i}:{s['items'][i]['eta']}" not in told]
 def secs(at): return (datetime.now(timezone.utc)-datetime.fromisoformat(at)).total_seconds()
 def span(x): return f"{round(x/60)}m" if x < 3600 else f"{round(x/3600)}h" if x < 86400 else f"{round(x/86400)}d"
 def clock(at): return (t := datetime.fromisoformat(at).astimezone()).strftime("%H:%M" if t.date() == datetime.now().date() else "%a %H:%M")

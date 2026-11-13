@@ -152,7 +152,10 @@ you have all read since they last changed; such rows show *archived by* the agen
 bring rows back.
 
 **ETAs.** A row with an ETA shows it in its tail and in the item pane while it is planned, working, or
-blocked; once it passes, the row shows how far past it is, in red.
+blocked; once it passes, the row shows how far past it is, in red. The agent is also sent one notice
+on that row, like your comments: a joined session gets it through its channel, and a headless one
+is started for it. Each ETA is announced once; ETAs that lapsed over an hour before the server
+noticed are left to the Board check.
 
 **Convos on this computer.** The chip at the bottom right, next to *live*, says whether the archive
 holds what the agents wrote: *Archive current*, *N files behind*, or *Syncing...*, with the relay's last

@@ -51,7 +51,8 @@ Failed and skipped rows take a `--why` too. A new status drops the old reason.
 
 Give a row an ETA when you start work that takes a while: `--eta 45m`, `2h`, `18:30`, or an ISO
 time (`--eta none` clears it). The user sees it on the row, and it turns overdue once it passes;
-move it when your estimate changes rather than letting it lapse.
+move it when your estimate changes rather than letting it lapse. A lapsed ETA also sends you an
+orchestrate notice on that row: finish the row or give it a new ETA.
 
 Commands end with a **Board check** when something needs tidying: a lapsed ETA, a row left
 *working* with no news, a question the user may have settled in a comment, messages that have not

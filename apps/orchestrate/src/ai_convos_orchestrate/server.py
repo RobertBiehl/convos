@@ -239,6 +239,17 @@ def notify_parent(s, state):
     store.emit(psid, "comment", "orchestrate", text, target=target, reply_to=None)
     background(runtime.deliver, psid)
 
+NUDGED = set()
+
+def nudge(sid, items):
+    """An agent learns of a lapsed ETA on its next command; one sitting idle past it gets this notice, once per ETA, like the user's words."""
+    s = store.load(sid)
+    for i in [i for i in items if i in store.lapsed(s)]:
+        x = s["items"][i]
+        text = f"{i} ({x['title']!r}) passed its ETA ({store.clock(x['eta'])}). Finish it, or give it a new one: convos orchestrate set {i} --eta 30m"
+        store.emit(sid, "comment", "orchestrate", text, target=i, reply_to=None, notice=f"eta:{i}:{x['eta']}")
+    runtime.deliver(sid)
+
 def pump():
     """Retry delivery to joined sessions, tell parents about their children, and keep managed runtime truthful."""
     last, recover_at = {sid: store.status(s) for sid in store.session_ids() if (s := store.peek(sid))}, 0
@@ -262,6 +273,9 @@ def pump():
                 if s["session"].get("parent") and state in NOTIFY and sid in last: background(notify_parent, s, state)
                 last[sid] = state
             if s and s["closed"] and runtime.alive(sid) and not runtime.busy(sid): runtime.stop(sid)
+            if s and not s["closed"] and (late := [i for i in store.lapsed(s) if (sid, i, s["items"][i]["eta"]) not in NUDGED]):
+                NUDGED.update((sid, i, s["items"][i]["eta"]) for i in late)
+                background(nudge, sid, late)
             # words held for a usage limit go out once it resets; joined sessions get every word their channel can take
             gui = s and s["session"]["origin"] == "gui"
             if s and not s["closed"] and store.pending(s) and not transcripts.holding(s["session"]) and (transcripts.limit(s["session"]) if gui else channels.reachable(s)):
