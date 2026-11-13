@@ -665,8 +665,8 @@ function RowResults({ results, kids, ri, open }) {
   const box = useRef(), [w, setW] = useState(0);
   useLayoutEffect(() => { const ro = new ResizeObserver(() => setW(box.current.clientWidth)); ro.observe(box.current); return () => ro.disconnect(); }, []);
   const slots = (room) => Math.floor((room + GAP) / (CHIP_MIN + GAP)) - kids.length;
-  const n = results.length <= slots(w) ? results.length : Math.max(1, slots(w - MORE_W - GAP)), first = [...Array(n).keys()];
-  const shown = ri < n ? first : [...first.slice(0, -1), ri], more = results.length - shown.length, chips = shown.length + kids.length;
+  const n = results.length <= slots(w) ? results.length : Math.min(results.length, Math.max(1, slots(w - MORE_W - GAP))), first = [...Array(n).keys()];
+  const shown = ri < n || !results[ri] ? first : [...first.slice(0, -1), ri], more = results.length - shown.length, chips = Math.max(1, shown.length + kids.length);
   const each = Math.min(320, Math.floor((w - (more ? MORE_W + GAP : 0) - GAP * (chips - 1)) / chips));
   return html`<div class="rrow line" ref=${box} style=${{ "--each": `${each}px` }}>
     ${kids.map((k) => html`<button class="rchip k-session" title=${k.title} onClick=${(e) => { e.stopPropagation(); go(k.id); }}><${SI} s=${k.status} sm /><span>${k.title}</span></button>`)}
