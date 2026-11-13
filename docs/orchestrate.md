@@ -173,6 +173,9 @@ put; a **Latest** button (with the count of new rows) brings you back, as do `‚å
 Selection never moves the board. With no row selected, the right pane is the session: its
 info, results, and chat, plus **Works with**: the collab rooms the session belongs to and
 its teammates, each linking to their board when they are on orchestrate. Selecting a row switches it to that item and its thread.
+The pane scrolls as one: the session opens at its newest chat, a row at its header. Chat is
+conversation, not record (what lasts belongs in rows and results), so a thread shows its newest
+10 messages; **Show earlier** pages back, and following a link to an older comment reveals it.
 
 | Keys | Action |
 |---|---|

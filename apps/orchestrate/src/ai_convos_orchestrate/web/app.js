@@ -5,10 +5,10 @@ import { html, render, useState, useEffect, useRef, useLayoutEffect } from "/ven
 const store = (k, v) => { try { if (v === undefined) return JSON.parse(localStorage.getItem("orch." + k)); localStorage.setItem("orch." + k, JSON.stringify(v)); } catch { return null; } };
 const S = {
   sessions: [], meta: null, cur: null, detail: {}, sel: {}, collab: null,
-  overlay: null, closed: false, toast: null, pulses: {}, conn: false, askFocus: null, askPick: {}, drafts: {}, attach: {}, drop: false, optimistic: {}, res: {},
+  overlay: null, closed: false, toast: null, pulses: {}, conn: false, askFocus: null, askPick: {}, drafts: {}, attach: {}, drop: false, optimistic: {}, res: {}, shown: {},
   seen: store("seen") || {}, prev: {},
 };
-let paint = () => {}, followLatest = () => {};
+let paint = () => {}, followLatest = () => {}, holdDetail = () => {};
 const set = (patch) => { Object.assign(S, typeof patch === "function" ? patch(S) : patch); paint(); };
 const keyStack = [];
 const useKeys = (fn) => useEffect(() => { keyStack.push(fn); return () => keyStack.splice(keyStack.indexOf(fn), 1); }, [fn]);
@@ -124,6 +124,8 @@ async function follow(ref) {
   }
   const x = kind === "i" ? d.items[id] : kind === "c" ? d.comments[id] : kind === "q" ? d.asks[id] : null;
   S.sel[sid] = kind === "i" ? id : x?.target || null;
+  // a comment older than the visible chat is revealed, with everything after it
+  if (kind === "c" && x) { const list = commentsFor(d, x.target || null), key = `${sid}:${x.target || ""}`; S.shown[key] = Math.max(S.shown[key] || CHAT_PAGE, list.length - list.findIndex((c) => c.id === id)); }
   paint();
   if (kind === "c") setTimeout(() => { const el = document.querySelector(`.detail [data-c="${id}"]`); if (el) { el.scrollIntoView({ block: "center" }); el.classList.remove("hl"); void el.offsetWidth; el.classList.add("hl"); } }, 120);
 }
@@ -280,7 +282,7 @@ function reloadInPlace() {
   const b = document.querySelector(".center .scroll"), d = document.querySelector(".dscroll");
   try {
     sessionStorage.setItem("orch.restore", JSON.stringify({
-      at: Date.now(), cur: S.cur, sel: S.sel, res: S.res, closed: S.closed, drafts: S.drafts,
+      at: Date.now(), cur: S.cur, sel: S.sel, res: S.res, closed: S.closed, drafts: S.drafts, shown: S.shown,
       scroll: b ? { top: b.scrollTop, pinned: b.scrollHeight - b.scrollTop - b.clientHeight < 40 } : null, dscroll: d?.scrollTop || 0,
       composer: !!document.activeElement?.closest(".composer"),
     }));
@@ -756,10 +758,13 @@ function deliveryNote(c, s, d) {
   if (l?.wait) return html`<span class="state q" title=${l.title}>waits for the usage limit to reset (${l.at})</span>`;
   return html`<span class="state q">${s.origin === "gui" ? "queued" : s.live ? "delivering…" : "waits for the agent"}</span>`;
 }
+// chat is conversation, not record (rows and results hold what lasts), so a thread shows its newest messages and pages back on request
+const CHAT_PAGE = 10;
 function Thread({ d, s, target }) {
-  const list = commentsFor(d, target), byId = Object.fromEntries(Object.values(d.comments).map((c) => [c.id, c]));
-  if (!list.length) return html`<div class="empty" style="padding:16px 8px">No messages yet. ${K(target ? "c" : "⇧", ...(target ? [] : ["C"]))} to write one.</div>`;
-  return html`<div class="thread">${list.map((c) => html`<div class="msg ${c.actor === "user" ? "user" : ""}" key=${c.id + c.at} data-c=${c.id}>
+  const all = commentsFor(d, target), byId = Object.fromEntries(Object.values(d.comments).map((c) => [c.id, c])), key = `${s.id}:${target || ""}`;
+  if (!all.length) return html`<div class="empty" style="padding:16px 8px">No messages yet. ${K(target ? "c" : "⇧", ...(target ? [] : ["C"]))} to write one.</div>`;
+  const list = all.slice(-(S.shown[key] || CHAT_PAGE)), hidden = all.length - list.length;
+  return html`<div class="thread">${hidden ? html`<button class="earlier" onClick=${() => { holdDetail(); S.shown[key] = list.length + CHAT_PAGE; paint(); }}>Show ${Math.min(hidden, CHAT_PAGE)} earlier<span>${hidden} not shown</span></button>` : null}${list.map((c) => html`<div class="msg ${c.actor === "user" ? "user" : ""}" key=${c.id + c.at} data-c=${c.id}>
     <div class="mh">${c.actor !== "user" ? html`<span class="avatar ${c.actor === "agent" ? "agent" : c.actor === "orchestrate" ? "sys" : "sub"}">${initials(c.actor)}</span>` : null}<span>${c.actor === "user" ? "you" : c.actor}</span><span>· ${ago(c.at)}</span>${c.actor === "user" ? deliveryNote(c, s, d) : null}</div>
     <div class="bub">${c.reply_to && byId[c.reply_to] ? html`<div class="quote">${byId[c.reply_to].text}</div>` : null}${c.text ? html`<${Md} text=${c.text} />` : null}
       ${c.files?.length ? html`<div class="cimgs">${c.files.map((f, n) => html`<button key=${n} title=${f.name} onClick=${() => set({ overlay: { kind: "look", files: c.files, i: n, from: c } })}><img src=${blobUrl(f)} alt=${f.name} loading="lazy" /></button>`)}</div>` : null}</div>
@@ -819,17 +824,19 @@ function Composer({ s, target, label }) {
 
 function Detail({ s, d }) {
   const it = selected(), pinned = useRef(true), view = `${s.id}:${it?.id || ""}`;
-  useLayoutEffect(() => { pinned.current = !it; }, [view]);
+  // one scroll for the whole pane: header, results, chat. The session opens at its newest chat, a row at its header
+  useLayoutEffect(() => { pinned.current = !it; const b = document.querySelector(".dscroll"); if (b && it) b.scrollTop = 0; }, [view]);
   useLayoutEffect(() => { const b = document.querySelector(".dscroll"); if (b && pinned.current && !(S.restore?.cur === s.id && S.restore.dscroll != null)) b.scrollTop = b.scrollHeight; });
   const onScroll = (e) => { const b = e.currentTarget; pinned.current = !it && b.scrollHeight - b.scrollTop - b.clientHeight < 60; };
+  holdDetail = () => { pinned.current = false; };  // paging back in the chat keeps your place
   useLayoutEffect(() => { const r = S.restore; if (r?.cur === s.id && r.dscroll != null) { const el = document.querySelector(".dscroll"); if (el) { el.scrollTop = r.dscroll; r.dscroll = null; } } });
   if (!it) {
     const asks = openAsks(d).filter((a) => !a.target);
     return html`<aside class="detail" onDragOver=${dropOver} onDragLeave=${dropLeave} onDrop=${(e) => dropOn(e, `${s.id}:`)}>
       ${S.drop ? html`<div class="dropzone">Drop images to attach them to a message in the session chat</div>` : null}
-      <div class="dhead"><div class="lbl">Session · ${s.origin === "gui" ? "started here" : "joined"} · ${ago(s.created)}<span style="margin-left:auto"><${Hot} k=${["j", "k"]}>pick a row<//></span></div><h2>${s.title}</h2>
-        <${SessionInfo} s=${s} d=${d} /></div>
       <div class="dscroll" onScroll=${onScroll}>
+        <div class="dhead"><div class="lbl">Session · ${s.origin === "gui" ? "started here" : "joined"} · ${ago(s.created)}<span style="margin-left:auto"><${Hot} k=${["j", "k"]}>pick a row<//></span></div><h2>${s.title}</h2>
+          <${SessionInfo} s=${s} d=${d} /></div>
         ${d.prompt ? html`<section class="dsec"><h5>Starting prompt</h5><div class="bub" style="padding:9px 11px;border-radius:10px;border:1px solid var(--line);background:var(--panel2)"><${Md} text=${d.prompt} /></div></section>` : null}
         ${asks.length ? html`<section class="dsec"><h5>Questions</h5><${Questions} list=${asks} d=${d} /></section>` : null}
         <${Results} d=${d} target=${null} />
@@ -841,14 +848,14 @@ function Detail({ s, d }) {
   const eff = d.effective[it.id], asks = openAsks(d).filter((a) => a.target === it.id), kids = childrenOf(s.id, it.id), p = S.pulses[it.id];
   return html`<aside class="detail" onDragOver=${dropOver} onDragLeave=${dropLeave} onDrop=${(e) => dropOn(e, `${s.id}:${it.id}`)}>
     ${S.drop ? html`<div class="dropzone">Drop images to attach them to a comment on ${it.id}</div>` : null}
-    <div class="dhead ${p && Date.now() - p.at < 1600 ? "receive" : ""}" key=${it.id}>
-      <div class="lbl"><code>${it.id}</code>${!["agent", "user"].includes(it.actor) ? html`<span class="who">${it.actor}</span>` : null}<span>created ${ago(it.created)}</span>${it.parent ? html`<span>· under ${it.parent}</span>` : null}<span style="margin-left:auto"><${Hot} k="Esc">session<//></span></div>
-      <h2>${it.title}</h2>
-      <div class="row"><button onClick=${() => set({ overlay: { kind: "status", item: it.id } })}><${Pill} s=${eff} /></button><${Hot} k="s">change<//><${Eta} it=${it} />
-        <button class="ghostbtn" style="margin-left:auto" onClick=${() => archive(false, it.id)}>${d.items[rootOf(d, it.id)].archived ? G.unarchive : G.archive}${d.items[rootOf(d, it.id)].archived ? "Bring back" : "Archive"}${it.parent ? ` ${rootOf(d, it.id)}` : ""}</button><${Hot} k="e" /></div>
-      ${it.why ? html`<div class="whyline s-${it.status}"><${SI} s=${it.status} sm /><div>${it.why}</div></div>` : null}
-    </div>
     <div class="dscroll">
+      <div class="dhead ${p && Date.now() - p.at < 1600 ? "receive" : ""}" key=${it.id}>
+        <div class="lbl"><code>${it.id}</code>${!["agent", "user"].includes(it.actor) ? html`<span class="who">${it.actor}</span>` : null}<span>created ${ago(it.created)}</span>${it.parent ? html`<span>· under ${it.parent}</span>` : null}<span style="margin-left:auto"><${Hot} k="Esc">session<//></span></div>
+        <h2>${it.title}</h2>
+        <div class="row"><button onClick=${() => set({ overlay: { kind: "status", item: it.id } })}><${Pill} s=${eff} /></button><${Hot} k="s">change<//><${Eta} it=${it} />
+          <button class="ghostbtn" style="margin-left:auto" onClick=${() => archive(false, it.id)}>${d.items[rootOf(d, it.id)].archived ? G.unarchive : G.archive}${d.items[rootOf(d, it.id)].archived ? "Bring back" : "Archive"}${it.parent ? ` ${rootOf(d, it.id)}` : ""}</button><${Hot} k="e" /></div>
+        ${it.why ? html`<div class="whyline s-${it.status}"><${SI} s=${it.status} sm /><div>${it.why}</div></div>` : null}
+      </div>
       ${it.description ? html`<section class="dsec"><${Md} text=${it.description} /></section>` : null}
       ${asks.length ? html`<section class="dsec"><h5>Needs you</h5><${Questions} list=${asks} d=${d} here=${it.id} /></section>` : null}
       <${Results} d=${d} target=${it.id} />
@@ -1182,7 +1189,7 @@ function App() {
     [S.meta] = await Promise.all([api.get("/api/meta"), loadSessions()]);
     S.sessions.forEach((s) => { S.prev[s.id] = s.status; });
     const r = restored();
-    if (r) Object.assign(S, { sel: r.sel || {}, res: r.res || {}, closed: r.closed, drafts: r.drafts || {}, restore: r });
+    if (r) Object.assign(S, { sel: r.sel || {}, res: r.res || {}, closed: r.closed, drafts: r.drafts || {}, shown: r.shown || {}, restore: r });
     const want = r?.cur || location.hash.slice(1), o = ordered();
     go(S.sessions.find((s) => s.id === want)?.id || S.sessions.find((s) => s.status === "input" && !s.closed)?.id || [...o].sort((a, b) => b.s.updated.localeCompare(a.s.updated))[0]?.s.id);
     connect();
