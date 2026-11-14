@@ -301,7 +301,7 @@ def running():
 def launch(port=7311):
     """Open the IDE, starting a detached server when none is running."""
     if not (data := running()):
-        log = open(store.root()/"server.log", "ab")
+        log = open(store.core.secure_dir(store.root())/"server.log", "ab")  # first launch: the root does not exist yet
         subprocess.Popen([sys.executable, "-m", "ai_convos_orchestrate.server", str(port)], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
         deadline = time.monotonic()+20
         while not (data := running()) and time.monotonic() < deadline: time.sleep(0.2)
