@@ -76,6 +76,22 @@ Sparse metadata omits unavailable keys rather than storing guessed values or NUL
 members. Codex currently also retains `forked_from_id` and `thread_source` as
 documented provider extensions; they do not replace the explicit parent relation.
 
+A Codex subagent spawned with forked context replays its parent's history before
+its own work. Replayed items keep the parent's turn ids, so `fork_boundary` records
+the `provider_index` of the first `turn_context` whose turn id is absent from the
+parent rollout named by `forked_from_id`. Messages before it are inherited copies:
+they stay stored and readable, but discovery ranks only the copy in the session that
+authored it. The key is omitted when the parent rollout is not available locally,
+so nothing is hidden without that evidence. A fork without its own turn yet has a
+boundary past its last item.
+
+Discovery ranks session families. A conversation's root follows exact
+`parent_session_id` links within one source; `search` and `query` return one row per
+root with up to three conversations of that family (best message each), so subagent
+hits appear under the session that spawned them. `--flat` restores one row per
+conversation. Injected `developer` and `system` prompts leave default ranking and
+stay available with `-r developer`.
+
 Normalized values have four distinct evidence states: exact values copied from the
 provider, absent values the provider did not supply, explicit provider `unknown`
 values, and inferred classifications carrying an evidence marker. Convos never

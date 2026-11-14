@@ -82,7 +82,7 @@ def test_query_returns_one_hit_per_conversation(hybrid_db, monkeypatch):
     r = CliRunner().invoke(cli.app, ["query", "apple", "-n", "5", "-c", "5", "-f", "json"])
     assert r.exit_code == 0
     hits = __import__("json").loads(r.output)
-    assert len(hits) == 1 and set(hits[0])=={"score","message_id","role","content","created_at","title","source","conversation_id","cwd"} and isinstance(hits[0]["score"],float) and hits[0]["message_id"] in ("m1", "m3") and hits[0]["content"] == "apple..."
+    assert len(hits) == 1 and set(hits[0])=={"score","message_id","role","content","created_at","title","source","conversation_id","cwd","agent","root_id","related"} and isinstance(hits[0]["score"],float) and hits[0]["message_id"] in ("m1", "m3") and hits[0]["content"] == "apple..."
 
 
 def test_search_returns_one_hit_per_conversation(hybrid_db):
@@ -270,7 +270,7 @@ def test_stale_fts_scans_complete_rows_excludes_history_and_keeps_json_clean(tmp
     conn=duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations(id,source) VALUES ('c','test')"); conn.execute("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('old','c','user','old needle','{}')"); cli._archive_touch(conn,[("messages","old")]); cli.rebuild_fts_index(conn)
     conn.execute("INSERT INTO messages(id,conversation_id,role,content,metadata) VALUES ('new','c','user','fresh needle','{}'),('history','c','user','hidden unique','{\"history_of\":\"old\"}')"); cli._archive_touch(conn,[("messages","new"),("messages","history")]); before=conn.execute("SELECT * FROM retrieval_state").fetchone(); conn.close()
     runner=CliRunner(); result=runner.invoke(cli.app,["search","fresh","-f","json"]); rows=json.loads(result.stdout)
-    assert result.exit_code==0 and set(rows[0])=={"message_id","role","content","thinking","created_at","score","title","source","conversation_id","cwd"} and rows[0]["message_id"]=="new" and isinstance(rows[0]["score"],float) and "complete lexical scan" in result.stderr
+    assert result.exit_code==0 and set(rows[0])=={"message_id","role","content","thinking","created_at","score","title","source","conversation_id","cwd","agent","root_id","related"} and rows[0]["message_id"]=="new" and isinstance(rows[0]["score"],float) and "complete lexical scan" in result.stderr
     assert json.loads(runner.invoke(cli.app,["search","unique","-f","json"]).stdout)==[]
     conn=duckdb.connect(str(db)); assert conn.execute("SELECT * FROM retrieval_state").fetchone()==before; conn.close()
 

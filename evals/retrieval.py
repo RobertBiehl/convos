@@ -41,7 +41,7 @@ def _literal(case,k):
     try: return json.loads(result.output)
     except json.JSONDecodeError as e: raise ValueError(f"literal retrieval failed: {result.output.strip()}") from e
 def _rank(hits,expected):
-    return next((i for i,h in enumerate(hits,1) if any(str(h[key]).startswith(prefix) for prefix in expected for key in ("conversation_id","message_id"))),None)
+    return next((i for i,h in enumerate(hits,1) if any(str(x[key]).startswith(prefix) for x in [h,*h.get("related",[])] for prefix in expected for key in ("conversation_id","message_id"))),None)  # nested subagent hits count for their root
 def run(cases,mode="hybrid",limit=10):
     results=[]
     for case in cases:
