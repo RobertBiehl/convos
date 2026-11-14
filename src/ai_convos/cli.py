@@ -1373,7 +1373,7 @@ def wake_hooks(attempt=None,root=None):
     with operation_lock((Path(root)/"data/hook_inbox" if root is not None else HOOK_DIR)/".drain.lock","hooks.dispatch",0,mandatory=False) as available: pass
     if available: subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env={**os.environ,**({"CONVOS_PROJECT_ROOT":str(root)} if root is not None else {}),**({"CONVOS_HOOK_ATTEMPT":attempt} if attempt else {})})
 def enqueue_hook(source, payload):
-    path,root=(Path(payload["transcript_path"]).expanduser().resolve() if payload.get("transcript_path") else next((p.resolve() for p in sorted(hook_root(source).expanduser().resolve().rglob(f"{payload.get('session_id')}/session.jsonl")) if p.is_file()),None) if source=="muse" and re.fullmatch(r"[0-9a-f-]{1,64}",payload.get("session_id") or "") else None),hook_root(source).expanduser().resolve()
+    path,root=(Path(t).expanduser().resolve() if (t:=payload.get("agent_transcript_path") or payload.get("transcript_path")) else next((p.resolve() for p in sorted(hook_root(source).expanduser().resolve().rglob(f"{payload.get('session_id')}/session.jsonl")) if p.is_file()),None) if source=="muse" and re.fullmatch(r"[0-9a-f-]{1,64}",payload.get("session_id") or "") else None),hook_root(source).expanduser().resolve()
     if source not in ("claude-code", "codex", "muse") or path is None or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")
     st,key=path.stat(),gen_id("hook",f"{source}:{path}")
     if payload.get("hook_event_name", "Stop") not in ("Stop","SessionEnd","SubagentStop"):
