@@ -900,7 +900,8 @@ function Seg({ options, value, onChange, label, names = {} }) {
 
 // each provider brings its current models (the newest of each class), the efforts each model takes, and its permission modes
 const effortFor = (m, want) => !m?.efforts.length ? null : m.efforts.includes(want) ? want : m.efforts.includes("high") ? "high" : m.effort || m.efforts[0];
-function NewSession({ parent }) {
+function NewSession({ parent: asked }) {
+  const [parent, setParent] = useState(asked || null);
   const provs = S.meta.providers, ps = parent && S.sessions.find((s) => s.id === parent.split(":")[0]);
   const choose = (provider, effort) => { const p = provs[provider], m = p.models[0]; return { provider, model: m?.id, effort: effortFor(m, effort), permission: p.permissions[0] }; };
   const last = (() => { try { return localStorage.getItem("orch.provider"); } catch { return null; } })();
@@ -924,7 +925,7 @@ function NewSession({ parent }) {
     return false;
   });
   const toggle = (name) => name !== "orchestrate" && up({ skills: f.skills.includes(name) ? f.skills.filter((x) => x !== name) : [...f.skills, name] });
-  return html`<${Modal} title=${parent ? html`New child session <span style="color:var(--faint);font-weight:400">of ${ps?.title || parent}${parent.includes(":") ? ` › ${parent.split(":")[1]}` : ""}</span>` : "New session"} onClose=${() => set({ overlay: null })}
+  return html`<${Modal} title=${parent ? html`New child session <span style="color:var(--faint);font-weight:400">of ${ps?.title || parent}${parent.includes(":") ? ` › ${parent.split(":")[1]}` : ""}</span><button class="ghostbtn" style="margin-left:8px" title="Start it as its own session instead" onClick=${() => setParent(null)}>× Top level</button>` : "New session"} onClose=${() => set({ overlay: null })}
     footer=${html`<span class="grow">${f.provider === "claude-code" ? "Runs headless" : "Runs headless, one turn per message"}; you steer it from this board. ${K("Tab")} next field</span><button class="abtn" onClick=${() => set({ overlay: null })}>Cancel</button><button class="abtn primary" disabled=${busy} onClick=${submit}>${busy ? "Starting…" : "Start"} ${K("⌘", "↵")}</button>`}>
     <div class="mbody">
       <div class="field"><label>Path<span class="hint">${K("Tab")} complete · ${K("↑", "↓")} pick</span></label>
