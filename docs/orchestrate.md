@@ -28,8 +28,10 @@ the installed Claude Code binary knows, Codex's `models_cache.json`, and Muse's 
 Efforts follow the chosen model, and permissions the agent (Claude Code's permission modes, Codex's
 sandbox, Muse sandboxed or `--yolo`). The session pane changes a started session's permission in
 place: a live Claude Code agent switches at once (it is launched with
-`--allow-dangerously-skip-permissions`, so even into `bypassPermissions`; an agent launched before
-that restarts on its conversation after its turn), Codex and Muse with their next turn.
+`--allow-dangerously-skip-permissions`, so even into `bypassPermissions`), Codex and Muse with their
+next turn. An agent launched before that needs a restart on its conversation for `bypassPermissions`;
+the pane asks you to confirm it, and the agent then restarts at once if it waits on a permission
+prompt (the prompt goes away and the agent is told to go on), otherwise once its turn ends.
 
 ## Statuses
 

@@ -156,9 +156,10 @@ def launch(sid, meta, resume):
     own = os.open(fifo, os.O_RDWR)
     try:
         with open(d/"stdout.jsonl", "wb") as out, open(d/"stderr.log", "ab") as log:
-            proc = subprocess.Popen(command(sid, meta, resume), cwd=meta["cwd"], stdin=own, stdout=out, stderr=log, env=child_env(sid), start_new_session=True)
+            proc = subprocess.Popen(cmd := command(sid, meta, resume), cwd=meta["cwd"], stdin=own, stdout=out, stderr=log, env=child_env(sid), start_new_session=True)
     finally: os.close(own)
     hold(sid, proc.pid, proc, 0, False)
+    PROCS[sid]["bypassable"] = "--allow-dangerously-skip-permissions" in cmd
     set_runtime(sid, "idle", started=True, pid=proc.pid)
 
 def hold(sid, pid, proc, offset, busy):
@@ -185,6 +186,9 @@ def adopt(sid, s, pids):
     busy = rt.get("state") == "working" and last.get("type") != "result"
     try: hold(sid, pids[0], None, size-len(tail)+len(whole), busy)
     except OSError: return False
+    # agents launched before they could be switched into bypassPermissions need a restart for it
+    cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pids[0])], capture_output=True, text=True).stdout
+    PROCS[sid]["bypassable"] = "--allow-dangerously-skip-permissions" in cmd or "bypassPermissions" in cmd
     set_runtime(sid, "working" if busy else "idle", started=True, pid=pids[0])
     return True
 
@@ -206,13 +210,13 @@ def read(sid, p, offset):
                 if (e := event(line)) and e.get("type") == "result":
                     p["busy"] = False
                     set_runtime(sid, "idle", started=True, pid=p["pid"], cost=e.get("total_cost_usd"), turns=e.get("num_turns"))
-                # an agent launched before agents could be switched into bypassPermissions takes it by starting again
-                if e and e.get("type") == "control_response" and e["response"].get("error_code") == "bypass_not_launched": p["relaunch"] = True
+                # an agent launched before agents could be switched into bypassPermissions takes it only by starting again
+                if e and e.get("type") == "control_response" and e["response"].get("error_code") == "bypass_not_launched": p["bypassable"] = False
                 # Codex names its thread when the first turn starts; later turns resume it
                 if e and e.get("type") == "thread.started" and store.load(sid)["session"].get("provider_session") != e["thread_id"]:
                     store.emit(sid, "meta", "orchestrate", changes=dict(provider_session=e["thread_id"]))
             f.seek(-len(line), os.SEEK_CUR)
-            if p.get("relaunch") and not p["busy"] and not done:
+            if p.get("relaunch") and not done and (not p["busy"] or asking(sid, p)):
                 p["relaunch"] = False
                 threading.Thread(target=relaunch, args=(sid, p), daemon=True).start()
             if done: break
@@ -228,25 +232,48 @@ def read(sid, p, offset):
     if p["stdin"]: p["stdin"].close()
     set_runtime(sid, "stopped" if code in (None, 0, -signal.SIGTERM, -signal.SIGINT, 128+signal.SIGTERM, 128+signal.SIGINT) else "failed", started=True, **({} if code is None else dict(code=code)))
 
-def permit(sid, mode):
+def permit(sid, mode, confirmed=False):
     """Change a started session's permission. Codex and Muse take it with their next turn; a live Claude Code agent switches at
-    once, or restarts on its conversation after its turn when it was launched without the option to bypass permissions."""
+    once. One launched without the option to bypass permissions gets bypassPermissions only by restarting on its conversation,
+    which the user confirms first: "confirm" asks for that, and the restart comes after its turn, or at once while it waits on a
+    permission prompt."""
     meta = store.load(sid)["session"]
     if meta["origin"] != "gui": raise ValueError("A joined session keeps the permission of the terminal it runs in")
     if mode not in PERMISSIONS[meta["provider"]]: raise ValueError(f"{meta['provider']} permissions: {', '.join(PERMISSIONS[meta['provider']])}")
-    if mode == meta.get("permission"): return "unchanged"
-    store.emit(sid, "meta", "user", changes=dict(permission=mode))
     with LOCK:
-        if not alive(sid) or (p := PROCS[sid])["stdin"] is None: return "next turn" if meta["provider"] in TURNS else "next start"
+        live = alive(sid) and (p := PROCS[sid])["stdin"] is not None
+        restart = live and mode == "bypassPermissions" and not p.get("bypassable")
+    if restart and not confirmed: return "confirm"
+    if mode == meta.get("permission") and not restart: return "unchanged"
+    if mode != meta.get("permission"): store.emit(sid, "meta", "user", changes=dict(permission=mode))
+    with LOCK:
+        if not live: return "next turn" if meta["provider"] in TURNS else "next start"
+        p["relaunch"] = restart
+        if restart: return "restart"
         p["stdin"].write((json.dumps(dict(type="control_request", request_id=f"permission-{time.time_ns()}", request=dict(subtype="set_permission_mode", mode=mode))) + "\n").encode())
         p["stdin"].flush()
     return "now"
 
+def switching(sid, meta):
+    """A live agent that still runs without the bypassPermissions its session now has: it needs a restart, or one is coming."""
+    p = PROCS.get(sid)
+    if not p or not running(p) or p["stdin"] is None or meta.get("permission") != "bypassPermissions" or p.get("bypassable"): return None
+    return "restarting" if p.get("relaunch") else "needs restart"
+
+def asking(sid, p):
+    """A busy agent stuck on a permission prompt, looked up at most every two seconds."""
+    if time.time() < p.get("looked", 0) + 2: return False
+    p["looked"] = time.time()
+    return any(a["kind"] == "permission" for a in store.open_asks(store.peek(sid)))
+
 def relaunch(sid, p):
-    """Stop an idle agent and start it again on the same conversation, with the session's current settings."""
+    """Start an agent again on the same conversation with the session's current settings: once its turn is over, or at once
+    while it waits on a permission prompt, which then goes away and the agent is told to go on."""
+    mid, waiting = p["busy"], [a["id"] for a in store.open_asks(store.load(sid)) if a["kind"] == "permission"]
     stop(sid)
     p["reader"].join(15)
-    start(sid)
+    for ask in waiting: store.emit(sid, "cancel", "orchestrate", ask=ask)
+    start(sid, "[orchestrate] The user changed this session's permission, which restarted you in the middle of your turn; the tool call that waited for approval did not run. Continue where you left off." if mid else None)
 
 def stop(sid):
     with LOCK: p = PROCS.get(sid)

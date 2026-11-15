@@ -590,11 +590,24 @@ function WorksWith({ s }) {
   </div>`)}</div>`;
 }
 // a started session's permission changes in place: Claude Code switches at once, Codex and Muse with their next turn
-const APPLIES = { now: "now", "next turn": "from its next turn", "next start": "when it next starts" };
+// an agent started before it could be switched into bypassPermissions restarts on its conversation for it, once the user confirms
+const APPLIES = { now: "now", "next turn": "from its next turn", "next start": "when it next starts", restart: "after a restart" };
 function Permissions({ s }) {
-  const modes = S.meta.providers[s.provider].permissions, on = s.permission || modes[0];
-  const pick = async (e, permission) => { e.currentTarget.blur(); const r = permission !== on && await act({ kind: "permission", permission }); if (r) { toast(`${permission} ${APPLIES[r.applies] || ""}`.trim()); await loadSessions(); } };
-  return html`<div class="permline"><span>Permissions</span><div class="seg" aria-label="Session permissions">${modes.map((o) => html`<button type="button" tabIndex="-1" class=${o === on ? "on" : ""} onClick=${(e) => pick(e, o)}>${o}</button>`)}</div></div>`;
+  const modes = S.meta.providers[s.provider].permissions, on = s.permission || modes[0], [asking, setAsking] = useState(null);
+  const send = async (permission, confirm = false) => {
+    const r = await act({ kind: "permission", permission, confirm });
+    if (!r) return;
+    if (r.applies === "confirm") return setAsking(permission);
+    setAsking(null);
+    if (r.applies !== "unchanged") toast(`${permission} ${APPLIES[r.applies]}`);
+    await loadSessions();
+  };
+  const pick = (e, permission) => { e.currentTarget.blur(); setAsking(null); if (permission !== on || s.switching) send(permission); };
+  const want = asking || (s.switching === "needs restart" ? on : null);
+  return html`<div class="permline"><span>Permissions</span><div class="seg" aria-label="Session permissions">${modes.map((o) => html`<button type="button" tabIndex="-1" class=${o === on ? "on" : ""} onClick=${(e) => pick(e, o)}>${o}</button>`)}</div></div>
+    ${want ? html`<div class="permask"><div>This agent was started before it could switch into ${want} while running, so it needs a restart on its conversation: right away while it waits on a permission prompt, otherwise once its current turn ends.</div>
+      <div class="btns"><button class="abtn primary" onClick=${() => send(want, true)}>Restart into ${want}</button>${asking ? html`<button class="abtn" onClick=${() => setAsking(null)}>Cancel</button>` : null}</div></div>` : null}
+    ${s.switching === "restarting" ? html`<div class="permask"><div>Restarts into ${on} once its current turn ends, or at its next permission prompt.</div></div>` : null}`;
 }
 
 function SessionInfo({ s, d }) {
