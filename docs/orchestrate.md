@@ -21,7 +21,7 @@ convos orchestrate open        # open the IDE (starts its local server)
 ```
 
 Any Claude Code session joins with `/orchestrate`, any Codex session with
-`$orchestrate`. Sessions started from the IDE (`n`, or `Shift+N` for a child) run headless and are
+`$orchestrate`. Sessions started from the IDE (`n`) run headless and are
 owned by it. The dialog offers every agent installed on this Mac: Claude Code, Codex and Muse. Each
 comes with its current models, the newest of each class, read from the tool itself: the model ids
 the installed Claude Code binary knows, Codex's `models_cache.json`, and Muse's model catalog.
@@ -84,7 +84,9 @@ path it can open.
 item's subtree. Writes outside the subtree are refused.
 
 **Sessions are hierarchical.** A session records its parent `SESSION[:ITEM]`. The IDE
-nests children under their parent and shows them on the parent's row. When a child
+nests children under their parent and shows them on the parent's row. Agents make children
+with `spawn --on ITEM`; a session the user starts stands alone unless its dialog's *Part of*
+field names the current session or its selected row. When a child
 reaches *needs you*, *done*, *failed*, or *closed*, the parent receives a notice in that
 item's thread, so one session can orchestrate everything below it.
 
@@ -208,7 +210,7 @@ them, and `+N` for the rest. The right pane and Quick Look list them in the same
 | `a`, then `1`-`9` / `↵` | Answer a question; `a` again goes to the next one |
 | `Space`, `⌫` (on a question) | Look at the results it rests on; dismiss it unanswered |
 | `s` | Set the row's status |
-| `n`, `Shift+N` | New session, new child session |
+| `n` | New session (*Part of* in the dialog nests it) |
 | `r` `x` `Shift+X` | Resume, stop, close / reopen |
 | `e`, `Shift+E` | Archive the row with everything under it, or bring it back (open work asks for a second `e`); archive every finished row |
 | `a` | Go to the question that needs you (also the needs-you badges) |

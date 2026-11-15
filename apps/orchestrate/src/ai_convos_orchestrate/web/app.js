@@ -437,6 +437,9 @@ const repliedSince = (d, a) => Object.values(d.comments).filter((c) => c.actor =
 function openResult(target, i) { S.res[resKey(target)] = i; set({ overlay: { kind: "look" } }); if (target) markSeen([target]); }
 
 // ---------------------------------------------------------------- command registry (palette, help, keys)
+// a new session stands alone; nesting it under the session or row at hand is a choice in the dialog, never implied by the key
+const newSession = () => { const s = cur(), it = selected(); set({ overlay: { kind: "new", nest: s ? [[s.id, s.title], ...(it ? [[`${s.id}:${it.id}`, `${it.id} ${it.title}`]] : [])] : [] } }); };
+
 function commands() {
   const s = cur(), it = selected(), d = det();
   return [
@@ -459,8 +462,7 @@ function commands() {
     { group: "Items", keys: ["e"], label: it && d?.items[rootOf(d, it.id)].archived ? "Bring the row back to current" : "Archive the finished row", run: () => archive(false), when: it },
     { group: "Items", keys: ["⇧", "E"], label: "Archive every finished row", run: () => archive(true), when: d },
     { group: "Items", keys: ["↵"], label: "Open the selected result (or o)", run: () => openSelected(), when: d },
-    { group: "Sessions", keys: ["n"], label: "New session", run: () => set({ overlay: { kind: "new" } }) },
-    { group: "Sessions", keys: ["⇧", "N"], label: it ? `New child session for ${it.id}` : "New child session", run: () => s && set({ overlay: { kind: "new", parent: it ? `${s.id}:${it.id}` : s.id } }), when: s },
+    { group: "Sessions", keys: ["n"], label: "New session", run: newSession },
     { group: "Sessions", keys: ["r"], label: "Resume session", run: () => act({ kind: "resume" }, "Resuming…"), when: s && s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" },
     { group: "Sessions", keys: ["x"], label: "Stop session", run: () => act({ kind: "stop" }, "Stopping…"), when: s && s.origin === "gui" && s.live },
     { group: "Sessions", keys: ["⇧", "X"], label: s?.closed ? "Reopen session" : "Close session (keeps its board)", run: () => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed"), when: s },
@@ -520,7 +522,7 @@ function onKey(e) {
     " ": look, Escape: () => select(null), e: () => archive(false), E: () => archive(true),
     c: focusComposer, C: sessionChat, a: focusAsk, i: () => set({ overlay: { kind: "convos" } }),
     s: () => it && set({ overlay: { kind: "status", item: it.id } }), o: () => openSelected(),
-    n: () => set({ overlay: { kind: "new" } }), N: () => s && set({ overlay: { kind: "new", parent: it ? `${s.id}:${it.id}` : s.id } }),
+    n: newSession, N: newSession,
     r: () => s?.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" && act({ kind: "resume" }, "Resuming…"), x: () => s?.origin === "gui" && s.live && act({ kind: "stop" }, "Stopping…"),
     X: () => s && act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed · its board stays here"),
     p: () => s?.parent && go(s.parent.split(":")[0]), ".": () => set({ closed: !S.closed }),
@@ -594,7 +596,6 @@ function SessionInfo({ s, d }) {
     <div class="actions">
       ${s.origin === "gui" && s.live ? html`<button class="abtn" onClick=${() => act({ kind: "stop" }, "Stopping…")}>${K("x")} Stop</button>` : null}
       ${s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" ? html`<button class="abtn" onClick=${() => act({ kind: "resume" }, "Resuming…")}>${K("r")} Resume</button>` : null}
-      <button class="abtn" onClick=${() => set({ overlay: { kind: "new", parent: s.id } })}>${K("⇧", "N")} Child</button>
       <button class="abtn" onClick=${() => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed")}>${K("⇧", "X")} ${s.closed ? "Reopen" : "Close"}</button>
     </div>
     <div class="metaline">
@@ -900,12 +901,12 @@ function Seg({ options, value, onChange, label, names = {} }) {
 
 // each provider brings its current models (the newest of each class), the efforts each model takes, and its permission modes
 const effortFor = (m, want) => !m?.efforts.length ? null : m.efforts.includes(want) ? want : m.efforts.includes("high") ? "high" : m.effort || m.efforts[0];
-function NewSession({ parent: asked }) {
-  const [parent, setParent] = useState(asked || null);
-  const provs = S.meta.providers, ps = parent && S.sessions.find((s) => s.id === parent.split(":")[0]);
+function NewSession({ nest }) {
+  const [parent, setParent] = useState("");
+  const provs = S.meta.providers;
   const choose = (provider, effort) => { const p = provs[provider], m = p.models[0]; return { provider, model: m?.id, effort: effortFor(m, effort), permission: p.permissions[0] }; };
   const last = (() => { try { return localStorage.getItem("orch.provider"); } catch { return null; } })();
-  const [f, setF] = useState({ cwd: home(ps?.cwd || cur()?.cwd || S.meta.recent[0] || S.meta.home), title: "", ...choose(provs[last] ? last : Object.keys(provs)[0], "high"), skills: ["orchestrate"], prompt: "" });
+  const [f, setF] = useState({ cwd: home(cur()?.cwd || S.meta.recent[0] || S.meta.home), title: "", ...choose(provs[last] ? last : Object.keys(provs)[0], "high"), skills: ["orchestrate"], prompt: "" });
   const prov = provs[f.provider], model = prov.models.find((m) => m.id === f.model);
   const [sugg, setSugg] = useState([]), [si, setSi] = useState(-1), [skills, setSkills] = useState([]), [ki, setKi] = useState(0), [busy, setBusy] = useState(false);
   const up = (patch) => setF((x) => ({ ...x, ...patch }));
@@ -916,7 +917,7 @@ function NewSession({ parent: asked }) {
     if (!f.prompt.trim()) return toast("Write a starting prompt", true);
     if (!f.model) return toast(`${prov.label} has no model to run`, true);
     setBusy(true);
-    try { const r = await api.post("/api/spawn", { ...f, cwd: abs(f.cwd), parent }); try { localStorage.setItem("orch.provider", f.provider); } catch {} set({ overlay: null }); await loadSessions(); go(r.session); toast("Session started"); }
+    try { const r = await api.post("/api/spawn", { ...f, cwd: abs(f.cwd), parent: parent || null }); try { localStorage.setItem("orch.provider", f.provider); } catch {} set({ overlay: null }); await loadSessions(); go(r.session); toast("Session started"); }
     catch (e) { fail(e); setBusy(false); }
   };
   useKeys((e) => {
@@ -925,7 +926,7 @@ function NewSession({ parent: asked }) {
     return false;
   });
   const toggle = (name) => name !== "orchestrate" && up({ skills: f.skills.includes(name) ? f.skills.filter((x) => x !== name) : [...f.skills, name] });
-  return html`<${Modal} title=${parent ? html`New child session <span style="color:var(--faint);font-weight:400">of ${ps?.title || parent}${parent.includes(":") ? ` › ${parent.split(":")[1]}` : ""}</span><button class="ghostbtn" style="margin-left:8px" title="Start it as its own session instead" onClick=${() => setParent(null)}>× Top level</button>` : "New session"} onClose=${() => set({ overlay: null })}
+  return html`<${Modal} title="New session" onClose=${() => set({ overlay: null })}
     footer=${html`<span class="grow">${f.provider === "claude-code" ? "Runs headless" : "Runs headless, one turn per message"}; you steer it from this board. ${K("Tab")} next field</span><button class="abtn" onClick=${() => set({ overlay: null })}>Cancel</button><button class="abtn primary" disabled=${busy} onClick=${submit}>${busy ? "Starting…" : "Start"} ${K("⌘", "↵")}</button>`}>
     <div class="mbody">
       <div class="field"><label>Path<span class="hint">${K("Tab")} complete · ${K("↑", "↓")} pick</span></label>
@@ -954,6 +955,7 @@ function NewSession({ parent: asked }) {
             <span class="box" /><div style="min-width:0"><div class="nm">${sk.name}${sk.scope === "project" ? html`<span class="tag">project</span>` : null}</div><div class="ds">${sk.description}</div></div></div>`)}
         </div>
       </div>
+      ${nest.length ? html`<div class="field"><label>Part of<span class="hint">${K("←", "→")} · a parent's agent hears when this session finishes or needs you</span></label><${Seg} label="Part of" options=${["", ...nest.map(([k]) => k)]} names=${{ "": "Nothing, its own session", ...Object.fromEntries(nest.map(([k, v]) => [k, clip(v)])) }} value=${parent} onChange=${setParent} /></div>` : null}
       <div class="field"><label>Title<span class="hint">optional · defaults to the prompt's first line</span></label><input type="text" value=${f.title} onInput=${(e) => up({ title: e.target.value })} /></div>
       <div class="field"><label>Starting prompt<span class="hint">${K("⌘", "↵")} start</span></label><textarea value=${f.prompt} placeholder="What should this session do?" onInput=${(e) => up({ prompt: e.target.value })} /></div>
     </div>
@@ -1107,7 +1109,7 @@ function Look() {
 function Overlay() {
   const o = S.overlay;
   if (!o) return null;
-  if (o.kind === "new") return html`<${NewSession} parent=${o.parent} />`;
+  if (o.kind === "new") return html`<${NewSession} nest=${o.nest || []} />`;
   if (o.kind === "palette") return html`<${Palette} />`;
   if (o.kind === "help") return html`<${Help} />`;
   if (o.kind === "status") return html`<${StatusPicker} item=${o.item} />`;
