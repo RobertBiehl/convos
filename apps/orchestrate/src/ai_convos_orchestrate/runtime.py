@@ -107,7 +107,7 @@ def command(sid, meta, resume):
     return ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--model", meta["model"], *(["--effort", meta["effort"]] if meta.get("effort") else []),
             *(["--resume", meta["provider_session"]] if resume else ["--session-id", meta["provider_session"]]),
-            "--permission-mode", meta.get("permission") or "default", "--allowedTools", "Bash(convos orchestrate:*)",
+            "--permission-mode", meta.get("permission") or "default", "--allow-dangerously-skip-permissions", "--allowedTools", "Bash(convos orchestrate:*)",
             "--append-system-prompt", preamble(sid, meta),
             "--mcp-config", json.dumps(mcp), "--permission-prompt-tool", "mcp__orchestrate__permission"]
 
@@ -144,7 +144,8 @@ def turn(sid, s, text):
 
 def follow(sid, p, offset):
     PROCS[sid] = p
-    threading.Thread(target=read, args=(sid, p, offset), daemon=True, name=f"orchestrate-{sid}").start()
+    (reader := threading.Thread(target=read, args=(sid, p, offset), daemon=True, name=f"orchestrate-{sid}")).start()
+    p["reader"] = reader
 
 def launch(sid, meta, resume):
     d = store.sdir(sid)
@@ -205,10 +206,15 @@ def read(sid, p, offset):
                 if (e := event(line)) and e.get("type") == "result":
                     p["busy"] = False
                     set_runtime(sid, "idle", started=True, pid=p["pid"], cost=e.get("total_cost_usd"), turns=e.get("num_turns"))
+                # an agent launched before agents could be switched into bypassPermissions takes it by starting again
+                if e and e.get("type") == "control_response" and e["response"].get("error_code") == "bypass_not_launched": p["relaunch"] = True
                 # Codex names its thread when the first turn starts; later turns resume it
                 if e and e.get("type") == "thread.started" and store.load(sid)["session"].get("provider_session") != e["thread_id"]:
                     store.emit(sid, "meta", "orchestrate", changes=dict(provider_session=e["thread_id"]))
             f.seek(-len(line), os.SEEK_CUR)
+            if p.get("relaunch") and not p["busy"] and not done:
+                p["relaunch"] = False
+                threading.Thread(target=relaunch, args=(sid, p), daemon=True).start()
             if done: break
             time.sleep(0.25)
     code = p["proc"].wait() if p["proc"] else None
@@ -221,6 +227,26 @@ def read(sid, p, offset):
         return
     if p["stdin"]: p["stdin"].close()
     set_runtime(sid, "stopped" if code in (None, 0, -signal.SIGTERM, -signal.SIGINT, 128+signal.SIGTERM, 128+signal.SIGINT) else "failed", started=True, **({} if code is None else dict(code=code)))
+
+def permit(sid, mode):
+    """Change a started session's permission. Codex and Muse take it with their next turn; a live Claude Code agent switches at
+    once, or restarts on its conversation after its turn when it was launched without the option to bypass permissions."""
+    meta = store.load(sid)["session"]
+    if meta["origin"] != "gui": raise ValueError("A joined session keeps the permission of the terminal it runs in")
+    if mode not in PERMISSIONS[meta["provider"]]: raise ValueError(f"{meta['provider']} permissions: {', '.join(PERMISSIONS[meta['provider']])}")
+    if mode == meta.get("permission"): return "unchanged"
+    store.emit(sid, "meta", "user", changes=dict(permission=mode))
+    with LOCK:
+        if not alive(sid) or (p := PROCS[sid])["stdin"] is None: return "next turn" if meta["provider"] in TURNS else "next start"
+        p["stdin"].write((json.dumps(dict(type="control_request", request_id=f"permission-{time.time_ns()}", request=dict(subtype="set_permission_mode", mode=mode))) + "\n").encode())
+        p["stdin"].flush()
+    return "now"
+
+def relaunch(sid, p):
+    """Stop an idle agent and start it again on the same conversation, with the session's current settings."""
+    stop(sid)
+    p["reader"].join(15)
+    start(sid)
 
 def stop(sid):
     with LOCK: p = PROCS.get(sid)
@@ -256,11 +282,12 @@ def spawn(title, cwd, prompt, model=None, effort=None, skills=(), permission=Non
     models = {m["id"]: m for m in offer["models"]}
     if (model := model or next(iter(models), None)) not in models: raise ValueError(f"{offer['label']} has no model {model}; current: {', '.join(models)}")
     if effort and effort not in models[model]["efforts"]: raise ValueError(f"{model} takes effort {', '.join(models[model]['efforts'])}")
-    if (permission := permission or offer["permissions"][0]) not in offer["permissions"]: raise ValueError(f"{offer['label']} permissions: {', '.join(offer['permissions'])}")
     if not Path(cwd).expanduser().is_dir(): raise ValueError(f"No such directory: {cwd}")
-    if parent:
-        psid, _, pitem = parent.partition(":")
-        if pitem and pitem not in store.load(psid)["items"]: raise ValueError(f"Parent item {parent} does not exist")
+    above = store.load(parent.partition(":")[0]) if parent else None
+    if parent and (pitem := parent.partition(":")[2]) and pitem not in above["items"]: raise ValueError(f"Parent item {parent} does not exist")
+    # a child on the same agent as its parent runs with the parent's permission unless told otherwise
+    inherited = above["session"].get("permission") if above and above["session"]["provider"] == provider else None
+    if (permission := permission or inherited or offer["permissions"][0]) not in offer["permissions"]: raise ValueError(f"{offer['label']} permissions: {', '.join(offer['permissions'])}")
     meta = dict(id=(sid := store.new_id()), title=title.strip() or prompt.strip().splitlines()[0][:80], provider=provider, provider_session=None if provider == "codex" else str(uuid.uuid4()), model=model, effort=effort or None, cwd=str(Path(cwd).expanduser().resolve()), origin="gui", parent=parent or None, skills=sorted(set(skills) | {"orchestrate"}), permission=permission)
     store.emit(sid, "open", "user", prompt, session=meta)
     start(sid, prompt)

@@ -167,6 +167,8 @@ span.si > svg, span.si > span, span.si > span > svg { position: absolute; inset:
 .sinfo .actions { margin: 10px 0 0; flex-wrap: wrap; }
 .sinfo .metaline { margin-top: 10px; }
 .sinfo .activity { margin-top: 8px; }
+.sinfo .permline { margin-top: 8px; display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--dim); }
+.sinfo .permline .seg button { padding: 3px 9px; font-size: 11.5px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 7px; background: var(--panel2); border: 1px solid var(--line); font-size: 12px; color: var(--dim); max-width: 260px; }
 .chip:hover { border-color: var(--line2); color: var(--text); }
 .chip .ell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

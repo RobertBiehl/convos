@@ -589,6 +589,14 @@ function WorksWith({ s }) {
     })}</div>
   </div>`)}</div>`;
 }
+// a started session's permission changes in place: Claude Code switches at once, Codex and Muse with their next turn
+const APPLIES = { now: "now", "next turn": "from its next turn", "next start": "when it next starts" };
+function Permissions({ s }) {
+  const modes = S.meta.providers[s.provider].permissions, on = s.permission || modes[0];
+  const pick = async (e, permission) => { e.currentTarget.blur(); const r = permission !== on && await act({ kind: "permission", permission }); if (r) { toast(`${permission} ${APPLIES[r.applies] || ""}`.trim()); await loadSessions(); } };
+  return html`<div class="permline"><span>Permissions</span><div class="seg" aria-label="Session permissions">${modes.map((o) => html`<button type="button" tabIndex="-1" class=${o === on ? "on" : ""} onClick=${(e) => pick(e, o)}>${o}</button>`)}</div></div>`;
+}
+
 function SessionInfo({ s, d }) {
   const kids = childrenOf(s.id), counts = s.counts || {}, lim = limitOf(s);
   const runtime = s.origin === "gui" ? (s.live ? (s.busy ? "running a turn" : "live, idle") : (d.runtime?.state === "failed" ? `failed (exit ${d.runtime.code})` : d.runtime?.state === "idle" ? "ready · your next message starts a turn" : "stopped")) : s.provider === "codex" ? (s.wake?.startsWith("collab") ? `joined · run by ${s.wake}: a message asks collab for a turn` : s.wake === "daemon" ? "joined · a message wakes the thread through Codex's daemon" : s.live ? "joined · Codex running (messages arrive at its next turn)" : "joined · driven by codex exec (messages wait for its next turn)") : (s.live ? "joined · reachable" : "joined · offline (messages wait in its inbox)");
@@ -605,6 +613,7 @@ function SessionInfo({ s, d }) {
       <span class="m"><code>${s.id}</code></span>
       ${d.runtime?.cost ? html`<span class="m">$${d.runtime.cost.toFixed(2)}</span>` : null}
     </div>
+    ${s.origin === "gui" && S.meta.providers?.[s.provider] ? html`<${Permissions} s=${s} />` : null}
     ${lim ? html`<div class="limitline">${G.clock}<div>Stopped by the usage limit at ${lim.hit}. ${lim.wait ? (s.pending ? `${s.pending} message${s.pending === 1 ? " waits" : "s wait"} and go${s.pending === 1 ? "es" : ""} out at ${lim.go}, after it resets.` : `Messages you send wait and go out at ${lim.go}, after it resets.`) : lim.at ? `The limit reset at ${lim.at}; send a message to continue.` : "The notice names no reset time, so messages go out right away."}<div class="notice">${lim.title}</div></div></div>` : null}
     <div class="activity">${s.status === "working" || s.busy ? html`<${SI} s="working" sm />` : null}${s.activity && !["done", "closed"].includes(s.status) ? html`<span class="txt" key=${s.activity.at}>${s.activity.text}</span><span style="color:var(--faint)">· ${ago(s.activity.at)}</span>` : html`<span style="color:var(--faint)">${s.items ? `${counts.done || 0} of ${s.items} done` : "No items yet"}</span>`}</div>
     ${s.items ? html`<div style="margin-top:10px"><${Progress} counts=${counts} big /></div>` : null}

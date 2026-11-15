@@ -26,7 +26,10 @@ owned by it. The dialog offers every agent installed on this Mac: Claude Code, C
 comes with its current models, the newest of each class, read from the tool itself: the model ids
 the installed Claude Code binary knows, Codex's `models_cache.json`, and Muse's model catalog.
 Efforts follow the chosen model, and permissions the agent (Claude Code's permission modes, Codex's
-sandbox, Muse sandboxed or `--yolo`).
+sandbox, Muse sandboxed or `--yolo`). The session pane changes a started session's permission in
+place: a live Claude Code agent switches at once (it is launched with
+`--allow-dangerously-skip-permissions`, so even into `bypassPermissions`; an agent launched before
+that restarts on its conversation after its turn), Codex and Muse with their next turn.
 
 ## Statuses
 
@@ -58,7 +61,7 @@ install`) documents the tools; how an agent uses them is left to the agent.
 | `need ACTION [--on ITEM] [--detail MD] [--wait S]` | Ask the user to do something only they can (run a test on their hardware, sign in). The card reads **Your action** and offers Done and Can't with an optional note; the reply reaches the agent like an answer (`Action: ... -> Done`). |
 | `withdraw Q...` | Take back open questions or needs that no longer apply. |
 | `inbox [--wait S]` | Pull undelivered comments, answers, and notices. |
-| `spawn PROMPT --on ITEM [--provider claude-code\|codex\|muse] [--model M]` | Start a child session working for this item. |
+| `spawn PROMPT --on ITEM [--provider claude-code\|codex\|muse] [--model M] [--permission P]` | Start a child session working for this item. On the same agent, it runs with this session's permission unless `--permission` says otherwise. |
 | `archive ITEM...` | Archive finished top-level rows the user has read (see below). |
 | `show`, `ls`, `close`, `reopen` | Inspect and close. `show` marks rows `· unseen by the user`, `· archivable`, `(archived)`. |
 

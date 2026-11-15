@@ -256,7 +256,7 @@ def spawn(ctx: typer.Context, prompt: str = typer.Argument(..., help="Starting p
           on: str = typer.Option(None, "--on", help="Your item the child session works for"), cwd: str = typer.Option(".", "--cwd"),
           provider: str = typer.Option("claude-code", "--provider", help="claude-code, codex or muse"), model: str = typer.Option(None, "--model", help="Default: the provider's first current model"),
           effort: str = typer.Option(None, "--effort"), skill: list[str] = typer.Option([], "--skill", help="Repeat; orchestrate is always on"),
-          permission: str = typer.Option(None, "--permission", help="Default: the provider's first mode")):
+          permission: str = typer.Option(None, "--permission", help="Default: this session's own, when it runs on the same agent; otherwise the provider's first mode")):
     """Start a child session (headless, managed by the IDE) working for this session. Needs the IDE server running."""
     from .server import request
     sid = ident(ctx)
