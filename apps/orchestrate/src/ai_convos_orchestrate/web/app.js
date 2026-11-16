@@ -1038,13 +1038,16 @@ function ImageView({ a, api }) {
   const box = useRef(), cv = useRef(), drag = useRef(null), dragged = useRef(false), [pic, setPic] = useState(null), [size, setSize] = useState(null), [v, setV] = useState({ z: 1, x: 0, y: 0 }), [grab, setGrab] = useState(false);
   useLayoutEffect(() => { const el = box.current, ro = new ResizeObserver(() => setSize({ w: el.clientWidth, h: el.clientHeight })); ro.observe(el); return () => ro.disconnect(); }, []);
   useEffect(() => { let live = true; const im = new Image(); im.src = blobUrl(a); im.decode().then(() => live && setPic(im.naturalWidth ? im : false), () => live && setPic(false)); return () => { live = false; }; }, [a.hash]);
-  const nat = pic && { w: pic.naturalWidth, h: pic.naturalHeight }, ready = nat && size, fit = ready ? Math.min(size.w / nat.w, size.h / nat.h, 1) : 1, s = fit * v.z, w = ready ? nat.w * s : 0, h = ready ? nat.h * s : 0;
+  // a very tall image (a whole-page capture) would shrink to a sliver if fitted whole, so it fits the width instead, opens at its top
+  // and scrolls; − still zooms out to the whole image
+  const nat = pic && { w: pic.naturalWidth, h: pic.naturalHeight }, ready = nat && size, whole = ready ? Math.min(size.w / nat.w, size.h / nat.h, 1) : 1, across = ready ? Math.min(size.w / nat.w, 1) : 1;
+  const tall = ready && nat.h > 2.4 * nat.w && whole < across, fit = tall ? across : whole, low = whole / fit, s = fit * v.z, w = ready ? nat.w * s : 0, h = ready ? nat.h * s : 0;
   const cx = (x, w) => w <= size.w ? (size.w - w) / 2 : Math.min(0, Math.max(size.w - w, x)), cy = (y, h) => h <= size.h ? (size.h - h) / 2 : Math.min(0, Math.max(size.h - h, y));
   const x = ready ? cx(v.x, w) : 0, y = ready ? cy(v.y, h) : 0, zoomed = ready && (w > size.w + 1 || h > size.h + 1), top = Math.max(1, 6 / fit);
   // the visible part of the image, in view pixels relative to the image's top-left corner (the canvas covers exactly this)
   const vis = ready ? { l: Math.max(0, -x), t: Math.max(0, -y), r: Math.min(w, size.w - x), b: Math.min(h, size.h - y) } : null;
   const zoomAt = (factor, px = size.w / 2, py = size.h / 2) => ready && setV((o) => {
-    const z = Math.min(top, Math.max(1, o.z * factor)), s0 = fit * o.z, s1 = fit * z, x0 = cx(o.x, nat.w * s0), y0 = cy(o.y, nat.h * s0);
+    const z = Math.min(top, Math.max(low, o.z * factor)), s0 = fit * o.z, s1 = fit * z, x0 = cx(o.x, nat.w * s0), y0 = cy(o.y, nat.h * s0);
     return { z, x: px - (px - x0) * s1 / s0, y: py - (py - y0) * s1 / s0 };
   });
   const fitView = () => setV({ z: 1, x: 0, y: 0 });
@@ -1073,7 +1076,7 @@ function ImageView({ a, api }) {
   return html`<div class="viewer ${zoomed ? "zoomed" : inward ? "" : "out"} ${grab ? "grabbing" : ""}" ref=${box} onWheel=${wheel} onPointerDown=${down} onPointerMove=${dragTo} onPointerUp=${up} onPointerCancel=${up} onClick=${click}>
     ${vis ? html`<canvas ref=${cv} class=${zoomed ? "" : "framed"} role="img" aria-label=${a.name} style=${{ left: `${x + vis.l}px`, top: `${y + vis.t}px`, width: `${vis.r - vis.l}px`, height: `${vis.b - vis.t}px` }} />`
       : html`<div class="vload">${pic === false ? "This image could not be decoded" : "Loading full resolution…"}</div>`}
-    ${ready ? html`<div class="zoomlbl">${Math.round(s * 100)}%${v.z > 1 ? "" : " · fit"}<span>${K("+", "−")} zoom · ${K("0")} fit · click ${inward ? (s < 0.995 ? "100%" : "200%") : "fit"}${zoomed ? " · drag to pan" : ""}</span></div>` : null}
+    ${ready ? html`<div class="zoomlbl">${Math.round(s * 100)}%${v.z === 1 ? (tall ? " · fit width" : " · fit") : v.z <= low ? " · whole" : ""}<span>${K("+", "−")} zoom · ${K("0")} ${tall ? "top" : "fit"} · click ${inward ? (s < 0.995 ? "100%" : "200%") : tall ? "fit width" : "fit"}${zoomed ? (tall ? " · scroll or drag" : " · drag to pan") : ""}</span></div>` : null}
     ${zoomed ? html`<div class="mini" style=${{ width: `${nat.w * m}px`, height: `${nat.h * m}px` }} onClick=${(e) => e.stopPropagation()} onPointerDown=${(e) => { e.stopPropagation(); centre(e); e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove=${(e) => e.buttons && centre(e)}>
       <img src=${blobUrl(a)} alt="" draggable="false" /><span class="vp" style=${{ left: `${vis.l / s * m}px`, top: `${vis.t / s * m}px`, width: `${(vis.r - vis.l) / s * m}px`, height: `${(vis.b - vis.t) / s * m}px` }} /></div>` : null}
   </div>`;

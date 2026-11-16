@@ -301,7 +301,7 @@ button.badge { cursor: pointer; }
 .res { border: 1px solid var(--line); border-radius: 9px; background: var(--panel2); overflow: hidden; cursor: pointer; transition: transform .2s var(--spring), border-color .15s; display: flex; flex-direction: column; animation: pop .4s var(--spring); }
 .res:hover, .res.focus { border-color: var(--accent); }
 .res .thumb { height: 76px; display: grid; place-items: center; background: var(--raise); color: var(--faint); overflow: hidden; }
-.res .thumb img { width: 100%; height: 100%; object-fit: cover; }
+.res .thumb img { width: 100%; height: 100%; object-fit: cover; object-position: top; }
 .res .thumb svg { width: 26px; height: 26px; }
 .res .cap { padding: 5px 8px; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
 .res.wide { grid-column: 1 / -1; cursor: default; }
@@ -433,7 +433,7 @@ button.badge { cursor: pointer; }
 .lightbox .strip { display: flex; gap: 10px; padding: 4px 18px 16px; overflow-x: auto; justify-content: safe center; }
 .lightbox .card { flex: none; width: 132px; padding: 0; border: 1px solid rgba(255,255,255,.14); border-radius: 9px; background: rgba(255,255,255,.05); overflow: hidden; cursor: pointer; color: #c7ccd6; text-align: left; font: inherit; }
 .lightbox .card .th { height: 70px; display: grid; place-items: center; background: rgba(255,255,255,.04); color: #9aa1ad; overflow: hidden; }
-.lightbox .card .th img { width: 100%; height: 100%; object-fit: cover; }
+.lightbox .card .th img { width: 100%; height: 100%; object-fit: cover; object-position: top; }
 .lightbox .card .th svg { width: 24px; height: 24px; }
 .lightbox .card .tl { padding: 5px 8px; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lightbox .card.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); color: #fff; }
