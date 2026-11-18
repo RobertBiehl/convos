@@ -25,6 +25,17 @@ def claude_models():
         SCANNED.update(claude=key, claude_models=[f"claude-{c}-{a}" + (f"-{b}" if b else "") for c, (a, b) in newest.items()])
     return [dict(id=m, efforts=CLAUDE_EFFORTS) for m in SCANNED["claude_models"]]
 
+def claude_version():
+    """The installed Claude Code's version, asked again only when its binary changes (an update replaces it); None when it cannot
+    tell, which only hides the version: it never stops an agent from starting."""
+    try:
+        key = (str(path := Path(os.path.realpath(shutil.which("claude")))), path.stat().st_mtime_ns)
+        if (hit := SCANNED.get("claude_version")) and hit[0] == key: return hit[1]
+        out = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=15).stdout
+    except (OSError, TypeError, subprocess.SubprocessError): return None
+    SCANNED["claude_version"] = (key, version := m[1] if (m := re.match(r"\s*(\d[\w.+-]*)", out)) else None)
+    return version
+
 def codex_models():
     """The models Codex lists (its models_cache.json, which Codex refreshes), the newest of each class: gpt-6.1-sol over gpt-6-sol."""
     try: rows = json.loads((Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"models_cache.json").read_text())["models"]
@@ -100,6 +111,7 @@ def preamble(sid, meta):
     return SYSTEM.format(sid=sid, load=load) + (TURN if meta["provider"] in TURNS else "")
 PROCS, LOCK = {}, threading.RLock()
 OPEN = ("working", "idle", "starting")
+BYPASS = "changed this session's permission"  # why an agent restarts into bypassPermissions; also told to it mid-turn
 
 class Unreachable(ValueError): pass
 class Busy(Unreachable): pass  # a turn-based agent is mid-turn: words wait and start its next turn
@@ -200,7 +212,7 @@ def launch(sid, meta, resume):
             proc = subprocess.Popen(cmd := command(sid, meta, resume), cwd=meta["cwd"], stdin=own, stdout=out, stderr=log, env=child_env(sid), start_new_session=True)
     finally: os.close(own)
     hold(sid, proc.pid, proc, 0, False)
-    PROCS[sid]["bypassable"] = "--allow-dangerously-skip-permissions" in cmd
+    PROCS[sid].update(bypassable="--allow-dangerously-skip-permissions" in cmd, version=claude_version())
     set_runtime(sid, "idle", started=True, pid=proc.pid)
 
 def hold(sid, pid, proc, offset, busy):
@@ -229,7 +241,9 @@ def adopt(sid, s, pids):
     except OSError: return False
     # agents launched before they could be switched into bypassPermissions need a restart for it
     cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pids[0])], capture_output=True, text=True).stdout
-    PROCS[sid]["bypassable"] = "--allow-dangerously-skip-permissions" in cmd or "bypassPermissions" in cmd
+    # the Claude Code it runs is named in the first turn it reported; one that has not had a turn yet stays unknown
+    with out.open("rb") as f: head = f.read(1 << 20)
+    PROCS[sid].update(bypassable="--allow-dangerously-skip-permissions" in cmd or "bypassPermissions" in cmd, version=m[1].decode() if (m := re.search(rb'"claude_code_version":"([^"]+)"', head)) else None)
     set_runtime(sid, "working" if busy else "idle", started=True, pid=pids[0])
     return True
 
@@ -257,9 +271,9 @@ def read(sid, p, offset):
                 if e and e.get("type") == "thread.started" and store.load(sid)["session"].get("provider_session") != e["thread_id"]:
                     store.emit(sid, "meta", "orchestrate", changes=dict(provider_session=e["thread_id"]))
             f.seek(-len(line), os.SEEK_CUR)
-            if p.get("relaunch") and not done and (not p["busy"] or asking(sid, p)):
-                p["relaunch"] = False
-                threading.Thread(target=relaunch, args=(sid, p), daemon=True).start()
+            # only bypassPermissions makes a waiting permission prompt moot; any other restart waits for the turn to end
+            if p.get("relaunch") and not done and (not p["busy"] or p["relaunch"] == BYPASS and asking(sid, p)):
+                threading.Thread(target=relaunch, args=(sid, p, p.pop("relaunch")), daemon=True).start()
             if done: break
             time.sleep(0.25)
     code = p["proc"].wait() if p["proc"] else None
@@ -289,17 +303,51 @@ def permit(sid, mode, confirmed=False):
     if mode != meta.get("permission"): store.emit(sid, "meta", "user", changes=dict(permission=mode))
     with LOCK:
         if not live: return "next turn" if meta["provider"] in TURNS else "next start"
-        p["relaunch"] = restart
+        # a restart pending only for bypassPermissions is not needed once the user picks another mode
+        if restart or p.get("relaunch") == BYPASS: p["relaunch"] = restart and BYPASS
         if restart: return "restart"
         p["stdin"].write((json.dumps(dict(type="control_request", request_id=f"permission-{time.time_ns()}", request=dict(subtype="set_permission_mode", mode=mode))) + "\n").encode())
         p["stdin"].flush()
     return "now"
 
+def tune(sid, model, effort):
+    """Switch a started session's model or effort. Codex and Muse take them with their next turn; a live Claude Code agent restarts
+    on its conversation for them, at once when idle, otherwise once its current turn ends."""
+    meta = store.load(sid)["session"]
+    if meta["origin"] != "gui": raise ValueError("A joined session runs with the model of the terminal it runs in")
+    offer = providers()[meta["provider"]]
+    known = {m["id"]: m for m in offer["models"]}
+    # the model a session already runs stays selectable after a newer one replaces it in the list
+    if model not in known and model != meta["model"]: raise ValueError(f"{offer['label']} has no model {model}; current: {', '.join(known)}")
+    if effort and model in known and effort not in known[model]["efforts"]: raise ValueError(f"{model} takes effort {', '.join(known[model]['efforts']) or 'none'}")
+    if not (changes := {k: v for k, v in dict(model=model, effort=effort or None).items() if v != meta.get(k)}): return "unchanged"
+    store.emit(sid, "meta", "user", changes=changes)
+    return restart(sid, "switched this session's model or effort")
+
+def restart(sid, why="restarted this session"):
+    """Start a live Claude Code agent again on its conversation, with the session's current settings and the Claude Code installed
+    now (how an update reaches it): at once when idle, otherwise once its current turn ends. Codex and Muse start afresh every turn."""
+    meta = store.load(sid)["session"]
+    if meta["origin"] != "gui": raise ValueError("A joined session runs in its own terminal; restart it there")
+    with LOCK:
+        if not alive(sid) or (p := PROCS[sid])["stdin"] is None: return "next turn" if meta["provider"] in TURNS else "next start"
+        # one restart covers every reason; a pending one for bypassPermissions also goes ahead at a permission prompt
+        p["relaunch"] = p.get("relaunch") or why
+        return "after turn" if p["busy"] else "now"
+
 def switching(sid, meta):
-    """A live agent that still runs without the bypassPermissions its session now has: it needs a restart, or one is coming."""
+    """A live agent that restarts once its current turn ends ("restarting at prompt": or at its next permission prompt, for
+    bypassPermissions), or that still runs without the bypassPermissions its session now has and needs a restart for it."""
     p = PROCS.get(sid)
-    if not p or not running(p) or p["stdin"] is None or meta.get("permission") != "bypassPermissions" or p.get("bypassable"): return None
-    return "restarting" if p.get("relaunch") else "needs restart"
+    if not p or not running(p) or p["stdin"] is None: return None
+    if p.get("relaunch"): return "restarting at prompt" if p["relaunch"] == BYPASS else "restarting"
+    return "needs restart" if meta.get("permission") == "bypassPermissions" and not p.get("bypassable") else None
+
+def agent(sid, meta):
+    """The Claude Code a live agent runs and the one installed now; they differ after an update, which a restart applies."""
+    p = PROCS.get(sid)
+    if meta["provider"] != "claude-code" or not p or not running(p) or p["stdin"] is None: return None
+    return dict(running=p.get("version"), installed=claude_version())
 
 def asking(sid, p):
     """A busy agent stuck on a permission prompt, looked up at most every two seconds."""
@@ -307,14 +355,14 @@ def asking(sid, p):
     p["looked"] = time.time()
     return any(a["kind"] == "permission" for a in store.open_asks(store.peek(sid)))
 
-def relaunch(sid, p):
+def relaunch(sid, p, why):
     """Start an agent again on the same conversation with the session's current settings: once its turn is over, or at once
-    while it waits on a permission prompt, which then goes away and the agent is told to go on."""
+    while it waits on a permission prompt (for bypassPermissions), which then goes away and the agent is told to go on."""
     mid, waiting = p["busy"], [a["id"] for a in store.open_asks(store.load(sid)) if a["kind"] == "permission"]
     stop(sid)
     p["reader"].join(15)
     for ask in waiting: store.emit(sid, "cancel", "orchestrate", ask=ask)
-    start(sid, "[orchestrate] The user changed this session's permission, which restarted you in the middle of your turn; the tool call that waited for approval did not run. Continue where you left off." if mid else None)
+    start(sid, f"[orchestrate] The user {why}, which restarted you in the middle of your turn; the tool call that waited for approval did not run. Continue where you left off." if mid else None)
 
 def stop(sid):
     with LOCK: p = PROCS.get(sid)

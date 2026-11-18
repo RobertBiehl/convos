@@ -33,6 +33,14 @@ next turn. An agent launched before that needs a restart on its conversation for
 the pane asks you to confirm it, and the agent then restarts at once if it waits on a permission
 prompt (the prompt goes away and the agent is told to go on), otherwise once its turn ends.
 
+The pane also switches a started session's model and effort. Codex and Muse take them with their next
+turn; a live Claude Code agent restarts on its conversation for them (`--resume`), at once when idle,
+otherwise once its current turn ends. The model a session runs stays selectable after a newer one of
+its class replaces it in the list. **Restart** (`⇧R`) starts a live Claude Code agent again on its
+conversation the same way, with the Claude Code installed now: the pane shows the version the agent
+runs, and once an update installs a newer one, the button reads *Restart into VERSION*. Codex and Muse
+start a fresh process every turn, so an update reaches them by itself.
+
 ## Statuses
 
 Items are `planned`, `working`, `blocked`, `done`, `failed`, or `skipped`. An item with

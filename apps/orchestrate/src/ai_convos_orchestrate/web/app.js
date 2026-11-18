@@ -487,6 +487,7 @@ function commands() {
     { group: "Sessions", keys: ["n"], label: "New session", run: newSession },
     { group: "Sessions", keys: ["r"], label: "Resume session", run: () => act({ kind: "resume" }, "Resuming…"), when: s && s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" },
     { group: "Sessions", keys: ["x"], label: "Stop session", run: () => act({ kind: "stop" }, "Stopping…"), when: s && s.origin === "gui" && s.live },
+    { group: "Sessions", keys: ["⇧", "R"], label: "Restart session on its conversation (applies a Claude Code update)", run: restartSession, when: s && s.agent },
     { group: "Sessions", keys: ["⇧", "X"], label: s?.closed ? "Reopen session" : "Close session (keeps its board)", run: () => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed"), when: s },
     { group: "Sessions", keys: ["."], label: S.closed ? "Hide closed sessions" : "Show closed sessions", run: () => set({ closed: !S.closed }) },
     { group: "View", keys: ["i"], label: "Convos on this computer: is the archive current, sync, relay, disk", run: () => set({ overlay: { kind: "convos" } }) },
@@ -546,7 +547,7 @@ function onKey(e) {
     s: () => it && set({ overlay: { kind: "status", item: it.id } }), o: () => openSelected(),
     n: newSession, N: newSession,
     r: () => s?.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" && act({ kind: "resume" }, "Resuming…"), x: () => s?.origin === "gui" && s.live && act({ kind: "stop" }, "Stopping…"),
-    X: () => s && act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed · its board stays here"),
+    X: () => s && act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed · its board stays here"), R: () => s?.agent && restartSession(),
     p: () => s?.parent && go(s.parent.split(":")[0]), ".": () => set({ closed: !S.closed }),
     L: toggleTheme, "?": () => set({ overlay: { kind: "help" } }), "/": () => set({ overlay: { kind: "palette" } }),
   };
@@ -628,9 +629,28 @@ function Permissions({ s }) {
   const want = asking || (s.switching === "needs restart" ? on : null);
   return html`<div class="permline"><span>Permissions</span><div class="seg" aria-label="Session permissions">${modes.map((o) => html`<button type="button" tabIndex="-1" class=${o === on ? "on" : ""} onClick=${(e) => pick(e, o)}>${o}</button>`)}</div></div>
     ${want ? html`<div class="permask"><div>This agent was started before it could switch into ${want} while running, so it needs a restart on its conversation: right away while it waits on a permission prompt, otherwise once its current turn ends.</div>
-      <div class="btns"><button class="abtn primary" onClick=${() => send(want, true)}>Restart into ${want}</button>${asking ? html`<button class="abtn" onClick=${() => setAsking(null)}>Cancel</button>` : null}</div></div>` : null}
-    ${s.switching === "restarting" ? html`<div class="permask"><div>Restarts into ${on} once its current turn ends, or at its next permission prompt.</div></div>` : null}`;
+      <div class="btns"><button class="abtn primary" onClick=${() => send(want, true)}>Restart into ${want}</button>${asking ? html`<button class="abtn" onClick=${() => setAsking(null)}>Cancel</button>` : null}</div></div>` : null}`;
 }
+// a started session's model and effort change in place: Codex and Muse take them with their next turn; a live Claude Code agent
+// restarts on its conversation for them, at once when idle, otherwise once its current turn ends
+const RESTARTS = { now: "restarting on its conversation", "after turn": "restarts on its conversation once its current turn ends", "next turn": "from its next turn", "next start": "when it next starts" };
+function Tuning({ s }) {
+  const models = S.meta.providers[s.provider].models, model = models.find((m) => m.id === s.model);
+  // the model it runs stays listed after a newer one of its class replaces it
+  const ids = [...models.map((m) => m.id), ...(s.model && !model ? [s.model] : [])];
+  const send = async (id, effort) => {
+    const r = await act({ kind: "tune", model: id, effort });
+    if (!r) return;
+    if (r.applies !== "unchanged") toast(`${id}${effort ? ` · ${effort}` : ""}: ${RESTARTS[r.applies]}`);
+    await loadSessions();
+  };
+  const row = (label, options, on, pick) => html`<div class="permline"><span>${label}</span><div class="seg" aria-label=${`Session ${label.toLowerCase()}`}>${options.map((o) => html`<button type="button" tabIndex="-1" class=${o === on ? "on" : ""} onClick=${(e) => { e.currentTarget.blur(); if (o !== on) pick(o); }}>${o}</button>`)}</div></div>`;
+  return html`${row("Model", ids, s.model, (id) => send(id, s.effort && effortFor(models.find((m) => m.id === id), s.effort)))}
+    ${model?.efforts.length ? row("Effort", model.efforts, s.effort, (effort) => send(s.model, effort)) : null}`;
+}
+// a live Claude Code agent restarts on its conversation: how a Claude Code update reaches it (Codex and Muse start afresh each turn)
+const restartSession = async () => { const r = await act({ kind: "restart" }); if (r) { toast(`Session ${RESTARTS[r.applies]}`); await loadSessions(); } };
+const newer = (s) => s.agent?.running && s.agent.installed && s.agent.installed !== s.agent.running;
 
 function SessionInfo({ s, d }) {
   const kids = childrenOf(s.id), counts = s.counts || {}, lim = limitOf(s);
@@ -638,17 +658,20 @@ function SessionInfo({ s, d }) {
   return html`<div class="sinfo">
     <div class="actions">
       ${s.origin === "gui" && s.live ? html`<button class="abtn" onClick=${() => act({ kind: "stop" }, "Stopping…")}>${K("x")} Stop</button>` : null}
+      ${s.agent ? html`<button class="abtn ${newer(s) ? "primary" : ""}" title=${newer(s) ? `Restart on its conversation into Claude Code ${s.agent.installed}` : "Start the agent again on its conversation"} onClick=${restartSession}>${K("⇧", "R")} ${newer(s) ? `Restart into ${s.agent.installed}` : "Restart"}</button>` : null}
       ${s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" ? html`<button class="abtn" onClick=${() => act({ kind: "resume" }, "Resuming…")}>${K("r")} Resume</button>` : null}
       <button class="abtn" onClick=${() => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed")}>${K("⇧", "X")} ${s.closed ? "Reopen" : "Close"}</button>
     </div>
     <div class="metaline">
       <span class="m"><span class="dot ${s.live ? "live" : ""}" />${runtime}</span>
-      <span class="m">${s.provider}${s.model ? html` · <code>${s.model}</code>` : null}${s.effort ? ` · ${s.effort}` : ""}</span>
+      <span class="m">${s.provider}${s.agent?.running ? ` ${s.agent.running}` : ""}${s.model ? html` · <code>${s.model}</code>` : null}${s.effort ? ` · ${s.effort}` : ""}</span>
+      ${newer(s) ? html`<span class="m upd">Claude Code ${s.agent.installed} is installed: restart to update</span>` : null}
       <span class="m"><code>${home(s.cwd)}</code></span>
       <span class="m"><code>${s.id}</code></span>
       ${d.runtime?.cost ? html`<span class="m">$${d.runtime.cost.toFixed(2)}</span>` : null}
     </div>
-    ${s.origin === "gui" && S.meta.providers?.[s.provider] ? html`<${Permissions} s=${s} />` : null}
+    ${s.origin === "gui" && S.meta.providers?.[s.provider] ? html`<${Tuning} s=${s} /><${Permissions} s=${s} />` : null}
+    ${s.switching?.startsWith("restarting") ? html`<div class="permask"><div>Restarts on its conversation once its current turn ends${s.switching === "restarting at prompt" ? ", or at its next permission prompt" : ""}.</div></div>` : null}
     ${lim?.released ? html`<div class="limitline">${G.clock}<div>Usage reset at ${lim.released}. ${s.origin === "gui" ? "The turn the limit stopped can carry on." : "Send a message to continue."}${s.origin === "gui" && !s.busy ? html`<div class="btns resetbtn"><button class="abtn primary" onClick=${() => act({ kind: "resume" }, "Continuing…")}>Continue</button></div>` : null}</div></div>`
       : lim ? html`<div class="limitline">${G.clock}<div>Stopped by the usage limit at ${lim.hit}. ${lim.wait ? (s.pending ? `${s.pending} message${s.pending === 1 ? " waits" : "s wait"} and go${s.pending === 1 ? "es" : ""} out at ${lim.go}, after it resets.` : `Messages you send wait and go out at ${lim.go}, after it resets.`) : lim.released ? `Your usage was reset at ${lim.released}; send a message to continue.` : lim.at ? `The limit reset at ${lim.at}; send a message to continue.` : "The notice names no reset time, so messages go out right away."}<div class="notice">${lim.title}</div>${lim.wait && s.provider === "codex" ? html`<${CodexReset} key=${s.id} />` : null}</div></div>` : null}
     <div class="activity">${s.status === "working" || s.busy ? html`<${SI} s="working" sm />` : null}${s.activity && !["done", "closed"].includes(s.status) ? html`<span class="txt" key=${s.activity.at}>${s.activity.text}</span><span style="color:var(--faint)">· ${ago(s.activity.at)}</span>` : html`<span style="color:var(--faint)">${s.items ? `${counts.done || 0} of ${s.items} done` : "No items yet"}</span>`}</div>
