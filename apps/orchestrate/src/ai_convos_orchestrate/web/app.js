@@ -51,7 +51,7 @@ function limitOf(s) {
   return { wait, hit, at: t && clock(t), go: t && clock(new Date(+t + 60000)), released: l.released && clock(new Date(l.released)), title: l.text, short: !t ? "Usage limit · no reset time" : wait ? `Usage limit · resets ${clock(t)}` : `Usage limit reset ${clock(new Date(l.released || t))} · not resumed` };
 }
 // a Codex limit can be lifted early with one of the user's usage-limit resets, which covers the whole Codex account
-const OUTCOMES = { reset: "Usage reset: held messages go out now", nothingToReset: "Codex says your usage needs no reset right now", noCredit: "No usage-limit resets are left", alreadyRedeemed: "That reset was already used; try again" };
+const OUTCOMES = { reset: "Usage reset", nothingToReset: "Codex says your usage needs no reset right now", noCredit: "No usage-limit resets are left", alreadyRedeemed: "That reset was already used; try again" };
 function CodexReset() {
   const [r, setR] = useState(null), [asking, setAsking] = useState(false), [busy, setBusy] = useState(false);
   useEffect(() => { let live = true; api.get("/api/codex/resets").then((v) => live && setR(v), () => live && setR(false)); return () => { live = false; }; }, []);
@@ -68,7 +68,7 @@ function CodexReset() {
     await loadSessions();
   };
   const n = r.next, until = n?.expiresAt && new Date(n.expiresAt * 1000).toLocaleDateString([], { month: "short", day: "numeric" });
-  return asking ? html`<div class="permask"><div>Use one of your ${r.available} Codex usage-limit resets${n?.title ? html` (<b>${n.title}</b>)` : ""}? It lifts the limit for your whole Codex account, so every Codex session continues, not only this one.${until ? ` It uses the reset that expires first, on ${until}.` : ""}</div>
+  return asking ? html`<div class="permask"><div>Use one of your ${r.available} Codex usage-limit resets${n?.title ? html` (<b>${n.title}</b>)` : ""}? It lifts the limit for your whole Codex account, and messages held for it go out at once.${until ? ` It uses the reset that expires first, on ${until}.` : ""}</div>
       <div class="btns"><button class="abtn primary" disabled=${busy} onClick=${use}>${busy ? "Resetting…" : "Yes, use a reset"}</button><button class="abtn" disabled=${busy} onClick=${() => setAsking(false)}>Cancel</button></div></div>`
     : html`<div class="btns resetbtn"><button class="abtn" onClick=${() => setAsking(true)}>Use a reset · ${r.available} left</button></div>`;
 }
@@ -649,7 +649,8 @@ function SessionInfo({ s, d }) {
       ${d.runtime?.cost ? html`<span class="m">$${d.runtime.cost.toFixed(2)}</span>` : null}
     </div>
     ${s.origin === "gui" && S.meta.providers?.[s.provider] ? html`<${Permissions} s=${s} />` : null}
-    ${lim ? html`<div class="limitline">${G.clock}<div>Stopped by the usage limit at ${lim.hit}. ${lim.wait ? (s.pending ? `${s.pending} message${s.pending === 1 ? " waits" : "s wait"} and go${s.pending === 1 ? "es" : ""} out at ${lim.go}, after it resets.` : `Messages you send wait and go out at ${lim.go}, after it resets.`) : lim.released ? `Your usage was reset at ${lim.released}; send a message to continue.` : lim.at ? `The limit reset at ${lim.at}; send a message to continue.` : "The notice names no reset time, so messages go out right away."}<div class="notice">${lim.title}</div>${lim.wait && s.provider === "codex" ? html`<${CodexReset} key=${s.id} />` : null}</div></div>` : null}
+    ${lim?.released ? html`<div class="limitline">${G.clock}<div>Usage reset at ${lim.released}. ${s.origin === "gui" ? "The turn the limit stopped can carry on." : "Send a message to continue."}${s.origin === "gui" && !s.busy ? html`<div class="btns resetbtn"><button class="abtn primary" onClick=${() => act({ kind: "resume" }, "Continuing…")}>Continue</button></div>` : null}</div></div>`
+      : lim ? html`<div class="limitline">${G.clock}<div>Stopped by the usage limit at ${lim.hit}. ${lim.wait ? (s.pending ? `${s.pending} message${s.pending === 1 ? " waits" : "s wait"} and go${s.pending === 1 ? "es" : ""} out at ${lim.go}, after it resets.` : `Messages you send wait and go out at ${lim.go}, after it resets.`) : lim.released ? `Your usage was reset at ${lim.released}; send a message to continue.` : lim.at ? `The limit reset at ${lim.at}; send a message to continue.` : "The notice names no reset time, so messages go out right away."}<div class="notice">${lim.title}</div>${lim.wait && s.provider === "codex" ? html`<${CodexReset} key=${s.id} />` : null}</div></div>` : null}
     <div class="activity">${s.status === "working" || s.busy ? html`<${SI} s="working" sm />` : null}${s.activity && !["done", "closed"].includes(s.status) ? html`<span class="txt" key=${s.activity.at}>${s.activity.text}</span><span style="color:var(--faint)">· ${ago(s.activity.at)}</span>` : html`<span style="color:var(--faint)">${s.items ? `${counts.done || 0} of ${s.items} done` : "No items yet"}</span>`}</div>
     ${s.items ? html`<div style="margin-top:10px"><${Progress} counts=${counts} big /></div>` : null}
     ${kids.length ? html`<div class="children">${kids.map((k) => html`<button class="chip" onClick=${() => go(k.id)}><${SI} s=${k.status} sm /><span class="ell">${k.title}</span></button>`)}</div>` : null}

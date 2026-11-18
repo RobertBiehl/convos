@@ -117,8 +117,17 @@ def act(body):
     if kind == "deliver": return dict(channel=runtime.deliver(sid))
     if kind == "permission": return dict(applies=runtime.permit(sid, body["permission"], bool(body.get("confirm"))))
     # a reset covers the user's whole Codex account; the deliver loop then sends what every Codex session held for the limit
-    if kind == "codex_reset": return dict(outcome=runtime.use_codex_reset())
+    if kind == "codex_reset":
+        if (outcome := runtime.use_codex_reset()) in ("reset", "nothingToReset"): carry_on()
+        return dict(outcome=outcome)
     raise ValueError(f"Unknown action {kind}")
+
+def carry_on():
+    """After a Codex reset, each Codex session started here whose last turn the limit stopped continues; one with words held
+    for the limit gets those instead, from the deliver loop."""
+    for sid in store.session_ids():
+        if (s := store.peek(sid)) and not s["closed"] and (m := s["session"])["origin"] == "gui" and m["provider"] == "codex" and (transcripts.limit(m) or {}).get("released") and not runtime.alive(sid) and not store.pending(s):
+            background(runtime.start, sid, "[orchestrate] The user used a usage-limit reset, so the limit that stopped your last turn is lifted. Continue where you left off.")
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
