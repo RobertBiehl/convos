@@ -41,6 +41,15 @@ conversation the same way, with the Claude Code installed now: the pane shows th
 runs, and once an update installs a newer one, the button reads *Restart into VERSION*. Codex and Muse
 start a fresh process every turn, so an update reaches them by itself.
 
+A joined Claude Code or Codex session can **Move into orchestrate**. The pane first shows what that
+does: the terminal agent it ends (Claude Code names each running session in its `sessions` folder; the
+agent's own orchestrate calls also record its pid), and the model, effort and permission the
+conversation continues with (Claude Code: the transcript's model, the session's effort, the terminal's
+permission flags; Codex: the thread's last turn context). Once confirmed, the terminal agent gets
+SIGTERM and the same conversation resumes headless here, in the folder it was started in; one stopped
+mid-turn is told to continue. From then on it is a session started here. A session another program runs
+headless, a Codex thread collab manages, or one Codex still holds open is refused with what to do.
+
 ## Statuses
 
 Items are `planned`, `working`, `blocked`, `done`, `failed`, or `skipped`. An item with

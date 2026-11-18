@@ -409,6 +409,74 @@ def spawn(title, cwd, prompt, model=None, effort=None, skills=(), permission=Non
     start(sid, prompt)
     return sid
 
+def commands(pids):
+    out = subprocess.run(["ps", "-ww", "-o", "pid=,command=", "-p", ",".join(map(str, pids))], capture_output=True, text=True).stdout if pids else ""
+    return {int(pid): cmd for pid, _, cmd in (line.strip().partition(" ") for line in out.splitlines())}
+
+def plan_move(s):
+    """What moving a joined session into orchestrate does: which terminal agent it ends (Claude Code names each running session
+    in its sessions folder, and the agent's own orchestrate calls record its pid; Codex's TUI holds its thread's transcript open),
+    and the model, effort, permission and folder the conversation continues with. "blocked" says why it cannot move."""
+    meta, path = s["session"], transcripts.transcript(s["session"])
+    plan = dict(provider=meta["provider"], pid=None, version=None, busy=False, blocked=None)
+    if meta["origin"] == "gui": return dict(plan, blocked="This session already runs in orchestrate")
+    if meta["provider"] not in ("claude-code", "codex") or not path: return dict(plan, blocked=f"orchestrate cannot find this {meta['provider']} session's conversation to continue it")
+    lines = [e for line in transcripts.tail(path) if (e := transcripts.entry(line))]
+    if meta["provider"] == "claude-code":
+        root = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))
+        listed = {}
+        for f in (root/"sessions").glob("*.json"):
+            try: d = json.loads(f.read_text())
+            except (OSError, ValueError): continue
+            if isinstance(d, dict) and "pid" in d: listed[d["pid"]] = d
+        try: recorded = json.loads(channels.endpoint_path(meta["id"]).read_text())["pid"]
+        except (OSError, ValueError, KeyError): recorded = None
+        pids = {p for p, d in listed.items() if d.get("sessionId") == meta["provider_session"]} | ({recorded} if recorded else set())
+        running = {p: c for p, c in commands(sorted(pids)).items() if re.match(r"(?:\S*/)?claude(?:\s|$)", c)}
+        if headless := [p for p, c in running.items() if re.search(r"(?:^|\s)(?:-p|--print|--input-format)(?:\s|$)", c)]:
+            return dict(plan, blocked=f"Another program runs this session headless (pid {headless[0]}); stop it there first")
+        pid = max(running, default=None)
+        cmd, info = running.get(pid, ""), listed.get(pid, {})
+        mode = m[1] if (m := re.search(r"--permission-mode[ =](\S+)", cmd)) else None
+        permission = "bypassPermissions" if "--dangerously-skip-permissions" in cmd or mode == "bypassPermissions" else mode if mode in PERMISSIONS["claude-code"] else "default"
+        model = next((e["message"]["model"] for e in reversed(lines) if e.get("type") == "assistant" and not e.get("isSidechain") and str(e["message"].get("model", "")).startswith("claude-")), None)
+        # Claude Code keeps a conversation under the folder it was started in, which --resume must run in
+        cwd = info.get("cwd") or next((e["cwd"] for e in lines if e.get("cwd")), meta["cwd"])
+        return dict(plan, pid=pid, version=info.get("version"), busy=info.get("status") == "busy", model=model or meta.get("model") or (claude_models() or [dict(id=None)])[0]["id"],
+                    effort=meta.get("effort") if meta.get("effort") in CLAUDE_EFFORTS else None, permission=permission, cwd=cwd)
+    if channels.wake(meta) and channels.wake(meta)[0] == "collab": return dict(plan, blocked="collab runs this Codex thread; stop it there first")
+    held = subprocess.run(["lsof", "-t", str(path)], capture_output=True, text=True).stdout.split()
+    if holders := {p: c for p, c in commands([int(p) for p in held]).items() if re.match(r"(?:\S*/)?codex(?:\s|$)", c)}:
+        pid, cmd = min(holders.items())
+        how = "stop it with `codex app-server daemon stop`" if "app-server" in cmd else "exit it in its terminal"
+        return dict(plan, pid=pid, blocked=f"Codex still has this thread open (pid {pid}); {how}, then move it")
+    ctx = next((e["payload"] for e in reversed(lines) if e.get("type") == "turn_context"), {})
+    sandbox = (ctx.get("sandbox_policy") or {}).get("type")
+    return dict(plan, model=ctx.get("model") or meta.get("model"), effort=ctx.get("effort"), permission=sandbox if sandbox in PERMISSIONS["codex"] else "workspace-write", cwd=ctx.get("cwd") or meta["cwd"])
+
+def move(sid):
+    """Move a joined session into orchestrate: end the terminal agent that runs it and continue the same conversation headless
+    here. From then on it is a session started here: restart, model and effort work on it, and its terminal is done with it."""
+    s = store.load(sid)
+    if (plan := plan_move(s))["blocked"]: raise ValueError(plan["blocked"])
+    if not plan["model"]: raise ValueError("orchestrate cannot tell which model this session runs")
+    if not Path(plan["cwd"]).is_dir(): raise ValueError(f"Working directory is missing: {plan['cwd']}")
+    if pid := plan["pid"]:
+        os.kill(pid, signal.SIGTERM)
+        # ended once gone, or a zombie its terminal has yet to reap
+        for _ in range(60):
+            if subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()[:1] in ("", "Z"): break
+            time.sleep(0.25)
+        else: raise ValueError(f"Its terminal agent (pid {pid}) did not exit; quit it there, then move it again")
+    store.emit(sid, "meta", "user", changes=dict(origin="gui", model=plan["model"], effort=plan["effort"], permission=plan["permission"], cwd=plan["cwd"], moved=store.now()))
+    channels.endpoint_path(sid).unlink(missing_ok=True)
+    if plan["provider"] in TURNS:
+        # its next message starts a turn, which resumes the thread with orchestrate's preamble
+        return set_runtime(sid, "idle")
+    set_runtime(sid, "stopped", started=True)
+    start(sid, "[orchestrate] The user moved this session from its terminal into orchestrate, which stopped you in the middle of your turn and now runs you headless. Continue where you left off." if plan["busy"] else None)
+    if store.pending(store.load(sid)): deliver(sid)
+
 def message(s, found):
     who = "from the user" if all(p["actor"] == "user" or p["type"] in ("answer", "dismissed") for p in found) else "on your board"
     return "\n".join([f"[orchestrate] {len(found)} new {who} (session {s['session']['id']}):", *[store.describe(s, p) for p in found]])

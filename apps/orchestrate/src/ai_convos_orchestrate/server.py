@@ -27,7 +27,7 @@ def version():
 
 def summary(s):
     meta, eff = s["session"], store.effective(s)
-    return dict(id=meta["id"], title=meta["title"], provider=meta["provider"], model=meta.get("model"), effort=meta.get("effort"), permission=meta.get("permission"), switching=runtime.switching(meta["id"], meta), agent=runtime.agent(meta["id"], meta), cwd=meta["cwd"], origin=meta["origin"], parent=meta.get("parent"), skills=meta.get("skills", []),
+    return dict(id=meta["id"], title=meta["title"], provider=meta["provider"], model=meta.get("model"), effort=meta.get("effort"), permission=meta.get("permission"), switching=runtime.switching(meta["id"], meta), agent=runtime.agent(meta["id"], meta), cwd=meta["cwd"], origin=meta["origin"], moved=meta.get("moved"), parent=meta.get("parent"), skills=meta.get("skills", []),
                 status=store.status(s), counts=dict(collections.Counter(eff.values())), items=len(s["items"]), asks=len(store.open_asks(s)), pending=len(store.pending(s)),
                 activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=transcripts.limit(meta), heard=len(transcripts.arrived(meta) or ()), wake=channels.waking(meta),
                 why=next((x["why"] for x in sorted(s["items"].values(), key=lambda x: x["updated"], reverse=True) if x["status"] == "blocked" and x.get("why") and not x.get("archived")), None))
@@ -118,6 +118,7 @@ def act(body):
     if kind == "permission": return dict(applies=runtime.permit(sid, body["permission"], bool(body.get("confirm"))))
     if kind == "tune": return dict(applies=runtime.tune(sid, body["model"], body.get("effort")))
     if kind == "restart": return dict(applies=runtime.restart(sid))
+    if kind == "move": return (runtime.move(sid), dict(ok=True))[1]
     # a reset covers the user's whole Codex account; the deliver loop then sends what every Codex session held for the limit
     if kind == "codex_reset":
         if (outcome := runtime.use_codex_reset()) in ("reset", "nothingToReset"): carry_on()
@@ -171,6 +172,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def route_get(self, path, query):
         if path == "/api/sessions": return self.send(200, [summary(s) for sid in store.session_ids() if (s := store.peek(sid) or store.load(sid))])
         if m := re.fullmatch(r"/api/session/(o[0-9a-f]{11})", path): return self.send(200, detail(store.load(m[1])))
+        if m := re.fullmatch(r"/api/session/(o[0-9a-f]{11})/move", path): return self.send(200, runtime.plan_move(store.load(m[1])))
         if m := re.fullmatch(r"/api/blob/([0-9a-f]{64})", path):
             blob = store.body_path(m[1])
             mime = query.get("mime", "")

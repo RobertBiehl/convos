@@ -658,6 +658,19 @@ function Tuning({ s }) {
 // a live Claude Code agent restarts on its conversation: how a Claude Code update reaches it (Codex and Muse start afresh each turn)
 const restartSession = async () => { const r = await act({ kind: "restart" }); if (r) { toast(`Session ${RESTARTS[r.applies]}`); await loadSessions(); } };
 const newer = (s) => s.agent?.running && s.agent.installed && s.agent.installed !== s.agent.running;
+// a joined session moves into orchestrate: its terminal agent ends and the same conversation continues headless here, after the
+// user has seen what ends and what it continues with
+const movable = (s) => s.origin !== "gui" && !s.closed && ["claude-code", "codex"].includes(s.provider);
+const planMove = async (s) => { try { set({ moving: { id: s.id, plan: await api.get(`/api/session/${s.id}/move`) } }); } catch (e) { fail(e); } };
+function MoveBox({ plan }) {
+  const [busy, setBusy] = useState(false), close = () => set({ moving: null });
+  const go = async () => { setBusy(true); const r = await act({ kind: "move" }); setBusy(false); close(); if (r) { toast("Moved into orchestrate"); await loadSessions(); } };
+  if (plan.blocked) return html`<div class="permask"><div>${plan.blocked}.</div><div class="btns"><button class="abtn" onClick=${close}>OK</button></div></div>`;
+  const agent = plan.provider === "codex" ? "Codex" : "Claude Code";
+  const how = html`<code>${plan.model}</code>${plan.effort ? ` · ${plan.effort}` : ""} · ${plan.permission}`;
+  return html`<div class="permask"><div>Move this session into orchestrate? ${plan.pid ? html`This ends the ${agent} agent in its terminal (pid ${plan.pid}${plan.version ? `, ${agent} ${plan.version}` : ""}) and continues the same conversation headless here with ${how}.${plan.busy ? " It is in the middle of a turn: that turn stops, and the agent is told to continue here." : ""}` : html`No terminal runs it now; the same conversation continues headless here with ${how}.`} Don't resume it in a terminal while it runs here.</div>
+    <div class="btns"><button class="abtn primary" disabled=${busy} onClick=${go}>${busy ? "Moving…" : "Move it here"}</button><button class="abtn" disabled=${busy} onClick=${close}>Cancel</button></div></div>`;
+}
 
 function SessionInfo({ s, d }) {
   const kids = childrenOf(s.id), counts = s.counts || {}, lim = limitOf(s);
@@ -668,7 +681,9 @@ function SessionInfo({ s, d }) {
       ${s.agent ? html`<button class="abtn ${newer(s) ? "primary" : ""}" title=${newer(s) ? `Restart on its conversation into Claude Code ${s.agent.installed}` : "Start the agent again on its conversation"} onClick=${restartSession}>${K("⇧", "R")} ${newer(s) ? `Restart into ${s.agent.installed}` : "Restart"}</button>` : null}
       ${s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" ? html`<button class="abtn" onClick=${() => act({ kind: "resume" }, "Resuming…")}>${K("r")} Resume</button>` : null}
       <button class="abtn" onClick=${() => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed")}>${K("⇧", "X")} ${s.closed ? "Reopen" : "Close"}</button>
+      ${movable(s) ? html`<button class="abtn" title="End its terminal agent and continue the same conversation here, so restart, model and effort work on it" onClick=${() => planMove(s)}>Move into orchestrate</button>` : null}
     </div>
+    ${S.moving?.id === s.id && movable(s) ? html`<${MoveBox} plan=${S.moving.plan} />` : null}
     <div class="metaline">
       <span class="m"><span class="dot ${s.live ? "live" : ""}" />${runtime}</span>
       <span class="m">${s.provider}${s.agent?.running ? ` ${s.agent.running}` : ""}${s.model ? html` · <code>${s.model}</code>` : null}${s.effort ? ` · ${s.effort}` : ""}</span>
@@ -925,7 +940,7 @@ function Detail({ s, d }) {
     return html`<aside class="detail" onDragOver=${dropOver} onDragLeave=${dropLeave} onDrop=${(e) => dropOn(e, `${s.id}:`)}>
       ${S.drop ? html`<div class="dropzone">Drop images to attach them to a message in the session chat</div>` : null}
       <div class="dscroll" onScroll=${onScroll}>
-        <div class="dhead"><div class="lbl">Session · ${s.origin === "gui" ? "started here" : "joined"} · ${ago(s.created)}<span style="margin-left:auto"><${Hot} k=${["j", "k"]}>pick a row<//></span></div><h2>${s.title}</h2>
+        <div class="dhead"><div class="lbl">Session · ${s.moved ? `joined ${ago(s.created)}, moved here from its terminal ${ago(s.moved)}` : `${s.origin === "gui" ? "started here" : "joined"} · ${ago(s.created)}`}<span style="margin-left:auto"><${Hot} k=${["j", "k"]}>pick a row<//></span></div><h2>${s.title}</h2>
           <${SessionInfo} s=${s} d=${d} /></div>
         ${d.prompt ? html`<section class="dsec"><h5>Starting prompt</h5><div class="bub" style="padding:9px 11px;border-radius:10px;border:1px solid var(--line);background:var(--panel2)"><${Md} text=${d.prompt} /></div></section>` : null}
         ${asks.length ? html`<section class="dsec"><h5>Questions</h5><${Questions} list=${asks} d=${d} /></section>` : null}
