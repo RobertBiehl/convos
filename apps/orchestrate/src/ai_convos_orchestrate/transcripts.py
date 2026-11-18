@@ -7,6 +7,7 @@ is read again only when it changes.
 """
 import datetime as dt, json, os, re, threading, time, zoneinfo
 from pathlib import Path
+from . import store
 
 MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 # "resets 12pm (Europe/Berlin)", "resets 12:50am (Europe/Rome)", "resets Oct 15 at 1pm (Europe/Rome)"
@@ -85,16 +86,32 @@ def transcript(meta):
     FOUND[key] = (found[-1] if found else None, time.monotonic()+60)
     return FOUND[key][0]
 
+def released(provider):
+    """When the user last lifted this provider's usage limit early (a reset redeemed from orchestrate, or the provider saying
+    usage is allowed again); a limit hit before then no longer holds words. Kept in resets.json beside the sessions."""
+    try: return dt.datetime.fromisoformat(json.loads((store.root()/"resets.json").read_text())[provider])
+    except (OSError, ValueError, KeyError): return None
+
+def release(provider):
+    path = store.root()/"resets.json"
+    try: known = json.loads(path.read_text())
+    except (OSError, ValueError): known = {}
+    (tmp := path.with_suffix(".tmp")).write_text(json.dumps(dict(known, **{provider: dt.datetime.now(dt.timezone.utc).isoformat()})))
+    tmp.replace(path)
+
 def limit(meta):
-    """This session's usage-limit interruption ({text, at, resets} with resets None when the notice names no time), or None."""
+    """This session's usage-limit interruption ({text, at, resets} with resets None when the notice names no time), or None.
+    A limit lifted early resets when it was lifted (minus the grace, so held words go out at once) and names that time."""
     if not (path := transcript(meta)): return None
     try: mark = ((st := path.stat()).st_mtime_ns, st.st_size)
     except OSError: return None
-    if (hit := STATE.get(path)) and hit[0] == mark: return hit[1]
-    try: value = READ[meta["provider"]](path)
-    except (OSError, KeyError, TypeError, AttributeError): value = None
-    if value: value = dict(value, resets=value["resets"] and value["resets"].astimezone(dt.timezone.utc).isoformat())
-    STATE[path] = (mark, value)
+    if (hit := STATE.get(path)) and hit[0] == mark: value = hit[1]
+    else:
+        try: value = READ[meta["provider"]](path)
+        except (OSError, KeyError, TypeError, AttributeError): value = None
+        if value: value = dict(value, resets=value["resets"] and value["resets"].astimezone(dt.timezone.utc).isoformat())
+        STATE[path] = (mark, value)
+    if value and (lifted := released(meta["provider"])) and lifted > stamp(value["at"]): return dict(value, resets=(lifted-dt.timedelta(seconds=GRACE)).isoformat(), released=lifted.isoformat())
     return value
 
 def holding(meta):

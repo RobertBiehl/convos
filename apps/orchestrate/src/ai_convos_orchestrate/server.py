@@ -116,6 +116,8 @@ def act(body):
         return dict(ok=True)
     if kind == "deliver": return dict(channel=runtime.deliver(sid))
     if kind == "permission": return dict(applies=runtime.permit(sid, body["permission"], bool(body.get("confirm"))))
+    # a reset covers the user's whole Codex account; the deliver loop then sends what every Codex session held for the limit
+    if kind == "codex_reset": return dict(outcome=runtime.use_codex_reset())
     raise ValueError(f"Unknown action {kind}")
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -152,8 +154,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, path.read_bytes(), TYPES[path.suffix], [("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-src 'self'; object-src 'self'")])
         if not self.trusted(): return self.send(401, {"error": "Open orchestrate with: convos orchestrate open"})
         try: self.route_get(url.path, query)
-        except (ValueError, KeyError) as error: self.send(400, {"error": str(error)})
         except (BrokenPipeError, ConnectionResetError): pass
+        except (ValueError, KeyError, OSError) as error: self.send(400, {"error": str(error)})
 
     def route_get(self, path, query):
         if path == "/api/sessions": return self.send(200, [summary(s) for sid in store.session_ids() if (s := store.peek(sid) or store.load(sid))])
@@ -178,6 +180,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/dirs": return self.send(200, dirs(query.get("prefix", "")))
         if path == "/api/collab": return self.send(200, collab())
         if path == "/api/convos": return self.send(200, overview.overview(query.get("fresh") == "1"))
+        if path == "/api/codex/resets": return self.send(200, runtime.codex_resets())
         if path == "/api/stream": return self.stream()
         self.send(404, {"error": "not found"})
 

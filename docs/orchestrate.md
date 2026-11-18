@@ -125,6 +125,11 @@ session replies again. Orchestrate reads this from the provider's transcript of 
 Code's `projects/*/SESSION.jsonl`, Codex's `rollout-*-THREAD.jsonl`) and stores nothing. Your
 comments and answers to a stopped session wait and go out a minute after the limit resets, so they
 reach an agent that can act on them; a notice without a reset time (out of credits) holds nothing.
+A Codex session's panel also offers **Use a reset** while you have Codex usage-limit resets (Codex
+0.170 or later): after you confirm, orchestrate redeems the one that expires first through Codex's
+app server, and what every Codex session held for the limit goes out at once, since a reset covers
+the account. When Codex says usage is allowed again (a reset used elsewhere), held words go out too;
+the time is kept in `resets.json` beside the sessions.
 
 **Questions.** Several open questions read as one stack under **Needs you**: the one in focus
 (else the oldest) is open, the rest are one line each, and `a` steps through them. A card shows

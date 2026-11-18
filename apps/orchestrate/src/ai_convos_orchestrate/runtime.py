@@ -34,6 +34,47 @@ def codex_models():
     newest = {cls: max((m for m in listed if re.sub(r"^gpt-[\d.]+-", "", m["slug"]) == cls), key=version) for cls in dict.fromkeys(re.sub(r"^gpt-[\d.]+-", "", m["slug"]) for m in sorted(listed, key=lambda m: m.get("priority", 99)))}
     return [dict(id=m["slug"], efforts=[x["effort"] for x in m.get("supported_reasoning_levels") or []], effort=m.get("default_reasoning_level")) for m in newest.values()]
 
+def codex_account(method, params):
+    """One request to Codex's app server under the user's own Codex login: account reads and actions, never a model turn."""
+    p = subprocess.Popen(["codex", "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    (timer := threading.Timer(30, p.kill)).start()
+    try:
+        for rid, name, args in ((1, "initialize", dict(clientInfo=dict(name="convos-orchestrate", title="Convos Orchestrate", version="1"), capabilities=None)), (None, "initialized", None), (2, method, params)):
+            p.stdin.write(json.dumps(dict(jsonrpc="2.0", method=name, **({} if rid is None else dict(id=rid)), **({} if args is None else dict(params=args)))) + "\n")
+            p.stdin.flush()
+            if rid is None: continue
+            for line in p.stdout:
+                if (reply := json.loads(line)).get("id") == rid: break
+            else: raise ValueError("Codex's app server ended before it answered")
+            if "error" in reply: raise ValueError(f"Codex: {reply['error'].get('message') or reply['error']}")
+        return reply["result"]
+    finally:
+        timer.cancel()
+        p.kill()
+
+RESETS = {}
+
+def codex_resets(fresh=False):
+    """The user's Codex usage-limit resets (how many are left, the one that expires first) and whether Codex allows usage now.
+    Read at most every 30 s; usage allowed again lifts every Codex limit orchestrate holds words for."""
+    if not fresh and (hit := RESETS.get("read")) and time.monotonic() < hit[0]+30: return hit[1]
+    r = codex_account("account/rateLimits/read", {})
+    summary = r["rateLimitResetCredits"] or dict(availableCount=0, credits=None)
+    left = sorted((c for c in summary["credits"] or [] if c["status"] == "available"), key=lambda c: c["expiresAt"] or float("inf"))
+    value = dict(available=int(summary["availableCount"]), next=left[0] if left else None, allowed=r["ordinaryUsageAllowed"])
+    if value["allowed"] is True: transcripts.release("codex")
+    RESETS["read"] = (time.monotonic(), value)
+    return value
+
+def use_codex_reset():
+    """Redeem the user's Codex reset that expires first; on success the words held for the limit go out."""
+    pick = codex_resets(fresh=True)["next"]
+    outcome = codex_account("account/rateLimitResetCredit/consume", dict(idempotencyKey=str(uuid.uuid4()), creditId=pick and pick["id"]))["outcome"]
+    # nothingToReset: Codex says usage needs no reset, so nothing should wait for one either
+    if outcome in ("reset", "nothingToReset"): transcripts.release("codex")
+    RESETS.clear()
+    return outcome
+
 def muse_models():
     """Muse's model catalog (cached by Muse per provider): the visible models, the newest of each class, its default first."""
     root = Path(os.environ.get("XDG_DATA_HOME", Path.home()/".local"/"share"))/"muse"/"model-catalog"
