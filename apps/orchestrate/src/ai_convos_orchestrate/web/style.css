@@ -144,6 +144,9 @@ span.si > svg, span.si > span, span.si > span > svg { position: absolute; inset:
 .crumbs button:hover { color: var(--text); }
 .shead h1 { margin: 0; font-size: 18px; letter-spacing: -.015em; font-weight: 650; display: flex; align-items: center; gap: 10px; }
 .shead h1 .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shead h1 .agentchip { flex: none; margin-left: auto; padding: 3px 9px; border: 1px solid var(--line2); border-radius: 999px; font-size: 11.5px; font-weight: 500; letter-spacing: 0; color: var(--dim); white-space: nowrap; }
+.shead h1 .agentchip:hover { color: var(--text); border-color: var(--accent); }
+.shead h1 .agentchip.upd { color: var(--accent); border-color: var(--accent); }
 .metaline { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--faint); font-size: 12px; margin-top: 8px; align-items: center; }
 .metaline .m { display: inline-flex; gap: 5px; align-items: center; }
 .metaline code { font: 11.5px var(--mono); color: var(--dim); }

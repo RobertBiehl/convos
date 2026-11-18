@@ -596,8 +596,15 @@ function Crumbs({ s }) {
 function SessionBar({ s }) {
   return html`<header class="shead slim">
     <${Crumbs} s=${s} />
-    <h1><span class="t">${s.title}</span>${s.status === "input" ? html`<button class="pillbtn" title="Go to what needs you" onClick=${() => needYou(s.id)}><${Pill} s="input" /><${Hot} k="a">answer<//></button>` : html`<${Pill} s=${s.status} />`}<${LimitPill} s=${s} /></h1>
+    <h1><span class="t">${s.title}</span>${s.status === "input" ? html`<button class="pillbtn" title="Go to what needs you" onClick=${() => needYou(s.id)}><${Pill} s="input" /><${Hot} k="a">answer<//></button>` : html`<${Pill} s=${s.status} />`}<${LimitPill} s=${s} /><${AgentChip} s=${s} /></h1>
   </header>`;
+}
+// what a session started here runs, always in view; a click brings up its model, effort, permission and restart controls, which
+// sit above a long chat that the pane opens at its newest message
+function AgentChip({ s }) {
+  if (s.origin !== "gui" || !s.model) return null;
+  const show = () => { select(null); requestAnimationFrame(() => { const b = document.querySelector(".dscroll"); if (b) b.scrollTop = 0; }); };
+  return html`<button class="agentchip ${newer(s) ? "upd" : ""}" title=${newer(s) ? `Claude Code ${s.agent.installed} is installed: restart to update` : "Model, effort, permissions, restart"} onClick=${show}><code>${s.model}</code>${s.effort ? ` · ${s.effort}` : ""}${newer(s) ? " · update" : ""}</button>`;
 }
 // who this session works with: its collab rooms and teammates, each a jump to their board when they are on orchestrate
 function WorksWith({ s }) {
