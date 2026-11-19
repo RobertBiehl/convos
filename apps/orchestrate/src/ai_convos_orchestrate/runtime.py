@@ -437,11 +437,14 @@ def plan_move(s):
             return dict(plan, blocked=f"Another program runs this session headless (pid {headless[0]}); stop it there first")
         pid = max(running, default=None)
         cmd, info = running.get(pid, ""), listed.get(pid, {})
-        mode = m[1] if (m := re.search(r"--permission-mode[ =](\S+)", cmd)) else None
+        # the terminal's flags, else the mode the conversation last ran in, as its transcript records it
+        mode = m[1] if (m := re.search(r"--permission-mode[ =](\S+)", cmd)) else None if cmd else next((e["permissionMode"] for e in reversed(lines) if e.get("permissionMode")), None)
         permission = "bypassPermissions" if "--dangerously-skip-permissions" in cmd or mode == "bypassPermissions" else mode if mode in PERMISSIONS["claude-code"] else "default"
         model = next((e["message"]["model"] for e in reversed(lines) if e.get("type") == "assistant" and not e.get("isSidechain") and str(e["message"].get("model", "")).startswith("claude-")), None)
-        # Claude Code keeps a conversation under the folder it was started in, which --resume must run in
-        cwd = info.get("cwd") or next((e["cwd"] for e in lines if e.get("cwd")), meta["cwd"])
+        # Claude Code keeps a conversation under the folder it was started in, which --resume must run in; its first entries name
+        # it, later ones follow the agent into other folders
+        with path.open("rb") as f: head = f.read(1 << 16)
+        cwd = info.get("cwd") or (json.loads(m[0][6:]) if (m := re.search(rb'"cwd":"(?:[^"\\]|\\.)*"', head)) else meta["cwd"])
         return dict(plan, pid=pid, version=info.get("version"), busy=info.get("status") == "busy", model=model or meta.get("model") or (claude_models() or [dict(id=None)])[0]["id"],
                     effort=meta.get("effort") if meta.get("effort") in CLAUDE_EFFORTS else None, permission=permission, cwd=cwd)
     if channels.wake(meta) and channels.wake(meta)[0] == "collab": return dict(plan, blocked="collab runs this Codex thread; stop it there first")
