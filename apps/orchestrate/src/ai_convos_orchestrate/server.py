@@ -3,7 +3,7 @@
 Binds loopback only. Every API request needs the per-server token (set as a SameSite=Strict cookie by
 the launch URL), a loopback Host header, and, for writes, a custom header no cross-site form can send.
 """
-import base64, collections, hashlib, hmac, http.server, json, os, re, secrets, socket, subprocess, sys, threading, time, urllib.parse, webbrowser
+import base64, collections, faulthandler, hashlib, hmac, http.server, json, os, re, secrets, signal, socket, subprocess, sys, threading, time, urllib.parse, webbrowser
 from pathlib import Path
 from . import store, runtime, channels, overview, transcripts
 
@@ -29,7 +29,7 @@ def summary(s):
     meta, eff = s["session"], store.effective(s)
     return dict(id=meta["id"], title=meta["title"], provider=meta["provider"], model=meta.get("model"), effort=meta.get("effort"), permission=meta.get("permission"), switching=runtime.switching(meta["id"], meta), agent=runtime.agent(meta["id"], meta), cwd=meta["cwd"], origin=meta["origin"], moved=meta.get("moved"), parent=meta.get("parent"), skills=meta.get("skills", []),
                 status=store.status(s), counts=dict(collections.Counter(eff.values())), items=len(s["items"]), asks=len(store.open_asks(s)), pending=len(store.pending(s)),
-                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=transcripts.limit(meta), heard=len(transcripts.arrived(meta) or ()), wake=channels.waking(meta),
+                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=transcripts.limit(meta), heard=len(transcripts.arrived(meta) or ()), unheard=runtime.unheard(meta["id"]), wake=channels.waking(meta),
                 why=next((x["why"] for x in sorted(s["items"].values(), key=lambda x: x["updated"], reverse=True) if x["status"] == "blocked" and x.get("why") and not x.get("archived")), None))
 
 def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], received=None if (heard := transcripts.arrived(s["session"])) is None else sorted(heard), unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
@@ -210,12 +210,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try: mtime = (store.sdir(sid)/"view.json").stat().st_mtime_ns
                 except OSError: continue
                 # a session changes with its board, when its provider's usage limit stops or releases it, and when its agent
-                # receives the user's words (its transcript shows them)
+                # receives the user's words (its transcript shows them), or turns out not to take them
                 meta = metas.get(sid)
-                if seen.get(sid) != (mtime, meta and transcripts.limit(meta), meta and len(transcripts.arrived(meta) or ())) and (s := store.peek(sid)):
+                if seen.get(sid) != (mtime, meta and transcripts.limit(meta), meta and len(transcripts.arrived(meta) or ()), runtime.unheard(sid)) and (s := store.peek(sid)):
                     metas[sid] = s["session"]
                     events.append(("session", out := summary(s)))
-                    seen[sid] = (mtime, out["limit"], out["heard"])
+                    seen[sid] = (mtime, out["limit"], out["heard"], out["unheard"])
             if not events and time.monotonic()-beat > 15: events.append(("ping", {}))
             if events:
                 self.wfile.write("".join(f"event: {k}\ndata: {json.dumps(v, separators=(',', ':'))}\n\n" for k, v in events).encode())
@@ -280,24 +280,25 @@ def pump():
             except store.core.LockBusy as error:
                 recover_at = time.monotonic()+60
                 print(f"orchestrate: startup waits for the archive: {str(error)[:200]}", file=sys.stderr)
-        # agents outlive a server restart: pick them up again, and record the ones that ended
-        try: runtime.reconcile()
-        except (ValueError, OSError, subprocess.SubprocessError, store.core.LockBusy) as error: print(f"orchestrate: reconcile: {str(error)[:200]}", file=sys.stderr)
+        # agents outlive a server restart: pick them up again, and record the ones that ended. Whatever may wait (on the archive,
+        # on an agent) runs in the background, one run at a time per job, so this loop never stops for one session
+        runtime.once("reconcile", runtime.reconcile)
+        runtime.stuck()
         time.sleep(3)
         for sid in store.session_ids():
             s = store.peek(sid)
             if s and (state := store.status(s)) != last.get(sid):
                 if s["session"].get("parent") and state in NOTIFY and sid in last: background(notify_parent, s, state)
                 last[sid] = state
-            if s and s["closed"] and runtime.alive(sid) and not runtime.busy(sid): runtime.stop(sid)
+            if s and s["closed"] and runtime.alive(sid) and not runtime.busy(sid): runtime.once(f"stop {sid}", runtime.stop, sid)
+            if s: runtime.listen(sid, s["session"])
             if s and not s["closed"] and (late := [i for i in store.lapsed(s) if (sid, i, s["items"][i]["eta"]) not in NUDGED]):
                 NUDGED.update((sid, i, s["items"][i]["eta"]) for i in late)
                 background(nudge, sid, late)
             # words held for a usage limit go out once it resets; joined sessions get every word their channel can take
             gui = s and s["session"]["origin"] == "gui"
             if s and not s["closed"] and store.pending(s) and not transcripts.holding(s["session"]) and (transcripts.limit(s["session"]) if gui else channels.reachable(s)):
-                try: runtime.deliver(sid)
-                except (ValueError, OSError, subprocess.SubprocessError, store.core.LockBusy) as error: print(f"orchestrate: deliver {sid}: {error}", file=sys.stderr)
+                runtime.once(f"deliver {sid}", runtime.deliver, sid)
 
 def free_port(preferred, wait=6):
     """The preferred port keeps open tabs working across restarts; wait briefly for a predecessor to release it."""
@@ -323,6 +324,8 @@ def serve(port=7311, open_browser=True):
     httpd.daemon_threads = True
     store.core.atomic_json(info_path(), dict(pid=os.getpid(), port=SERVER["port"], token=SERVER["token"]))
     os.chmod(info_path(), 0o600)
+    # `kill -USR1 PID` prints every thread's stack to the server log: what a stalled server waits on
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     threading.Thread(target=pump, daemon=True, name="orchestrate-pump").start()
     url = f"http://127.0.0.1:{SERVER['port']}/?t={SERVER['token']}"
     print(f"Orchestrate at {url}", flush=True)

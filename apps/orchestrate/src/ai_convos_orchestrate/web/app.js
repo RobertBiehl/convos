@@ -572,7 +572,7 @@ function Sidebar() {
           <${SI} s=${s.status} />
           <div style="min-width:0">
             <div class="title">${s.title}</div>
-            <div class="sub">${s.limit ? html`<span class="lim" title=${s.limit.text}>${limitOf(s).short}</span>` : s.status === "working" && s.activity ? html`<span class="act">${s.activity.text}</span>` : s.status === "blocked" && s.why ? html`<span class="why" title=${s.why}>${s.why}</span>` : html`<span>${base(s.cwd)}</span><span>·</span><span>${ago(s.updated)}</span>`}</div>
+            <div class="sub">${s.limit ? html`<span class="lim" title=${s.limit.text}>${limitOf(s).short}</span>` : s.unheard?.length ? html`<span class="lim" title=${DEAF(s)}>not taking your messages</span>` : s.status === "working" && s.activity ? html`<span class="act">${s.activity.text}</span>` : s.status === "blocked" && s.why ? html`<span class="why" title=${s.why}>${s.why}</span>` : html`<span>${base(s.cwd)}</span><span>·</span><span>${ago(s.updated)}</span>`}</div>
             ${s.items ? html`<div class="mini"><${Progress} counts=${s.counts} /></div>` : null}
           </div>
           <div class="right">${i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${s.asks ? html`<button class="badge" title="Go to what needs you" onClick=${(e) => { e.stopPropagation(); needYou(s.id); }}>${s.asks}</button>` : unread ? html`<span class="unread" />` : null}${s.live ? html`<span class="dot live" title="live" />` : null}</div>
@@ -604,8 +604,11 @@ function SessionBar({ s }) {
 function AgentChip({ s }) {
   if (s.origin !== "gui" || !s.model) return null;
   const show = () => { select(null); requestAnimationFrame(() => { const b = document.querySelector(".dscroll"); if (b) b.scrollTop = 0; }); };
-  return html`<button class="agentchip ${newer(s) ? "upd" : ""}" title=${newer(s) ? `Claude Code ${s.agent.installed} is installed: restart to update` : "Model, effort, permissions, restart"} onClick=${show}><code>${s.model}</code>${s.effort ? ` · ${s.effort}` : ""}${newer(s) ? " · update" : ""}</button>`;
+  return html`<button class="agentchip ${s.unheard?.length ? "deaf" : newer(s) ? "upd" : ""}" title=${s.unheard?.length ? DEAF(s) : newer(s) ? `Claude Code ${s.agent.installed} is installed: restart to update` : "Model, effort, permissions, restart"} onClick=${show}><code>${s.model}</code>${s.effort ? ` · ${s.effort}` : ""}${s.unheard?.length ? " · not taking messages" : newer(s) ? " · update" : ""}</button>`;
 }
+// a live Claude Code agent that has not logged taking words written to its stdin minutes ago (it does within a second, even mid
+// tool call): it stopped acting on its input, as Claude Code 2.1.327 did after a skill reload; a restart gives them to it again
+const DEAF = (s) => ((it) => `Claude Code has not taken ${s.unheard.join(", ")} from its input, minutes after orchestrate wrote ${it} there: it no longer acts on what it reads. A restart gives ${it} to it again.`)(s.unheard.length === 1 ? "it" : "them");
 // who this session works with: its collab rooms and teammates, each a jump to their board when they are on orchestrate
 function WorksWith({ s }) {
   const rooms = (S.collab?.rooms || []).filter((r) => r.members?.some((m) => m.orchestrate === s.id));
@@ -693,7 +696,8 @@ function SessionInfo({ s, d }) {
       ${d.runtime?.cost ? html`<span class="m">$${d.runtime.cost.toFixed(2)}</span>` : null}
     </div>
     ${s.origin === "gui" && S.meta.providers?.[s.provider] ? html`<${Tuning} s=${s} /><${Permissions} s=${s} />` : null}
-    ${s.switching?.startsWith("restarting") ? html`<div class="permask"><div>Restarts on its conversation once its current turn ends${s.switching === "restarting at prompt" ? ", or at its next permission prompt" : ""}.</div></div>` : null}
+    ${s.unheard?.length ? html`<div class="limitline">${G.clock}<div>${DEAF(s)} A turn it may still run stops.<div class="btns resetbtn"><button class="abtn primary" onClick=${restartSession}>Restart and resend</button></div></div></div>`
+      : s.switching?.startsWith("restarting") ? html`<div class="permask"><div>Restarts on its conversation once its current turn ends${s.switching === "restarting at prompt" ? ", or at its next permission prompt" : ""}.</div></div>` : null}
     ${lim?.released ? html`<div class="limitline">${G.clock}<div>Usage reset at ${lim.released}. ${s.origin === "gui" ? "The turn the limit stopped can carry on." : "Send a message to continue."}${s.origin === "gui" && !s.busy ? html`<div class="btns resetbtn"><button class="abtn primary" onClick=${() => act({ kind: "resume" }, "Continuing…")}>Continue</button></div>` : null}</div></div>`
       : lim ? html`<div class="limitline">${G.clock}<div>Stopped by the usage limit at ${lim.hit}. ${lim.wait ? (s.pending ? `${s.pending} message${s.pending === 1 ? " waits" : "s wait"} and go${s.pending === 1 ? "es" : ""} out at ${lim.go}, after it resets.` : `Messages you send wait and go out at ${lim.go}, after it resets.`) : lim.released ? `Your usage was reset at ${lim.released}; send a message to continue.` : lim.at ? `The limit reset at ${lim.at}; send a message to continue.` : "The notice names no reset time, so messages go out right away."}<div class="notice">${lim.title}</div>${lim.wait && s.provider === "codex" ? html`<${CodexReset} key=${s.id} />` : null}</div></div>` : null}
     <div class="activity">${s.status === "working" || s.busy ? html`<${SI} s="working" sm />` : null}${s.activity && !["done", "closed"].includes(s.status) ? html`<span class="txt" key=${s.activity.at}>${s.activity.text}</span><span style="color:var(--faint)">· ${ago(s.activity.at)}</span>` : html`<span style="color:var(--faint)">${s.items ? `${counts.done || 0} of ${s.items} done` : "No items yet"}</span>`}</div>
@@ -857,6 +861,7 @@ function deliveryNote(c, s, d) {
   // ✓ sent: handed to the session's channel; ✓✓ received: the agent's own transcript shows it, so it is in the agent's context
   if (c.delivered && d.received?.includes(c.id)) return html`<span class="state d" title="The agent has it: its transcript shows it">✓✓ received</span>`;
   // codex queue parks a message until the thread's next turn
+  if (c.delivered && s.unheard?.includes(c.id)) return html`<span class="state q" title=${DEAF(s)}>✓ sent · not taken</span>`;
   if (c.delivered && d.received && s.provider === "codex") return html`<span class="state q" title="In Codex's queue: the thread takes it when its next turn starts">queued</span>`;
   if (c.delivered) return html`<span class="state s" title=${d.received ? "Handed to the session; ✓✓ once the agent has it in its context" : "Handed to the session"}>✓ sent</span>`;
   const l = limitOf(s);

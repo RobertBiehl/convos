@@ -20,6 +20,9 @@ FOUND, STATE, SEEN, LOCK = {}, {}, {}, threading.Lock()
 # message starting "- c5 user comment". A literal start keeps the scan at gigabytes per second.
 WORDS = re.compile(rb'- ([cq]\d+) (?:user comment|answered on|dismissed by the user|orchestrate notice)')
 QUEUED = b'{"type":"queue-operation"'  # Claude Code logs a message it queues mid-turn before the agent sees it
+# Claude Code logs each message it reads from its stdin entering its queue at once, with no content, even mid tool call; the
+# words themselves show only once the model takes them
+ENQUEUED = re.compile(rb'^\{"type":"queue-operation","operation":"enqueue","timestamp":"([^"]+)","sessionId":"[0-9a-f-]+"\}$', re.M)
 
 def wall(tz, y, m, d, h, mi): return dt.datetime(y, m, d, h, mi, tzinfo=tz) if tz else dt.datetime(y, m, d, h, mi).astimezone()
 
@@ -133,7 +136,7 @@ def arrived(meta):
     if not (path := transcript(meta)): return None
     sid = meta["id"].encode()
     with LOCK:
-        offset, ids = SEEN.get(path, (0, frozenset()))
+        offset, ids, last = SEEN.get(path, (0, frozenset(), None))
         try:
             if path.stat().st_size <= offset: return ids
             with path.open("rb") as f:
@@ -143,7 +146,12 @@ def arrived(meta):
                     data = rest+chunk
                     end = data.rfind(b"\n")+1
                     found |= {m[1].decode() for m in WORDS.finditer(data, 0, end) if heard(data, m.start(), sid)}
+                    last = max((m[1].decode() for m in ENQUEUED.finditer(data, 0, end)), default=last)
                     offset, rest = offset+end, data[end:]
         except OSError: return ids
-        SEEN[path] = (offset, ids := ids | found)
+        SEEN[path] = (offset, ids := ids | found, last)
         return ids
+
+def enqueued(meta):
+    """When a Claude Code agent last took a message from its stdin into its queue, as its transcript logs it; None before any."""
+    return None if arrived(meta) is None else SEEN.get(transcript(meta), (0, 0, None))[2]

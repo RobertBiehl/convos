@@ -6,7 +6,7 @@ Codex and Muse take one prompt per process, so each of their turns is a run of `
 provider's own channel (Claude Code messaging socket, codex queue); whatever cannot be delivered stays pending for the
 agent's `inbox`.
 """
-import collections, json, mmap, os, re, shutil, signal, subprocess, sys, threading, time, uuid
+import collections, contextlib, faulthandler, json, mmap, os, queue, re, shutil, signal, subprocess, sys, threading, time, uuid
 from pathlib import Path
 from . import store, channels, transcripts
 
@@ -109,8 +109,9 @@ def preamble(sid, meta):
     skills = ["orchestrate", *[k for k in meta.get("skills", []) if k != "orchestrate"]]
     load = LOAD[meta["provider"]].format(", ".join(f"${k}" if meta["provider"] == "codex" else k for k in skills))
     return SYSTEM.format(sid=sid, load=load) + (TURN if meta["provider"] in TURNS else "")
-PROCS, LOCK = {}, threading.RLock()
+PROCS, LOCKS, RUNNING, GUARD = {}, {}, {}, threading.Lock()
 OPEN = ("working", "idle", "starting")
+LATE = 120  # seconds a Claude Code agent has to log taking the user's words from its stdin (it does within a second)
 BYPASS = "changed this session's permission"  # why an agent restarts into bypassPermissions; also told to it mid-turn
 
 class Unreachable(ValueError): pass
@@ -120,6 +121,30 @@ def running(p):
     if p["proc"]: return p["proc"].poll() is None
     try: return os.kill(p["pid"], 0) is None
     except OSError: return False
+
+def lock(sid):
+    """Each session has its own lock: one waiting on the archive or on its agent holds up no other session."""
+    return LOCKS.setdefault(sid, threading.RLock())
+
+def once(key, fn, *args):
+    """Run fn in the background unless its last run under key still goes on; the next round tries again. Every wait on the archive
+    or on one agent stays inside its own run, and a run stuck for long is reported with every thread's stack (stuck)."""
+    with GUARD:
+        if key in RUNNING: return
+        RUNNING[key] = [time.monotonic(), False]
+    def run():
+        try: fn(*args)
+        except (ValueError, OSError, subprocess.SubprocessError, store.core.LockBusy) as error: print(f"orchestrate: {key}: {str(error)[:300]}", file=sys.stderr)
+        finally: RUNNING.pop(key)
+    threading.Thread(target=run, daemon=True, name=f"orchestrate {key}").start()
+
+def stuck(secs=120):
+    """Print every thread's stack once a background run has gone on for secs, so the next stall shows what it waits on."""
+    for key, run in list(RUNNING.items()):
+        if not run[1] and time.monotonic()-run[0] > secs:
+            run[1] = True
+            print(f"orchestrate: {key} still runs after {secs}s; every thread's stack follows", file=sys.stderr, flush=True)
+            faulthandler.dump_traceback(sys.stderr, all_threads=True)
 
 def alive(sid): return (p := PROCS.get(sid)) is not None and running(p)
 def busy(sid): return alive(sid) and PROCS[sid]["busy"]
@@ -167,7 +192,7 @@ def command(sid, meta, resume):
 def start(sid, text=None):
     """Start (or resume) a managed session's agent; optionally give it the user's words. A turn-based agent in the middle of
     a turn raises Busy: the words wait and start its next turn."""
-    with LOCK:
+    with lock(sid):
         if not alive(sid):
             s = store.load(sid)
             meta, resume = s["session"], s["runtime"] is not None and s["runtime"].get("started")
@@ -219,7 +244,23 @@ def hold(sid, pid, proc, offset, busy):
     """Own a running agent: write to its stdin pipe, follow its output file from offset."""
     fd = os.open(store.sdir(sid)/"stdin.fifo", os.O_WRONLY | os.O_NONBLOCK)  # refused at once when nothing reads the pipe
     os.set_blocking(fd, True)
-    follow(sid, dict(pid=pid, proc=proc, busy=busy, stdin=os.fdopen(fd, "wb")), offset)
+    p = dict(pid=pid, proc=proc, busy=busy, stdin=os.fdopen(fd, "wb"), outbox=queue.SimpleQueue(), given={})
+    threading.Thread(target=write, args=(sid, p), daemon=True, name=f"orchestrate-{sid}-stdin").start()
+    follow(sid, p, offset)
+
+def write(sid, p):
+    """An agent's stdin pipe has its own writer: an agent that stops reading fills the pipe, which holds up only its own words,
+    never whoever gave them or another session."""
+    while (line := p["outbox"].get()) is not None:
+        try:
+            p["stdin"].write(line)
+            p["stdin"].flush()
+        except OSError as error:
+            print(f"orchestrate: {sid}: its agent's stdin failed: {error}", file=sys.stderr)
+            break
+    with contextlib.suppress(OSError): p["stdin"].close()
+
+def tell(p, line): p["outbox"].put((json.dumps(line) + "\n").encode())
 
 def adopt(sid, s, pids):
     """Pick up the agent a previous server started. Agents from before agents had a pipe file cannot be reached; they finish their turn."""
@@ -248,10 +289,8 @@ def adopt(sid, s, pids):
     return True
 
 def send(sid, text):
-    with LOCK:
-        p = PROCS[sid]
-        p["stdin"].write((json.dumps(dict(type="user", message=dict(role="user", content=[dict(type="text", text=text)]))) + "\n").encode())
-        p["stdin"].flush()
+    with lock(sid):
+        tell(p := PROCS[sid], dict(type="user", message=dict(role="user", content=[dict(type="text", text=text)])))
         p["busy"] = True
     set_runtime(sid, "working", started=True, pid=p["pid"])
 
@@ -271,20 +310,21 @@ def read(sid, p, offset):
                 if e and e.get("type") == "thread.started" and store.load(sid)["session"].get("provider_session") != e["thread_id"]:
                     store.emit(sid, "meta", "orchestrate", changes=dict(provider_session=e["thread_id"]))
             f.seek(-len(line), os.SEEK_CUR)
-            # only bypassPermissions makes a waiting permission prompt moot; any other restart waits for the turn to end
-            if p.get("relaunch") and not done and (not p["busy"] or p["relaunch"] == BYPASS and asking(sid, p)):
+            # only bypassPermissions makes a waiting permission prompt moot, and an agent deaf to the user has no turn worth waiting
+            # for; any other restart waits for the turn to end
+            if p.get("relaunch") and not done and (not p["busy"] or p.get("deaf") or p["relaunch"] == BYPASS and asking(sid, p)):
                 threading.Thread(target=relaunch, args=(sid, p, p.pop("relaunch")), daemon=True).start()
             if done: break
             time.sleep(0.25)
     code = p["proc"].wait() if p["proc"] else None
-    with LOCK:
+    with lock(sid):
         if PROCS.get(sid) is p: PROCS.pop(sid)
     if p["stdin"] is None and code in (None, 0):
         # a turn-based agent rests between turns; words that arrived during this one start the next
         set_runtime(sid, "idle", started=True)
-        if store.pending(store.load(sid)): deliver(sid)
+        if store.pending(store.load(sid)): once(f"deliver {sid}", deliver, sid)
         return
-    if p["stdin"]: p["stdin"].close()
+    if p["stdin"]: p["outbox"].put(None)
     set_runtime(sid, "stopped" if code in (None, 0, -signal.SIGTERM, -signal.SIGINT, 128+signal.SIGTERM, 128+signal.SIGINT) else "failed", started=True, **({} if code is None else dict(code=code)))
 
 def permit(sid, mode, confirmed=False):
@@ -295,19 +335,18 @@ def permit(sid, mode, confirmed=False):
     meta = store.load(sid)["session"]
     if meta["origin"] != "gui": raise ValueError("A joined session keeps the permission of the terminal it runs in")
     if mode not in PERMISSIONS[meta["provider"]]: raise ValueError(f"{meta['provider']} permissions: {', '.join(PERMISSIONS[meta['provider']])}")
-    with LOCK:
+    with lock(sid):
         live = alive(sid) and (p := PROCS[sid])["stdin"] is not None
         restart = live and mode == "bypassPermissions" and not p.get("bypassable")
     if restart and not confirmed: return "confirm"
     if mode == meta.get("permission") and not restart: return "unchanged"
     if mode != meta.get("permission"): store.emit(sid, "meta", "user", changes=dict(permission=mode))
-    with LOCK:
+    with lock(sid):
         if not live: return "next turn" if meta["provider"] in TURNS else "next start"
         # a restart pending only for bypassPermissions is not needed once the user picks another mode
         if restart or p.get("relaunch") == BYPASS: p["relaunch"] = restart and BYPASS
         if restart: return "restart"
-        p["stdin"].write((json.dumps(dict(type="control_request", request_id=f"permission-{time.time_ns()}", request=dict(subtype="set_permission_mode", mode=mode))) + "\n").encode())
-        p["stdin"].flush()
+        tell(p, dict(type="control_request", request_id=f"permission-{time.time_ns()}", request=dict(subtype="set_permission_mode", mode=mode)))
     return "now"
 
 def tune(sid, model, effort):
@@ -329,11 +368,11 @@ def restart(sid, why="restarted this session"):
     now (how an update reaches it): at once when idle, otherwise once its current turn ends. Codex and Muse start afresh every turn."""
     meta = store.load(sid)["session"]
     if meta["origin"] != "gui": raise ValueError("A joined session runs in its own terminal; restart it there")
-    with LOCK:
+    with lock(sid):
         if not alive(sid) or (p := PROCS[sid])["stdin"] is None: return "next turn" if meta["provider"] in TURNS else "next start"
         # one restart covers every reason; a pending one for bypassPermissions also goes ahead at a permission prompt
         p["relaunch"] = p.get("relaunch") or why
-        return "after turn" if p["busy"] else "now"
+        return "after turn" if p["busy"] and not p.get("deaf") else "now"
 
 def switching(sid, meta):
     """A live agent that restarts once its current turn ends ("restarting at prompt": or at its next permission prompt, for
@@ -349,6 +388,20 @@ def agent(sid, meta):
     if meta["provider"] != "claude-code" or not p or not running(p) or p["stdin"] is None: return None
     return dict(running=p.get("version"), installed=claude_version())
 
+def listen(sid, meta):
+    """Mark a live Claude Code agent deaf when its transcript logs neither taking words written to its stdin LATE seconds ago
+    into its queue nor the words themselves: an agent that reads its input but stopped acting on it (Claude Code 2.1.327 after
+    a skill reload). The board warns; a restart gives them to it again."""
+    if meta["provider"] != "claude-code" or not (p := PROCS.get(sid)) or not running(p) or not p["stdin"] or not p["given"] or (heard := transcripts.arrived(meta)) is None: return
+    took = (last := transcripts.enqueued(meta)) and transcripts.stamp(last).timestamp()
+    # words count as taken once it logs taking a message after they were written (its log has millisecond times)
+    p["given"] = {i: at for i, at in p["given"].items() if i not in heard and not (took and took >= at-0.001)}
+    deaf = sorted((i for i, at in p["given"].items() if at <= time.time()-LATE), key=lambda i: (i[0], int(i[1:])))
+    if deaf != p.get("deaf", []): print(f"orchestrate: {sid}: its agent {f'has not taken {len(deaf)} words from its stdin: ' + ', '.join(deaf[:8]) if deaf else 'took every word it was given'}", file=sys.stderr)
+    p["deaf"] = deaf
+
+def unheard(sid): return (p := PROCS.get(sid)) and p.get("deaf") or []
+
 def asking(sid, p):
     """A busy agent stuck on a permission prompt, looked up at most every two seconds."""
     if time.time() < p.get("looked", 0) + 2: return False
@@ -357,15 +410,17 @@ def asking(sid, p):
 
 def relaunch(sid, p, why):
     """Start an agent again on the same conversation with the session's current settings: once its turn is over, or at once
-    while it waits on a permission prompt (for bypassPermissions), which then goes away and the agent is told to go on."""
-    mid, waiting = p["busy"], [a["id"] for a in store.open_asks(store.load(sid)) if a["kind"] == "permission"]
+    while it waits on a permission prompt (for bypassPermissions), which then goes away and the agent is told to go on. Words
+    the old agent was given but never showed in its transcript go to the new one again."""
+    mid, waiting, deaf = p["busy"] and not p.get("deaf"), [a["id"] for a in store.open_asks(store.load(sid)) if a["kind"] == "permission"], p.get("deaf")
     stop(sid)
     p["reader"].join(15)
     for ask in waiting: store.emit(sid, "cancel", "orchestrate", ask=ask)
-    start(sid, f"[orchestrate] The user {why}, which restarted you in the middle of your turn; the tool call that waited for approval did not run. Continue where you left off." if mid else None)
+    start(sid, f"[orchestrate] The user {why}, which restarted you in the middle of your turn;{' the tool call that waited for approval did not run.' if waiting else ''} Continue where you left off." if mid else None)
+    if deaf: deliver(sid, deaf)
 
 def stop(sid):
-    with LOCK: p = PROCS.get(sid)
+    with lock(sid): p = PROCS.get(sid)
     if p is None or not running(p):
         for pid in agents(sid): os.killpg(pid, signal.SIGTERM)
         return set_runtime(sid, "stopped", started=True)
@@ -380,7 +435,7 @@ def reconcile():
     live = live_agents()
     for sid in store.session_ids():
         if alive(sid) or not (s := store.peek(sid)) or s["session"]["origin"] != "gui" or s["closed"]: continue
-        with LOCK:
+        with lock(sid):
             if alive(sid): continue
             state = (s["runtime"] or {}).get("state")
             if pids := live.get(sid):
@@ -388,10 +443,10 @@ def reconcile():
             elif s["session"]["provider"] in TURNS and state in OPEN:
                 # between turns a Codex or Muse agent has no process; a turn that ended while no server watched it leaves it resting
                 if state != "idle": set_runtime(sid, "idle", started=True)
-                if store.pending(store.load(sid)): deliver(sid)
+                if store.pending(store.load(sid)): once(f"deliver {sid}", deliver, sid)
             elif state in OPEN:
                 set_runtime(sid, "stopped", started=True)
-                if store.pending(store.load(sid)): deliver(sid)
+                if store.pending(store.load(sid)): once(f"deliver {sid}", deliver, sid)
 
 def spawn(title, cwd, prompt, model=None, effort=None, skills=(), permission=None, parent=None, provider="claude-code"):
     if not (offer := providers().get(provider)): raise ValueError(f"{provider} cannot be started here; installed: {', '.join(providers()) or 'none'}")
@@ -486,18 +541,33 @@ def message(s, found):
 
 DELIVERING = collections.defaultdict(threading.Lock)
 
-def deliver(sid):
-    """Route undelivered user words to the session exactly once. Returns the channel used, or 'pending' when the agent must pull."""
+def deliver(sid, again=()):
+    """Route undelivered user words to the session exactly once, with again the ids to give once more (to a restarted agent whose
+    predecessor never showed them). Returns the channel used, or 'pending' when the agent must pull."""
     with DELIVERING[sid]:
         s = store.load(sid)
-        if not (found := store.pending(s)): return None
+        if not (found := store.pending(s, again=set(again))): return None
         text, meta = message(s, found), s["session"]
+        ids = [p["id"] for p in found]
         # an agent stopped by its usage limit cannot act on them; they go out once the limit resets
-        if transcripts.holding(meta): return "pending"
+        if transcripts.holding(meta): return wait(sid, ids, "its usage limit has not reset")
         if meta["origin"] == "gui":
+            at = time.time()
             try: start(sid, text)
-            except Unreachable: return "pending"
+            except Unreachable as error: return wait(sid, ids, str(error))
             route = "stdin"
-        elif not (route := channels.push(sid, meta, text)): return "pending"
-        store.emit(sid, "deliver", "orchestrate", ids=[p["id"] for p in found], channel=route)
+        elif not (route := channels.push(sid, meta, text)): return wait(sid, ids, "its terminal agent cannot be reached")
+        store.emit(sid, "deliver", "orchestrate", ids=ids, channel=route)
+        print(f"orchestrate: {sid}: gave {', '.join(ids)} via {route}", file=sys.stderr)
+        # what went into a Claude Code agent's stdin must show in its transcript (listen)
+        if route == "stdin" and (p := PROCS.get(sid)) and p["stdin"]: p["given"].update(dict.fromkeys(ids, at))
+        WAITING.pop(sid, None)
         return route
+
+WAITING = {}
+
+def wait(sid, ids, why):
+    """Words that wait are logged once per reason, not on every retry."""
+    if WAITING.get(sid) != (key := (tuple(ids), why)): print(f"orchestrate: {sid}: {', '.join(ids)} wait: {why}", file=sys.stderr)
+    WAITING[sid] = key
+    return "pending"

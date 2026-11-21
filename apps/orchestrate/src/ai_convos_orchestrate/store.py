@@ -297,11 +297,12 @@ def status(s):
     values = set(effective(s).values()) | ({"input"} if open_asks(s) else set()) | ({"working"} if (s["runtime"] or {}).get("state") == "working" else set())
     return next((x for x in PRECEDENCE if x in values), "done" if s["items"] else "idle")
 
-def pending(s, scope=None):
-    """User words the agent has not received yet: comments, answers, and questions the user dismissed, oldest first."""
-    comments = [dict(type="comment", **c) for c in s["comments"].values() if c["delivered"] is None and within(s, c["target"], scope)]
+def pending(s, scope=None, again=()):
+    """User words the agent has not received yet (and those in again, given once more): comments, answers, and questions the
+    user dismissed, oldest first."""
+    comments = [dict(type="comment", **c) for c in s["comments"].values() if (c["delivered"] is None or c["id"] in again) and within(s, c["target"], scope)]
     # cancelled_by exists only on questions cancelled since it was recorded; older ones were all cancelled by orchestrate
-    answers = [dict(type="answer" if a["answer"] else "dismissed", **a) for a in s["asks"].values() if (a["answer"] or a.get("cancelled_by") == "user") and a["delivered"] is None and a["kind"] != "permission" and within(s, a["target"], scope)]
+    answers = [dict(type="answer" if a["answer"] else "dismissed", **a) for a in s["asks"].values() if (a["answer"] or a.get("cancelled_by") == "user") and (a["delivered"] is None or a["id"] in again) and a["kind"] != "permission" and within(s, a["target"], scope)]
     return sorted(comments+answers, key=lambda x: x["answer"]["at"] if x["type"] == "answer" else x["cancelled"] if x["type"] == "dismissed" else x["at"])
 
 def describe(s, entry):

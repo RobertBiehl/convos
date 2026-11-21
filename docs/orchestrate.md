@@ -130,6 +130,20 @@ mid-turn counts only when the agent takes it, a queued Codex message when a turn
 spend nothing on this, so they reply to questions and just act on instructions. The transcript is
 read incrementally, and words count only under their own session's header.
 
+**Not taking messages.** Claude Code logs each message it reads from its stdin entering its queue
+within a second, even in the middle of a long tool call. When a live agent started here has logged
+neither that nor the words two minutes after orchestrate wrote them, the session shows *not taking
+your messages* (in the list, on the model chip, and on the comments it never took), with **Restart
+and resend**: the agent starts again on its conversation at once and gets those words again. This
+caught Claude Code 2.1.327 agents that, after a skill reload, read their input and dropped it.
+
+Each agent's stdin has its own writer thread, every session has its own lock, and the server's
+delivery loop runs each session's delivery, and the pickup of agents, in the background, one run
+at a time each. An agent that stops reading, or a long wait for the archive, therefore holds up only
+its own session. The server log records each delivery (`gave c12 via stdin`), why words wait, agents
+not taking words, and every thread's stack when a background run takes over two minutes;
+`kill -USR1 PID` prints the stacks on demand.
+
 A headless agent outlives the server that started it: its stdin is a named pipe in the session's
 folder, which the agent itself also holds open, and its output goes to a file there. A restarted
 server picks it up again, in or between turns; a Codex or Muse turn is followed to its end the same way. A session never runs two agents: while any agent
