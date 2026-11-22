@@ -181,7 +181,8 @@ def command(sid, meta, resume):
     if meta["provider"] == "muse":
         return ["muse", "exec", "--json", "--session-id", meta["provider_session"], "--model", meta["model"], *(["--reasoning-effort", meta["effort"]] if meta.get("effort") else []),
                 "--approval-mode", "never", "--trust-workspace", *(["--yolo"] if meta.get("permission") == "yolo" else []), "--prompt-file", str(store.sdir(sid)/"prompt.md")]
-    mcp = dict(mcpServers=dict(orchestrate=dict(command=sys.executable, args=["-m", "ai_convos_orchestrate.mcp"], env={k: v for k, v in child_env(sid).items() if k.startswith(("CONVOS_", "PATH", "HOME"))})))
+    # a permission prompt waits up to 6 h for the user (mcp.decide); Claude Code would give up on the tool after 30 min
+    mcp = dict(mcpServers=dict(orchestrate=dict(command=sys.executable, args=["-m", "ai_convos_orchestrate.mcp"], env={k: v for k, v in child_env(sid).items() if k.startswith(("CONVOS_", "PATH", "HOME"))}, timeout=6*3600*1000)))
     return ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--model", meta["model"], *(["--effort", meta["effort"]] if meta.get("effort") else []),
             *(["--resume", meta["provider_session"]] if resume else ["--session-id", meta["provider_session"]]),

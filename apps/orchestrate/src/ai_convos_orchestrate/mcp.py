@@ -3,7 +3,8 @@
 Claude Code calls `permission` (via --permission-prompt-tool) whenever a tool needs approval. The call
 blocks until the user answers in the IDE; "Allow always" is remembered for that tool in this session.
 """
-import json, os, sys
+import json, os, re, sys
+from pathlib import Path
 from . import store
 
 TOOL = dict(name="permission", description="Ask the user in Convos Orchestrate to allow or deny a tool call.",
@@ -15,9 +16,29 @@ def preview(name, data):
     if "file_path" in data: return f"`{data['file_path']}`\n\n```\n{json.dumps({k: v for k, v in data.items() if k != 'file_path'}, indent=1)[:3000]}\n```"
     return f"```json\n{json.dumps(data, indent=1)[:4000]}\n```"
 
+WRITERS, FILES = ("Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"), ("file_path", "notebook_path")
+GUARDED = re.compile(r"""(?:^|[/\s'"=])(?:\.git|hooks)(?:$|[/\s'"])|\.claude""")
+
+def in_worktree(meta, name, data):
+    """In a bypassPermissions session Claude Code still asks for some calls; the user had orchestrate allow those (q11 on
+    o5619965e7ab:i60) that stay inside one of the session's own .claude/worktrees/NAME/ checkouts and name no .git, hooks or
+    .claude path there. A command must start by cd'ing into the checkout; any other place on disk, the home folder, or a way up
+    out of it, and the call still comes to the user."""
+    if meta.get("permission") != "bypassPermissions" or name not in WRITERS: return False
+    root = re.escape(str(Path(meta["cwd"])/".claude"/"worktrees")) + r"""/[^/\s'"]+"""
+    text = data.get("command") if name == "Bash" else next((data[k] for k in FILES if k in data), None)
+    if not isinstance(text, str) or not re.match(rf"""\s*cd\s+['"]?{root}(?:[/'"]|\s|$)""" if name == "Bash" else rf"{root}/", text): return False
+    rest = re.sub(root, "WT", text).replace("/dev/null", "")
+    tops = "|".join(re.escape(x) for x in os.listdir("/"))
+    return not (GUARDED.search(rest) or re.search(rf"(?<![\w.$-])/(?:{tops})(?:/|\b)", rest) or re.search(r"""(?:^|[\s'"=:(])~/|\bcd\s+~(?:\s|$)|\$\{?HOME\b|(?:^|[/\s'"])\.\.(?:[/\s'"]|$)""", rest))
+
 def decide(sid, args):
     name, data = args["tool_name"], args.get("input", {})
-    if name in store.load(sid)["session"].get("allow", []): return dict(behavior="allow", updatedInput=data)
+    meta = store.load(sid)["session"]
+    if name in meta.get("allow", []): return dict(behavior="allow", updatedInput=data)
+    if in_worktree(meta, name, data):
+        with (store.sdir(sid)/"allowed.jsonl").open("a") as log: log.write(json.dumps(dict(at=store.now(), tool=name, input=data)) + "\n")
+        return dict(behavior="allow", updatedInput=data)
     s, e = store.emit(sid, "ask", "agent", f"Allow {name}?", target=None, options=OPTIONS, multi=False, ask_kind="permission", detail=preview(name, data))
     s, answer = store.wait_for(sid, lambda s: s["asks"][e["ask"]]["answer"] or s["asks"][e["ask"]]["cancelled"], 6*3600)
     if not answer:
