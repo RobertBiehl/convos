@@ -364,11 +364,16 @@ function moveResult(delta) {
   const list = rowResults(), it = selected(); if (!list.length) return;
   S.res[resKey(it?.id)] = Math.max(0, Math.min(list.length - 1, resIdx(it?.id) + delta)); paint();
 }
+// links open in the browser; an app or command an agent attached starts on this Mac, through the server
+const outside = (r) => r.kind === "link" || r.kind === "app";
+const launchApp = async (a) => { if (await act({ kind: "launch", attachment: a.id })) toast(a.run ? `Running in a new Terminal window: ${a.run}` : `Opening ${a.name}`); };
+const openOutside = (r) => r.kind === "app" ? launchApp(r) : window.open(r.url, "_blank", "noopener,noreferrer");
+const appTitle = (a) => a.run ? `Runs in a new Terminal window, in ${home(a.cwd)}:\n${a.run}` : `Opens ${home(a.path)}`;
 function look() { if (rowResults().length || selected()) set({ overlay: { kind: "look" } }); }
 function openSelected() {
   const list = rowResults(), a = list[Math.min(list.length - 1, resIdx(selected()?.id))];
   if (!a) return false;
-  if (a.kind === "link") window.open(a.url, "_blank", "noopener,noreferrer"); else set({ overlay: { kind: "look" } });
+  if (outside(a)) openOutside(a); else set({ overlay: { kind: "look" } });
   return true;
 }
 function focusComposer() {
@@ -450,7 +455,7 @@ function evidence(d, a) {
 }
 function lookEvidence(a, list, n) {
   const r = list[n];
-  if (r.kind === "link") return window.open(r.url, "_blank", "noopener,noreferrer");
+  if (outside(r)) return openOutside(r);
   markSeen([...new Set(list.map((x) => x.target).filter(Boolean))]);
   set({ overlay: { kind: "look", files: list, i: n, label: `What ${a.id} rests on · ${clip(a.text, 80)}` } });
 }
@@ -534,7 +539,7 @@ function onKey(e) {
     }
     if (k === "Enter" && a) { e.preventDefault(); return answer(a, S.askPick[a.id] || [], document.querySelector(`[data-ask="${a.id}"] input`)?.value || ""); }
     if (k === "Tab" && a) { e.preventDefault(); return document.querySelector(`[data-ask="${a.id}"] input`)?.focus(); }
-    if (k === " " && a) { const ev = evidence(d, a), n = ev.findIndex((r) => r.kind !== "link"); e.preventDefault(); return n >= 0 && lookEvidence(a, ev, n); }
+    if (k === " " && a) { const ev = evidence(d, a), n = ev.findIndex((r) => !outside(r)); e.preventDefault(); return n >= 0 && lookEvidence(a, ev, n); }
     if ((k === "Backspace" || k === "Delete") && a && a.kind !== "permission") { e.preventDefault(); return dismiss(a); }
     if (k === "Escape") return set({ askFocus: null });
   }
@@ -733,7 +738,7 @@ function Question({ a, d, here }) {
     ${a.detail ? html`<${Md} text=${a.detail} cls="qd" />` : null}
     ${a.options.length ? html`<div class="opts">${a.options.map((o, i) => html`<button class="opt ${pick.includes(o) ? "on" : ""}" onClick=${(e) => { e.stopPropagation(); if (!a.multi) return answer(a, [o], note.current?.value || ""); S.askPick[a.id] = pick.includes(o) ? pick.filter((x) => x !== o) : [...pick, o]; paint(); }}>${focus && i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${o}</button>`)}</div>` : null}
     ${focus || !a.options.length ? html`<div class="note"><input ref=${note} placeholder=${a.kind === "action" ? "Optional note: what you saw, why you can't" : a.options.length ? "Optional note" : "Your answer"} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); answer(a, pick, e.target.value); } if (e.key === "Escape") { e.target.blur(); set({ askFocus: null }); } }} /><button class="abtn primary" onClick=${(e) => { e.stopPropagation(); answer(a, pick, note.current?.value || ""); }}>Send ${K("↵")}</button></div>` : null}
-    ${focus ? html`<div style="margin-top:8px;color:var(--faint);font-size:11.5px;display:flex;flex-wrap:wrap;gap:6px 14px"><${Hot} k=${a.options.length ? ["1", "…", String(Math.min(9, a.options.length))] : "Tab"}>${a.multi ? "toggle" : "choose"}<//><${Hot} k="Tab">note<//><${Hot} k="↵">send<//>${ev.some((x) => x.kind !== "link") ? html`<${Hot} k="Space">results<//>` : null}${many ? html`<${Hot} k="a">next question<//>` : null}${a.kind !== "permission" ? html`<${Hot} k="⌫">dismiss<//>` : null}<${Hot} k="Esc">later<//></div>` : null}
+    ${focus ? html`<div style="margin-top:8px;color:var(--faint);font-size:11.5px;display:flex;flex-wrap:wrap;gap:6px 14px"><${Hot} k=${a.options.length ? ["1", "…", String(Math.min(9, a.options.length))] : "Tab"}>${a.multi ? "toggle" : "choose"}<//><${Hot} k="Tab">note<//><${Hot} k="↵">send<//>${ev.some((x) => !outside(x)) ? html`<${Hot} k="Space">results<//>` : null}${many ? html`<${Hot} k="a">next question<//>` : null}${a.kind !== "permission" ? html`<${Hot} k="⌫">dismiss<//>` : null}<${Hot} k="Esc">later<//></div>` : null}
   </div>`;
 }
 
@@ -747,10 +752,10 @@ const linkLabel = (url) => {
 // the small preview of a result everywhere: images as themselves, videos as their first frame with a play badge, others as a glyph
 const thumbOf = (a, alt = "") => a.kind === "image" ? html`<img src=${blobUrl(a)} alt=${alt} loading="lazy" />`
   : a.kind === "video" ? html`<span class="vthumb"><video src=${blobUrl(a) + "#t=0.1"} preload="metadata" muted playsinline />${G.play}</span>`
-  : a.kind === "link" ? G.link : a.kind === "pdf" ? G.pdf : a.kind === "html" ? G.page : G.file;
+  : a.kind === "link" ? G.link : a.kind === "app" ? G.play : a.kind === "pdf" ? G.pdf : a.kind === "html" ? G.page : G.file;
 function ResultChip({ a, on, onOpen, tag }) {
   const label = a.kind === "link" ? linkLabel(a.url) : a.caption || a.name;
-  return html`<button class="rchip k-${a.kind} ${on ? "on" : ""}" title=${a.kind === "link" ? a.url : a.name} onClick=${(e) => { e.stopPropagation(); onOpen(); }}>
+  return html`<button class="rchip k-${a.kind} ${on ? "on" : ""}" title=${a.kind === "link" ? a.url : a.kind === "app" ? appTitle(a) : a.name} onClick=${(e) => { e.stopPropagation(); onOpen(); }}>
     ${thumbOf(a)}<span>${tag ? html`<b class="tag">${a.id}</b>` : null}${label}</span></button>`;
 }
 
@@ -846,6 +851,7 @@ function Board({ s, d }) {
 function Result({ a, target, i, on }) {
   const [text, setText] = useState(null);
   useEffect(() => { if (a.kind === "markdown" || a.kind === "text") fetch(blobUrl(a)).then((r) => r.text()).then(setText).catch(() => setText("(unavailable)")); }, [a.hash]);
+  if (a.kind === "app") return html`<button class="res app ${on ? "focus" : ""}" title=${appTitle(a)} onClick=${() => launchApp(a)}><div class="thumb">${G.play}</div><div class="cap">${a.caption || a.name}</div></button>`;
   if (a.kind === "link") return html`<a class="res ${on ? "focus" : ""}" href=${a.url} target="_blank" rel="noopener noreferrer"><div class="thumb">${G.link}</div><div class="cap" title=${a.url}>${a.caption || a.name}</div></a>`;
   if (a.kind === "markdown" || a.kind === "text") return html`<div class="res wide ${on ? "focus" : ""}"><div class="cap" style="display:flex;gap:6px;cursor:pointer" onClick=${() => openResult(target, i)}>${a.name}${a.caption ? html`<span style="color:var(--faint)">· ${a.caption}</span>` : null}</div><div class="mdbox">${text === null ? "…" : a.kind === "markdown" ? html`<${Md} text=${text} />` : html`<pre style="margin:0;white-space:pre-wrap;font:11.5px var(--mono)">${text}</pre>`}</div></div>`;
   return html`<button class="res ${on ? "focus" : ""}" onClick=${() => openResult(target, i)}><div class="thumb">${thumbOf(a, a.name)}</div><div class="cap" title=${a.name}>${a.caption || a.name}</div></button>`;
@@ -1179,7 +1185,7 @@ function Look() {
     if (z?.seek && e.shiftKey && (k === "ArrowLeft" || k === "ArrowRight")) { e.preventDefault(); z.seek(k === "ArrowLeft" ? -5 : 5); return true; }
     if (z?.pan && e.shiftKey && k.startsWith("Arrow")) { e.preventDefault(); z.pan(...{ ArrowLeft: [120, 0], ArrowRight: [-120, 0], ArrowUp: [0, 120], ArrowDown: [0, -120] }[k]); return true; }
     const run = { "+": () => z?.zoom?.(1.25), "=": () => z?.zoom?.(1.25), "-": () => z?.zoom?.(0.8), "0": () => z?.fit?.(), p: () => z?.toggle?.(), m: () => z?.mute?.(), " ": () => set({ overlay: null }), Escape: () => set({ overlay: null }), ArrowRight: () => step(1), l: () => step(1), ArrowLeft: () => step(-1), h: () => step(-1),
-      ArrowDown: () => row(1), j: () => row(1), ArrowUp: () => row(-1), k: () => row(-1), Enter: () => a && (a.kind === "link" ? window.open(a.url, "_blank", "noopener,noreferrer") : window.open(blobUrl(a), "_blank", "noopener")) }[k];
+      ArrowDown: () => row(1), j: () => row(1), ArrowUp: () => row(-1), k: () => row(-1), Enter: () => a && (outside(a) ? openOutside(a) : window.open(blobUrl(a), "_blank", "noopener")) }[k];
     if (run) { e.preventDefault(); run(); }
     return true;
   });
@@ -1196,6 +1202,7 @@ function Look() {
         : a.kind === "pdf" ? html`<iframe src=${blobUrl(a)} title=${a.name} />`
         : a.kind === "html" ? html`<iframe class="page" src=${blobUrl(a)} title=${a.name} sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" />`
         : a.kind === "link" ? html`<div class="doc" style="height:auto"><div style="color:var(--faint);margin-bottom:6px">${linkLabel(a.url)}</div><h2 style="margin:0 0 10px">${a.caption || a.name}</h2><a href=${a.url} target="_blank" rel="noopener noreferrer" style="word-break:break-all">${a.url}</a><p style="color:var(--faint);margin-top:14px">${K("↵")} opens it in your browser.</p></div>`
+        : a.kind === "app" ? html`<div class="doc" style="height:auto"><h2 style="margin:0 0 10px">${a.caption || a.name}</h2><pre style="white-space:pre-wrap;font:12px var(--mono)">${appTitle(a)}</pre><button class="abtn primary" onClick=${() => launchApp(a)}>${a.run ? "Run" : "Open"}</button><p style="color:var(--faint);margin-top:14px">${K("↵")} ${a.run ? "runs it in a new Terminal window" : "opens it on this Mac"}.</p></div>`
         : a.kind === "markdown" ? html`<div class="doc">${text === null ? "…" : html`<${Md} text=${text} />`}</div>`
         : a.kind === "text" ? html`<div class="doc"><pre style="white-space:pre-wrap;font:12px var(--mono)">${text}</pre></div>`
         : html`<div class="doc" style="height:auto"><h2 style="margin:0 0 10px">${a.name}</h2><a href=${blobUrl(a)} download=${a.name}>Download</a></div>`}

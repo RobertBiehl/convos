@@ -3,7 +3,7 @@
 Binds loopback only. Every API request needs the per-server token (set as a SameSite=Strict cookie by
 the launch URL), a loopback Host header, and, for writes, a custom header no cross-site form can send.
 """
-import base64, collections, faulthandler, hashlib, hmac, http.server, json, os, re, secrets, signal, socket, subprocess, sys, threading, time, urllib.parse, webbrowser
+import base64, collections, faulthandler, hashlib, hmac, http.server, json, os, re, secrets, shlex, signal, socket, subprocess, sys, threading, time, urllib.parse, webbrowser
 from pathlib import Path
 from . import store, runtime, channels, overview, transcripts
 
@@ -115,6 +115,7 @@ def act(body):
         background(runtime.start, sid, "[orchestrate] The user resumed this session. Check your board (convos orchestrate show) and continue where you left off.")
         return dict(ok=True)
     if kind == "deliver": return dict(channel=runtime.deliver(sid))
+    if kind == "launch": return dict(ok=start_result(sid, store.load(sid)["attachments"][body["attachment"]]))
     if kind == "permission": return dict(applies=runtime.permit(sid, body["permission"], bool(body.get("confirm"))))
     if kind == "tune": return dict(applies=runtime.tune(sid, body["model"], body.get("effort")))
     if kind == "restart": return dict(applies=runtime.restart(sid))
@@ -255,6 +256,18 @@ def notify_parent(s, state):
     text = f"Child session {meta['id']} ({meta['title']!r}) is now {store.STATUS_LABEL.get(state, state)}. Inspect it with: convos orchestrate -s {meta['id']} show"
     store.emit(psid, "comment", "orchestrate", text, target=target, reply_to=None)
     background(runtime.deliver, psid)
+
+def start_result(sid, a):
+    """Start what an agent attached for the user: an app (or file) with macOS open, a command in a new Terminal window, run by
+    the user's shell in the folder it was attached from. A .command file needs no permission to control Terminal."""
+    if a["kind"] != "app": raise ValueError(f"{a['id']} is not an app or command")
+    if a["path"] and not Path(a["path"]).exists(): raise ValueError(f"{a['path']} no longer exists")
+    if not a["path"]:
+        store.core.secure_dir((path := store.sdir(sid)/"launch"/f"{a['id']}.command").parent)
+        path.write_text(f"#!{os.environ.get('SHELL', '/bin/zsh')} -il\ncd {shlex.quote(a['cwd'])} && {a['run']}\n")
+        path.chmod(0o700)
+    if (done := subprocess.run(["open", a["path"] or str(path)], capture_output=True, text=True, timeout=30)).returncode: raise ValueError(f"open failed: {done.stderr.strip()}")
+    return True
 
 NUDGED = set()
 

@@ -28,6 +28,8 @@ detected, pass `-s SESSION` on every later command.
 | `now "TEXT"` | One-line live activity for the session ("Running the test suite"). `now ""` clears. |
 | `attach FILE_OR_URL --on ITEM [--caption C] [--replaces aN]` | Append a result: image, video, PDF, markdown, any file, or a link. `--replaces` puts a newer version in place of an older result on the same row. |
 | `attach --text MARKDOWN --on ITEM --name NAME.md` | Append an inline markdown result. |
+| `attach --open PATH --on ITEM [--caption C]` | A result the user starts with one click: an app (or any file or folder) opens on their Mac. |
+| `attach --run "COMMAND" --on ITEM [--caption C]` | A result the user starts with one click: the command runs in a new Terminal window, in your current folder. |
 | `say "TEXT" [--on ITEM] [--reply COMMENT]` | Write in the session chat, or in an item's thread. |
 | `ask "QUESTION" [-o A -o B] [--multi] [--on ITEM] [--detail MD] [--wait SEC]` | Ask the user. The item shows *needs you* until answered. |
 | `need "WHAT THE USER DOES" [--on ITEM] [--detail MD] [--wait SEC]` | Ask the user to do something only they can. The item shows *needs you* until they mark it Done or Can't. |
@@ -121,6 +123,11 @@ session under that row, with its own board.
 Prefer attaching the real artifact (a screenshot, a screen recording, the generated PDF,
 the report file) over describing it. Attach an HTML page as the page itself (`attach proposal.html`):
 the IDE renders it in Quick Look, scripts included, so do not also attach screenshots of it. Videos play in the IDE as MP4 (H.264) or WebM. Links to PRs, commits, and dashboards are results too.
+
+When the user should try something themselves (a build to play-test, a tool to run), attach it so it starts
+with one click instead of a path they copy into a terminal: `attach --open build/Game.app --on i4 --caption "Play build 9"`
+for an app, or `attach --run "make demo" --on i4` for a command. Then name the result in your `need`
+(`need "Play-test build 9 (a12)" --on i4`), so its button sits on the request.
 
 A row shows its results on one line, newest first, so keep each row to a handful. A newer version of a
 result (a revised design, a re-run measurement) replaces the old one: `attach design-v2.md --on i4 --replaces a7`.

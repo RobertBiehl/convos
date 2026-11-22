@@ -166,11 +166,17 @@ MANY = 8
 def attach(ctx: typer.Context, source: str = typer.Argument(None, help="File path or URL"), on: str = typer.Option(None, "--on", help="Item; omit for the session"),
            text: str = typer.Option(None, "--text", help="Inline markdown result instead of a file; '-' reads stdin"),
            name: str = typer.Option(None, "--name"), caption: str = typer.Option("", "--caption"),
-           replaces: str = typer.Option(None, "--replaces", help="A result on the same row this one supersedes (a newer version); it leaves the row")):
-    """Append a result to an item: image, PDF, markdown, any file, or a link."""
-    if (source is None) == (text is None): raise ValueError("Pass exactly one of SOURCE or --text")
+           replaces: str = typer.Option(None, "--replaces", help="A result on the same row this one supersedes (a newer version); it leaves the row"),
+           app: str = typer.Option(None, "--open", help="An app (or any file or folder) the user opens with one click on the board"),
+           run: str = typer.Option(None, "--run", help="A command the user runs with one click, in a new Terminal window in this folder")):
+    """Append a result to an item: image, PDF, markdown, any file, a link, or an app or command the user starts from the board."""
+    if sum(x is not None for x in (source, text, app, run)) != 1: raise ValueError("Pass exactly one of SOURCE, --text, --open or --run")
     target = on or ctx.obj["scope"]
-    if source and source.split(":", 1)[0] in ("http", "https"):
+    if app is not None or run is not None:
+        # nothing is copied: the board starts the app where it is, or the command in the folder it was attached from
+        if app is not None and not (path := Path(app).expanduser().resolve()).exists(): raise ValueError(f"No such app or file: {app}")
+        meta, blob = dict(kind="app", name=name or (path.name if app is not None else run), mime=None, size=None, hash=None, url=None, path=str(path) if app is not None else None, run=run, cwd=os.getcwd()), None
+    elif source.split(":", 1)[0] in ("http", "https"):
         meta, blob = dict(kind="link", name=name or source, mime=None, size=None, hash=None, url=source), None
     else:
         path = None if text is not None else Path(source).expanduser()

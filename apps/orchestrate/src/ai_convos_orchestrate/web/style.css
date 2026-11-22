@@ -279,6 +279,7 @@ button.badge { cursor: pointer; }
 .rchip:hover { color: var(--text); border-color: var(--line2); }
 .rchip.on { color: var(--text); border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-bg); }
 .rchip.k-link svg { color: var(--accent); }
+.rchip.k-app svg, .res.app .thumb svg { color: var(--accent); }
 .rchip.k-pdf svg { color: var(--failed); }
 .rchip.k-session { padding-left: 7px; border-style: dashed; }
 .irow > .rrow.line { grid-column: 2 / -1; grid-row: 2; margin-top: -4px; min-width: 0; flex-wrap: nowrap; overflow: hidden; }
