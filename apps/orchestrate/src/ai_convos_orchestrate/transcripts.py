@@ -2,10 +2,10 @@
 words have reached it.
 
 Claude Code keeps projects/*/SESSION.jsonl under its config dir; Codex keeps sessions/YYYY/MM/DD/rollout-*-THREAD.jsonl.
-For limits the latest turn decides: a session stays interrupted until it replies again. Nothing is stored; a transcript
-is read again only when it changes.
+For limits the latest turn decides: a session stays interrupted until it replies again. A transcript is read again only
+when it changes, and how far its words were read is kept in heard.json, so a restarted server does not read gigabytes again.
 """
-import datetime as dt, json, os, re, threading, time, zoneinfo
+import datetime as dt, functools, json, os, re, threading, time, zoneinfo
 from pathlib import Path
 from . import store
 
@@ -15,7 +15,8 @@ CLAUDE = re.compile(r"resets (?:([A-Z][a-z]{2}) (\d{1,2}),? (?:at )?)?(\d{1,2})(
 # "try again at 2:59 AM.", "try again at Sep 7th, 2026 7:41 AM." (this machine's local time)
 CODEX = re.compile(r"try again at (?:([A-Z][a-z]{2}) (\d{1,2})(?:st|nd|rd|th)?,? (\d{4}),? )?(\d{1,2}):(\d{2})\s*([AP]M)")
 GRACE = 60  # the provider shows its reset to the minute; held words go out a minute after it
-FOUND, STATE, SEEN, LOCK = {}, {}, {}, threading.Lock()
+FOUND, STATE, SEEN, LOCKS, SAVED, SAVE = {}, {}, {}, {}, {}, threading.Lock()
+SAVE_EVERY = 1 << 26  # bytes read between saves of heard.json: the most a restart reads again of one transcript
 # how the user's words read wherever they reach an agent (a pushed message, inbox output, hook context): a line of the
 # message starting "- c5 user comment". A literal start keeps the scan at gigabytes per second.
 WORDS = re.compile(rb'- ([cq]\d+) (?:user comment|answered on|dismissed by the user|orchestrate notice)')
@@ -129,16 +130,35 @@ def heard(data, i, sid):
     head = data.rfind(b"(session o", start, i)
     return (data[i-1:i] == b'"' or data[i-2:i] == b"\\n") and not data.startswith(QUEUED, start) and (head < 0 or data.startswith(sid, head+9))
 
+@functools.cache
+def remembered():
+    """How far earlier servers read each transcript: {path: (offset, ids, last enqueue, inode)}."""
+    try: return {Path(k): (offset, frozenset(ids), last, ino) for k, (offset, ids, last, ino) in json.loads((store.root()/"heard.json").read_text()).items()}
+    except (OSError, ValueError): return {}
+
+def save():
+    with SAVE:
+        known = {**remembered(), **SEEN}  # one copy: other threads keep reading transcripts meanwhile
+        (tmp := store.root()/"heard.json.tmp").write_text(json.dumps({str(k): [offset, sorted(ids), last, ino] for k, (offset, ids, last, ino) in known.items()}))
+        tmp.replace(store.root()/"heard.json")
+        SAVED.update((k, v[0]) for k, v in known.items())
+
 def arrived(meta):
     """Ids of the user's words this session's agent has in its context: its own transcript shows them. Codex logs a queued
     message only once a turn takes it; Claude Code logs a message it queues mid-turn twice, and only the second time is the
-    agent's. Read incrementally, so a long transcript is read whole once; None when there is no transcript to read."""
+    agent's. Read incrementally from where the last read stopped, even in an earlier server (a transcript only grows; another
+    file under its name starts over); one transcript's first read does not hold up the others. None without a transcript."""
     if not (path := transcript(meta)): return None
     sid = meta["id"].encode()
-    with LOCK:
-        offset, ids, last = SEEN.get(path, (0, frozenset(), None))
+    with LOCKS.setdefault(path, threading.Lock()):
+        try: st = path.stat()
+        except OSError: return SEEN.get(path, (0, frozenset()))[1]
+        before = SEEN.get(path) or remembered().get(path)
+        offset, ids, last, ino = before if before and before[3] == st.st_ino else (0, frozenset(), None, st.st_ino)
+        if st.st_size <= offset:
+            SEEN[path] = (offset, ids, last, ino)
+            return ids
         try:
-            if path.stat().st_size <= offset: return ids
             with path.open("rb") as f:
                 f.seek(offset)
                 rest, found = b"", set()
@@ -149,8 +169,9 @@ def arrived(meta):
                     last = max((m[1].decode() for m in ENQUEUED.finditer(data, 0, end)), default=last)
                     offset, rest = offset+end, data[end:]
         except OSError: return ids
-        SEEN[path] = (offset, ids := ids | found, last)
-        return ids
+        SEEN[path] = (offset, ids | found, last, ino)
+    if found - ids or last != (before or (0, 0, None))[2] or offset-SAVED.get(path, 0) >= SAVE_EVERY: save()
+    return ids | found
 
 def enqueued(meta):
     """When a Claude Code agent last took a message from its stdin into its queue, as its transcript logs it; None before any."""
