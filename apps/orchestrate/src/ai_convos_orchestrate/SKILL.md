@@ -122,6 +122,13 @@ is invisible to the user unless it joins. Put this in its brief, with the orches
 `convos orchestrate join --title "ITS GOAL" --parent SESSION:ITEM`. It then shows as a child
 session under that row, with its own board.
 
+## Worktrees
+
+Every project keeps its git worktrees in one place: `.claude/worktrees/NAME` in the repo's main checkout (the
+first path `git worktree list` prints), where Claude Code puts its own. Make yours there, run from the main
+checkout: `git worktree add .claude/worktrees/NAME -b BRANCH`. Never put one beside the repo (in `~/Workspace`)
+or in a folder of your own choosing, and leave alone the checkouts other sessions made elsewhere.
+
 ## Results
 
 Prefer attaching the real artifact (a screenshot, a screen recording, the generated PDF,

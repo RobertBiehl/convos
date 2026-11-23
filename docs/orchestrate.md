@@ -109,6 +109,12 @@ path it can open.
 `convos orchestrate --scope ITEM --as NAME`, and every write is then confined to that
 item's subtree. Writes outside the subtree are refused.
 
+**Worktrees live in one place per project.** The skill tells agents to make every git worktree at
+`.claude/worktrees/NAME` in the repo's main checkout, where Claude Code puts its own, and never beside
+the repo in `~/Workspace`. Git ignores that folder once `**/.claude/worktrees/` is in the global
+excludes file (`~/.config/git/ignore`); Claude Code also adds it to a repo's `.git/info/exclude`
+when it first makes one there.
+
 **Sessions are hierarchical.** A session records its parent `SESSION[:ITEM]`. The IDE
 nests children under their parent and shows them on the parent's row. Agents make children
 with `spawn --on ITEM`; a session the user starts stands alone unless its dialog's *Part of*
@@ -181,11 +187,11 @@ for your answer; the tool is configured with that timeout, since Claude Code oth
 after 30 minutes.
 
 Claude Code still asks for some calls in a session set to *bypassPermissions*. Orchestrate allows
-those itself when they stay inside one of the session's own `.claude/worktrees/NAME/` checkouts. An
-`Edit` or `Write` qualifies when its file lies there. A `Bash` command qualifies when it starts by
-`cd`-ing into the checkout and names no other place on disk, no `~/` or `$HOME`, and no `..`.
-Either way, it must name no `.git`, `hooks` or `.claude` path inside the checkout. Everything else
-still comes to you. Each call allowed this way is logged in `allowed.jsonl` in the session's folder.
+those itself when they stay inside one git worktree of the session's repo, as `git worktree list`
+names them, the main checkout included. An `Edit` or `Write` qualifies when its file lies there. A
+`Bash` command qualifies when it starts by `cd`-ing into the worktree and names no other place on
+disk, no `~/` or `$HOME`, and no `..`. Either way, it must name no `.git`, `hooks` or `.claude` path
+inside the worktree. Everything else still comes to you. Each call allowed this way is logged in `allowed.jsonl` in the session's folder.
 The rule applies to agents started after the change.
 
 ## Storage

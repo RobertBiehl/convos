@@ -3,7 +3,7 @@
 Claude Code calls `permission` (via --permission-prompt-tool) whenever a tool needs approval. The call
 blocks until the user answers in the IDE; "Allow always" is remembered for that tool in this session.
 """
-import json, os, re, sys
+import json, os, re, subprocess, sys
 from pathlib import Path
 from . import store
 
@@ -19,15 +19,21 @@ def preview(name, data):
 WRITERS, FILES = ("Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"), ("file_path", "notebook_path")
 GUARDED = re.compile(r"""(?:^|[/\s'"=])(?:\.git|hooks)(?:$|[/\s'"])|\.claude""")
 
+def worktrees(cwd):
+    """Every checkout of the repo cwd lies in, its main one included, as git lists them; none outside a repo."""
+    out = subprocess.run(["git", "-C", cwd, "worktree", "list", "--porcelain"], capture_output=True, text=True).stdout
+    return [line.removeprefix("worktree ") for line in out.splitlines() if line.startswith("worktree ")]
+
 def in_worktree(meta, name, data):
-    """In a bypassPermissions session Claude Code still asks for some calls; the user had orchestrate allow those (q11 on
-    o5619965e7ab:i60) that stay inside one of the session's own .claude/worktrees/NAME/ checkouts and name no .git, hooks or
-    .claude path there. A command must start by cd'ing into the checkout; any other place on disk, the home folder, or a way up
-    out of it, and the call still comes to the user."""
+    """In a bypassPermissions session Claude Code still asks for some calls; the user had orchestrate allow those (q11, q13 on
+    o5619965e7ab:i60) that stay inside one git worktree of the session's repo, wherever it lies, and name no .git, hooks or .claude
+    path there. A command must start by cd'ing into the worktree; any other place on disk, the home folder, or a way up out of it,
+    and the call still comes to the user."""
     if meta.get("permission") != "bypassPermissions" or name not in WRITERS: return False
-    root = re.escape(str(Path(meta["cwd"])/".claude"/"worktrees")) + r"""/[^/\s'"]+"""
     text = data.get("command") if name == "Bash" else next((data[k] for k in FILES if k in data), None)
-    if not isinstance(text, str) or not re.match(rf"""\s*cd\s+['"]?{root}(?:[/'"]|\s|$)""" if name == "Bash" else rf"{root}/", text): return False
+    if not isinstance(text, str) or not (roots := worktrees(meta["cwd"])): return False
+    root = "(?:" + "|".join(re.escape(r) for r in sorted(roots, key=len, reverse=True)) + r""")(?=[/\s'"]|$)"""
+    if not re.match(rf"""\s*cd\s+['"]?{root}""" if name == "Bash" else rf"{root}/", text): return False
     rest = re.sub(root, "WT", text).replace("/dev/null", "")
     tops = "|".join(re.escape(x) for x in os.listdir("/"))
     return not (GUARDED.search(rest) or re.search(rf"(?<![\w.$-])/(?:{tops})(?:/|\b)", rest) or re.search(r"""(?:^|[\s'"=:(])~/|\bcd\s+~(?:\s|$)|\$\{?HOME\b|(?:^|[/\s'"])\.\.(?:[/\s'"]|$)""", rest))
