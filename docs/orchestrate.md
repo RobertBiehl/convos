@@ -203,6 +203,9 @@ closes. Attachments are content-addressed archive attachments. Projections under
 `~/.convos/orchestrate/sessions/*/view.json` are disposable caches rebuilt from the
 archive when missing or dirty. Provider socket endpoints are local working state, never
 archive data.
+`~/.convos/orchestrate/heard.json` records how far each provider transcript has been read for
+the user's words (✓✓ received). After a restart the server resumes from there, as long as the file
+is still the same one, instead of reading transcripts of a gigabyte or more from the start.
 
 ## The IDE
 
