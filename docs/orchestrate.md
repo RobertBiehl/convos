@@ -193,8 +193,10 @@ after 30 minutes.
 Claude Code still asks for some calls in a session set to *bypassPermissions*. Orchestrate allows
 those itself when they stay inside one git worktree of the session's repo, as `git worktree list`
 names them, the main checkout included. An `Edit` or `Write` qualifies when its file lies there. A
-`Bash` command qualifies when it starts by `cd`-ing into the worktree and names no other place on
-disk, no `~/` or `$HOME`, and no `..`. Either way, it must name no `.git`, `hooks` or `.claude` path
+`Bash` command qualifies when it starts by `cd`-ing into the worktree, or when the agent's shell is
+already in one (Claude Code keeps the last `cd` and records that folder in its transcript on the
+call, before it asks), and names no other place on disk, no `~/`, `$HOME` or `$OLDPWD`, no bare
+`cd`, `cd -` or `popd`, and no `..`. Either way, it must name no `.git`, `hooks` or `.claude` path
 inside the worktree. Everything else still comes to you. Each call allowed this way is logged in `allowed.jsonl` in the session's folder.
 The rule applies to agents started after the change.
 

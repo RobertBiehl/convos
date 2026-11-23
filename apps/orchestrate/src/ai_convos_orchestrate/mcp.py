@@ -5,7 +5,7 @@ blocks until the user answers in the IDE; "Allow always" is remembered for that 
 """
 import json, os, re, subprocess, sys
 from pathlib import Path
-from . import store
+from . import store, transcripts
 
 TOOL = dict(name="permission", description="Ask the user in Convos Orchestrate to allow or deny a tool call.",
             inputSchema=dict(type="object", properties=dict(tool_name=dict(type="string"), input=dict(type="object"), tool_use_id=dict(type="string")), required=["tool_name", "input"]))
@@ -24,25 +24,33 @@ def worktrees(cwd):
     out = subprocess.run(["git", "-C", cwd, "worktree", "list", "--porcelain"], capture_output=True, text=True).stdout
     return [line.removeprefix("worktree ") for line in out.splitlines() if line.startswith("worktree ")]
 
-def in_worktree(meta, name, data):
+def shell_cwd(meta, call):
+    """The folder a Claude Code Bash call runs in: the shell keeps its last cd, and the transcript records that folder on the
+    entry that makes the call, which is written before the permission prompt comes."""
+    if not call or not (path := transcripts.transcript(meta)): return None
+    entries = (e for line in reversed(transcripts.tail(path, 1 << 23)) if call.encode() in line and (e := transcripts.entry(line)))
+    return next((e.get("cwd") for e in entries if e.get("type") == "assistant"), None)
+
+def in_worktree(meta, name, data, call=None):
     """In a bypassPermissions session Claude Code still asks for some calls; the user had orchestrate allow those (q11, q13 on
     o5619965e7ab:i60) that stay inside one git worktree of the session's repo, wherever it lies, and name no .git, hooks or .claude
-    path there. A command must start by cd'ing into the worktree; any other place on disk, the home folder, or a way up out of it,
-    and the call still comes to the user."""
+    path there. A command must start by cd'ing into the worktree, or run where the shell already is inside one (c271); any other
+    place on disk, the home folder, a bare or backward cd, or a way up out of it, and the call still comes to the user."""
     if meta.get("permission") != "bypassPermissions" or name not in WRITERS: return False
     text = data.get("command") if name == "Bash" else next((data[k] for k in FILES if k in data), None)
     if not isinstance(text, str) or not (roots := worktrees(meta["cwd"])): return False
     root = "(?:" + "|".join(re.escape(r) for r in sorted(roots, key=len, reverse=True)) + r""")(?=[/\s'"]|$)"""
-    if not re.match(rf"""\s*cd\s+['"]?{root}""" if name == "Bash" else rf"{root}/", text): return False
+    if name != "Bash" and not re.match(rf"{root}/", text): return False
+    if name == "Bash" and not re.match(rf"""\s*cd\s+['"]?{root}""", text) and not ((here := shell_cwd(meta, call)) and re.match(root, here)): return False
     rest = re.sub(root, "WT", text).replace("/dev/null", "")
     tops = "|".join(re.escape(x) for x in os.listdir("/"))
-    return not (GUARDED.search(rest) or re.search(rf"(?<![\w.$-])/(?:{tops})(?:/|\b)", rest) or re.search(r"""(?:^|[\s'"=:(])~/|\bcd\s+~(?:\s|$)|\$\{?HOME\b|(?:^|[/\s'"])\.\.(?:[/\s'"]|$)""", rest))
+    return not (GUARDED.search(rest) or re.search(rf"(?<![\w.$-])/(?:{tops})(?:/|\b)", rest) or re.search(r"""(?:^|[\s'"=:(])~/|\bcd(?:\s+-)?\s*(?:$|[;&|)])|\bcd\s+~(?:\s|$)|\$\{?(?:HOME|OLDPWD)\b|\bpopd\b|(?:^|[/\s'"])\.\.(?:[/\s'"`;&|)]|$)""", rest, re.M))
 
 def decide(sid, args):
     name, data = args["tool_name"], args.get("input", {})
     meta = store.load(sid)["session"]
     if name in meta.get("allow", []): return dict(behavior="allow", updatedInput=data)
-    if in_worktree(meta, name, data):
+    if in_worktree(meta, name, data, args.get("tool_use_id")):
         with (store.sdir(sid)/"allowed.jsonl").open("a") as log: log.write(json.dumps(dict(at=store.now(), tool=name, input=data)) + "\n")
         return dict(behavior="allow", updatedInput=data)
     s, e = store.emit(sid, "ask", "agent", f"Allow {name}?", target=None, options=OPTIONS, multi=False, ask_kind="permission", detail=preview(name, data))
