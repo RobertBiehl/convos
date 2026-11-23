@@ -260,6 +260,9 @@ const commentsFor = (d, target) => [...Object.values(d.comments), ...(S.optimist
 // a row's current results, newest first: a result replaced by a newer version leaves the row (its id still leads to the newer one)
 const resultsFor = (d, target) => Object.values(d.attachments).filter((a) => (a.target || null) === (target || null) && !a.replaced_by).filter((a, n, xs) => !a.hash || xs.findIndex((x) => x.hash === a.hash) === n).reverse();
 const blobUrl = (a) => a.src || `/api/blob/${a.hash}?mime=${encodeURIComponent(a.mime || "")}&name=${encodeURIComponent(a.name)}`;
+// agents often write JSON on one line; it reads indented, or as written when it does not parse
+const readable = (a, t) => { if (t === null || !/json/.test(a.mime || "")) return t; try { return JSON.stringify(JSON.parse(t), null, 2); } catch { return t; } };
+const copyText = (t) => navigator.clipboard.writeText(t).then(() => toast("Copied"), fail);
 const pulse = (id, kind) => { S.pulses[id] = { kind, n: (S.pulses[id]?.n || 0) + 1, at: Date.now() }; };
 
 // ---------------------------------------------------------------- data flow
@@ -853,7 +856,7 @@ function Result({ a, target, i, on }) {
   useEffect(() => { if (a.kind === "markdown" || a.kind === "text") fetch(blobUrl(a)).then((r) => r.text()).then(setText).catch(() => setText("(unavailable)")); }, [a.hash]);
   if (a.kind === "app") return html`<button class="res app ${on ? "focus" : ""}" title=${appTitle(a)} onClick=${() => launchApp(a)}><div class="thumb">${G.play}</div><div class="cap">${a.caption || a.name}</div></button>`;
   if (a.kind === "link") return html`<a class="res ${on ? "focus" : ""}" href=${a.url} target="_blank" rel="noopener noreferrer"><div class="thumb">${G.link}</div><div class="cap" title=${a.url}>${a.caption || a.name}</div></a>`;
-  if (a.kind === "markdown" || a.kind === "text") return html`<div class="res wide ${on ? "focus" : ""}"><div class="cap" style="display:flex;gap:6px;cursor:pointer" onClick=${() => openResult(target, i)}>${a.name}${a.caption ? html`<span style="color:var(--faint)">· ${a.caption}</span>` : null}</div><div class="mdbox">${text === null ? "…" : a.kind === "markdown" ? html`<${Md} text=${text} />` : html`<pre style="margin:0;white-space:pre-wrap;font:11.5px var(--mono)">${text}</pre>`}</div></div>`;
+  if (a.kind === "markdown" || a.kind === "text") return html`<div class="res wide ${on ? "focus" : ""}"><div class="cap" style="display:flex;gap:6px;cursor:pointer" onClick=${() => openResult(target, i)}>${a.name}${a.caption ? html`<span class="ell" style="color:var(--faint)">· ${a.caption}</span>` : null}${text !== null ? html`<button class="copy" title="Copy its contents" onClick=${(e) => { e.stopPropagation(); copyText(readable(a, text)); }}>Copy</button>` : null}</div><div class="mdbox">${text === null ? "…" : a.kind === "markdown" ? html`<${Md} text=${text} />` : html`<pre style="margin:0;white-space:pre-wrap;font:11.5px var(--mono)">${readable(a, text)}</pre>`}</div></div>`;
   return html`<button class="res ${on ? "focus" : ""}" onClick=${() => openResult(target, i)}><div class="thumb">${thumbOf(a, a.name)}</div><div class="cap" title=${a.name}>${a.caption || a.name}</div></button>`;
 }
 function Results({ d, target }) {
@@ -1180,8 +1183,11 @@ function Look() {
   const [text, setText] = useState(null), zoom = useRef(null);
   useEffect(() => { if (it && !own) markSeen([it.id]); }, [it?.id]);
   useEffect(() => { setText(null); if (a && (a.kind === "markdown" || a.kind === "text")) fetch(blobUrl(a)).then((r) => r.text()).then(setText).catch(() => setText("(unavailable)")); }, [a?.id]);
+  const copyable = text !== null && (a?.kind === "markdown" || a?.kind === "text"), copy = () => copyText(readable(a, text));
   useKeys((e) => {
     const k = e.key, z = zoom.current;
+    // c copies the whole result; with text selected, ⌘C copies just that as usual, and without, all of it
+    if (copyable && k === "c" && (!(e.metaKey || e.ctrlKey) || window.getSelection().isCollapsed)) { e.preventDefault(); copy(); return true; }
     if (z?.seek && e.shiftKey && (k === "ArrowLeft" || k === "ArrowRight")) { e.preventDefault(); z.seek(k === "ArrowLeft" ? -5 : 5); return true; }
     if (z?.pan && e.shiftKey && k.startsWith("Arrow")) { e.preventDefault(); z.pan(...{ ArrowLeft: [120, 0], ArrowRight: [-120, 0], ArrowUp: [0, 120], ArrowDown: [0, -120] }[k]); return true; }
     const run = { "+": () => z?.zoom?.(1.25), "=": () => z?.zoom?.(1.25), "-": () => z?.zoom?.(0.8), "0": () => z?.fit?.(), p: () => z?.toggle?.(), m: () => z?.mute?.(), " ": () => set({ overlay: null }), Escape: () => set({ overlay: null }), ArrowRight: () => step(1), l: () => step(1), ArrowLeft: () => step(-1), h: () => step(-1),
@@ -1194,7 +1200,7 @@ function Look() {
   const close = (e) => e.target === e.currentTarget && set({ overlay: null }), title = (r) => r.caption || (r.kind === "link" ? linkLabel(r.url) : r.name);
   return html`<div class="lightbox" onMouseDown=${close}>
     <header><div class="grow ttl"><div class="t1">${a ? title(a) : it.title}</div><div class="t2">${own && o.label ? `${a.id} · ${o.label}` : own ? `${o.from.id === "…" ? "your comment" : `${o.from.id} · ${o.from.actor === "user" ? "your" : o.from.actor + "'s"} comment`} on ${o.from.target ? `${o.from.target} · ${d?.items[o.from.target]?.title}` : "the session"}` : it ? `${it.id} · ${it.title}` : `Session · ${s.title}`}${a && a.caption && a.kind !== "link" ? ` · ${a.name}` : ""}</div></div>
-      ${list.length ? html`<span>${i + 1} / ${list.length}</span><${Hot} k=${["←", "→"]}>${own && !o.label ? "image" : "result"}<//>` : null}${own ? null : html`<${Hot} k=${["↑", "↓"]}>row<//>`}${a ? html`<${Hot} k="↵">open<//>` : null}<${Hot} k="Space">close<//></header>
+      ${list.length ? html`<span>${i + 1} / ${list.length}</span><${Hot} k=${["←", "→"]}>${own && !o.label ? "image" : "result"}<//>` : null}${own ? null : html`<${Hot} k=${["↑", "↓"]}>row<//>`}${copyable ? html`<button class="copy" onClick=${copy}>Copy</button><${Hot} k="c">copy<//>` : null}${a ? html`<${Hot} k="↵">open<//>` : null}<${Hot} k="Space">close<//></header>
     <div class="stage" onMouseDown=${close} key=${a?.id || a?.hash || a?.src || it?.id}>
       ${!a ? html`<div class="doc"><div style="display:flex;gap:10px;align-items:center;margin-bottom:12px"><${Pill} s=${d.effective[it.id]} /><span style="color:var(--faint)">${it.id} · updated ${ago(it.updated)}</span></div><h2 style="margin:0 0 10px">${it.title}</h2>${it.description ? html`<${Md} text=${it.description} />` : html`<p style="color:var(--faint)">No description and no results on this row.</p>`}</div>`
         : a.kind === "image" ? html`<${ImageView} key=${a.id || a.hash || a.src} a=${a} api=${zoom} />`
@@ -1204,7 +1210,7 @@ function Look() {
         : a.kind === "link" ? html`<div class="doc" style="height:auto"><div style="color:var(--faint);margin-bottom:6px">${linkLabel(a.url)}</div><h2 style="margin:0 0 10px">${a.caption || a.name}</h2><a href=${a.url} target="_blank" rel="noopener noreferrer" style="word-break:break-all">${a.url}</a><p style="color:var(--faint);margin-top:14px">${K("↵")} opens it in your browser.</p></div>`
         : a.kind === "app" ? html`<div class="doc" style="height:auto"><h2 style="margin:0 0 10px">${a.caption || a.name}</h2><pre style="white-space:pre-wrap;font:12px var(--mono)">${appTitle(a)}</pre><button class="abtn primary" onClick=${() => launchApp(a)}>${a.run ? "Run" : "Open"}</button><p style="color:var(--faint);margin-top:14px">${K("↵")} ${a.run ? "runs it in a new Terminal window" : "opens it on this Mac"}.</p></div>`
         : a.kind === "markdown" ? html`<div class="doc">${text === null ? "…" : html`<${Md} text=${text} />`}</div>`
-        : a.kind === "text" ? html`<div class="doc"><pre style="white-space:pre-wrap;font:12px var(--mono)">${text}</pre></div>`
+        : a.kind === "text" ? html`<div class="doc"><pre style="white-space:pre-wrap;font:12px var(--mono)">${readable(a, text)}</pre></div>`
         : html`<div class="doc" style="height:auto"><h2 style="margin:0 0 10px">${a.name}</h2><a href=${blobUrl(a)} download=${a.name}>Download</a></div>`}
     </div>
     ${list.length ? html`<div class="strip" onMouseDown=${close}>${list.map((r, n) => html`<button class="card ${n === i ? "on" : ""}" key=${r.id || n} onClick=${() => pick(n)}><div class="th">${thumbOf(r)}</div><div class="tl">${title(r)}</div></button>`)}</div>` : null}

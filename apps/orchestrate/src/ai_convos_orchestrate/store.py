@@ -335,18 +335,20 @@ MAGIC = ((b"\x89PNG\r\n\x1a\n", "image", "image/png", ".png"), (b"\xff\xd8\xff",
          (b"%PDF-", "pdf", "application/pdf", ".pdf"))
 def typed(a):
     """A result attached under a name without an extension was stored as an untyped file; its bytes still say what it is.
-    Only how the board shows it changes: the archived event keeps what the agent sent. HTML attached before it had a kind was text."""
+    Only how the board shows it changes: the archived event keeps what the agent sent. HTML attached before it had a kind was text.
+    Text under a type browsers only download (JSON, a patch, a script) is shown as text, so the user reads and copies it in place."""
     if a["kind"] == "text" and a["mime"] == "text/html": return {**a, "kind": "html"}
-    if a["kind"] != "file" or a["mime"] != "application/octet-stream": return a
+    if a["kind"] != "file": return a
     with body_path(a["hash"]).open("rb") as f: head = f.read(4096)
-    found = next(((k, m, x) for magic, k, m, x in MAGIC if head.startswith(magic)), None)
-    if not found and head[:4] == b"RIFF" and head[8:12] == b"WEBP": found = ("image", "image/webp", ".webp")
-    if not found and head[4:8] == b"ftyp": found = ("video", "video/mp4", ".mp4")
-    # agents' notes are markdown; anything that reads as text without NUL bytes is shown as one
+    bare = a["mime"] == "application/octet-stream"
+    found = next(((k, m, x) for magic, k, m, x in MAGIC if head.startswith(magic)), None) if bare else None
+    if bare and not found and head[:4] == b"RIFF" and head[8:12] == b"WEBP": found = ("image", "image/webp", ".webp")
+    if bare and not found and head[4:8] == b"ftyp": found = ("video", "video/mp4", ".mp4")
+    # agents' notes are markdown; anything else that reads as text without NUL bytes is shown as text
     if not found and b"\0" not in head:
         try: codecs.getincrementaldecoder("utf-8")().decode(head)
         except UnicodeDecodeError: pass
-        else: found = ("html", "text/html", ".html") if head.lstrip()[:15].lower().startswith((b"<!doctype html", b"<html")) else ("markdown", "text/markdown", ".md")
+        else: found = ("text", a["mime"] if not bare else "text/plain", "") if Path(a["name"]).suffix or not bare else ("html", "text/html", ".html") if head.lstrip()[:15].lower().startswith((b"<!doctype html", b"<html")) else ("markdown", "text/markdown", ".md")
     return {**a, "kind": found[0], "mime": found[1], "name": a["name"]+found[2]} if found else a
 
 def wait_for(sid, predicate, seconds):

@@ -263,6 +263,7 @@ them, and `+N` for the rest. The right pane and Quick Look list them in the same
 | `Space` | Quick Look: preview the result or row; `←` `→` results, `↑` `↓` rows |
 | `+` `−` `0` (in Quick Look) | Zoom an image (also pinch, ⌘-scroll), fit it again; a click toggles fit and 100%; drag, scroll, or `Shift+arrows` pan; the minimap shows and moves the visible part. Zoomed views always draw from the full-resolution original |
 | `p` `m` `⇧←` `⇧→` (in Quick Look) | Video: play/pause, mute, seek 5 s (videos start playing when they open) |
+| `c` (in Quick Look) | Copy a text result whole: markdown, or text under a type browsers only download (JSON, a patch, a script), which the board shows in place, JSON indented. `⌘C` copies a selection, or everything when nothing is selected; the result's tile has a Copy button too |
 | `↵` / `o` | Open the selected result |
 | `c` | Comment on the selected row, or on the session when none is selected |
 | `⌘↵` / `Ctrl+↵` (while writing) | Send the comment; the composer lets go of focus so the board keys work again. `↵`, `⌥↵`, `⇧↵` start a new line |
