@@ -122,15 +122,20 @@ def act(body):
     if kind == "move": return (runtime.move(sid), dict(ok=True))[1]
     # a reset covers the user's whole Codex account; the deliver loop then sends what every Codex session held for the limit
     if kind == "codex_reset":
-        if (outcome := runtime.use_codex_reset()) in ("reset", "nothingToReset"): carry_on()
+        if (outcome := runtime.use_codex_reset()) in ("reset", "nothingToReset"): carry_on("codex")
         return dict(outcome=outcome)
+    # the user lifted a limit where orchestrate cannot (Claude has no reset it can redeem): that provider's held words go out
+    if kind == "lifted":
+        transcripts.release(provider := store.load(sid)["session"]["provider"])
+        carry_on(provider)
+        return dict(ok=True)
     raise ValueError(f"Unknown action {kind}")
 
-def carry_on():
-    """After a Codex reset, each Codex session started here whose last turn the limit stopped continues; one with words held
-    for the limit gets those instead, from the deliver loop."""
+def carry_on(provider):
+    """After a reset of the provider's limit, each of its sessions started here whose last turn the limit stopped continues; one
+    with words held for the limit gets those instead, from the deliver loop."""
     for sid in store.session_ids():
-        if (s := store.peek(sid)) and not s["closed"] and (m := s["session"])["origin"] == "gui" and m["provider"] == "codex" and (transcripts.limit(m) or {}).get("released") and not runtime.alive(sid) and not store.pending(s):
+        if (s := store.peek(sid)) and not s["closed"] and (m := s["session"])["origin"] == "gui" and m["provider"] == provider and (transcripts.limit(m) or {}).get("released") and not runtime.alive(sid) and not store.pending(s):
             background(runtime.start, sid, "[orchestrate] The user used a usage-limit reset, so the limit that stopped your last turn is lifted. Continue where you left off.")
 
 class Handler(http.server.BaseHTTPRequestHandler):

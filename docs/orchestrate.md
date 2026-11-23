@@ -171,7 +171,11 @@ A Codex session's panel also offers **Use a reset** while you have Codex usage-l
 app server, and what every Codex session held for the limit goes out at once, since a reset covers
 the account, and each Codex session started here whose turn the limit stopped continues. When Codex
 says usage is allowed again (a reset used elsewhere), held words go out too and the panel offers
-**Continue**; the time is kept in `resets.json` beside the sessions.
+**Continue**; the time is kept in `resets.json` beside the sessions. Claude Code and Muse offer no
+reset orchestrate can redeem or read, so when you reset or extend that usage yourself, **Usage is
+back · continue** on a held session tells orchestrate: held words go out to every session of that
+provider, and each one started here whose turn the limit stopped continues. An agent that hits the
+limit again shows it again.
 
 **Questions.** Several open questions read as one stack under **Needs you**: the one in focus
 (else the oldest) is open, the rest are one line each, and `a` steps through them. A card shows
