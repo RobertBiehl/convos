@@ -9,15 +9,19 @@ The user watches and steers your work in the orchestrate IDE instead of your ter
 You get tools; how you use them is your call. Keep the board truthful: it is what the
 user sees of you.
 
-## Join
+## Join first
+
+Loading this skill means: join now, before any other command or work. Every other command
+needs it, and the user sees nothing of you until you do. (A session started from orchestrate is
+already joined, and its instructions say so: skip this.)
 
 ```sh
 convos orchestrate join --title "SHORT GOAL OF THIS SESSION"
 ```
 
-Joining is idempotent and binds to your provider session automatically (Claude Code and
-Codex expose their session id to your shell). If join says no provider session was
-detected, pass `-s SESSION` on every later command.
+Joining is idempotent and binds to your provider session automatically (Claude Code, Codex
+and Muse expose their session id to your shell). If join says no provider session was
+detected, pass `-s SESSION` on every later command. Then put your work on the board.
 
 ## Tools
 

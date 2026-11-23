@@ -20,8 +20,11 @@ convos orchestrate install     # the /orchestrate and $orchestrate skills
 convos orchestrate open        # open the IDE (starts its local server)
 ```
 
-Any Claude Code session joins with `/orchestrate`, any Codex session with
-`$orchestrate`. Sessions started from the IDE (`n`) run headless and are
+Any Claude Code or Muse session joins with `/orchestrate`, any Codex session with
+`$orchestrate`; the skill tells the agent to join before anything else. Join binds the board to the
+agent's own session id (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, or `MUSE_SESSION_ID`, which
+wins when a Muse runs inside a Claude Code shell). A joined Muse session has no message channel
+yet: your words wait for its `inbox`, which every command's board check points it to. Sessions started from the IDE (`n`) run headless and are
 owned by it. The dialog offers every agent installed on this Mac: Claude Code, Codex and Muse. Each
 comes with its current models, the newest of each class, read from the tool itself: the model ids
 the installed Claude Code binary knows, Codex's `models_cache.json`, and Muse's model catalog.
