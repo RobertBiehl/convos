@@ -34,7 +34,7 @@ metadata and never invents facts a source did not record.
 
 | Field | Meaning |
 | --- | --- |
-| `source` | Provider/integration namespace: `codex`, `claude-code`, `chatgpt`, `claude`, or `perplexity`. |
+| `source` | Provider/integration namespace: `codex`, `claude-code`, `muse`, `antigravity`, `chatgpt`, `claude`, or `perplexity`. |
 | `title` | Display label only; never identity. |
 | `created_at`, `updated_at` | Earliest and latest recorded event timestamps. |
 | `model` | First exact non-synthetic assistant model recorded for the session; NULL when unavailable. |
@@ -83,16 +83,16 @@ promotes absent or inferred evidence to exact.
 
 ## Provider mapping
 
-| Canonical evidence | Codex | Claude Code |
-| --- | --- | --- |
-| Session identity | first `session_meta.payload.id` | main `sessionId`; subagent `agentId` |
-| Parent | `source.subagent.thread_spawn.parent_thread_id` | subagent root `sessionId` |
-| Kind | presence of explicit `source.subagent` | `agentId`, `isSidechain`, or provider subagent path |
-| Agent | spawn nickname, role, depth | agent ID/name/type/depth when recorded |
-| cwd | first session metadata | system/event cwd |
-| Git | branch, commit, repository URL | branch; other fields remain absent |
-| Model | active `turn_context.payload.model` | assistant `message.model` |
-| Client | originator and CLI version | entrypoint and version |
+| Canonical evidence | Codex | Claude Code | Antigravity |
+| --- | --- | --- | --- |
+| Session identity | first `session_meta.payload.id` | main `sessionId`; subagent `agentId` | `brain/<uuid>` directory UUID |
+| Parent | `source.subagent.thread_spawn.parent_thread_id` | subagent root `sessionId` | `conversation_summaries.db` `parent_conversation_id` |
+| Kind | presence of explicit `source.subagent` | `agentId`, `isSidechain`, or provider subagent path | summary `parent_conversation_id` / `nesting_depth > 0` |
+| Agent | spawn nickname, role, depth | agent ID/name/type/depth when recorded | summary `agent_name`, `nesting_depth` |
+| cwd | first session metadata | system/event cwd | first decoded `file://` URI in `workspace_uris` |
+| Git | branch, commit, repository URL | branch; other fields remain absent | absent |
+| Model | active `turn_context.payload.model` | assistant `message.model` | `PLANNER_RESPONSE.model` |
+| Client | originator and CLI version | entrypoint and version | summary `app_data_dir` originator |
 
 Repeated Codex `session_meta` records inside one rollout are forked context, not new
 conversations. The first record names the rollout whose UUID is in the filename;

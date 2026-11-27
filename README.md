@@ -6,8 +6,8 @@
 
 **Queryable memory for coding agents, backed by exact conversation evidence.**
 
-Convos captures Claude Code and Codex work automatically. Agents can query those
-sessions and optional ChatGPT and Claude imports, then open the exact turns they
+Convos captures Claude Code, Codex, Muse, and Antigravity work automatically. Agents can query those
+sessions and optional ChatGPT, Claude, and Perplexity imports, then open the exact turns they
 need to continue.
 
 [![Convos film: one engineer and agent, a teammate using /convos, and a team continuing the work](.github/media/convos-team-story.gif)](.github/media/convos-team-story.mp4)
@@ -78,8 +78,8 @@ macOS may compile `llama-cpp-python` locally when no compatible wheel is
 available. The default Linux install, literal search, capture, and remote sync
 do not require a native compiler.
 
-`convos init` creates the archive, installs the bundled Codex + Claude Code
-skill and capture hooks, imports existing local Codex and Claude Code sessions,
+`convos init` creates the archive, installs the bundled Codex + Claude Code + Antigravity
+skill and capture hooks, imports existing local Codex, Claude Code, Muse, and Antigravity sessions,
 and performs safe local setup for installed products. That first local scan is
 incremental on later runs and never probes ChatGPT or Claude web. With the
 Memory product installed, the same command turns on automatic memory delivery
@@ -102,12 +102,12 @@ convos install-skills
 - Fast full-text search with direct source, day, role, project, conversation, and thinking filters
 - Hybrid semantic search (BM25 + embeddings + Reciprocal Rank Fusion) via `convos query`
 - Fetch from ChatGPT, Claude and Perplexity using browser cookies (Safari, Chrome, Firefox)
-- Import exports from ChatGPT, Claude, Claude Code, and Codex
-- Capture completed Claude Code + Codex turns just in time with lifecycle hooks
+- Import exports from ChatGPT, Claude, Claude Code, Codex, Muse, and Antigravity
+- Capture completed Claude Code + Codex + Antigravity turns just in time with lifecycle hooks
 - Deterministic project resume packets and exact session replay
 - Optional code-change provenance: blame, timeline, time travel, and graph browsing
 - Optional end-to-end encrypted personal multi-device and team synchronization
-- Orchestrate (beta): a keyboard-first browser IDE where your Claude Code and Codex sessions report work, results, and questions, and you steer them
+- Orchestrate: a keyboard-first browser IDE where your Claude Code, Codex, Muse, and Antigravity sessions report work, results, and questions, and you steer them
 - Local secret scanning with mandatory pre-encryption team redaction
 - Export to JSON or CSV
 
@@ -131,18 +131,18 @@ uv tool install convos-remote-server
 See [self-hosting, recovery, team policy, and installation](docs/remote.md) and
 the runnable synthetic [personal and team scenarios](examples/remote/README.md).
 
-## Orchestrate (beta)
+## Orchestrate
 
 Orchestrate is a local, keyboard-first IDE in your browser for your agent
-sessions. Each Claude Code or Codex session publishes a board: items with
+sessions. Each Claude Code, Codex, Muse, or Antigravity session publishes a board: items with
 statuses, a live activity line, results (images, videos, PDFs, markdown, files,
 links), threads, and questions you answer. Comment on any row and the comment
 reaches the running session; start, stop, and resume headless sessions from the
 board.
 
 ```bash
-uv tool install convos --with convos-orchestrate --prerelease allow   # beta: only pre-releases exist
-convos orchestrate install   # /orchestrate for Claude Code, $orchestrate for Codex
+uv tool install convos        # orchestrate comes with convos
+convos orchestrate install   # /orchestrate for Claude Code & Antigravity, $orchestrate for Codex
 convos orchestrate open      # the IDE, served on 127.0.0.1 only
 ```
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, mmap, os, random, re, shlex, shutil, signal, site, ssl, subprocess, sys, sysconfig, tempfile, threading, time, typer, urllib.error, urllib.parse, urllib.request, zipfile
+import base64, click, contextlib, csv, duckdb, fcntl, getpass, graphlib, hashlib, itertools, json, mmap, os, random, re, shlex, shutil, signal, site, sqlite3, ssl, subprocess, sys, sysconfig, tempfile, threading, time, typer, urllib.error, urllib.parse, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -11,10 +11,10 @@ from .migrations import fts_needs_rebuild, migrate_remote_changes, migrate_remot
 
 # Newer Typer vendors Click; command errors must use the active runtime.
 click=getattr(typer,"_click",click)
-app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, Codex, Muse, and Perplexity", pretty_exceptions_show_locals=False)
+app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, Codex, Muse, Antigravity, and Perplexity", pretty_exceptions_show_locals=False)
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
 PROJECT_ROOT,DATA_DIR,DB_PATH,STATE_PATH=(root:=find_root()),(data:=root/"data"),data/"convos.db",data/"sync_state.json"
-HOOK_DIR,HOOK_STATE,HOOK_TAIL,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF,OPEN_INGEST_STALE,ROW_GROUP_ROWS=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_tails.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,12,20,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest(),300,4096  # conservative web pacing stays below the observed ~200-detail failure point
+HOOK_DIR,HOOK_STATE,HOOK_TAIL,HOOK_PROGRESS,HOOK_EMBED_DIRTY,HOOK_FTS_DIRTY,_NOISE_RE,_NOISE,HOOK_DRAIN_EVENTS,HOOK_DRAIN_SECONDS,CHATGPT_BURST,CHATGPT_RATE,PARSER_EPOCH,CORE_VERSION,ATTACHMENT_LIMIT,_FTS_DEF,OPEN_INGEST_STALE,ROW_GROUP_ROWS=DATA_DIR/"hook_inbox",DATA_DIR/"hook_state.json",DATA_DIR/"hook_tails.json",DATA_DIR/"hook_progress.json",DATA_DIR/"hook_embeddings_dirty",DATA_DIR/"hook_fts_dirty",(_NR:=r"^(Base directory for this skill:|# AGENTS\.md instructions for|The following is a <SYSTEM_MESSAGE>|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))"),f" AND NOT regexp_matches(COALESCE(content,''),'{_NR}')",8,10,20,8/15,12,20,32*1024**2,hashlib.sha256(b"messages:id:content:thinking:active-v1").hexdigest(),300,4096  # conservative web pacing stays below the observed ~200-detail failure point
 _PERPLEXITY,_CHATGPT_HOSTS,_CLAUDE_HEADERS="https://www.perplexity.ai",(("https://chatgpt.com",("chatgpt.com",)),("https://chat.openai.com",("chat.openai.com","openai.com"))),{"Origin":"https://claude.ai","Referer":"https://claude.ai/","Accept":"application/json","Accept-Language":"en-US,en;q=0.9","anthropic-client-sha":"unknown","anthropic-client-version":"unknown"}
 _INJECTED_RE,MESSAGE_ORDER,MESSAGE_ORDER_DESC=r"(?s)(?:# AGENTS\.md instructions for [^\n]+\n\n<INSTRUCTIONS>\n.*\n</INSTRUCTIONS>|<(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)(?: [^>]*)?>.*</(?:codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)>)\s*","m.created_at NULLS FIRST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) NULLS LAST,m.id","m.created_at DESC NULLS LAST,TRY_CAST(json_extract_string(m.metadata,'$.provider_index') AS BIGINT) DESC NULLS LAST,m.id DESC"
 
@@ -125,7 +125,7 @@ def attachment_body(data,root=None):
         return (required(_file_sha256(path)==blob,ValueError("attachment body conflicts with content hash")),os.chmod(path,0o600),path)[-1]
     return (atomic_publish(path,lambda tmp:tmp.write_bytes(data)),path)[-1]
 
-def detect_source(path: Path): return "muse" if path.is_dir() and (path/"session.jsonl").exists() and "runtime.session" in open(path/"session.jsonl").read(4000) else "codex" if path.is_dir() and (path/"sessions").exists() else "claude-code" if path.is_dir() else "chatgpt" if path.suffix==".zip" or "chatgpt" in path.name.lower() else "claude" if "chat_messages" in (data:=required(json.loads(path.read_text()),ValueError(f"Empty export: {path}")))[0] else "chatgpt"
+def detect_source(path: Path): return "antigravity" if path.name in ("transcript_full.jsonl","transcript.jsonl") or path.is_dir() and ((path/"brain").is_dir() or (path/".system_generated/logs/transcript_full.jsonl").exists() or (path/".system_generated/logs/transcript.jsonl").exists()) else "muse" if path.is_dir() and (path/"session.jsonl").exists() and "runtime.session" in open(path/"session.jsonl").read(4000) else "codex" if path.is_dir() and (path/"sessions").exists() else "claude-code" if path.is_dir() else "chatgpt" if path.suffix==".zip" or "chatgpt" in path.name.lower() else "claude" if "chat_messages" in (data:=required(json.loads(path.read_text()),ValueError(f"Empty export: {path}")))[0] else "chatgpt"
 
 def stat_mtime(path: Path): return st.st_mtime if (st:=safe_parse(f"path stat {path}",Path.stat,path)) else None
 def latest_mtime(path: Path, globs: tuple[str, ...] = ("*.jsonl", "*.json", "*.zip")): return max((m for g in globs for p in path.rglob(g) if (m := stat_mtime(p)) is not None), default=0)
@@ -1028,8 +1028,8 @@ def safe_parse(context: str, fn, *args, **kwargs):
     except Exception as e: return log_parse_error(context,e)
 
 def parse_source(path: Path, source: str|None = None, bindings=None) -> ParseResult:
-    parsers,src={"chatgpt":parse_chatgpt,"claude":parse_claude,"claude-code":parse_claude_code,"codex":parse_codex,"muse":parse_muse},source or detect_source(path)
-    return (required(src in parsers,ValueError(f"Unknown source: {src}")),parsers[src](path,bindings=bindings) if src in ("claude-code","codex","muse") else parsers[src](path))[1]
+    parsers,src={"chatgpt":parse_chatgpt,"claude":parse_claude,"claude-code":parse_claude_code,"codex":parse_codex,"muse":parse_muse,"antigravity":parse_antigravity},source or detect_source(path)
+    return (required(src in parsers,ValueError(f"Unknown source: {src}")),parsers[src](path,bindings=bindings) if src in ("claude-code","codex","muse","antigravity") else parsers[src](path))[1]
 
 def chatgpt_mapping(cid: str, mapping: dict) -> tuple[list, list, list]:
     tree_path=lambda nid:(*tree_path(parent),(mapping[parent].get("children") or [x for x in mapping if mapping[x].get("parent")==parent]).index(nid)) if (parent:=mapping[nid].get("parent")) in mapping else (tuple(mapping).index(nid),)
@@ -1267,6 +1267,48 @@ def parse_muse_session(jsonl: Path, bindings=None) -> dict | None:
     cwd,branch,commit=next((r.get("cwd") for e in envs if e.get("payload_type")=="runtime.session.route_facts" and isinstance((r:=(e.get("payload") or {}).get("record") or {}),dict) and r.get("cwd")),None),next(((((e.get("payload") or {}).get("record") or {}).get("reference") or {}).get("name") for e in envs if e.get("payload_type")=="session.workspace_branch.observed"),None),next((r.get("commit") for e in envs if e.get("payload_type")=="session.workspace_branch.observed" and isinstance((r:=(e.get("payload") or {}).get("record") or {}),dict) and r.get("commit")),None)
     return {"conv":dict(id=cid,source="muse",title=(runs[0][2][:80] if runs else f"muse ({(sid or jsonl.parent.name)[:8]})"),created_at=min(bounds) if bounds else None,updated_at=max(bounds) if bounds else None,model=models[0][1] if models else None,cwd=cwd,git_branch=branch,project_id=None,metadata=json.dumps({k:v for k,v in {"session_id":sid,"parent_session_id":jsonl.parts[-4] if sub and re.fullmatch(r"[0-9a-f-]{1,64}",jsonl.parts[-4]) else None,"session_kind":"subagent" if sub else "main","session_kind_evidence":"exact" if sub else "inferred","capture_mode":"transcript","git_commit":commit}.items() if v is not None})),"msgs":umsgs+amsgs+atexts+asumms,"tools":tools,"attachs":[],"edits":edits,"edit_evidence":evidence} if umsgs+amsgs+atexts+asumms else None
 def parse_muse(muse_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult: return _parse_sessions(files or muse_dir.rglob("session.jsonl"),parse_muse_session,bindings)
+def _ag_meta(jsonl: Path, sid: str | None) -> dict:
+    app_dir,out=jsonl.parents[4] if sid and len(jsonl.parts)>=6 and jsonl.parts[-5]=="brain" else None,{}
+    if not app_dir: return out
+    if (dbp:=app_dir/"conversation_summaries.db").is_file():
+        try:
+            with contextlib.closing(sqlite3.connect(f"{dbp.resolve().as_uri()}?mode=ro",uri=True,timeout=0)) as c: row=c.execute("SELECT title,workspace_uris,project_id,agent_name,parent_conversation_id,nesting_depth,app_data_dir FROM conversation_summaries WHERE conversation_id=?",(sid,)).fetchone()
+            if row: out.update(title=row[0] or None,uris=json.loads(row[1]) if row[1] else [],project=row[2] or None,agent=row[3] or None,parent=row[4] or None,depth=row[5] or 0,orig=row[6] or None,exact=True)
+        except (OSError,sqlite3.Error,ValueError): pass
+    if not out and (meta:=app_dir/"cache"/"conversation_metadata.json").is_file():
+        with contextlib.suppress(OSError,ValueError,KeyError,TypeError):
+            s=json.loads(meta.read_text())["conversations"][sid]["summary"]
+            out.update(title=s.get("Title") or None,uris=s.get("WorkspaceURIs") or [],project=s.get("ProjectID") or None,agent=s.get("AgentName") or None,orig=s.get("AppDataDir") or None)
+    if not out.get("title") and (ann:=app_dir/"annotations"/f"{sid}.pbtxt").is_file():
+        with contextlib.suppress(OSError,ValueError):
+            if m:=re.search(r'^title:\s*"((?:\\.|[^"\\])*)"',ann.read_text(),re.M): out["title"]=json.loads(f'"{m[1]}"')
+    return out
+def parse_antigravity_session(jsonl: Path, bindings=None) -> dict | None:
+    recs=[(i,r) for i,r in iter_jsonl(jsonl)]
+    required(sum(1 for line in jsonl.read_text().splitlines() if line.strip())==len(recs),ValueError(f"Malformed Antigravity session: {jsonl}"))
+    if not (by_idx:={r["step_index"]:r for _,r in recs if isinstance(r,dict) and isinstance(r.get("step_index"),int)}): return None
+    steps,sid,compact=[by_idx[k] for k in sorted(by_idx)],(jsonl.parents[2].name if len(jsonl.parts)>=4 and jsonl.parts[-3:-1]==(".system_generated","logs") and re.fullmatch(r"[0-9a-f-]{8,64}",jsonl.parents[2].name) else None),jsonl.name=="transcript.jsonl"
+    cid,meta,b=(bindings or {}).get(("antigravity",sid),gen_id("antigravity",sid or str(jsonl))),_ag_meta(jsonl,sid),bindings or {}
+    def unq(v):
+        if not compact or not isinstance(v,str) or not (v.startswith('"') and v.endswith('"')): return v
+        try: return json.loads(v)
+        except ValueError: return v
+    norm=lambda args:{k:unq(v) for k,v in args.items()} if isinstance(args,dict) else {}
+    roles,bounds,msgs,calls={"USER_INPUT":"user","PLANNER_RESPONSE":"assistant","SYSTEM_MESSAGE":"system"},[t for s in steps if (t:=ts_from_iso(s.get("created_at")))],[],[]
+    for s in steps:
+        if (role:=roles.get(s.get("type"))) is None: continue
+        idx,ts,mid=s["step_index"],ts_from_iso(s.get("created_at")),provider_message_id("antigravity",cid,s["step_index"],None,b)
+        msgs.append(dict(id=mid,conversation_id=cid,role=role,content=s.get("content") or "",thinking=(s.get("thinking") or "").strip() or None if role=="assistant" else None,created_at=ts,model=s.get("model") if role=="assistant" else None,metadata=json.dumps({"provider_index":idx}),parent_id=None))
+        for j,tc in enumerate(s.get("tool_calls") or () if role=="assistant" else ()):
+            res=r if (r:=by_idx.get(idx+1+j)) and r.get("type")=="GENERIC" and r.get("source")=="MODEL" else None
+            calls.append((idx,j,ts,mid,tc["name"],norm(tc.get("args")),res,gen_id("antigravity",f"tool:{cid}:{idx}:{j}")))
+    tools=[dict(id=tid,message_id=mid,tool_name=name,input=json.dumps(args),output=json.dumps((res.get("error") or res.get("content","")) if res else ""),status="failed" if res and (res.get("status")=="ERROR" or res.get("error")) else "complete" if res and res.get("status")=="DONE" else "pending",duration_ms=None,created_at=ts) for idx,j,ts,mid,name,args,res,tid in calls]
+    cands=[(mid,ts,tid,fp,op,new,old,("unknown","result_missing") if not res or res.get("status") not in ("DONE","ERROR") else ("invalid","provider_failure") if res.get("status")=="ERROR" or res.get("error") else ("confirmed","provider_success") if re.search(r"(?:^|\n)(?:Created file\.|Overwrote file\.|Appended to file\.|Wrote |Updated |Successfully |Made \d+ replacement)",res.get("content") or "") else ("unknown","unconfirmed_result")) for idx,j,ts,mid,name,args,res,tid in calls if name in ("write_file","edit_file","write_to_file","replace_file_content") for fp,op,new,old in [{"write_file":(args.get("Path"),"write",args.get("Content",""),None),"edit_file":(args.get("Path"),"edit",args.get("Replacement",""),args.get("Target")),"write_to_file":(args.get("TargetFile"),"write",args.get("CodeContent",""),None),"replace_file_content":(args.get("TargetFile"),"edit",args.get("ReplacementContent",""),args.get("TargetContent"))}[name]] if fp]
+    edits,evidence=[dict(id=gen_id("antigravity",f"edit:{tid}:0"),message_id=mid,file_path=fp,edit_type=op,content=new,created_at=ts,old_content=old) for mid,ts,tid,fp,op,new,old,(st,_) in cands if st=="confirmed"],[dict(file_edit_id=gen_id("antigravity",f"edit:{tid}:0"),status=st,reason=rsn,tool_call_id=tid) for mid,ts,tid,fp,op,new,old,(st,rsn) in cands]
+    first_u=next((re.sub(r"(?s)^<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>.*$",r"\1",m["content"]).strip().splitlines()[0][:80] for m in msgs if m["role"]=="user" and m["content"].strip()),None)
+    cwd,parent=next((urllib.parse.unquote(urllib.parse.urlparse(u).path) for u in meta.get("uris",()) if isinstance(u,str) and u.startswith("file://")),None),meta.get("parent")
+    return {"conv":dict(id=cid,source="antigravity",title=meta.get("title") or first_u or f"antigravity ({(sid or jsonl.stem)[:8]})",created_at=min(bounds,default=None),updated_at=max(bounds,default=None),model=next((m["model"] for m in msgs if m["role"]=="assistant" and m["model"]),None),cwd=cwd,git_branch=None,project_id=meta.get("project"),metadata=json.dumps({k:v for k,v in {"session_id":sid,"parent_session_id":parent,"session_kind":"subagent" if parent else "main","session_kind_evidence":"exact" if meta.get("exact") else "inferred","agent_name":meta.get("agent"),"agent_depth":meta.get("depth") or None,"originator":meta.get("orig") or (jsonl.parents[4].name if sid and len(jsonl.parts)>=6 and jsonl.parts[-5]=="brain" else None),"capture_mode":"transcript","timestamp_basis":"utc"}.items() if v is not None})),"msgs":msgs,"tools":tools,"attachs":[],"edits":edits,"edit_evidence":evidence} if msgs else None
+def parse_antigravity(ag_dir: Path, files: list[Path] | None = None, bindings=None) -> ParseResult: return _parse_sessions(files or ([ag_dir] if ag_dir.is_file() else list(ag_dir.rglob("transcript_full.jsonl")) or list(ag_dir.rglob("transcript.jsonl"))),parse_antigravity_session,bindings)
 
 _CONV_UPS = "INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source,title=excluded.title,created_at=CASE WHEN (excluded.source IN ('codex','claude-code') AND json_extract_string(excluded.metadata,'$.timestamp_basis')='utc' AND json_extract_string(conversations.metadata,'$.timestamp_basis') IS DISTINCT FROM 'utc') OR conversations.created_at IS NULL OR excluded.created_at < conversations.created_at THEN excluded.created_at ELSE conversations.created_at END,updated_at=CASE WHEN (excluded.source IN ('codex','claude-code') AND json_extract_string(excluded.metadata,'$.timestamp_basis')='utc' AND json_extract_string(conversations.metadata,'$.timestamp_basis') IS DISTINCT FROM 'utc') OR conversations.updated_at IS NULL OR excluded.updated_at > conversations.updated_at THEN excluded.updated_at ELSE conversations.updated_at END,model=COALESCE(excluded.model,conversations.model),cwd=COALESCE(excluded.cwd,conversations.cwd),git_branch=COALESCE(excluded.git_branch,conversations.git_branch),project_id=COALESCE(excluded.project_id,conversations.project_id),metadata=excluded.metadata"
 
@@ -1363,9 +1405,9 @@ def commit_result(r,purpose,progress=None):
         ((total.__setitem__(slice(None),[total[i]+out[i] for i in range(7)]),changed.update(out[7]),total.__setitem__(slice(5,7),[len(newids),len({m["conversation_id"] for m in r.msgs if m["id"] in changed}-newids)]),r.provenance_edits.update(part.provenance_edits),r.provenance_conversations.update(part.provenance_conversations),progress and progress(f"{purpose} batch {page}, {sum(total[:5])} rows changed")),archive_yield(DB_PATH))
     return (*total,changed)
 
-def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("MUSE_HOME",Path.home()/".local/share/muse"))/"sessions" if source=="muse" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
+def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("MUSE_HOME",Path.home()/".local/share/muse"))/"sessions" if source=="muse" else Path(os.environ.get("ANTIGRAVITY_APP_DATA_DIR",Path.home()/".gemini/antigravity-cli"))/"brain" if source=="antigravity" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
 def hook_result(source,path,bindings=None,tail=None):  # tail: a verified Claude Code tail record to resume from; the result's tail is the next one (None: parse in full)
-    session=parse_claude_code_session(path,bindings,tail) if source=="claude-code" else (parse_muse_session if source=="muse" else parse_codex_session)(path,bindings)
+    session=parse_claude_code_session(path,bindings,tail) if source=="claude-code" else (parse_muse_session if source=="muse" else parse_antigravity_session if source=="antigravity" else parse_codex_session)(path,bindings)
     return ParseResult(convs=[session["conv"]],msgs=session["msgs"],tools=session["tools"],attachs=session["attachs"],edits=session["edits"],edit_evidence=session["edit_evidence"],tail=session.get("tail") and session["tail"]|jsonl_mark(path,*((tail["offset"],tail["cut"]) if tail else (0,0)),session["tail"]["cut"])) if session else ParseResult()
 def hook_bindings(sessions=None):
     with _core(ready=True,purpose="hooks.schema") as conn: return session_bindings(conn,sessions)
@@ -1373,10 +1415,12 @@ def wake_hooks(attempt=None,root=None):
     with operation_lock((Path(root)/"data/hook_inbox" if root is not None else HOOK_DIR)/".drain.lock","hooks.dispatch",0,mandatory=False) as available: pass
     if available: subprocess.Popen([sys.executable,"-m","ai_convos","drain-hooks","--no-block"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env={**os.environ,**({"CONVOS_PROJECT_ROOT":str(root)} if root is not None else {}),**({"CONVOS_HOOK_ATTEMPT":attempt} if attempt else {})})
 def enqueue_hook(source, payload):
-    path,root=(Path(t).expanduser().resolve() if (t:=payload.get("agent_transcript_path") or payload.get("transcript_path")) else next((p.resolve() for p in sorted(hook_root(source).expanduser().resolve().rglob(f"{payload.get('session_id')}/session.jsonl")) if p.is_file()),None) if source=="muse" and re.fullmatch(r"[0-9a-f-]{1,64}",payload.get("session_id") or "") else None),hook_root(source).expanduser().resolve()
-    if source not in ("claude-code", "codex", "muse") or path is None or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")
+    root,t,sid=hook_root(source).expanduser().resolve(),payload.get("agent_transcript_path") or payload.get("transcript_path") or payload.get("transcriptPath"),payload.get("conversationId") or payload.get("session_id") or ""
+    p=Path(t).expanduser() if t else next((p for p in sorted(root.rglob(f"{sid}/session.jsonl")) if p.is_file()),None) if source=="muse" and re.fullmatch(r"[0-9a-f-]{1,64}",sid) else next((q for name in ("transcript_full.jsonl","transcript.jsonl") if (q:=root/sid/".system_generated/logs"/name).is_file()),None) if source=="antigravity" and re.fullmatch(r"[0-9a-f-]{8,64}",sid) else None
+    path=(p.with_name("transcript_full.jsonl") if source=="antigravity" and p and p.name=="transcript.jsonl" and p.with_name("transcript_full.jsonl").is_file() else p).resolve() if p else None
+    if source not in ("claude-code", "codex", "muse", "antigravity") or path is None or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")
     st,key=path.stat(),gen_id("hook",f"{source}:{path}")
-    if payload.get("hook_event_name", "Stop") not in ("Stop","SessionEnd","SubagentStop"):
+    if payload.get("hookEventName", payload.get("hook_event_name", "Stop")) not in ("Stop","SessionEnd","SubagentStop"):
         with operation_lock(HOOK_DIR/".flush.lock","hooks.flush",0,mandatory=False) as pulse:
             if not pulse: return
             tick,now=HOOK_DIR/f"{key}.tick",time.time()
@@ -1542,6 +1586,7 @@ def emit(data,fmt): [typer.echo(json.dumps(row,default=str)) for row in data if 
 def capture(source: str):
     try: enqueue_hook(source, json.loads(sys.stdin.read() or "{}"))
     except Exception as e: log_parse_error(f"{source} hook", e)
+    finally: source == "antigravity" and typer.echo("{}")
 
 def drain_hooks_cmd(block:bool=typer.Option(False,"--block/--no-block",hidden=True)): drain_hooks(block=block,provenance=True)
 
@@ -1640,7 +1685,7 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
             with _core(read_only=True,purpose="doctor") as conn:
                 cols,required,missing,(convs,msgs,unembedded,latest),fts_schema,fts,evidence,relationships=(cols:=set(conn.execute("SELECT table_name,column_name FROM information_schema.columns").fetchall())),(required:={"conversations":("id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"),"messages":("id","conversation_id","role","content","thinking","created_at","model","metadata","embedding","parent_id"),"tool_calls":("id","message_id","tool_name","input","output","status","duration_ms","created_at"),"attachments":("id","message_id","filename","mime_type","size","path","url","created_at"),"artifacts":("id","conversation_id","artifact_type","title","content","language","created_at","version"),"file_edits":("id","message_id","file_path","edit_type","content","created_at","old_content"),"file_edit_evidence":("file_edit_id","status","reason","tool_call_id")}),(missing:=[f"{table}.{column}" for table,columns in required.items() for column in columns if (table,column) not in cols]),conn.execute(f"SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM messages WHERE embedding IS NULL AND COALESCE(content,'')!=''{_NOISE}),(SELECT MAX(updated_at) FROM conversations)").fetchone() if not missing else (0,0,0,None),(fts_schema:=bool(conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone())),bool(fts_schema and ("retrieval_state","messages_generation") in cols and (rs:=conn.execute("SELECT messages_generation,fts_generation,fts_definition_hash FROM retrieval_state WHERE singleton").fetchone()) and rs[0]==rs[1] and rs[2]==_FTS_DEF),dict(conn.execute("SELECT status,COUNT(*) FROM provenance.file_edit_evidence GROUP BY status").fetchall()) if not missing else {},archive_relationships(conn,True) if not missing else {}
                 provenance_pending=conn.execute("SELECT count(*) FROM provenance.pending").fetchone()[0] if ("pending","entity") in cols else None
-                coverage=[(source,known.get((source,provider_session_key(source,session)),'untracked')) for source,session in conn.execute("SELECT c.source,json_extract_string(c.metadata,'$.session_id') FROM conversations c WHERE c.source IN ('codex','claude-code') AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id)").fetchall()] if not missing else []
+                coverage=[(source,known.get((source,provider_session_key(source,session)),'untracked')) for source,session in conn.execute("SELECT c.source,json_extract_string(c.metadata,'$.session_id') FROM conversations c WHERE c.source IN ('codex','claude-code','antigravity') AND NOT EXISTS(SELECT 1 FROM remote.row_origins o WHERE o.table_name='conversations' AND o.physical_row_id=c.id)").fetchall()] if not missing else []
             typer.echo(f"archive: {convs} convs, {msgs} msgs, {unembedded} unembedded, {DB_PATH.stat().st_size/1024**3:.1f} GB, latest={latest or 'never'}, schema={'ready' if not missing else 'missing:' + ','.join(missing)}, fts={'current' if fts else 'stale' if fts_schema else 'missing'}, edit_evidence="+",".join(f"{k}:{evidence.get(k,0)}" for k in ("confirmed","unknown","invalid","unverified"))+("\nmissing physical parents: unavailable (schema incomplete)" if missing else "\nmissing physical parents:\n"+"\n".join(f"  {key}: rows={value['rows']}, parent_ids={value['parent_ids']}"+(f", marked_history_rows={value['marked_history_rows']}" if key.startswith('messages.') or value['marked_history_rows'] else "") for key,value in relationships.items())))
             typer.echo(f"provenance: pending={provenance_pending if provenance_pending is not None else 'unavailable'}")
             for source in sorted({s for s,status in coverage}): typer.echo(f"local sources {source}: "+', '.join(f'{status}={sum((s,value)==(source,status) for s,value in coverage)}' for status in ('present','missing','untracked'))+' (native conversations)')
@@ -1650,8 +1695,8 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
         except Exception as e: typer.echo(f"archive: unavailable ({e})")
     else: typer.echo(f"archive: missing ({DB_PATH})\nrepair: convos init")
     paths,expected,current=(paths:=_skill_paths()),(expected:=paths[1].read_text() if paths[1].exists() else None),sum(expected is not None and p.is_file() and not p.is_symlink() and p.read_text()==expected for p in paths[3])
-    typer.echo(f"skills: {current}/2 current")
-    if current!=2: typer.echo("repair: convos install-skills")
+    typer.echo(f"skills: {current}/{len(paths[3])} current")
+    if current!=len(paths[3]): typer.echo("repair: convos install-skills")
     install_hooks(status=True)
     for ep in entry_points(group="convos.doctor"):
         try: typer.echo(ep.load()())
@@ -1666,7 +1711,7 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
 
 
 def _skill_paths():
-    rel,shares,roots,skill,homes=(rel:=Path("skills")/"convos"/"SKILL.md"),(shares:=[Path(p)/"share"/"convos" for p in (sysconfig.get_paths().get("data",""),site.getuserbase())]),(roots:=[PROJECT_ROOT,Path(__file__).resolve().parents[2],*shares]),next((r/rel for r in roots if (r/rel).exists()),roots[-1]/rel),[Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))]
+    rel,shares,roots,skill,homes=(rel:=Path("skills")/"convos"/"SKILL.md"),(shares:=[Path(p)/"share"/"convos" for p in (sysconfig.get_paths().get("data",""),site.getuserbase())]),(roots:=[PROJECT_ROOT,Path(__file__).resolve().parents[2],*shares]),next((r/rel for r in roots if (r/rel).exists()),roots[-1]/rel),[Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude")),Path(os.environ.get("ANTIGRAVITY_CONFIG_DIR",Path.home()/".gemini/config"))]
     return rel,skill,homes,[home/rel for home in homes]
 def install_skills():
     rel,skill,homes,dests=_skill_paths()
@@ -1678,21 +1723,28 @@ def install_skills():
         if old.is_file() and not old.is_symlink() and old.read_text()==legacy: typer.echo(f"Removed legacy {old}") if old.unlink() is None else None
 
 def _capture_command(source): return f"{f'CONVOS_PROJECT_ROOT={shlex.quote(str(root))} ' if (root:=Path(os.environ.get('CONVOS_PROJECT_ROOT',PROJECT_ROOT)).expanduser().resolve())!=Path.home()/'.convos' else ''}{shlex.quote(str(Path(sys.executable).with_name('convos')))} capture {source}"
-def _managed_hook(h, source): return h.get("command", "").endswith("convos remote hook") or h.get("command", "").endswith((f" hook {source}", f" capture {source}")) and h.get("statusMessage") in ("Updating conversation archive", "Saving conversation to Convos")
+def _managed_hook(h, source): return isinstance(h, dict) and (h.get("command", "").endswith("convos remote hook") or h.get("command", "").endswith((f" hook {source}", f" capture {source}")) and (source == "antigravity" or h.get("statusMessage") in ("Updating conversation archive", "Saving conversation to Convos")))
 def edit_hook_config(path, events, source, remove=False):
-    data,(clean)=(data:=json.loads(path.read_text()) if path.exists() else {}),(lambda groups:[{**group,"hooks":kept} for group in groups for kept in [[h for h in group.get("hooks",[]) if not _managed_hook(h,source)]] if kept])
-    hooks,(cmd)=(hooks:={event:kept for event,groups in data.get("hooks",{}).items() if (kept:=clean(groups))}),(_capture_command(source) if not remove else None)
+    data,cmd=(json.loads(path.read_text()) if path.exists() else {}),(_capture_command(source) if not remove else None)
+    if source=="antigravity":
+        required(isinstance(data,dict) and all(isinstance(v,dict) and all(k=="enabled" or isinstance(hs,list) for k,hs in v.items()) for v in data.values()),ValueError(f"Invalid antigravity hooks config: {path}"))
+        out={name:kept for name,spec in data.items() if (kept:={k:v if k=="enabled" else [h for h in v if not _managed_hook(h,source)] for k,v in spec.items() if k=="enabled" or isinstance(v,list) and any(not _managed_hook(h,source) for h in v)}) and (name!="convos-capture" or any(k!="enabled" for k in kept))}
+        if not remove: out["convos-capture"]={**out.get("convos-capture",{}),**{ev:[*out.get("convos-capture",{}).get(ev,[]),dict(type="command",command=cmd,timeout=5)] for ev in events}}
+        return out, sum(_managed_hook(h,source) for spec in out.values() for v in spec.values() if isinstance(v,list) for h in v)
+    clean=lambda groups:[{**group,"hooks":kept} for group in groups for kept in [[h for h in group.get("hooks",[]) if not _managed_hook(h,source)]] if kept]
+    hooks={event:kept for event,groups in data.get("hooks",{}).items() if (kept:=clean(groups))}
     for event in (() if remove else events): hooks.setdefault(event, []).append(dict(hooks=[dict(type="command", command=cmd, timeout=5, statusMessage="Saving conversation to Convos")]))
     return {**data,"hooks":hooks}, sum(_managed_hook(h, source) for gs in hooks.values() for g in gs for h in g.get("hooks", []))
 
 def install_hooks(remove: bool = typer.Option(False, "--remove"), status: bool = typer.Option(False, "--status")):
-    cfgs = [(Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"settings.json", ("Stop", "SessionEnd"), "claude-code"), (Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"hooks.json", ("Stop",), "codex")]
+    cfgs = [(Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"settings.json", ("Stop", "SessionEnd"), "claude-code"), (Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"hooks.json", ("Stop",), "codex"), (Path(os.environ.get("ANTIGRAVITY_CONFIG_DIR", Path.home()/".gemini/config"))/"hooks.json", ("Stop",), "antigravity")]
     if not status and (unsafe := next((p for p,_,_ in cfgs if p.is_symlink() or p.exists() and not p.is_file() or p.parent.exists() and not p.parent.is_dir()), None)): raise typer.Exit(typer.echo(f"Refusing unsafe managed file: {unsafe}",err=True) or 1)
     if not status: cfgs = [(path,events,source,*edit_hook_config(path, events, source, remove)) for path,events,source in cfgs]
     for path, events, source, *planned in cfgs:
         if status:
-            expected,data,n=(expected:=_capture_command(source)),(data:=json.loads(path.read_text()) if path.exists() else {}),sum(sum(h.get("command")==expected and h.get("statusMessage")=="Saving conversation to Convos" for g in data.get("hooks",{}).get(event,[]) for h in g.get("hooks",[]))==1 for event in events)
-            n*=sum(_managed_hook(h,source) for groups in data.get("hooks",{}).values() for group in groups for h in group.get("hooks",[]))==len(events)
+            expected,data=(expected:=_capture_command(source)),(json.loads(path.read_text()) if path.exists() else {})
+            if source=="antigravity": n=sum(sum(isinstance(h,dict) and h.get("command")==expected for spec in data.values() if isinstance(spec,dict) for h in (spec.get(event) if isinstance(spec.get(event),list) else ()))==1 for event in events)*int(sum(_managed_hook(h,source) for spec in data.values() if isinstance(spec,dict) for v in spec.values() if isinstance(v,list) for h in v)==len(events))
+            else: n=sum(sum(h.get("command")==expected and h.get("statusMessage")=="Saving conversation to Convos" for g in data.get("hooks",{}).get(event,[]) for h in g.get("hooks",[]))==1 for event in events)*int(sum(_managed_hook(h,source) for groups in data.get("hooks",{}).values() for group in groups for h in group.get("hooks",[]))==len(events))
         else:
             data,n=planned
             atomic_json(path,data)
@@ -1722,14 +1774,14 @@ def backup():
 def _sync_leader(fn,full=False):
     with operation_lock(DATA_DIR/".sync.lock","sync",wait=0) as pulse,(operation_lock(HOOK_DIR/".drain.lock","sync.full.capture",wait=30) if full else contextlib.nullcontext()) as capture: return fn(lambda stage:(pulse(stage),capture and capture(stage),sys.stderr.isatty() and (now:=time.monotonic())-getattr(pulse,"shown",0)>=1 and (setattr(pulse,"shown",now),typer.echo(f"  Local sync: {stage}",err=True)))[0])
 
-def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch all sources and reconcile all provenance"), verbose: bool = typer.Option(False, "-v", "--verbose"), local_only: bool = typer.Option(False, "--local-only", help="Import local agent sessions and configured exports without contacting web sources."), muse: bool = True):
+def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch all sources and reconcile all provenance"), verbose: bool = typer.Option(False, "-v", "--verbose"), local_only: bool = typer.Option(False, "--local-only", help="Import local agent sessions and configured exports without contacting web sources."), muse: bool = True, antigravity: bool = True):
     if sys.argv[1:2] == ["sync"]: signal.signal(signal.SIGINT, signal.SIG_DFL)
     state,local,web,imports,chatgpt_ok,chatgpt_frontiers,offline,ready,checkpoint_lock={},{},{},{},{},{},local_only is True,False,threading.RLock()
     def set_state(section,key,val):
         with checkpoint_lock: (state.setdefault(section,{}).__setitem__(key,val),atomic_json(STATE_PATH,state))
     def plan_local(name, path, parser, bindings, sink, progress):
-        if name in ("codex", "claude-code", "muse"):
-            previous,prev,mt=(previous:=local.get(name,{})),previous.get("files",{}),{str(p):m for p in path.rglob("*.jsonl") if (m:=stat_mtime(p)) is not None}
+        if name in ("codex", "claude-code", "muse", "antigravity"):
+            previous,prev,mt=(previous:=local.get(name,{})),previous.get("files",{}),{str(p):m for p in path.rglob("transcript_full.jsonl" if name=="antigravity" else "*.jsonl") if (m:=stat_mtime(p)) is not None}
             epochs,missing,dependencies={p:previous.get("epochs",{}).get(p,previous.get("parser")) for p in prev},sorted(set(prev)-mt.keys()),previous.get("bindings",{})
             if missing!=previous.get("missing",[]): set_state("local",name,{**previous,"missing":missing})
             if missing: typer.echo(f"{name}: {len(missing)} previously imported transcript(s) missing locally; archived conversations retained.",err=True)
@@ -1810,7 +1862,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         def schedule(job): jobs.extend([job] if job else [])
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
             jobs+=start("imports") or [j for p in paths if (j:=plan_import(p))]
-        for name,label,enabled,p,parser in (("claude-code","Claude Code",claude_code,Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))/"projects",parse_claude_code),("codex","Codex",codex,Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),parse_codex),("muse","Muse",muse,Path(os.environ.get("MUSE_HOME",Path.home()/".local/share/muse"))/"sessions",parse_muse)):
+        for name,label,enabled,p,parser in (("claude-code","Claude Code",claude_code,Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))/"projects",parse_claude_code),("codex","Codex",codex,Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),parse_codex),("muse","Muse",muse,Path(os.environ.get("MUSE_HOME",Path.home()/".local/share/muse"))/"sessions",parse_muse),("antigravity","Antigravity",antigravity,hook_root("antigravity"),parse_antigravity)):
             if enabled: start(label,name) or schedule(plan_local(name,p,parser,bindings,lambda r,name=name:checkpoint(r,name),pulse))
         if not offline:
             start("ChatGPT"+(f", provider order={len(candidates)-len(repair_order)} attempted/{len(candidates)} unresolved" if candidates else ""),"chatgpt")

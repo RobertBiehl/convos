@@ -38,7 +38,7 @@ jobs:
           for path in "$CONVOS_PROJECT_ROOT" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR"; do
             test ! -e "$path" || test -z "$(find "$path" -mindepth 1 -print -quit)"
           done
-      - run: uv build --wheel
+      - run: uv build --wheel && uv build --wheel --package convos-orchestrate
       - run: bash scripts/smoke-wheel.sh dist/convos-*.whl
 
   customer-lifecycle:

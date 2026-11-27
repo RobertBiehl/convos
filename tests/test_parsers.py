@@ -718,6 +718,116 @@ class TestMuseParser:
         assert len(cli.parse_source(d).convs)==1
 
 
+def _ag_session_path(app_dir, sid="11111111-2222-3333-4444-555555555555", name="transcript_full.jsonl"):
+    p = app_dir / "brain" / sid / ".system_generated" / "logs" / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _ag_summary_db(app_dir, rows):
+    import sqlite3
+    db = sqlite3.connect(str(app_dir / "conversation_summaries.db"))
+    db.execute("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT, project_id TEXT, agent_name TEXT, parent_conversation_id TEXT, nesting_depth INTEGER, app_data_dir TEXT)")
+    db.executemany("INSERT INTO conversation_summaries VALUES (?,?,?,?,?,?,?,?)", rows)
+    db.commit()
+    db.close()
+
+
+class TestAntigravityParser:
+    """High-value contract tests for Antigravity transcripts, metadata, and edit evidence."""
+
+    def _basic(self):
+        return [
+            {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-27T10:00:00Z", "content": "Fix the bug"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "RUNNING", "created_at": "2026-11-27T10:00:01Z", "content": "partial"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-27T10:00:01Z", "content": "Checking file", "thinking": "Inspect first", "model": "gemini-4-neon-xhigh", "tool_calls": [{"id": "c1", "name": "read_file", "args": {"Path": "/repo/a.py"}}]},
+            {"step_index": 2, "type": "GENERIC", "source": "MODEL", "status": "DONE", "created_at": "2026-11-27T10:00:02Z", "content": "print(1)"},
+            {"step_index": 3, "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": "2026-11-27T10:00:03Z", "content": "Reminder"},
+            {"step_index": 4, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-27T10:00:04Z", "content": "All done", "model": "gemini-4-neon-xhigh"},
+        ]
+
+    def test_metadata_subagent_and_compact_unquoting(self, tmp_path):
+        from ai_convos.cli import parse_antigravity, parse_antigravity_session
+        parent, child = "aaaaaaaa-1111-2222-3333-444444444444", "bbbbbbbb-1111-2222-3333-444444444444"
+        app = tmp_path / "antigravity-cli"
+        _ag_session_path(app, parent).write_text("\n".join(map(json.dumps, self._basic())))
+        _ag_session_path(app, child).write_text(json.dumps({"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-27T10:00:00Z", "content": "Subtask"}))
+        _ag_summary_db(app, [
+            (parent, "Bug Fix Session", json.dumps(["file:///repo/my%20app"]), "proj-1", None, "", 0, "antigravity-cli"),
+            (child, "Researcher", "[]", None, "research", parent, 1, "antigravity-cli"),
+        ])
+        result = parse_antigravity(app / "brain")
+        by_sid = {json.loads(c["metadata"])["session_id"]: c for c in result.convs}
+        main, sub = by_sid[parent], by_sid[child]
+        assert (main["source"], main["title"], main["cwd"], main["project_id"], main["model"]) == ("antigravity", "Bug Fix Session", "/repo/my app", "proj-1", "gemini-4-neon-xhigh")
+        assert json.loads(sub["metadata"]) == {"session_id": child, "parent_session_id": parent, "session_kind": "subagent", "session_kind_evidence": "exact", "capture_mode": "transcript", "timestamp_basis": "utc", "agent_name": "research", "agent_depth": 1, "originator": "antigravity-cli"}
+        assert len(result.tools) == 1 and (result.tools[0]["tool_name"], result.tools[0]["status"]) == ("read_file", "complete")
+        # Compact transcript.jsonl double-encoded args + JSON/annotation metadata fallback
+        app2 = tmp_path / "fallback"
+        compact = _ag_session_path(app2, parent, name="transcript.jsonl")
+        compact.write_text("\n".join(map(json.dumps, [
+            {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-27T10:00:00Z", "content": "Hi"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-27T10:00:01Z", "content": "done", "model": "gemini-4-neon-xhigh", "tool_calls": [{"id": "c1", "name": "write_file", "args": {"Path": json.dumps("/repo/x.py"), "Content": json.dumps("x = 1")}}]},
+            {"step_index": 2, "type": "GENERIC", "source": "MODEL", "status": "DONE", "created_at": "2026-11-27T10:00:02Z", "content": "Created file."},
+        ])))
+        (app2 / "cache").mkdir(parents=True)
+        (app2 / "cache" / "conversation_metadata.json").write_text(json.dumps({"conversations": {parent: {"summary": {"WorkspaceURIs": ["file:///workspace/demo"]}}}}))
+        (app2 / "annotations").mkdir(parents=True)
+        (app2 / "annotations" / f"{parent}.pbtxt").write_text('title: "Annotated Title"\n')
+        parsed = parse_antigravity_session(compact)
+        assert (parsed["conv"]["title"], parsed["conv"]["cwd"]) == ("Annotated Title", "/workspace/demo")
+        assert [(e["file_path"], e["edit_type"], e["content"]) for e in parsed["edits"]] == [("/repo/x.py", "write", "x = 1")]
+
+    def test_file_edit_evidence_and_statuses(self, tmp_path):
+        import duckdb
+        from ai_convos import cli
+        app = tmp_path / "app"
+        events = [
+            {"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-27T10:00:00Z", "content": "edit files"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-27T10:00:01Z", "content": "", "model": "gemini-4-neon-xhigh", "tool_calls": [
+                {"id": "c1", "name": "write_file", "args": {"Path": "/repo/new.py", "Content": "a=1"}},
+                {"id": "c2", "name": "edit_file", "args": {"Path": "/repo/old.py", "Target": "a=1", "Replacement": "a=2"}},
+                {"id": "c3", "name": "replace_file_content", "args": {"TargetFile": "/repo/r.py", "TargetContent": "old", "ReplacementContent": "new"}},
+                {"id": "c4", "name": "write_to_file", "args": {"TargetFile": "/repo/fail.py", "CodeContent": "nope"}},
+                {"id": "c5", "name": "edit_file", "args": {"Path": "/repo/unconfirmed.py", "Target": "x", "Replacement": "y"}},
+                {"id": "c6", "name": "write_file", "args": {"Path": "/repo/missing.py", "Content": "z"}},
+            ]},
+            {"step_index": 2, "type": "GENERIC", "source": "MODEL", "status": "DONE", "created_at": "2026-11-27T10:00:02Z", "content": "Created file."},
+            {"step_index": 3, "type": "GENERIC", "source": "MODEL", "status": "DONE", "created_at": "2026-11-27T10:00:03Z", "content": "Made 1 replacement in /repo/old.py"},
+            {"step_index": 4, "type": "GENERIC", "source": "MODEL", "status": "DONE", "created_at": "2026-11-27T10:00:04Z", "content": "Updated /repo/r.py"},
+            {"step_index": 5, "type": "GENERIC", "source": "MODEL", "status": "ERROR", "created_at": "2026-11-27T10:00:05Z", "error": "permission denied"},
+            {"step_index": 6, "type": "GENERIC", "source": "MODEL", "status": "DONE", "created_at": "2026-11-27T10:00:06Z", "content": "nothing matched"},
+        ]
+        _ag_session_path(app).write_text("\n".join(map(json.dumps, events)))
+        result = cli.parse_antigravity(app / "brain")
+        assert [t["status"] for t in result.tools] == ["complete", "complete", "complete", "failed", "complete", "pending"]
+        assert [(e["file_path"], e["edit_type"], e["content"], e["old_content"]) for e in result.edits] == [
+            ("/repo/new.py", "write", "a=1", None),
+            ("/repo/old.py", "edit", "a=2", "a=1"),
+            ("/repo/r.py", "edit", "new", "old"),
+        ]
+        assert sorted(v["status"] for v in result.edit_evidence) == ["confirmed", "confirmed", "confirmed", "invalid", "unknown", "unknown"]
+        assert {v["reason"] for v in result.edit_evidence if v["status"] == "unknown"} == {"result_missing", "unconfirmed_result"}
+        db = duckdb.connect(); cli.init_schema(db); cli.upsert(db, result)
+        assert db.execute("SELECT (SELECT COUNT(*) FROM file_edits),(SELECT COUNT(*) FROM provenance.file_edit_evidence WHERE status='confirmed')").fetchone() == (3, 3)
+
+    def test_native_binding_survives_move_and_malformed_fails(self, tmp_path):
+        import duckdb
+        from ai_convos import cli
+        sid = "11111111-2222-3333-4444-555555555555"
+        app1, app2 = tmp_path / "a1", tmp_path / "a2"
+        a = _ag_session_path(app1, sid); a.write_text("\n".join(map(json.dumps, self._basic())))
+        b = _ag_session_path(app2, sid); b.write_text(a.read_text())
+        bad = _ag_session_path(app1, "22222222-2222-2222-2222-222222222222"); bad.write_text('{"step_index":0}\n{broken')
+        first = cli.parse_antigravity(app1 / "brain")
+        assert first.failed_inputs == [str(bad)] and len(first.convs) == 1
+        db = duckdb.connect(); cli.init_schema(db); cli.upsert(db, first)
+        moved = cli.parse_antigravity(app2 / "brain", files=[b], bindings=cli.session_bindings(db))
+        assert ([c["id"] for c in moved.convs], [m["id"] for m in moved.msgs]) == ([c["id"] for c in first.convs], [m["id"] for m in first.msgs])
+        cli.upsert(db, moved)
+        assert db.execute("SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM provider_sessions)").fetchone() == (1, 4, 1)
+
+
 # ---- ChatGPT Export Parser Tests ----
 
 class TestChatGPTExportParser:
@@ -1018,14 +1128,16 @@ class TestTimestampParsing:
 
 class TestInstallSkills:
     def test_writes_bundled_skill_to_both_targets(self, tmp_path, monkeypatch):
-        """install_skills resolves the bundled SKILL.md and installs it to codex + claude dirs."""
+        """install_skills resolves the bundled SKILL.md and installs it to codex + claude + antigravity dirs."""
         from ai_convos.cli import install_skills
         src = Path(__file__).resolve().parents[1] / "skills" / "convos" / "SKILL.md"
         assert src.exists(), "bundled skill missing from repo source tree"
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
         monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "custom-claude"))
+        monkeypatch.setenv("ANTIGRAVITY_CONFIG_DIR", str(tmp_path / "custom-ag"))
         install_skills()
         dests = [tmp_path / ".codex" / "skills" / "convos" / "SKILL.md",
-                 tmp_path / "custom-claude" / "skills" / "convos" / "SKILL.md"]
+                 tmp_path / "custom-claude" / "skills" / "convos" / "SKILL.md",
+                 tmp_path / "custom-ag" / "skills" / "convos" / "SKILL.md"]
         assert all(d.read_text() == src.read_text() for d in dests)

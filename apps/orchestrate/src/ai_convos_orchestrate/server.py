@@ -3,9 +3,9 @@
 Binds loopback only. Every API request needs the per-server token (set as a SameSite=Strict cookie by
 the launch URL), a loopback Host header, and, for writes, a custom header no cross-site form can send.
 """
-import base64, collections, hashlib, hmac, http.server, json, os, re, secrets, socket, subprocess, sys, threading, time, urllib.parse, webbrowser
+import base64, collections, faulthandler, hashlib, hmac, http.server, json, os, re, secrets, shlex, signal, socket, subprocess, sys, threading, time, urllib.parse, webbrowser
 from pathlib import Path
-from . import store, runtime, channels, overview
+from . import store, runtime, channels, overview, transcripts
 
 WEB = Path(__file__).with_name("web")
 STATIC = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css", "/vendor/preact-htm.js": "vendor/preact-htm.js"}
@@ -27,18 +27,27 @@ def version():
 
 def summary(s):
     meta, eff = s["session"], store.effective(s)
-    return dict(id=meta["id"], title=meta["title"], provider=meta["provider"], model=meta.get("model"), effort=meta.get("effort"), cwd=meta["cwd"], origin=meta["origin"], parent=meta.get("parent"), skills=meta.get("skills", []),
+    return dict(id=meta["id"], title=meta["title"], provider=meta["provider"], model=meta.get("model"), effort=meta.get("effort"), permission=meta.get("permission"), switching=runtime.switching(meta["id"], meta), agent=runtime.agent(meta["id"], meta), cwd=meta["cwd"], origin=meta["origin"], moved=meta.get("moved"), parent=meta.get("parent"), skills=meta.get("skills", []),
                 status=store.status(s), counts=dict(collections.Counter(eff.values())), items=len(s["items"]), asks=len(store.open_asks(s)), pending=len(store.pending(s)),
-                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"])
+                activity=s["activity"], runtime=s["runtime"], live=runtime.alive(meta["id"]) or channels.reachable(s), busy=runtime.busy(meta["id"]), closed=s["closed"], created=meta["created"], updated=s["updated"], seq=s["seq"], limit=transcripts.limit(meta), heard=len(transcripts.arrived(meta) or ()), unheard=runtime.unheard(meta["id"]), wake=channels.waking(meta),
+                why=next((x["why"] for x in sorted(s["items"].values(), key=lambda x: x["updated"], reverse=True) if x["status"] == "blocked" and x.get("why") and not x.get("archived")), None))
 
-def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
+def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], received=None if (heard := transcripts.arrived(s["session"])) is None else sorted(heard), unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
 
-def skills(cwd):
-    roots = [Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"skills", *([Path(cwd)/".claude"/"skills"] if cwd else [])]
+def skills(cwd, provider="claude-code"):
+    # Codex reads its own skills; Antigravity reads ~/.gemini/config/skills + .agents/skills; Claude Code's are also what Muse loads
+    if provider == "antigravity":
+        home = Path(os.environ.get("ANTIGRAVITY_CONFIG_DIR", Path.home()/".gemini"/"config"))
+        cli_home = Path(os.environ.get("ANTIGRAVITY_APP_DATA_DIR", Path.home()/".gemini"/"antigravity-cli"))
+        roots = [home/"skills", cli_home/"skills", *([Path(cwd)/".agents"/"skills", Path(cwd)/".agent"/"skills"] if cwd else [])]
+        user_roots = (home/"skills", cli_home/"skills")
+    else:
+        home, project = (Path(os.environ.get("CODEX_HOME", Path.home()/".codex")), ".codex") if provider == "codex" else (Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude")), ".claude")
+        roots, user_roots = [home/"skills", *([Path(cwd)/project/"skills"] if cwd else [])], (home/"skills",)
     def meta(path):
         head = path.read_text(errors="replace")[:2000].split("---")
         fields = dict(re.findall(r"^(name|description):\s*(.+)$", head[1], re.M)) if len(head) > 2 else {}
-        return dict(name=fields.get("name", path.parent.name).strip(), description=fields.get("description", "").strip()[:240], scope="project" if cwd and str(path).startswith(str(Path(cwd))) else "user")
+        return dict(name=fields.get("name", path.parent.name).strip(), description=fields.get("description", "").strip()[:240], scope="user" if any(u in path.parents for u in user_roots) else "project")
     found = {m["name"]: m for r in roots if r.is_dir() for p in sorted(r.glob("*/SKILL.md")) for m in [meta(p)]}
     return sorted(found.values(), key=lambda m: (m["name"] != "orchestrate", m["name"]))
 
@@ -112,7 +121,28 @@ def act(body):
         background(runtime.start, sid, "[orchestrate] The user resumed this session. Check your board (convos orchestrate show) and continue where you left off.")
         return dict(ok=True)
     if kind == "deliver": return dict(channel=runtime.deliver(sid))
+    if kind == "launch": return dict(ok=start_result(sid, store.load(sid)["attachments"][body["attachment"]]))
+    if kind == "permission": return dict(applies=runtime.permit(sid, body["permission"], bool(body.get("confirm"))))
+    if kind == "tune": return dict(applies=runtime.tune(sid, body["model"], body.get("effort")))
+    if kind == "restart": return dict(applies=runtime.restart(sid))
+    if kind == "move": return (runtime.move(sid), dict(ok=True))[1]
+    # a reset covers the user's whole Codex account; the deliver loop then sends what every Codex session held for the limit
+    if kind == "codex_reset":
+        if (outcome := runtime.use_codex_reset()) in ("reset", "nothingToReset"): carry_on("codex")
+        return dict(outcome=outcome)
+    # the user lifted a limit where orchestrate cannot (Claude has no reset it can redeem): that provider's held words go out
+    if kind == "lifted":
+        transcripts.release(provider := store.load(sid)["session"]["provider"])
+        carry_on(provider)
+        return dict(ok=True)
     raise ValueError(f"Unknown action {kind}")
+
+def carry_on(provider):
+    """After a reset of the provider's limit, each of its sessions started here whose last turn the limit stopped continues; one
+    with words held for the limit gets those instead, from the deliver loop."""
+    for sid in store.session_ids():
+        if (s := store.peek(sid)) and not s["closed"] and (m := s["session"])["origin"] == "gui" and m["provider"] == provider and (transcripts.limit(m) or {}).get("released") and not runtime.alive(sid) and not store.pending(s):
+            background(runtime.start, sid, "[orchestrate] The user used a usage-limit reset, so the limit that stopped your last turn is lifted. Continue where you left off.")
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -148,12 +178,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, path.read_bytes(), TYPES[path.suffix], [("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-src 'self'; object-src 'self'")])
         if not self.trusted(): return self.send(401, {"error": "Open orchestrate with: convos orchestrate open"})
         try: self.route_get(url.path, query)
-        except (ValueError, KeyError) as error: self.send(400, {"error": str(error)})
         except (BrokenPipeError, ConnectionResetError): pass
+        except (ValueError, KeyError, OSError) as error: self.send(400, {"error": str(error)})
 
     def route_get(self, path, query):
         if path == "/api/sessions": return self.send(200, [summary(s) for sid in store.session_ids() if (s := store.peek(sid) or store.load(sid))])
         if m := re.fullmatch(r"/api/session/(o[0-9a-f]{11})", path): return self.send(200, detail(store.load(m[1])))
+        if m := re.fullmatch(r"/api/session/(o[0-9a-f]{11})/move", path): return self.send(200, runtime.plan_move(store.load(m[1])))
         if m := re.fullmatch(r"/api/blob/([0-9a-f]{64})", path):
             blob = store.body_path(m[1])
             mime = query.get("mime", "")
@@ -169,11 +200,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f.seek(start)
                 data = f.read(end-start+1)
             return self.send(206, data, ctype, [*headers, ("Content-Range", f"bytes {start}-{end}/{size}")])
-        if path == "/api/meta": return self.send(200, dict(providers=runtime.PROVIDERS, home=str(Path.home()), image_limit=store.core.ATTACHMENT_LIMIT, body_limit=BODY_LIMIT, recent=sorted({store.peek(i)["session"]["cwd"] for i in store.session_ids() if store.peek(i)})[:30]))
-        if path == "/api/skills": return self.send(200, skills(query.get("cwd")))
+        if path == "/api/meta": return self.send(200, dict(providers=runtime.providers(), home=str(Path.home()), image_limit=store.core.ATTACHMENT_LIMIT, body_limit=BODY_LIMIT, recent=sorted({store.peek(i)["session"]["cwd"] for i in store.session_ids() if store.peek(i)})[:30]))
+        if path == "/api/skills": return self.send(200, skills(query.get("cwd"), query.get("provider") or "claude-code"))
         if path == "/api/dirs": return self.send(200, dirs(query.get("prefix", "")))
         if path == "/api/collab": return self.send(200, collab())
         if path == "/api/convos": return self.send(200, overview.overview(query.get("fresh") == "1"))
+        if path == "/api/codex/resets": return self.send(200, runtime.codex_resets())
         if path == "/api/stream": return self.stream()
         self.send(404, {"error": "not found"})
 
@@ -181,7 +213,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         for k, v in (("Content-Type", "text/event-stream"), ("Cache-Control", "no-store"), ("Connection", "keep-alive")): self.send_header(k, v)
         self.end_headers()
-        seen, beat, current, tick = {}, time.monotonic(), None, 0
+        seen, metas, beat, current, tick = {}, {}, time.monotonic(), None, 0
         while True:
             events = []
             if tick % 4 == 0 and (v := version()) != current: (events.append(("version", v)), current := v)
@@ -189,9 +221,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for sid in store.session_ids():
                 try: mtime = (store.sdir(sid)/"view.json").stat().st_mtime_ns
                 except OSError: continue
-                if seen.get(sid) != mtime and (s := store.peek(sid)):
-                    seen[sid] = mtime
-                    events.append(("session", summary(s)))
+                # a session changes with its board, when its provider's usage limit stops or releases it, and when its agent
+                # receives the user's words (its transcript shows them), or turns out not to take them
+                meta = metas.get(sid)
+                if seen.get(sid) != (mtime, meta and transcripts.limit(meta), meta and len(transcripts.arrived(meta) or ()), runtime.unheard(sid)) and (s := store.peek(sid)):
+                    metas[sid] = s["session"]
+                    events.append(("session", out := summary(s)))
+                    seen[sid] = (mtime, out["limit"], out["heard"], out["unheard"])
             if not events and time.monotonic()-beat > 15: events.append(("ping", {}))
             if events:
                 self.wfile.write("".join(f"event: {k}\ndata: {json.dumps(v, separators=(',', ':'))}\n\n" for k, v in events).encode())
@@ -210,7 +246,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path == "/api/seen":
                 store.mark_seen(body["session"], [i for i in body["items"] if i in store.load(body["session"])["items"]])
                 return self.send(200, dict(ok=True))
-            if path == "/api/spawn": return self.send(200, dict(session=runtime.spawn(body.get("title", ""), body["cwd"], body["prompt"], body["model"], body.get("effort"), body.get("skills", []), body.get("permission", "default"), body.get("parent"))))
+            if path == "/api/spawn": return self.send(200, dict(session=runtime.spawn(body.get("title", ""), body["cwd"], body["prompt"], body.get("model"), body.get("effort"), body.get("skills", []), body.get("permission"), body.get("parent"), body.get("provider") or "claude-code")))
             self.send(404, {"error": "not found"})
         except store.core.LockBusy as error:
             # another process has the archive open (DuckDB lets one writer in, and a reader blocks it): name it, keep serving
@@ -232,6 +268,29 @@ def notify_parent(s, state):
     store.emit(psid, "comment", "orchestrate", text, target=target, reply_to=None)
     background(runtime.deliver, psid)
 
+def start_result(sid, a):
+    """Start what an agent attached for the user: an app (or file) with macOS open, a command in a new Terminal window, run by
+    the user's shell in the folder it was attached from. A .command file needs no permission to control Terminal."""
+    if a["kind"] != "app": raise ValueError(f"{a['id']} is not an app or command")
+    if a["path"] and not Path(a["path"]).exists(): raise ValueError(f"{a['path']} no longer exists")
+    if not a["path"]:
+        store.core.secure_dir((path := store.sdir(sid)/"launch"/f"{a['id']}.command").parent)
+        path.write_text(f"#!{os.environ.get('SHELL', '/bin/zsh')} -il\ncd {shlex.quote(a['cwd'])} && {a['run']}\n")
+        path.chmod(0o700)
+    if (done := subprocess.run(["open", a["path"] or str(path)], capture_output=True, text=True, timeout=30)).returncode: raise ValueError(f"open failed: {done.stderr.strip()}")
+    return True
+
+NUDGED = set()
+
+def nudge(sid, items):
+    """An agent learns of a lapsed ETA on its next command; one sitting idle past it gets this notice, once per ETA, like the user's words."""
+    s = store.load(sid)
+    for i in [i for i in items if i in store.lapsed(s)]:
+        x = s["items"][i]
+        text = f"{i} ({x['title']!r}) passed its ETA ({store.clock(x['eta'])}). Finish it, or give it a new one: convos orchestrate set {i} --eta 30m"
+        store.emit(sid, "comment", "orchestrate", text, target=i, reply_to=None, notice=f"eta:{i}:{x['eta']}")
+    runtime.deliver(sid)
+
 def pump():
     """Retry delivery to joined sessions, tell parents about their children, and keep managed runtime truthful."""
     last, recover_at = {sid: store.status(s) for sid in store.session_ids() if (s := store.peek(sid))}, 0
@@ -245,19 +304,25 @@ def pump():
             except store.core.LockBusy as error:
                 recover_at = time.monotonic()+60
                 print(f"orchestrate: startup waits for the archive: {str(error)[:200]}", file=sys.stderr)
-        # agents outlive a server restart: pick them up again, and record the ones that ended
-        try: runtime.reconcile()
-        except (ValueError, OSError, subprocess.SubprocessError, store.core.LockBusy) as error: print(f"orchestrate: reconcile: {str(error)[:200]}", file=sys.stderr)
+        # agents outlive a server restart: pick them up again, and record the ones that ended. Whatever may wait (on the archive,
+        # on an agent) runs in the background, one run at a time per job, so this loop never stops for one session
+        runtime.once("reconcile", runtime.reconcile)
+        runtime.stuck()
         time.sleep(3)
         for sid in store.session_ids():
             s = store.peek(sid)
             if s and (state := store.status(s)) != last.get(sid):
                 if s["session"].get("parent") and state in NOTIFY and sid in last: background(notify_parent, s, state)
                 last[sid] = state
-            if s and s["closed"] and runtime.alive(sid) and not runtime.busy(sid): runtime.stop(sid)
-            if s and not s["closed"] and s["session"]["origin"] != "gui" and store.pending(s) and channels.reachable(s):
-                try: runtime.deliver(sid)
-                except (ValueError, OSError, subprocess.SubprocessError, store.core.LockBusy) as error: print(f"orchestrate: deliver {sid}: {error}", file=sys.stderr)
+            if s and s["closed"] and runtime.alive(sid) and not runtime.busy(sid): runtime.once(f"stop {sid}", runtime.stop, sid)
+            if s: runtime.listen(sid, s["session"])
+            if s and not s["closed"] and (late := [i for i in store.lapsed(s) if (sid, i, s["items"][i]["eta"]) not in NUDGED]):
+                NUDGED.update((sid, i, s["items"][i]["eta"]) for i in late)
+                background(nudge, sid, late)
+            # words held for a usage limit go out once it resets; joined sessions get every word their channel can take
+            gui = s and s["session"]["origin"] == "gui"
+            if s and not s["closed"] and store.pending(s) and not transcripts.holding(s["session"]) and (transcripts.limit(s["session"]) if gui else channels.reachable(s)):
+                runtime.once(f"deliver {sid}", runtime.deliver, sid)
 
 def free_port(preferred, wait=6):
     """The preferred port keeps open tabs working across restarts; wait briefly for a predecessor to release it."""
@@ -283,6 +348,8 @@ def serve(port=7311, open_browser=True):
     httpd.daemon_threads = True
     store.core.atomic_json(info_path(), dict(pid=os.getpid(), port=SERVER["port"], token=SERVER["token"]))
     os.chmod(info_path(), 0o600)
+    # `kill -USR1 PID` prints every thread's stack to the server log: what a stalled server waits on
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     threading.Thread(target=pump, daemon=True, name="orchestrate-pump").start()
     url = f"http://127.0.0.1:{SERVER['port']}/?t={SERVER['token']}"
     print(f"Orchestrate at {url}", flush=True)

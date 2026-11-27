@@ -55,19 +55,20 @@ def board(s):
     """Plain-text board: the agent's own view of what the user sees."""
     eff, meta = store.effective(s), s["session"]
     def who(i): return f" ({i['actor']})" if i["actor"] not in ("agent", "user") else ""
-    def results(target, depth): return [f"{'  '*depth}  {a['id']:<4} {a['kind']}: {a['caption'] or a['name']}" for a in s["attachments"].values() if a["target"] == target]
+    def results(target, depth): return [f"{'  '*depth}  {a['id']:<4} {a['kind']}: {a['caption'] or a['name']}" for a in s["attachments"].values() if a["target"] == target and not a.get("replaced_by")]
     marks = store.seen(meta["id"])
     new = store.unread(s, marks)
     # what the user has read, so the agent knows what it may archive: unseen rows stay, finished rows the user has read may go
     def due(i): return "" if not i.get("eta") or i["status"] not in store.OPEN else f" · {store.span(store.secs(i['eta']))} past its ETA" if i["eta"] < store.now() else f" · ETA {store.clock(i['eta'])}"
+    def reason(i): return f" · {i['why']}" if i.get("why") else ""
     def mark(i): return " (archived)" if i.get("archived") else " · unseen by the user" if i["id"] in new else " · archivable" if not i["parent"] and not store.blocked(s, i["id"], marks) else ""
-    def tree(parent, depth): return [line for i in s["items"].values() if i["parent"] == parent for line in [f"{'  '*depth}  {i['id']:<4} [{eff[i['id']]}] {i['title']}{who(i)}{due(i)}{mark(i)}", *results(i["id"], depth+2), *tree(i["id"], depth+1)]]
-    asks = [f"  {a['id']} on {a['target'] or 'session'}: {a['text']}{' -> ' + ' | '.join(a['options']) if a['options'] else ''}" for a in store.open_asks(s)]
+    def tree(parent, depth): return [line for i in s["items"].values() if i["parent"] == parent for line in [f"{'  '*depth}  {i['id']:<4} [{eff[i['id']]}] {i['title']}{who(i)}{reason(i)}{due(i)}{mark(i)}", *results(i["id"], depth+2), *tree(i["id"], depth+1)]]
+    asks = [f"  {a['id']} on {a['target'] or 'session'}: {store.LEAD[a['kind']]} {a['text']}{' -> ' + ' | '.join(a['options']) if a['options'] else ''}" for a in store.open_asks(s)]
     waiting = [store.describe(s, p) for p in store.pending(s)]
     return "\n".join([f"{meta['id']} {meta['title']!r} [{store.status(s)}] {meta['provider']} {meta['cwd']}",
                       *([f"now: {s['activity']['text']}"] if s["activity"] else []),
                       *(tree(None, 0) or ["  (no items yet: convos orchestrate add 'TITLE')"]), *(["session results:", *results(None, 0)] if results(None, 0) else []),
-                      *(["open questions:", *asks] if asks else []), *(["undelivered user messages (run inbox):", *waiting] if waiting else [])])
+                      *(["waiting on the user:", *asks] if asks else []), *(["undelivered user messages (run inbox):", *waiting] if waiting else [])])
 
 def ident(ctx):
     sid = store.resolve(ctx.obj["session"])
@@ -89,7 +90,8 @@ def join(ctx: typer.Context, title: str = typer.Option(..., "--title", "-t", hel
         if s["closed"]: s = store.emit(sid, "reopen", ctx.obj["actor"])[0]
         if s["session"]["title"] != title: s = store.emit(sid, "meta", ctx.obj["actor"], changes=dict(title=title))[0]
         return out(ctx, dict(session=sid, joined=False), f"Already joined as {sid}.\n{board(s)}")
-    meta = dict(id=(sid := store.new_id()), title=title, provider=provider, provider_session=provider_session, model=model or os.environ.get("ANTHROPIC_MODEL"), effort=os.environ.get("CLAUDE_EFFORT"), cwd=str(Path(cwd).resolve()), origin="joined", parent=parent, skills=[])
+    inferred = transcripts.latest_model(dict(provider=provider, provider_session=provider_session)) if not model and provider == "antigravity" and provider_session else None
+    meta = dict(id=(sid := store.new_id()), title=title, provider=provider, provider_session=provider_session, model=model or inferred or os.environ.get("ANTHROPIC_MODEL"), effort=os.environ.get("CLAUDE_EFFORT"), cwd=str(Path(cwd).resolve()), origin="joined", parent=parent, skills=[])
     s = store.emit(sid, "open", ctx.obj["actor"], "", session=meta)[0]
     channels.record(sid)
     hint = "" if provider_session else f"\nNo provider session id was detected: pass -s {sid} on every command, or export CONVOS_ORCHESTRATE_SESSION={sid}."
@@ -104,30 +106,35 @@ def show(ctx: typer.Context):
 @cmd
 def add(ctx: typer.Context, title: str, description: str = typer.Option("", "--description", "-d", help="Markdown; '-' reads stdin"),
         status: str = typer.Option("planned", "--status"), parent: str = typer.Option(None, "--parent", "-p"),
-        eta: str = typer.Option(None, "--eta", help="When you expect it done: 45m, 2h, 18:30, or an ISO time"), again: bool = typer.Option(False, "--again", help="Add it even if a row with this title already sits under the same parent")):
+        eta: str = typer.Option(None, "--eta", help="When you expect it done: 45m, 2h, 18:30, or an ISO time"), again: bool = typer.Option(False, "--again", help="Add it even if a row with this title already sits under the same parent"),
+        why: str = typer.Option(None, "--why", help="Why it is blocked, failed, or skipped; a blocked row needs one")):
     """Add an item (one unit of work) to the board. Re-adding a title that is already under the same parent returns that row."""
     body, parent, title = text_arg(description), parent or ctx.obj["scope"], title.strip()
     # a re-run setup script must not grow a second board: the existing row's id comes back and nothing is written
     if not again and (twin := next((i for i, x in store.load(ident(ctx))["items"].items() if x["parent"] == parent and x["title"] == title), None)):
         return report(ctx, dict(item=twin, existing=True), f"{twin} already on the board: {title} (nothing added; --again adds another)")
-    s, e = emit(ctx, "item", body, parent=parent, title=title, status=status, eta=eta_at(eta) if eta else None)
-    report(ctx, dict(item=e["item"]), f"{e['item']} [{status}] {title}")
+    s, e = emit(ctx, "item", body, parent=parent, title=title, status=status, eta=eta_at(eta) if eta else None, **({"why": why.strip()} if why and why.strip() else {}))
+    report(ctx, dict(item=e["item"]), f"{e['item']} [{status}] {title}{f' · {why.strip()}' if why and why.strip() else ''}")
 
 @cmd(name="set")
 def set_(ctx: typer.Context, item: str, status: str = typer.Option(None, "--status"), title: str = typer.Option(None, "--title"),
         description: str = typer.Option(None, "--description", "-d", help="Markdown; '-' reads stdin"),
-        eta: str = typer.Option(None, "--eta", help="When you expect it done: 45m, 2h, 18:30, an ISO time; 'none' clears")):
-    """Change an item's status, title, ETA, or description."""
-    changes = {k: v for k, v in dict(status=status, title=title).items() if v is not None} | ({"eta": eta_at(eta)} if eta is not None else {})
-    if not changes and description is None: raise ValueError("Nothing to change: pass --status, --title, --eta, or --description")
+        eta: str = typer.Option(None, "--eta", help="When you expect it done: 45m, 2h, 18:30, an ISO time; 'none' clears"),
+        why: str = typer.Option(None, "--why", help="Why it is blocked, failed, or skipped: what it waits for, and on whom")):
+    """Change an item's status, title, ETA, reason, or description."""
+    changes = {k: v for k, v in dict(status=status, title=title, why=why and why.strip()).items() if v} | ({"eta": eta_at(eta)} if eta is not None else {})
+    if not changes and description is None: raise ValueError("Nothing to change: pass --status, --title, --eta, --why, or --description")
     # only real changes are written, so repeating a command neither adds history nor brings an archived row back
     body, now = text_arg(description) if description is not None else "", store.load(ident(ctx))["items"].get(item)
-    if now: changes, description = {k: v for k, v in changes.items() if now.get(k) != v}, None if description is None or now["description"] == body else description
+    if now:
+        # a new status drops the old reason, so a reason given with it stays even when it repeats the old one
+        moved = changes.get("status", now["status"]) != now["status"]
+        changes, description = {k: v for k, v in changes.items() if now.get(k) != v or k == "why" and moved}, None if description is None or now["description"] == body else description
     if now and not changes and description is None: return report(ctx, dict(item=item, changes={}), f"{item} [{now['status']}] {now['title']} (unchanged)")
     s, e = emit(ctx, "update", body, item=item, changes=changes, description=description is not None)
     x = s["items"][item]
-    due = f" (ETA {store.clock(x['eta'])})" if x.get("eta") else ""
-    report(ctx, dict(item=item, changes=changes), f"{item} [{x['status']}] {x['title']}{due}")
+    due, reason = f" (ETA {store.clock(x['eta'])})" if x.get("eta") else "", f" · {x['why']}" if x.get("why") else ""
+    report(ctx, dict(item=item, changes=changes), f"{item} [{x['status']}] {x['title']}{reason}{due}")
 
 @cmd
 def archive(ctx: typer.Context, items: list[str] = typer.Argument(..., help="Top-level rows")):
@@ -155,14 +162,22 @@ def say(ctx: typer.Context, text: str, on: str = typer.Option(None, "--on", help
 KINDS = {"image/": "image", "video/": "video", "application/pdf": "pdf", "text/markdown": "markdown", "text/html": "html", "text/": "text"}
 def kind_of(name, mime): return "markdown" if name.lower().endswith((".md", ".markdown")) else next((k for prefix, k in KINDS.items() if mime.startswith(prefix)), "file")
 
+MANY = 8
 @cmd
 def attach(ctx: typer.Context, source: str = typer.Argument(None, help="File path or URL"), on: str = typer.Option(None, "--on", help="Item; omit for the session"),
            text: str = typer.Option(None, "--text", help="Inline markdown result instead of a file; '-' reads stdin"),
-           name: str = typer.Option(None, "--name"), caption: str = typer.Option("", "--caption")):
-    """Append a result to an item: image, PDF, markdown, any file, or a link."""
-    if (source is None) == (text is None): raise ValueError("Pass exactly one of SOURCE or --text")
+           name: str = typer.Option(None, "--name"), caption: str = typer.Option("", "--caption"),
+           replaces: str = typer.Option(None, "--replaces", help="A result on the same row this one supersedes (a newer version); it leaves the row"),
+           app: str = typer.Option(None, "--open", help="An app (or any file or folder) the user opens with one click on the board"),
+           run: str = typer.Option(None, "--run", help="A command the user runs with one click, in a new Terminal window in this folder")):
+    """Append a result to an item: image, PDF, markdown, any file, a link, or an app or command the user starts from the board."""
+    if sum(x is not None for x in (source, text, app, run)) != 1: raise ValueError("Pass exactly one of SOURCE, --text, --open or --run")
     target = on or ctx.obj["scope"]
-    if source and source.split(":", 1)[0] in ("http", "https"):
+    if app is not None or run is not None:
+        # nothing is copied: the board starts the app where it is, or the command in the folder it was attached from
+        if app is not None and not (path := Path(app).expanduser().resolve()).exists(): raise ValueError(f"No such app or file: {app}")
+        meta, blob = dict(kind="app", name=name or (path.name if app is not None else run), mime=None, size=None, hash=None, url=None, path=str(path) if app is not None else None, run=run, cwd=os.getcwd()), None
+    elif source.split(":", 1)[0] in ("http", "https"):
         meta, blob = dict(kind="link", name=name or source, mime=None, size=None, hash=None, url=source), None
     else:
         path = None if text is not None else Path(source).expanduser()
@@ -179,17 +194,30 @@ def attach(ctx: typer.Context, source: str = typer.Argument(None, help="File pat
         mime = mimetypes.guess_type(data_name)[0] or ("text/markdown" if text is not None else "application/octet-stream")
         meta = dict(kind=kind_of(data_name, mime), name=data_name, mime=mime, size=size, hash=blob.name, url=None)
         if text is not None: path.unlink()
-    s, e = emit(ctx, "attach", caption, blob=blob, target=target, file=meta)
-    report(ctx, dict(attachment=e["attachment"], kind=meta["kind"]), f"{e['attachment']} {meta['kind']} {meta['name']} attached to {target or 'session'}")
+    s, e = emit(ctx, "attach", caption, blob=blob, target=target, file=meta, **({"replaces": replaces} if replaces else {}))
+    # a row is read at a glance: past a handful of results, new work belongs in child rows
+    count = sum(1 for a in s["attachments"].values() if a["target"] == target and not a.get("replaced_by"))
+    crowded = f"\n{target} now holds {count} results. Put further work in child rows (convos orchestrate add 'TITLE' -p {target}) and attach there; a newer version of a result replaces it: --replaces aN" if target and count > MANY and not replaces else ""
+    report(ctx, dict(attachment=e["attachment"], kind=meta["kind"], replaces=replaces, results=count), f"{e['attachment']} {meta['kind']} {meta['name']} attached to {target or 'session'}{f', replacing {replaces}' if replaces else ''}{crowded}")
 
 @cmd
 def ask(ctx: typer.Context, question: str, option: list[str] = typer.Option([], "--option", "-o", help="Repeat for each choice; omit for free text"),
         multi: bool = typer.Option(False, "--multi"), on: str = typer.Option(None, "--on"), detail: str = typer.Option("", "--detail", help="Markdown context shown under the question"),
         wait: float = typer.Option(0, "--wait", help="Block up to SECONDS for the answer")):
     """Ask the user a question (optionally multiple choice). The item shows 'needs you' until answered."""
+    pose(ctx, "question", question, option, multi, on, detail, wait)
+
+@cmd
+def need(ctx: typer.Context, action: str = typer.Argument(..., help="What the user has to do, as an instruction to them"), on: str = typer.Option(None, "--on"),
+         detail: str = typer.Option("", "--detail", help="Markdown: how to do it, where things are"), wait: float = typer.Option(0, "--wait", help="Block up to SECONDS for the user")):
+    """Ask the user to do something only they can (run a test on their machines, sign in, approve). The item shows 'needs you' until they mark it Done or Can't."""
+    pose(ctx, "action", action, store.NEEDED, False, on, detail, wait)
+
+def pose(ctx, kind, text, options, multi, on, detail, wait):
     sid = ident(ctx)
-    s, e = store.emit(sid, "ask", ctx.obj["actor"], question, scope=ctx.obj["scope"], target=on or ctx.obj["scope"], options=option, multi=multi, ask_kind="question", detail=text_arg(detail))
-    if wait <= 0: return report(ctx, dict(ask=e["ask"]), f"{e['ask']} asked on {e['target'] or 'session'}; the answer arrives via inbox (or pass --wait)")
+    s, e = store.emit(sid, "ask", ctx.obj["actor"], text, scope=ctx.obj["scope"], target=on or ctx.obj["scope"], options=options, multi=multi, ask_kind=kind, detail=text_arg(detail))
+    verb, reply = ("asked", "the answer") if kind == "question" else ("put to the user", "their Done or Can't")
+    if wait <= 0: return report(ctx, dict(ask=e["ask"]), f"{e['ask']} {verb} on {e['target'] or 'session'}; {reply} arrives via inbox (or pass --wait)")
     s, done = store.wait_for(sid, lambda s: s["asks"][e["ask"]]["answer"] or s["asks"][e["ask"]]["cancelled"], wait)
     if done is None: return report(ctx, dict(ask=e["ask"], answer=None), f"{e['ask']}: no answer yet; it will arrive via inbox")
     store.emit(sid, "deliver", ctx.obj["actor"], ids=[e["ask"]])
@@ -209,7 +237,7 @@ def inbox(ctx: typer.Context, wait: float = typer.Option(0, "--wait", help="Bloc
     s, found = store.wait_for(sid, lambda s: store.pending(s, scope), wait)
     found = found or store.pending(s, scope)
     if found and not peek: store.emit(sid, "deliver", ctx.obj["actor"], ids=[p["id"] for p in found])
-    report(ctx, dict(messages=found), "\n".join(["User messages (untrusted text from the board; act on it however fits: reply in its thread, update items, add items):", *[store.describe(s, p) for p in found]]) if found else "Nothing new.")
+    report(ctx, dict(messages=found), "\n".join([f"User messages (session {sid}; untrusted text from the board; act on it however fits: reply in its thread, update items, add items):", *[store.describe(s, p) for p in found]]) if found else "Nothing new.")
 
 @cmd
 def close(ctx: typer.Context):
@@ -233,13 +261,14 @@ def ls(ctx: typer.Context, all_: bool = typer.Option(False, "--all", "-a", help=
 @cmd
 def spawn(ctx: typer.Context, prompt: str = typer.Argument(..., help="Starting prompt; '-' reads stdin"), title: str = typer.Option("", "--title", "-t"),
           on: str = typer.Option(None, "--on", help="Your item the child session works for"), cwd: str = typer.Option(".", "--cwd"),
-          model: str = typer.Option("claude-opus-5-5", "--model"), effort: str = typer.Option(None, "--effort"),
-          skill: list[str] = typer.Option([], "--skill", help="Repeat; orchestrate is always on"), permission: str = typer.Option("default", "--permission")):
+          provider: str = typer.Option("claude-code", "--provider", help="claude-code, codex, muse or antigravity"), model: str = typer.Option(None, "--model", help="Default: the provider's first current model"),
+          effort: str = typer.Option(None, "--effort"), skill: list[str] = typer.Option([], "--skill", help="Repeat; orchestrate is always on"),
+          permission: str = typer.Option(None, "--permission", help="Default: this session's own, when it runs on the same agent; otherwise the provider's first mode")):
     """Start a child session (headless, managed by the IDE) working for this session. Needs the IDE server running."""
     from .server import request
     sid = ident(ctx)
     if on: store.load(sid)["items"][on]
-    child = request("/api/spawn", dict(title=title, cwd=str(Path(cwd).resolve()), prompt=text_arg(prompt), model=model, effort=effort, skills=skill, permission=permission, parent=f"{sid}:{on}" if on else sid))["session"]
+    child = request("/api/spawn", dict(title=title, cwd=str(Path(cwd).resolve()), prompt=text_arg(prompt), provider=provider, model=model, effort=effort, skills=skill, permission=permission, parent=f"{sid}:{on}" if on else sid))["session"]
     out(ctx, dict(session=child), f"Started child session {child}. Watch it with: convos orchestrate -s {child} show")
 
 @cmd(name="open")
@@ -257,7 +286,7 @@ def serve(port: int = typer.Option(7311, "--port"), browser: bool = typer.Option
 
 @cmd
 def install(ctx: typer.Context, remove: bool = typer.Option(False, "--remove")):
-    """Install (or remove) the orchestrate skill for Claude Code (/orchestrate) and Codex ($orchestrate)."""
+    """Install (or remove) the orchestrate skill for Claude Code (/orchestrate), Codex ($orchestrate), and Antigravity (/orchestrate)."""
     from .setup import install as run
     results = run(remove)
     out(ctx, results, "\n".join(f"{r['provider']}: {'installed' if r['installed'] else 'removed'} {r['skill']}" for r in results))
@@ -265,4 +294,4 @@ def install(ctx: typer.Context, remove: bool = typer.Option(False, "--remove")):
 def register(parent): parent.add_typer(app, name="orchestrate")
 
 # Core loads product entry points during import; registration must already exist.
-from . import store, channels
+from . import store, channels, transcripts

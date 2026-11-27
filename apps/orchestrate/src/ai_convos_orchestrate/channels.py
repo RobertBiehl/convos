@@ -3,11 +3,13 @@
 Claude Code: each session binds an inbox socket and exports its path and token only to its own hooks and
 Bash commands. The agent's own `convos orchestrate` calls record them here as local working state
 (never in the archive), so orchestrate can post `{"type":"user",...}` lines the session treats as its own
-child's. Codex: `codex queue --thread ID --message TEXT` queues for the thread.
+child's. Codex: `codex queue --thread ID --message TEXT` parks the message until the thread takes its next turn,
+so orchestrate also gets the thread a turn: collab runs one for a thread it manages, and Codex's local daemon resumes an
+interactive one. The message counts as received once the thread's transcript shows it.
 """
-import json, os, shutil, socket, subprocess
+import json, os, shutil, socket, subprocess, sys, time
 from pathlib import Path
-from . import store
+from . import store, transcripts
 
 def endpoint_path(sid): return store.sdir(sid)/"endpoint.json"
 
@@ -31,11 +33,58 @@ def endpoint(s):
     except PermissionError: pass
     return value if Path(value["socket"]).is_socket() else None
 
+RUNNING = dict(at=-10.0, up=False)
+
+def codex_running():
+    """Whether any Codex process (the TUI or its app server) runs on this machine; checked at most every 3 s."""
+    if time.monotonic()-RUNNING["at"] > 3: RUNNING.update(at=time.monotonic(), up=subprocess.run(["pgrep", "-x", "codex"], capture_output=True).returncode == 0)
+    return RUNNING["up"]
+
+WAKE = {}
+
+def originator(path):
+    """How a Codex thread was started: its transcript's first line names the originator (codex-tui, codex_exec)."""
+    try:
+        with path.open("rb") as f: return json.loads(f.readline())["payload"].get("originator")
+    except (OSError, ValueError, KeyError, AttributeError): return None
+
+def collab_worker(thread):
+    """The collab room and managed member that runs this Codex thread, when collab is installed and one does."""
+    try: import ai_convos_collab as c
+    except ImportError: return None
+    for room in c.config()["rooms"].values():
+        try: state = c.snapshot(room)
+        except (ValueError, OSError): continue
+        if (m := next((m for m in state["members"].values() if m.get("managed") and m.get("provider") == "codex" and m.get("session") == thread), None)): return room, m["name"]
+    return None
+
+def wake(meta):
+    """How a message queued for this Codex thread gets a turn soon: ("collab", room, name) when collab runs the thread as a
+    managed worker (collab is asked for a turn, which runs with its own model and sandbox), ("daemon",) for an interactive
+    thread (Codex's local daemon resumes it), or None when another program drives it with `codex exec`: a daemon resume keeps
+    the thread's write lock after its turn and would lock that program out. Looked up at most every 30 s."""
+    if (hit := WAKE.get(ps := meta["provider_session"])) and time.monotonic() < hit[0]: return hit[1]
+    if worker := collab_worker(ps): how = ("collab", *worker)
+    elif (path := transcripts.transcript(meta)) and originator(path) == "codex-tui": how = ("daemon",)
+    else: how = None
+    WAKE[ps] = (time.monotonic()+30, how)
+    return how
+
+def waking(meta):
+    """What the IDE says about how this Codex thread is woken: collab ROOM/NAME, daemon, or None."""
+    how = meta["provider"] == "codex" and meta.get("provider_session") and wake(meta)
+    return how and (f"collab {how[1]['name']}/{how[2]}" if how[0] == "collab" else how[0])
+
+def wake_collab(room, name):
+    from ai_convos_collab.runtime import wake_data
+    try: wake_data(room, name)
+    except ValueError as error: print(f"orchestrate: collab could not wake {name}: {error}", file=sys.stderr)
+
 def reachable(s):
     meta = s["session"]
     if meta["origin"] == "gui": return False
     if meta["provider"] == "claude-code": return endpoint(s) is not None
-    return meta["provider"] == "codex" and bool(meta.get("provider_session")) and shutil.which("codex") is not None
+    return meta["provider"] == "codex" and bool(meta.get("provider_session")) and shutil.which("codex") is not None and (codex_running() or wake(meta) is not None)
 
 def push(sid, meta, text):
     s = store.load(sid)
@@ -47,6 +96,10 @@ def push(sid, meta, text):
             conn.sendall("".join(json.dumps(l) + "\n" for l in lines).encode())
         return "claude-socket"
     if meta["provider"] == "codex" and reachable(s):
-        subprocess.run(["codex", "queue", "--thread", meta["provider_session"], "--message", text], check=True, capture_output=True, timeout=30)
+        how = wake(meta)
+        # the daemon start is a no-op while it runs; --resume has it take the thread's turn now
+        if how == ("daemon",): subprocess.run(["codex", "app-server", "daemon", "start"], capture_output=True, timeout=60)
+        subprocess.run(["codex", "queue", "--thread", meta["provider_session"], "--message", text, *(["--resume"] if how == ("daemon",) else [])], check=True, capture_output=True, timeout=30)
+        if how and how[0] == "collab": wake_collab(how[1], how[2])
         return "codex-queue"
     return None

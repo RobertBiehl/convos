@@ -1,5 +1,5 @@
-Skills Setup (Codex + Claude Code)
-==================================
+Skills Setup (Codex + Claude Code + Antigravity)
+================================================
 
 This repo ships one skill: `convos`.
 
@@ -9,17 +9,21 @@ Install
 Run:
 
 ```bash
+convos install-skills
+# or from a repo checkout:
 bin/install-skills
 ```
 
 This installs to:
 - Codex: `~/.codex/skills/convos/SKILL.md`
 - Claude Code: `~/.claude/skills/convos/SKILL.md`
+- Antigravity: `~/.gemini/config/skills/convos/SKILL.md`
 
 Optional: install only one
 ```bash
 bin/install-skills codex
 bin/install-skills claude
+bin/install-skills antigravity
 ```
 
 Use
@@ -42,8 +46,9 @@ convos install-hooks --status
 Install and removal preflight and parse both agent config files before either is
 rewritten, so an unsafe or malformed second config cannot leave partial hooks.
 
-Claude Code uses `Stop` plus `SessionEnd`; Codex uses `Stop`. Remove only these
-convos handlers with `convos install-hooks --remove`. Codex may require
+Claude Code uses `Stop` plus `SessionEnd`; Codex and Antigravity use `Stop`
+(Antigravity stores its named `convos-capture` hook in `~/.gemini/config/hooks.json`).
+Remove only these convos handlers with `convos install-hooks --remove`. Codex may require
 reviewing the new command hook through `/hooks` after installation. The approval
 screen shows the literal `convos capture codex` command; Codex has no separate
 handler display-name field, while `Saving conversation to Convos` is shown as

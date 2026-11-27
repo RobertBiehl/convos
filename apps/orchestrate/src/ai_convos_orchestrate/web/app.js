@@ -5,10 +5,10 @@ import { html, render, useState, useEffect, useRef, useLayoutEffect } from "/ven
 const store = (k, v) => { try { if (v === undefined) return JSON.parse(localStorage.getItem("orch." + k)); localStorage.setItem("orch." + k, JSON.stringify(v)); } catch { return null; } };
 const S = {
   sessions: [], meta: null, cur: null, detail: {}, sel: {}, collab: null,
-  overlay: null, closed: false, toast: null, pulses: {}, conn: false, askFocus: null, askPick: {}, drafts: {}, attach: {}, drop: false, optimistic: {}, res: {},
+  overlay: null, closed: false, toast: null, pulses: {}, conn: false, askFocus: null, askPick: {}, drafts: {}, attach: {}, drop: false, optimistic: {}, res: {}, shown: {},
   seen: store("seen") || {}, prev: {},
 };
-let paint = () => {}, followLatest = () => {};
+let paint = () => {}, followLatest = () => {}, holdDetail = () => {};
 const set = (patch) => { Object.assign(S, typeof patch === "function" ? patch(S) : patch); paint(); };
 const keyStack = [];
 const useKeys = (fn) => useEffect(() => { keyStack.push(fn); return () => keyStack.splice(keyStack.indexOf(fn), 1); }, [fn]);
@@ -32,6 +32,8 @@ const ITEM_STATUSES = ["planned", "working", "blocked", "done", "failed", "skipp
 const BAR = ["done", "working", "input", "blocked", "failed", "planned", "skipped"];
 const num = (id) => parseInt(id.slice(1), 10);
 const base = (p) => (p || "").split("/").filter(Boolean).pop() || p;
+const PROV_NAME = { "claude-code": "Claude Code", codex: "Codex", muse: "Muse", antigravity: "Antigravity" };
+const provName = (p) => PROV_NAME[p] || p;
 const home = (p) => S.meta && p?.startsWith(S.meta.home) ? "~" + p.slice(S.meta.home.length) : p;
 const span = (s) => s < 45 ? "now" : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`;
 const ago = (ts) => ts ? span((Date.now() - new Date(ts)) / 1000) : "";
@@ -42,6 +44,37 @@ function etaOf(it) {
   return { late: left < 0, at, text: left < 0 ? `${span(-left)} past ETA` : `ETA ${at}`, title: left < 0 ? `ETA was ${t.toLocaleString()}` : `ETA ${t.toLocaleString()}, in ${span(left)}` };
 }
 const Eta = ({ it }) => { const e = etaOf(it); return e ? html`<span class="eta ${e.late ? "late" : ""}" title=${e.title}>${G.clock}${e.text}</span>` : null; };
+// the provider's usage limit stopped this session's last turn: words wait until a minute after the reset, then go out
+const clock = (t) => t.toLocaleString([], t.toDateString() === new Date().toDateString() ? { hour: "2-digit", minute: "2-digit" } : { weekday: "short", hour: "2-digit", minute: "2-digit" });
+function limitOf(s) {
+  const l = s.limit;
+  if (!l) return null;
+  const t = l.resets && new Date(l.resets), wait = !!t && t - Date.now() + 60000 > 0, hit = clock(new Date(l.at));
+  return { wait, hit, at: t && clock(t), go: t && clock(new Date(+t + 60000)), released: l.released && clock(new Date(l.released)), title: l.text, short: !t ? "Usage limit · no reset time" : wait ? `Usage limit · resets ${clock(t)}` : `Usage limit reset ${clock(new Date(l.released || t))} · not resumed` };
+}
+// a Codex limit can be lifted early with one of the user's usage-limit resets, which covers the whole Codex account
+const OUTCOMES = { reset: "Usage reset", nothingToReset: "Codex says your usage needs no reset right now", noCredit: "No usage-limit resets are left", alreadyRedeemed: "That reset was already used; try again" };
+function CodexReset() {
+  const [r, setR] = useState(null), [asking, setAsking] = useState(false), [busy, setBusy] = useState(false);
+  useEffect(() => { let live = true; api.get("/api/codex/resets").then((v) => live && setR(v), () => live && setR(false)); return () => { live = false; }; }, []);
+  if (!r || r.allowed === true) return null;
+  if (!r.available) return html`<div class="notice">No usage-limit resets left.</div>`;
+  const use = async () => {
+    setBusy(true);
+    const v = await act({ kind: "codex_reset" });
+    setBusy(false);
+    setAsking(false);
+    if (!v) return;
+    toast(OUTCOMES[v.outcome] || v.outcome, v.outcome !== "reset" && v.outcome !== "nothingToReset");
+    if (v.outcome !== "reset") setR(await api.get("/api/codex/resets").catch(() => false));
+    await loadSessions();
+  };
+  const n = r.next, until = n?.expiresAt && new Date(n.expiresAt * 1000).toLocaleDateString([], { month: "short", day: "numeric" });
+  return asking ? html`<div class="permask"><div>Use one of your ${r.available} Codex usage-limit resets${n?.title ? html` (<b>${n.title}</b>)` : ""}? It lifts the limit for your whole Codex account, and messages held for it go out at once.${until ? ` It uses the reset that expires first, on ${until}.` : ""}</div>
+      <div class="btns"><button class="abtn primary" disabled=${busy} onClick=${use}>${busy ? "Resetting…" : "Yes, use a reset"}</button><button class="abtn" disabled=${busy} onClick=${() => setAsking(false)}>Cancel</button></div></div>`
+    : html`<div class="btns resetbtn"><button class="abtn" onClick=${() => setAsking(true)}>Use a reset · ${r.available} left</button></div>`;
+}
+const LimitPill = ({ s }) => { const l = limitOf(s); return l ? html`<span class="pill limit" title=${l.title}>${G.clock}${l.short}</span>` : null; };
 const initials = (a) => a === "user" ? "you" : a === "agent" ? "A" : a === "orchestrate" ? "O" : a.slice(0, 2).toUpperCase();
 const K = (...keys) => keys.map((k) => html`<kbd>${k}</kbd>`);
 const Hot = ({ k, children }) => html`<span class="hot">${[].concat(k).map((x) => html`<kbd>${x}</kbd>`)}${children}</span>`;
@@ -49,6 +82,7 @@ const Hot = ({ k, children }) => html`<span class="hot">${[].concat(k).map((x) =
 const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const inline = (s) => s.split(/(`[^`\n]+`)/g).map((part, i) => i % 2 ? `<code>${esc(part.slice(1, -1))}</code>` : esc(part)
   .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<em>$2</em>")
+  .replace(/\[([^\]\n]+)\]\((o[0-9a-f]{11}(?::[icqa][1-9]\d*)?|[icqa][1-9]\d*)\)/g, (m, text, ref) => refLink(ref[0] === "o" ? ref.split(":")[0] : S.cur, ref[0] === "o" ? ref.split(":")[1] : ref, text, "ref inl") || text)
   .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
   .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>')).join("");
 function md(src) {
@@ -86,17 +120,17 @@ function refTarget(sid, id) {
   if (!d) return sid === S.cur ? null : `${clip(s.title, 20)} › ${id}`;
   const x = { i: d.items, a: d.attachments, q: d.asks, c: d.comments }[id[0]][id];
   if (!x) return null;
-  const label = id[0] === "i" ? x.title : id[0] === "a" ? x.caption || x.name || x.url : id[0] === "q" ? x.text : `${x.actor === "user" ? "you" : x.actor}: ${x.text}`;
-  return (sid === S.cur ? "" : `${clip(s.title, 16)} › `) + clip(label);
+  const label = id[0] === "i" ? x.title : id[0] === "a" ? (x.replaced_by ? `replaced by ${x.replaced_by}: ` : "") + (x.caption || x.name || x.url) : id[0] === "q" ? x.text : `${x.actor === "user" ? "you" : x.actor}: ${x.text}`;
+  return (sid === S.cur ? "" : `${s.title} › `) + clip(label, 90);
 }
+// the pill's own text stays short: the id here, another session by the part of its title before any colon
+const refName = (sid, id) => sid === S.cur && id ? id : [clip(S.sessions.find((x) => x.id === sid).title.split(":")[0], 18), id].filter(Boolean).join(" ");
+const refLink = (sid, id, text, cls = "ref") => { const label = sid && refTarget(sid, id); return label ? `<a class="${cls}" href="#${sid}" data-ref="${sid}:${id || ""}" title="${esc(label)}">${text ?? esc(refName(sid, id))}</a>` : null; };
 function refs(text) {
   let skip = 0;
   return text.split(/(<[^>]+>)/g).map((p) => {
     if (p.startsWith("<")) { if (/^<(a|code)[\s>]/.test(p)) skip++; else if (/^<\/(a|code)>/.test(p)) skip--; return p; }
-    return skip ? p : p.replace(REF, (m, pre, sid, sub, local) => {
-      const at = sid || S.cur, id = sid ? sub : local, label = at && refTarget(at, id);
-      return label ? `${pre}<a class="ref" href="#${at}" data-ref="${at}:${id || ""}"><b>${id || "session"}</b>${esc(label)}</a>` : m;
-    });
+    return skip ? p : p.replace(REF, (m, pre, sid, sub, local) => { const link = refLink(sid || S.cur, sid ? sub : local); return link ? pre + link : m; });
   }).join("");
 }
 async function follow(ref) {
@@ -107,13 +141,16 @@ async function follow(ref) {
   const d = S.detail[sid], kind = id?.[0];
   if (kind === "q" && !d.asks[id].answer && !d.asks[id].cancelled) return needYou(sid, id);
   if (kind === "a") {
-    const a = d.attachments[id];
+    let a = d.attachments[id];
+    while (a.replaced_by) a = d.attachments[a.replaced_by];
     S.sel[sid] = a.target || null;
-    S.res[`${sid}:${a.target || ""}`] = resultsFor(d, a.target).findIndex((x) => x.id === id || (a.hash && x.hash === a.hash));
+    S.res[`${sid}:${a.target || ""}`] = resultsFor(d, a.target).findIndex((x) => x.id === a.id || (a.hash && x.hash === a.hash));
     return set({ overlay: { kind: "look" } });
   }
   const x = kind === "i" ? d.items[id] : kind === "c" ? d.comments[id] : kind === "q" ? d.asks[id] : null;
   S.sel[sid] = kind === "i" ? id : x?.target || null;
+  // a comment older than the visible chat is revealed, with everything after it
+  if (kind === "c" && x) { const list = commentsFor(d, x.target || null), key = `${sid}:${x.target || ""}`; S.shown[key] = Math.max(S.shown[key] || CHAT_PAGE, list.length - list.findIndex((c) => c.id === id)); }
   paint();
   if (kind === "c") setTimeout(() => { const el = document.querySelector(`.detail [data-c="${id}"]`); if (el) { el.scrollIntoView({ block: "center" }); el.classList.remove("hl"); void el.offsetWidth; el.classList.add("hl"); } }, 120);
 }
@@ -222,13 +259,18 @@ const childrenOf = (sid, item) => S.sessions.filter((s) => item ? s.parent === `
 const openAsks = (d) => Object.values(d.asks).filter((a) => !a.answer && !a.cancelled);
 const commentsFor = (d, target) => [...Object.values(d.comments), ...(S.optimistic[S.cur] || [])].filter((c) => (c.target || null) === (target || null)).sort((a, b) => a.at.localeCompare(b.at));
 // the same bytes attached to one row twice (an agent re-attaching a file under a better name) are one result: the first stays
-const resultsFor = (d, target) => Object.values(d.attachments).filter((a) => (a.target || null) === (target || null)).filter((a, n, xs) => !a.hash || xs.findIndex((x) => x.hash === a.hash) === n);
+// a row's current results, newest first: a result replaced by a newer version leaves the row (its id still leads to the newer one)
+const resultsFor = (d, target) => Object.values(d.attachments).filter((a) => (a.target || null) === (target || null) && !a.replaced_by).filter((a, n, xs) => !a.hash || xs.findIndex((x) => x.hash === a.hash) === n).reverse();
 const blobUrl = (a) => a.src || `/api/blob/${a.hash}?mime=${encodeURIComponent(a.mime || "")}&name=${encodeURIComponent(a.name)}`;
+// agents often write JSON on one line; it reads indented, or as written when it does not parse
+const readable = (a, t) => { if (t === null || !/json/.test(a.mime || "")) return t; try { return JSON.stringify(JSON.parse(t), null, 2); } catch { return t; } };
+const copyText = (t) => navigator.clipboard.writeText(t).then(() => toast("Copied"), fail);
 const pulse = (id, kind) => { S.pulses[id] = { kind, n: (S.pulses[id]?.n || 0) + 1, at: Date.now() }; };
 
 // ---------------------------------------------------------------- data flow
 async function loadSessions() { S.sessions = await api.get("/api/sessions"); paint(); }
 const pendingDetail = {};
+function behind(s) { const d = s && S.detail[s.id]; return !!d && (d.seq < s.seq || d.summary.heard !== s.heard); }
 function scheduleDetail(sid) { clearTimeout(pendingDetail[sid]); pendingDetail[sid] = setTimeout(() => loadDetail(sid).catch(fail), 60); }
 async function loadDetail(sid) {
   const d = await api.get(`/api/session/${sid}`), old = S.detail[sid];
@@ -257,8 +299,9 @@ function connect() {
   es.onopen = () => set({ conn: true });
   es.onerror = () => set({ conn: false });
   es.addEventListener("version", (e) => { const v = JSON.parse(e.data); if (!S.version) S.version = v; else if (v !== S.version) reloadInPlace(); });
-  // the open session reloads on every change; a board cached from earlier reloads when it fell behind, so switching back is current
-  es.addEventListener("session", (e) => { const s = JSON.parse(e.data); upsert(s); if (s.id === S.cur || S.detail[s.id]?.seq < s.seq) scheduleDetail(s.id); paint(); });
+  // the open session reloads on every change; a board cached from earlier reloads when it fell behind (or its agent received
+  // words since), so switching back is current
+  es.addEventListener("session", (e) => { const s = JSON.parse(e.data); upsert(s); if (s.id === S.cur || behind(s)) scheduleDetail(s.id); paint(); });
 }
 
 // ---------------------------------------------------------------- updates reload in place, never while you are mid-thought
@@ -268,7 +311,7 @@ function reloadInPlace() {
   const b = document.querySelector(".center .scroll"), d = document.querySelector(".dscroll");
   try {
     sessionStorage.setItem("orch.restore", JSON.stringify({
-      at: Date.now(), cur: S.cur, sel: S.sel, res: S.res, closed: S.closed, drafts: S.drafts,
+      at: Date.now(), cur: S.cur, sel: S.sel, res: S.res, closed: S.closed, drafts: S.drafts, shown: S.shown,
       scroll: b ? { top: b.scrollTop, pinned: b.scrollHeight - b.scrollTop - b.clientHeight < 40 } : null, dscroll: d?.scrollTop || 0,
       composer: !!document.activeElement?.closest(".composer"),
     }));
@@ -285,7 +328,7 @@ function go(sid) {
   const apply = () => {
     S.cur = sid; S.askFocus = null;
     const known = S.sessions.find((x) => x.id === sid);
-    if (!S.detail[sid] || known?.seq > S.detail[sid].seq) loadDetail(sid).catch(fail);
+    if (!S.detail[sid] || behind(known)) loadDetail(sid).catch(fail);
     else { S.seen[sid] = S.detail[sid].seq; store("seen", S.seen); }
     history.replaceState(null, "", `#${sid}`);
     paint();
@@ -326,11 +369,16 @@ function moveResult(delta) {
   const list = rowResults(), it = selected(); if (!list.length) return;
   S.res[resKey(it?.id)] = Math.max(0, Math.min(list.length - 1, resIdx(it?.id) + delta)); paint();
 }
+// links open in the browser; an app or command an agent attached starts on this Mac, through the server
+const outside = (r) => r.kind === "link" || r.kind === "app";
+const launchApp = async (a) => { if (await act({ kind: "launch", attachment: a.id })) toast(a.run ? `Running in a new Terminal window: ${a.run}` : `Opening ${a.name}`); };
+const openOutside = (r) => r.kind === "app" ? launchApp(r) : window.open(r.url, "_blank", "noopener,noreferrer");
+const appTitle = (a) => a.run ? `Runs in a new Terminal window, in ${home(a.cwd)}:\n${a.run}` : `Opens ${home(a.path)}`;
 function look() { if (rowResults().length || selected()) set({ overlay: { kind: "look" } }); }
 function openSelected() {
   const list = rowResults(), a = list[Math.min(list.length - 1, resIdx(selected()?.id))];
   if (!a) return false;
-  if (a.kind === "link") window.open(a.url, "_blank", "noopener,noreferrer"); else set({ overlay: { kind: "look" } });
+  if (outside(a)) openOutside(a); else set({ overlay: { kind: "look" } });
   return true;
 }
 function focusComposer() {
@@ -398,7 +446,9 @@ async function resolveAsk(ask, body, okText) {
   await act(body, okText);
   S.askPick[ask.id] = [];
 }
-const answer = (ask, choices, text = "") => resolveAsk(ask, { kind: "answer", ask: ask.id, choices, text }, ask.kind === "permission" ? `${choices[0]}` : "Answer sent");
+const answer = (ask, choices, text = "") => resolveAsk(ask, { kind: "answer", ask: ask.id, choices, text }, ask.kind === "permission" ? `${choices[0]}` : ask.kind === "action" ? (choices[0] === "Done" ? "Marked done; the agent is told" : "Sent to the agent") : "Answer sent");
+// what the agent waits on you for: a question, a permission, or an action only you can take (the agent's need)
+const ASK_LABEL = { permission: "Permission", action: "Your action", question: "Question" };
 // a question the conversation has moved past: it leaves the board, and the agent is told it was dismissed unanswered
 const dismiss = (ask) => ask.kind !== "permission" && resolveAsk(ask, { kind: "dismiss", ask: ask.id }, `${ask.id} dismissed; the agent is told`);
 // what a question rests on: the results it names, then the other results on its row; pictures first, as they decide most
@@ -410,7 +460,7 @@ function evidence(d, a) {
 }
 function lookEvidence(a, list, n) {
   const r = list[n];
-  if (r.kind === "link") return window.open(r.url, "_blank", "noopener,noreferrer");
+  if (outside(r)) return openOutside(r);
   markSeen([...new Set(list.map((x) => x.target).filter(Boolean))]);
   set({ overlay: { kind: "look", files: list, i: n, label: `What ${a.id} rests on · ${clip(a.text, 80)}` } });
 }
@@ -419,6 +469,9 @@ const repliedSince = (d, a) => Object.values(d.comments).filter((c) => c.actor =
 function openResult(target, i) { S.res[resKey(target)] = i; set({ overlay: { kind: "look" } }); if (target) markSeen([target]); }
 
 // ---------------------------------------------------------------- command registry (palette, help, keys)
+// a new session stands alone; nesting it under the session or row at hand is a choice in the dialog, never implied by the key
+const newSession = () => { const s = cur(), it = selected(); set({ overlay: { kind: "new", nest: s ? [[s.id, s.title], ...(it ? [[`${s.id}:${it.id}`, `${it.id} ${it.title}`]] : [])] : [] } }); };
+
 function commands() {
   const s = cur(), it = selected(), d = det();
   return [
@@ -441,10 +494,10 @@ function commands() {
     { group: "Items", keys: ["e"], label: it && d?.items[rootOf(d, it.id)].archived ? "Bring the row back to current" : "Archive the finished row", run: () => archive(false), when: it },
     { group: "Items", keys: ["⇧", "E"], label: "Archive every finished row", run: () => archive(true), when: d },
     { group: "Items", keys: ["↵"], label: "Open the selected result (or o)", run: () => openSelected(), when: d },
-    { group: "Sessions", keys: ["n"], label: "New session", run: () => set({ overlay: { kind: "new" } }) },
-    { group: "Sessions", keys: ["⇧", "N"], label: it ? `New child session for ${it.id}` : "New child session", run: () => s && set({ overlay: { kind: "new", parent: it ? `${s.id}:${it.id}` : s.id } }), when: s },
-    { group: "Sessions", keys: ["r"], label: "Resume session", run: () => act({ kind: "resume" }, "Resuming…"), when: s && s.origin === "gui" && !s.live && !s.closed },
+    { group: "Sessions", keys: ["n"], label: "New session", run: newSession },
+    { group: "Sessions", keys: ["r"], label: "Resume session", run: () => act({ kind: "resume" }, "Resuming…"), when: s && s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" },
     { group: "Sessions", keys: ["x"], label: "Stop session", run: () => act({ kind: "stop" }, "Stopping…"), when: s && s.origin === "gui" && s.live },
+    { group: "Sessions", keys: ["⇧", "R"], label: "Restart session on its conversation (applies an agent update)", run: restartSession, when: s && s.agent },
     { group: "Sessions", keys: ["⇧", "X"], label: s?.closed ? "Reopen session" : "Close session (keeps its board)", run: () => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed"), when: s },
     { group: "Sessions", keys: ["."], label: S.closed ? "Hide closed sessions" : "Show closed sessions", run: () => set({ closed: !S.closed }) },
     { group: "View", keys: ["i"], label: "Convos on this computer: is the archive current, sync, relay, disk", run: () => set({ overlay: { kind: "convos" } }) },
@@ -491,7 +544,7 @@ function onKey(e) {
     }
     if (k === "Enter" && a) { e.preventDefault(); return answer(a, S.askPick[a.id] || [], document.querySelector(`[data-ask="${a.id}"] input`)?.value || ""); }
     if (k === "Tab" && a) { e.preventDefault(); return document.querySelector(`[data-ask="${a.id}"] input`)?.focus(); }
-    if (k === " " && a) { const ev = evidence(d, a), n = ev.findIndex((r) => r.kind !== "link"); e.preventDefault(); return n >= 0 && lookEvidence(a, ev, n); }
+    if (k === " " && a) { const ev = evidence(d, a), n = ev.findIndex((r) => !outside(r)); e.preventDefault(); return n >= 0 && lookEvidence(a, ev, n); }
     if ((k === "Backspace" || k === "Delete") && a && a.kind !== "permission") { e.preventDefault(); return dismiss(a); }
     if (k === "Escape") return set({ askFocus: null });
   }
@@ -502,9 +555,9 @@ function onKey(e) {
     " ": look, Escape: () => select(null), e: () => archive(false), E: () => archive(true),
     c: focusComposer, C: sessionChat, a: focusAsk, i: () => set({ overlay: { kind: "convos" } }),
     s: () => it && set({ overlay: { kind: "status", item: it.id } }), o: () => openSelected(),
-    n: () => set({ overlay: { kind: "new" } }), N: () => s && set({ overlay: { kind: "new", parent: it ? `${s.id}:${it.id}` : s.id } }),
-    r: () => s?.origin === "gui" && !s.live && !s.closed && act({ kind: "resume" }, "Resuming…"), x: () => s?.origin === "gui" && s.live && act({ kind: "stop" }, "Stopping…"),
-    X: () => s && act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed · its board stays here"),
+    n: newSession, N: newSession,
+    r: () => s?.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" && act({ kind: "resume" }, "Resuming…"), x: () => s?.origin === "gui" && s.live && act({ kind: "stop" }, "Stopping…"),
+    X: () => s && act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed · its board stays here"), R: () => s?.agent && restartSession(),
     p: () => s?.parent && go(s.parent.split(":")[0]), ".": () => set({ closed: !S.closed }),
     L: toggleTheme, "?": () => set({ overlay: { kind: "help" } }), "/": () => set({ overlay: { kind: "palette" } }),
   };
@@ -529,13 +582,13 @@ function Sidebar() {
           <${SI} s=${s.status} />
           <div style="min-width:0">
             <div class="title">${s.title}</div>
-            <div class="sub">${s.status === "working" && s.activity ? html`<span class="act">${s.activity.text}</span>` : html`<span>${base(s.cwd)}</span><span>·</span><span>${ago(s.updated)}</span>`}</div>
+            <div class="sub">${s.limit ? html`<span class="lim" title=${s.limit.text}>${limitOf(s).short}</span>` : s.unheard?.length ? html`<span class="lim" title=${DEAF(s)}>not taking your messages</span>` : s.status === "working" && s.activity ? html`<span class="act">${s.activity.text}</span>` : s.status === "blocked" && s.why ? html`<span class="why" title=${s.why}>${s.why}</span>` : html`<span>${base(s.cwd)}</span><span>·</span><span>${ago(s.updated)}</span>`}</div>
             ${s.items ? html`<div class="mini"><${Progress} counts=${s.counts} /></div>` : null}
           </div>
-          <div class="right">${i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${s.asks ? html`<button class="badge" title="Go to the question" onClick=${(e) => { e.stopPropagation(); needYou(s.id); }}>${s.asks}</button>` : unread ? html`<span class="unread" />` : null}${s.live ? html`<span class="dot live" title="live" />` : null}</div>
+          <div class="right">${i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${s.asks ? html`<button class="badge" title="Go to what needs you" onClick=${(e) => { e.stopPropagation(); needYou(s.id); }}>${s.asks}</button>` : unread ? html`<span class="unread" />` : null}${s.live ? html`<span class="dot live" title="live" />` : null}</div>
         </div>`;
       })}
-      ${!rows.length ? html`<div class="empty">No sessions yet.<br />Press ${K("n")} to start one, or type <code>/orchestrate</code> in any Claude Code or Codex session.</div>` : null}
+      ${!rows.length ? html`<div class="empty">No sessions yet.<br />Press ${K("n")} to start one, or type <code>/orchestrate</code> in any agent session.</div>` : null}
     </div>
     ${closedCount ? html`<h6 style="margin-bottom:12px"><span class="grow">${closedCount} closed</span><${Hot} k=".">${S.closed ? "hide" : "show"}<//></h6>` : null}
   </aside>`;
@@ -553,9 +606,19 @@ function Crumbs({ s }) {
 function SessionBar({ s }) {
   return html`<header class="shead slim">
     <${Crumbs} s=${s} />
-    <h1><span class="t">${s.title}</span>${s.status === "input" ? html`<button class="pillbtn" title="Go to the question" onClick=${() => needYou(s.id)}><${Pill} s="input" /><${Hot} k="a">answer<//></button>` : html`<${Pill} s=${s.status} />`}</h1>
+    <h1><span class="t">${s.title}</span>${s.status === "input" ? html`<button class="pillbtn" title="Go to what needs you" onClick=${() => needYou(s.id)}><${Pill} s="input" /><${Hot} k="a">answer<//></button>` : html`<${Pill} s=${s.status} />`}<${LimitPill} s=${s} /><${AgentChip} s=${s} /></h1>
   </header>`;
 }
+// what a session started here runs, always in view; a click brings up its model, effort, permission and restart controls, which
+// sit above a long chat that the pane opens at its newest message
+function AgentChip({ s }) {
+  if (s.origin !== "gui" || !s.model) return null;
+  const show = () => { select(null); requestAnimationFrame(() => { const b = document.querySelector(".dscroll"); if (b) b.scrollTop = 0; }); };
+  return html`<button class="agentchip ${s.unheard?.length ? "deaf" : newer(s) ? "upd" : ""}" title=${s.unheard?.length ? DEAF(s) : newer(s) ? `${provName(s.provider)} ${s.agent.installed} is installed: restart to update` : "Model, effort, permissions, restart"} onClick=${show}><code>${s.model}</code>${s.effort ? ` · ${s.effort}` : ""}${s.unheard?.length ? " · not taking messages" : newer(s) ? " · update" : ""}</button>`;
+}
+// a live Claude Code agent that has not logged taking words written to its stdin minutes ago (it does within a second, even mid
+// tool call): it stopped acting on its input, as Claude Code 2.1.327 did after a skill reload; a restart gives them to it again
+const DEAF = (s) => ((it) => `Claude Code has not taken ${s.unheard.join(", ")} from its input, minutes after orchestrate wrote ${it} there: it no longer acts on what it reads. A restart gives ${it} to it again.`)(s.unheard.length === 1 ? "it" : "them");
 // who this session works with: its collab rooms and teammates, each a jump to their board when they are on orchestrate
 function WorksWith({ s }) {
   const rooms = (S.collab?.rooms || []).filter((r) => r.members?.some((m) => m.orchestrate === s.id));
@@ -569,23 +632,84 @@ function WorksWith({ s }) {
     })}</div>
   </div>`)}</div>`;
 }
+// a started session's permission changes in place: Claude Code switches at once, Codex and Muse with their next turn
+// an agent started before it could be switched into bypassPermissions restarts on its conversation for it, once the user confirms
+const APPLIES = { now: "now", "after turn": "after its current turn", "next turn": "from its next turn", "next start": "when it next starts", restart: "after a restart" };
+function Permissions({ s }) {
+  const modes = S.meta.providers[s.provider].permissions, on = s.permission || modes[0], [asking, setAsking] = useState(null);
+  const send = async (permission, confirm = false) => {
+    const r = await act({ kind: "permission", permission, confirm });
+    if (!r) return;
+    if (r.applies === "confirm") return setAsking(permission);
+    setAsking(null);
+    if (r.applies !== "unchanged") toast(`${permission} ${APPLIES[r.applies]}`);
+    await loadSessions();
+  };
+  const pick = (e, permission) => { e.currentTarget.blur(); setAsking(null); if (permission !== on || s.switching) send(permission); };
+  const want = asking || (s.switching === "needs restart" ? on : null);
+  return html`<div class="permline"><span>Permissions</span><div class="seg" aria-label="Session permissions">${modes.map((o) => html`<button type="button" tabIndex="-1" class=${o === on ? "on" : ""} onClick=${(e) => pick(e, o)}>${o}</button>`)}</div></div>
+    ${want ? html`<div class="permask"><div>This agent was started before it could switch into ${want} while running, so it needs a restart on its conversation: right away while it waits on a permission prompt, otherwise once its current turn ends.</div>
+      <div class="btns"><button class="abtn primary" onClick=${() => send(want, true)}>Restart into ${want}</button>${asking ? html`<button class="abtn" onClick=${() => setAsking(null)}>Cancel</button>` : null}</div></div>` : null}`;
+}
+// a started session's model and effort change in place: Codex and Muse take them with their next turn; a live Claude Code agent
+// restarts on its conversation for them, at once when idle, otherwise once its current turn ends
+const RESTARTS = { now: "restarting on its conversation", "after turn": "restarts on its conversation once its current turn ends", "next turn": "from its next turn", "next start": "when it next starts" };
+function Tuning({ s }) {
+  const models = S.meta.providers[s.provider].models, model = models.find((m) => m.id === s.model);
+  // the model it runs stays listed after a newer one of its class replaces it
+  const ids = [...models.map((m) => m.id), ...(s.model && !model ? [s.model] : [])];
+  const send = async (id, effort) => {
+    const r = await act({ kind: "tune", model: id, effort });
+    if (!r) return;
+    if (r.applies !== "unchanged") toast(`${id}${effort ? ` · ${effort}` : ""}: ${RESTARTS[r.applies]}`);
+    await loadSessions();
+  };
+  const row = (label, options, on, pick, shown = options) => html`<div class="permline"><span>${label}</span><div class="seg" aria-label=${`Session ${label.toLowerCase()}`}>${shown.map((o) => html`<button type="button" tabIndex="-1" class=${o === on ? "on" : ""} onClick=${(e) => { e.currentTarget.blur(); if (o !== on) pick(o); }}>${o}</button>`)}<${More} rest=${options.filter((o) => !shown.includes(o))} pick=${pick} /></div></div>`;
+  return html`${row("Model", ids, s.model, (id) => send(id, s.effort && effortFor(models.find((m) => m.id === id), s.effort)), pinned(s.provider, ids, s.model))}
+    ${model?.efforts.length ? row("Effort", model.efforts, s.effort, (effort) => send(s.model, effort)) : null}`;
+}
+// a live Claude Code agent restarts on its conversation: how a Claude Code update reaches it (Codex and Muse start afresh each turn)
+const restartSession = async () => { const r = await act({ kind: "restart" }); if (r) { toast(`Session ${RESTARTS[r.applies]}`); await loadSessions(); } };
+const newer = (s) => s.agent?.running && s.agent.installed && s.agent.installed !== s.agent.running;
+// a joined session moves into orchestrate: its terminal agent ends and the same conversation continues headless here, after the
+// user has seen what ends and what it continues with
+const movable = (s) => s.origin !== "gui" && !s.closed && ["claude-code", "codex", "antigravity"].includes(s.provider);
+const planMove = async (s) => { try { set({ moving: { id: s.id, plan: await api.get(`/api/session/${s.id}/move`) } }); } catch (e) { fail(e); } };
+function MoveBox({ plan }) {
+  const [busy, setBusy] = useState(false), close = () => set({ moving: null });
+  const go = async () => { setBusy(true); const r = await act({ kind: "move" }); setBusy(false); close(); if (r) { toast("Moved into orchestrate"); await loadSessions(); } };
+  if (plan.blocked) return html`<div class="permask"><div>${plan.blocked}.</div><div class="btns"><button class="abtn" onClick=${close}>OK</button></div></div>`;
+  const agent = provName(plan.provider);
+  const how = html`<code>${plan.model}</code>${plan.effort ? ` · ${plan.effort}` : ""} · ${plan.permission}`;
+  return html`<div class="permask"><div>Move this session into orchestrate? ${plan.pid ? html`This ends the ${agent} agent in its terminal (pid ${plan.pid}${plan.version ? `, ${agent} ${plan.version}` : ""}) and continues the same conversation headless here with ${how}.${plan.busy ? " It is in the middle of a turn: that turn stops, and the agent is told to continue here." : ""}` : html`No terminal runs it now; the same conversation continues headless here with ${how}.`} Don't resume it in a terminal while it runs here.</div>
+    <div class="btns"><button class="abtn primary" disabled=${busy} onClick=${go}>${busy ? "Moving…" : "Move it here"}</button><button class="abtn" disabled=${busy} onClick=${close}>Cancel</button></div></div>`;
+}
+
 function SessionInfo({ s, d }) {
-  const kids = childrenOf(s.id), counts = s.counts || {};
-  const runtime = s.origin === "gui" ? (s.live ? (s.busy ? "running a turn" : "live, idle") : (d.runtime?.state === "failed" ? `failed (exit ${d.runtime.code})` : "stopped")) : (s.live ? "joined · reachable" : "joined · offline (messages wait in its inbox)");
+  const kids = childrenOf(s.id), counts = s.counts || {}, lim = limitOf(s);
+  const runtime = s.origin === "gui" ? (s.live ? (s.busy ? "running a turn" : "live, idle") : (d.runtime?.state === "failed" ? `failed (exit ${d.runtime.code})` : d.runtime?.state === "idle" ? "ready · your next message starts a turn" : "stopped")) : s.provider === "codex" ? (s.wake?.startsWith("collab") ? `joined · run by ${s.wake}: a message asks collab for a turn` : s.wake === "daemon" ? "joined · a message wakes the thread through Codex's daemon" : s.live ? "joined · Codex running (messages arrive at its next turn)" : "joined · driven by codex exec (messages wait for its next turn)") : (s.live ? "joined · reachable" : "joined · offline (messages wait in its inbox)");
   return html`<div class="sinfo">
     <div class="actions">
       ${s.origin === "gui" && s.live ? html`<button class="abtn" onClick=${() => act({ kind: "stop" }, "Stopping…")}>${K("x")} Stop</button>` : null}
-      ${s.origin === "gui" && !s.live && !s.closed ? html`<button class="abtn" onClick=${() => act({ kind: "resume" }, "Resuming…")}>${K("r")} Resume</button>` : null}
-      <button class="abtn" onClick=${() => set({ overlay: { kind: "new", parent: s.id } })}>${K("⇧", "N")} Child</button>
+      ${s.agent ? html`<button class="abtn ${newer(s) ? "primary" : ""}" title=${newer(s) ? `Restart on its conversation into ${provName(s.provider)} ${s.agent.installed}` : "Start the agent again on its conversation"} onClick=${restartSession}>${K("⇧", "R")} ${newer(s) ? `Restart into ${s.agent.installed}` : "Restart"}</button>` : null}
+      ${s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" ? html`<button class="abtn" onClick=${() => act({ kind: "resume" }, "Resuming…")}>${K("r")} Resume</button>` : null}
       <button class="abtn" onClick=${() => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed")}>${K("⇧", "X")} ${s.closed ? "Reopen" : "Close"}</button>
+      ${movable(s) ? html`<button class="abtn" title="End its terminal agent and continue the same conversation here, so restart, model and effort work on it" onClick=${() => planMove(s)}>Move into orchestrate</button>` : null}
     </div>
+    ${S.moving?.id === s.id && movable(s) ? html`<${MoveBox} plan=${S.moving.plan} />` : null}
     <div class="metaline">
       <span class="m"><span class="dot ${s.live ? "live" : ""}" />${runtime}</span>
-      <span class="m">${s.provider}${s.model ? html` · <code>${s.model}</code>` : null}${s.effort ? ` · ${s.effort}` : ""}</span>
+      <span class="m">${s.provider}${s.agent?.running ? ` ${s.agent.running}` : ""}${s.model ? html` · <code>${s.model}</code>` : null}${s.effort ? ` · ${s.effort}` : ""}</span>
+      ${newer(s) ? html`<span class="m upd">${provName(s.provider)} ${s.agent.installed} is installed: restart to update</span>` : null}
       <span class="m"><code>${home(s.cwd)}</code></span>
       <span class="m"><code>${s.id}</code></span>
       ${d.runtime?.cost ? html`<span class="m">$${d.runtime.cost.toFixed(2)}</span>` : null}
     </div>
+    ${s.origin === "gui" && S.meta.providers?.[s.provider] ? html`<${Tuning} s=${s} /><${Permissions} s=${s} />` : null}
+    ${s.unheard?.length ? html`<div class="limitline">${G.clock}<div>${DEAF(s)} A turn it may still run stops.<div class="btns resetbtn"><button class="abtn primary" onClick=${restartSession}>Restart and resend</button></div></div></div>`
+      : s.switching?.startsWith("restarting") ? html`<div class="permask"><div>Restarts on its conversation once its current turn ends${s.switching === "restarting at prompt" ? ", or at its next permission prompt" : ""}.</div></div>` : null}
+    ${lim?.released ? html`<div class="limitline">${G.clock}<div>Usage reset at ${lim.released}. ${s.origin === "gui" ? "The turn the limit stopped can carry on." : "Send a message to continue."}${s.origin === "gui" && !s.busy ? html`<div class="btns resetbtn"><button class="abtn primary" onClick=${() => act({ kind: "resume" }, "Continuing…")}>Continue</button></div>` : null}</div></div>`
+      : lim ? html`<div class="limitline">${G.clock}<div>Stopped by the usage limit at ${lim.hit}. ${lim.wait ? (s.pending ? `${s.pending} message${s.pending === 1 ? " waits" : "s wait"} and go${s.pending === 1 ? "es" : ""} out at ${lim.go}, after it resets.` : `Messages you send wait and go out at ${lim.go}, after it resets.`) : lim.released ? `Your usage was reset at ${lim.released}; send a message to continue.` : lim.at ? `The limit reset at ${lim.at}; send a message to continue.` : "The notice names no reset time, so messages go out right away."}<div class="notice">${lim.title}</div>${lim.wait && s.provider === "codex" ? html`<${CodexReset} key=${s.id} />` : lim.wait ? html`<div class="btns resetbtn"><button class="abtn" title=${`For when your ${provName(s.provider)} usage is back before this reset (you reset it, or bought more): every session this limit stopped carries on, and held messages go out`} onClick=${() => act({ kind: "lifted" }, "Usage marked as reset; stopped sessions carry on")}>Usage is back · continue</button></div>` : null}</div></div>` : null}
     <div class="activity">${s.status === "working" || s.busy ? html`<${SI} s="working" sm />` : null}${s.activity && !["done", "closed"].includes(s.status) ? html`<span class="txt" key=${s.activity.at}>${s.activity.text}</span><span style="color:var(--faint)">· ${ago(s.activity.at)}</span>` : html`<span style="color:var(--faint)">${s.items ? `${counts.done || 0} of ${s.items} done` : "No items yet"}</span>`}</div>
     ${s.items ? html`<div style="margin-top:10px"><${Progress} counts=${counts} big /></div>` : null}
     ${kids.length ? html`<div class="children">${kids.map((k) => html`<button class="chip" onClick=${() => go(k.id)}><${SI} s=${k.status} sm /><span class="ell">${k.title}</span></button>`)}</div>` : null}
@@ -609,17 +733,17 @@ function Question({ a, d, here }) {
   const focus = S.askFocus === a.id, pick = S.askPick[a.id] || [], target = a.target && d.items[a.target];
   const note = useRef(), ev = evidence(d, a).filter((x) => x.target !== here), pics = ev.filter(isPic), docs = ev.filter((r) => !isPic(r)), r = repliedSince(d, a), many = openAsks(d).length > 1;
   const peek = (x) => (e) => { e?.stopPropagation(); lookEvidence(a, ev, ev.indexOf(x)); };
-  return html`<div class="qcard ${focus ? "focus" : ""}" data-ask=${a.id} onClick=${() => !focus && set({ askFocus: a.id })}>
-    <div class="qh"><${SI} s="input" sm />${a.kind === "permission" ? "Permission" : "Question"} <code>${a.id}</code> · ${a.actor !== "agent" ? html`<span class="who">${a.actor}</span>` : null}${target ? html`on <b style="color:var(--dim)">${target.id} ${target.title}</b>` : "for the session"}<span style="margin-left:auto">${ago(a.at)}</span>${!focus ? html`<span>${K("a")} answer</span>` : null}
-      ${a.kind !== "permission" ? html`<button class="qx" title="Dismiss without answering (⌫): the agent is told" onClick=${(e) => { e.stopPropagation(); dismiss(a); }}>×</button>` : null}</div>
+  return html`<div class="qcard ${a.kind} ${focus ? "focus" : ""}" data-ask=${a.id} onClick=${() => !focus && set({ askFocus: a.id })}>
+    <div class="qh"><${SI} s="input" sm />${ASK_LABEL[a.kind]} <code>${a.id}</code> · ${a.actor !== "agent" ? html`<span class="who">${a.actor}</span>` : null}${target ? html`on <b style="color:var(--dim)">${target.id} ${target.title}</b>` : "for the session"}<span style="margin-left:auto">${ago(a.at)}</span>${!focus ? html`<span>${K("a")} answer</span>` : null}
+      ${a.kind !== "permission" ? html`<button class="qx" title=${a.kind === "action" ? "No longer needed (⌫): the agent is told" : "Dismiss without answering (⌫): the agent is told"} onClick=${(e) => { e.stopPropagation(); dismiss(a); }}>×</button>` : null}</div>
     ${r ? html`<div class="qsince">You commented on ${a.target || "the session"} after this was asked (${ago(r.at)}). If that settled it, dismiss it.</div>` : null}
     <div class="qt md" dangerouslySetInnerHTML=${{ __html: refs(esc(a.text)) }} />
     ${pics.length ? html`<div class="qpics">${pics.map((x) => html`<button key=${x.id} class="qpic" title=${`${x.id} · ${x.caption || x.name}`} onClick=${peek(x)}><span class="th">${thumbOf(x, x.name)}</span><span class="cp"><b>${x.id}</b> ${x.caption || x.name}</span></button>`)}</div>` : null}
     ${docs.length ? html`<div class="rrow">${docs.map((x) => html`<${ResultChip} key=${x.id} a=${x} tag onOpen=${peek(x)} />`)}</div>` : null}
     ${a.detail ? html`<${Md} text=${a.detail} cls="qd" />` : null}
     ${a.options.length ? html`<div class="opts">${a.options.map((o, i) => html`<button class="opt ${pick.includes(o) ? "on" : ""}" onClick=${(e) => { e.stopPropagation(); if (!a.multi) return answer(a, [o], note.current?.value || ""); S.askPick[a.id] = pick.includes(o) ? pick.filter((x) => x !== o) : [...pick, o]; paint(); }}>${focus && i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${o}</button>`)}</div>` : null}
-    ${focus || !a.options.length ? html`<div class="note"><input ref=${note} placeholder=${a.options.length ? "Optional note" : "Your answer"} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); answer(a, pick, e.target.value); } if (e.key === "Escape") { e.target.blur(); set({ askFocus: null }); } }} /><button class="abtn primary" onClick=${(e) => { e.stopPropagation(); answer(a, pick, note.current?.value || ""); }}>Send ${K("↵")}</button></div>` : null}
-    ${focus ? html`<div style="margin-top:8px;color:var(--faint);font-size:11.5px;display:flex;flex-wrap:wrap;gap:6px 14px"><${Hot} k=${a.options.length ? ["1", "…", String(Math.min(9, a.options.length))] : "Tab"}>${a.multi ? "toggle" : "choose"}<//><${Hot} k="Tab">note<//><${Hot} k="↵">send<//>${ev.some((x) => x.kind !== "link") ? html`<${Hot} k="Space">results<//>` : null}${many ? html`<${Hot} k="a">next question<//>` : null}${a.kind !== "permission" ? html`<${Hot} k="⌫">dismiss<//>` : null}<${Hot} k="Esc">later<//></div>` : null}
+    ${focus || !a.options.length ? html`<div class="note"><input ref=${note} placeholder=${a.kind === "action" ? "Optional note: what you saw, why you can't" : a.options.length ? "Optional note" : "Your answer"} onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); answer(a, pick, e.target.value); } if (e.key === "Escape") { e.target.blur(); set({ askFocus: null }); } }} /><button class="abtn primary" onClick=${(e) => { e.stopPropagation(); answer(a, pick, note.current?.value || ""); }}>Send ${K("↵")}</button></div>` : null}
+    ${focus ? html`<div style="margin-top:8px;color:var(--faint);font-size:11.5px;display:flex;flex-wrap:wrap;gap:6px 14px"><${Hot} k=${a.options.length ? ["1", "…", String(Math.min(9, a.options.length))] : "Tab"}>${a.multi ? "toggle" : "choose"}<//><${Hot} k="Tab">note<//><${Hot} k="↵">send<//>${ev.some((x) => !outside(x)) ? html`<${Hot} k="Space">results<//>` : null}${many ? html`<${Hot} k="a">next question<//>` : null}${a.kind !== "permission" ? html`<${Hot} k="⌫">dismiss<//>` : null}<${Hot} k="Esc">later<//></div>` : null}
   </div>`;
 }
 
@@ -633,13 +757,28 @@ const linkLabel = (url) => {
 // the small preview of a result everywhere: images as themselves, videos as their first frame with a play badge, others as a glyph
 const thumbOf = (a, alt = "") => a.kind === "image" ? html`<img src=${blobUrl(a)} alt=${alt} loading="lazy" />`
   : a.kind === "video" ? html`<span class="vthumb"><video src=${blobUrl(a) + "#t=0.1"} preload="metadata" muted playsinline />${G.play}</span>`
-  : a.kind === "link" ? G.link : a.kind === "pdf" ? G.pdf : a.kind === "html" ? G.page : G.file;
+  : a.kind === "link" ? G.link : a.kind === "app" ? G.play : a.kind === "pdf" ? G.pdf : a.kind === "html" ? G.page : G.file;
 function ResultChip({ a, on, onOpen, tag }) {
   const label = a.kind === "link" ? linkLabel(a.url) : a.caption || a.name;
-  return html`<button class="rchip k-${a.kind} ${on ? "on" : ""}" title=${a.kind === "link" ? a.url : a.name} onClick=${(e) => { e.stopPropagation(); onOpen(); }}>
+  return html`<button class="rchip k-${a.kind} ${on ? "on" : ""}" title=${a.kind === "link" ? a.url : a.kind === "app" ? appTitle(a) : a.name} onClick=${(e) => { e.stopPropagation(); onOpen(); }}>
     ${thumbOf(a)}<span>${tag ? html`<b class="tag">${a.id}</b>` : null}${label}</span></button>`;
 }
 
+// a row's results on one line, newest first: as many as fit, the picked one always among them, +N for the rest
+const CHIP_MIN = 180, GAP = 6, MORE_W = 52;
+function RowResults({ results, kids, ri, open }) {
+  const box = useRef(), [w, setW] = useState(0);
+  useLayoutEffect(() => { const ro = new ResizeObserver(() => setW(box.current.clientWidth)); ro.observe(box.current); return () => ro.disconnect(); }, []);
+  const slots = (room) => Math.floor((room + GAP) / (CHIP_MIN + GAP)) - kids.length;
+  const n = results.length <= slots(w) ? results.length : Math.min(results.length, Math.max(1, slots(w - MORE_W - GAP))), first = [...Array(n).keys()];
+  const shown = ri < n || !results[ri] ? first : [...first.slice(0, -1), ri], more = results.length - shown.length, chips = Math.max(1, shown.length + kids.length);
+  const each = Math.min(320, Math.floor((w - (more ? MORE_W + GAP : 0) - GAP * (chips - 1)) / chips));
+  return html`<div class="rrow line" ref=${box} style=${{ "--each": `${each}px` }}>
+    ${kids.map((k) => html`<button class="rchip k-session" title=${k.title} onClick=${(e) => { e.stopPropagation(); go(k.id); }}><${SI} s=${k.status} sm /><span>${k.title}</span></button>`)}
+    ${shown.map((k) => html`<${ResultChip} key=${results[k].id} a=${results[k]} on=${k === ri} onOpen=${() => open(k)} />`)}
+    ${more ? html`<button class="rchip more" title="${more} more: select the row, then → or Space" onClick=${(e) => { e.stopPropagation(); open(ri >= n ? n - 1 : n); }}>+${more}</button>` : null}
+  </div>`;
+}
 function ItemRow({ i, depth, d, s }) {
   const eff = d.effective[i.id], p = S.pulses[i.id], fresh = p && Date.now() - p.at < 1600, sel = S.sel[S.cur] === i.id;
   const comments = Object.values(d.comments).filter((c) => c.target === i.id).length, results = resultsFor(d, i.id), kids = childrenOf(s.id, i.id), ri = sel ? resIdx(i.id) : -1;
@@ -651,12 +790,9 @@ function ItemRow({ i, depth, d, s }) {
     <div class="ind"><${SI} s=${eff} /></div>
     <div class="body">
       <div class="tt"><span class="name">${i.title}</span>${!["agent", "user"].includes(i.actor) ? html`<span class="who"><span class="avatar sub" style="width:12px;height:12px;font-size:7px">${initials(i.actor)}</span>${i.actor}</span>` : null}</div>
-      ${i.description ? html`<div class="desc">${i.description.split("\n").find((l) => l.trim()).replace(/\*\*|__|`|^#+\s*|^[-*]\s+/g, "")}</div>` : null}
-      ${results.length || kids.length ? html`<div class="rrow">
-        ${results.map((a, n) => html`<${ResultChip} key=${a.id} a=${a} on=${n === ri} onOpen=${() => open(n)} />`)}
-        ${kids.map((k) => html`<button class="rchip k-session" title=${k.title} onClick=${(e) => { e.stopPropagation(); go(k.id); }}><${SI} s=${k.status} sm /><span>${k.title}</span></button>`)}
-      </div>` : null}
+      ${i.why ? html`<div class="why s-${i.status}" title=${i.why}>${i.why}</div>` : i.description ? html`<div class="desc">${i.description.split("\n").find((l) => l.trim()).replace(/\*\*|__|`|^#+\s*|^[-*]\s+/g, "")}</div>` : null}
     </div>
+    ${results.length || kids.length ? html`<${RowResults} results=${results} kids=${kids} ri=${ri} open=${open} />` : null}
     <div class="tail">
       ${eff === "input" ? html`<span class="pill s-input">needs you</span>` : null}<${Eta} it=${i} />
       ${comments ? html`<span class="n">${G.chat}${comments}</span>` : null}
@@ -720,8 +856,9 @@ function Board({ s, d }) {
 function Result({ a, target, i, on }) {
   const [text, setText] = useState(null);
   useEffect(() => { if (a.kind === "markdown" || a.kind === "text") fetch(blobUrl(a)).then((r) => r.text()).then(setText).catch(() => setText("(unavailable)")); }, [a.hash]);
+  if (a.kind === "app") return html`<button class="res app ${on ? "focus" : ""}" title=${appTitle(a)} onClick=${() => launchApp(a)}><div class="thumb">${G.play}</div><div class="cap">${a.caption || a.name}</div></button>`;
   if (a.kind === "link") return html`<a class="res ${on ? "focus" : ""}" href=${a.url} target="_blank" rel="noopener noreferrer"><div class="thumb">${G.link}</div><div class="cap" title=${a.url}>${a.caption || a.name}</div></a>`;
-  if (a.kind === "markdown" || a.kind === "text") return html`<div class="res wide ${on ? "focus" : ""}"><div class="cap" style="display:flex;gap:6px;cursor:pointer" onClick=${() => openResult(target, i)}>${a.name}${a.caption ? html`<span style="color:var(--faint)">· ${a.caption}</span>` : null}</div><div class="mdbox">${text === null ? "…" : a.kind === "markdown" ? html`<${Md} text=${text} />` : html`<pre style="margin:0;white-space:pre-wrap;font:11.5px var(--mono)">${text}</pre>`}</div></div>`;
+  if (a.kind === "markdown" || a.kind === "text") return html`<div class="res wide ${on ? "focus" : ""}"><div class="cap" style="display:flex;gap:6px;cursor:pointer" onClick=${() => openResult(target, i)}>${a.name}${a.caption ? html`<span class="ell" style="color:var(--faint)">· ${a.caption}</span>` : null}${text !== null ? html`<button class="copy" title="Copy its contents" onClick=${(e) => { e.stopPropagation(); copyText(readable(a, text)); }}>Copy</button>` : null}</div><div class="mdbox">${text === null ? "…" : a.kind === "markdown" ? html`<${Md} text=${text} />` : html`<pre style="margin:0;white-space:pre-wrap;font:11.5px var(--mono)">${readable(a, text)}</pre>`}</div></div>`;
   return html`<button class="res ${on ? "focus" : ""}" onClick=${() => openResult(target, i)}><div class="thumb">${thumbOf(a, a.name)}</div><div class="cap" title=${a.name}>${a.caption || a.name}</div></button>`;
 }
 function Results({ d, target }) {
@@ -730,16 +867,26 @@ function Results({ d, target }) {
   return html`<section class="dsec"><h5>Results · ${list.length}<span style="margin-left:auto;display:flex;gap:12px;text-transform:none;letter-spacing:0;font-weight:500"><${Hot} k=${["←", "→"]}>select<//><${Hot} k="Space">preview<//></span></h5><div class="results">${list.map((a, i) => html`<${Result} key=${a.id} a=${a} target=${target} i=${i} on=${i === on} />`)}</div></section>`;
 }
 
-function deliveryNote(c, s) {
+function deliveryNote(c, s, d) {
   if (c.sending) return html`<span class="state q">sending…</span>`;
-  if (c.delivered) return html`<span class="state d">✓ delivered</span>`;
+  // ✓ sent: handed to the session's channel; ✓✓ received: the agent's own transcript shows it, so it is in the agent's context
+  if (c.delivered && d.received?.includes(c.id)) return html`<span class="state d" title="The agent has it: its transcript shows it">✓✓ received</span>`;
+  // codex queue parks a message until the thread's next turn
+  if (c.delivered && s.unheard?.includes(c.id)) return html`<span class="state q" title=${DEAF(s)}>✓ sent · not taken</span>`;
+  if (c.delivered && d.received && s.provider === "codex") return html`<span class="state q" title="In Codex's queue: the thread takes it when its next turn starts">queued</span>`;
+  if (c.delivered) return html`<span class="state s" title=${d.received ? "Handed to the session; ✓✓ once the agent has it in its context" : "Handed to the session"}>✓ sent</span>`;
+  const l = limitOf(s);
+  if (l?.wait) return html`<span class="state q" title=${l.title}>waits for the usage limit to reset (${l.at})</span>`;
   return html`<span class="state q">${s.origin === "gui" ? "queued" : s.live ? "delivering…" : "waits for the agent"}</span>`;
 }
+// chat is conversation, not record (rows and results hold what lasts), so a thread shows its newest messages and pages back on request
+const CHAT_PAGE = 10;
 function Thread({ d, s, target }) {
-  const list = commentsFor(d, target), byId = Object.fromEntries(Object.values(d.comments).map((c) => [c.id, c]));
-  if (!list.length) return html`<div class="empty" style="padding:16px 8px">No messages yet. ${K(target ? "c" : "⇧", ...(target ? [] : ["C"]))} to write one.</div>`;
-  return html`<div class="thread">${list.map((c) => html`<div class="msg ${c.actor === "user" ? "user" : ""}" key=${c.id + c.at} data-c=${c.id}>
-    <div class="mh">${c.actor !== "user" ? html`<span class="avatar ${c.actor === "agent" ? "agent" : c.actor === "orchestrate" ? "sys" : "sub"}">${initials(c.actor)}</span>` : null}<span>${c.actor === "user" ? "you" : c.actor}</span><span>· ${ago(c.at)}</span>${c.actor === "user" ? deliveryNote(c, s) : null}</div>
+  const all = commentsFor(d, target), byId = Object.fromEntries(Object.values(d.comments).map((c) => [c.id, c])), key = `${s.id}:${target || ""}`;
+  if (!all.length) return html`<div class="empty" style="padding:16px 8px">No messages yet. ${K(target ? "c" : "⇧", ...(target ? [] : ["C"]))} to write one.</div>`;
+  const list = all.slice(-(S.shown[key] || CHAT_PAGE)), hidden = all.length - list.length;
+  return html`<div class="thread">${hidden ? html`<button class="earlier" onClick=${() => { holdDetail(); S.shown[key] = list.length + CHAT_PAGE; paint(); }}>Show ${Math.min(hidden, CHAT_PAGE)} earlier<span>${hidden} not shown</span></button>` : null}${list.map((c) => html`<div class="msg ${c.actor === "user" ? "user" : ""}" key=${c.id + c.at} data-c=${c.id}>
+    <div class="mh">${c.actor !== "user" ? html`<span class="avatar ${c.actor === "agent" ? "agent" : c.actor === "orchestrate" ? "sys" : "sub"}">${initials(c.actor)}</span>` : null}<span>${c.actor === "user" ? "you" : c.actor}</span><span>· ${ago(c.at)}</span>${c.actor === "user" ? deliveryNote(c, s, d) : null}</div>
     <div class="bub">${c.reply_to && byId[c.reply_to] ? html`<div class="quote">${byId[c.reply_to].text}</div>` : null}${c.text ? html`<${Md} text=${c.text} />` : null}
       ${c.files?.length ? html`<div class="cimgs">${c.files.map((f, n) => html`<button key=${n} title=${f.name} onClick=${() => set({ overlay: { kind: "look", files: c.files, i: n, from: c } })}><img src=${blobUrl(f)} alt=${f.name} loading="lazy" /></button>`)}</div>` : null}</div>
   </div>`)}</div>`;
@@ -755,7 +902,7 @@ function refCandidates(q) {
 }
 function Composer({ s, target, label }) {
   const key = `${s.id}:${target || ""}`, ref = useRef(), [focus, setFocus] = useState(false), [pick, setPick] = useState(null);
-  const pending = S.attach[key] || [], picker = useRef();
+  const pending = S.attach[key] || [], picker = useRef(), lim = limitOf(s);
   const submit = () => { const text = (S.drafts[key] || "").trim(); if (!text && !pending.length) return; S.drafts[key] = ""; S.attach[key] = []; ref.current.value = ""; grow(); sendComment(text, target, ref.current.parentElement, pending); ref.current.blur(); };
   const paste = (e) => { const fs = [...(e.clipboardData?.files || [])]; if (fs.some((f) => f.type.startsWith("image/"))) { e.preventDefault(); attachImages(key, fs); } };
   const grow = () => { const t = ref.current; if (t) { t.style.height = "auto"; t.style.height = Math.min(160, t.scrollHeight) + "px"; } };
@@ -783,6 +930,7 @@ function Composer({ s, target, label }) {
   return html`<div class="composer ${S.drop ? "over" : ""}">
     ${pick && cands.length ? html`<div class="refpick">${cands.map((c, n) => html`<div class=${n === pick.i ? "on" : ""} onMouseDown=${(e) => { e.preventDefault(); insert(c); }}>${c.icon ? html`<${SI} s=${c.icon} sm />` : html`<span class="g">${G[c.kind === "pdf" ? "pdf" : c.kind === "link" ? "link" : "file"]}</span>`}<code>${c.id}</code><span class="ell">${c.label}</span></div>`)}<div class="hint">${K("↑", "↓")} pick · ${K("↵")} insert · ${K("Esc")}</div></div>` : null}
     <div class="target">to <span class="to" key=${key}>${label}</span><span style="margin-left:auto;display:flex;gap:10px"><${Hot} k="#">reference<//><${Hot} k="c">row<//><${Hot} k=${["⇧", "C"]}>session<//></span></div>
+    ${lim?.wait ? html`<div class="limitnote" title=${lim.title}>${G.clock}Usage limit: this goes out at ${lim.go}, after the limit resets.</div>` : null}
     ${pending.length ? html`<div class="pend">${pending.map((f, n) => html`<span class="pimg" key=${f.src}><img src=${f.src} alt=${f.name} title=${f.name} /><button title="Remove (⌫ in an empty composer)" onMouseDown=${(e) => { e.preventDefault(); unattach(key, n); }}>×</button></span>`)}</div>` : null}
     <div class="box ${focus ? "focus" : ""}">
       <button class="clip" title="Attach images: or paste them (⌘V), or drop them here" onMouseDown=${(e) => e.preventDefault()} onClick=${() => picker.current.click()}>${G.clip}</button>
@@ -797,17 +945,19 @@ function Composer({ s, target, label }) {
 
 function Detail({ s, d }) {
   const it = selected(), pinned = useRef(true), view = `${s.id}:${it?.id || ""}`;
-  useLayoutEffect(() => { pinned.current = !it; }, [view]);
+  // one scroll for the whole pane: header, results, chat. The session opens at its newest chat, a row at its header
+  useLayoutEffect(() => { pinned.current = !it; const b = document.querySelector(".dscroll"); if (b && it) b.scrollTop = 0; }, [view]);
   useLayoutEffect(() => { const b = document.querySelector(".dscroll"); if (b && pinned.current && !(S.restore?.cur === s.id && S.restore.dscroll != null)) b.scrollTop = b.scrollHeight; });
   const onScroll = (e) => { const b = e.currentTarget; pinned.current = !it && b.scrollHeight - b.scrollTop - b.clientHeight < 60; };
+  holdDetail = () => { pinned.current = false; };  // paging back in the chat keeps your place
   useLayoutEffect(() => { const r = S.restore; if (r?.cur === s.id && r.dscroll != null) { const el = document.querySelector(".dscroll"); if (el) { el.scrollTop = r.dscroll; r.dscroll = null; } } });
   if (!it) {
     const asks = openAsks(d).filter((a) => !a.target);
     return html`<aside class="detail" onDragOver=${dropOver} onDragLeave=${dropLeave} onDrop=${(e) => dropOn(e, `${s.id}:`)}>
       ${S.drop ? html`<div class="dropzone">Drop images to attach them to a message in the session chat</div>` : null}
-      <div class="dhead"><div class="lbl">Session · ${s.origin === "gui" ? "started here" : "joined"} · ${ago(s.created)}<span style="margin-left:auto"><${Hot} k=${["j", "k"]}>pick a row<//></span></div><h2>${s.title}</h2>
-        <${SessionInfo} s=${s} d=${d} /></div>
       <div class="dscroll" onScroll=${onScroll}>
+        <div class="dhead"><div class="lbl">Session · ${s.moved ? `joined ${ago(s.created)}, moved here from its terminal ${ago(s.moved)}` : `${s.origin === "gui" ? "started here" : "joined"} · ${ago(s.created)}`}<span style="margin-left:auto"><${Hot} k=${["j", "k"]}>pick a row<//></span></div><h2>${s.title}</h2>
+          <${SessionInfo} s=${s} d=${d} /></div>
         ${d.prompt ? html`<section class="dsec"><h5>Starting prompt</h5><div class="bub" style="padding:9px 11px;border-radius:10px;border:1px solid var(--line);background:var(--panel2)"><${Md} text=${d.prompt} /></div></section>` : null}
         ${asks.length ? html`<section class="dsec"><h5>Questions</h5><${Questions} list=${asks} d=${d} /></section>` : null}
         <${Results} d=${d} target=${null} />
@@ -819,18 +969,18 @@ function Detail({ s, d }) {
   const eff = d.effective[it.id], asks = openAsks(d).filter((a) => a.target === it.id), kids = childrenOf(s.id, it.id), p = S.pulses[it.id];
   return html`<aside class="detail" onDragOver=${dropOver} onDragLeave=${dropLeave} onDrop=${(e) => dropOn(e, `${s.id}:${it.id}`)}>
     ${S.drop ? html`<div class="dropzone">Drop images to attach them to a comment on ${it.id}</div>` : null}
-    <div class="dhead ${p && Date.now() - p.at < 1600 ? "receive" : ""}" key=${it.id}>
-      <div class="lbl"><code>${it.id}</code>${!["agent", "user"].includes(it.actor) ? html`<span class="who">${it.actor}</span>` : null}<span>created ${ago(it.created)}</span>${it.parent ? html`<span>· under ${it.parent}</span>` : null}<span style="margin-left:auto"><${Hot} k="Esc">session<//></span></div>
-      <h2>${it.title}</h2>
-      <div class="row"><button onClick=${() => set({ overlay: { kind: "status", item: it.id } })}><${Pill} s=${eff} /></button><${Hot} k="s">change<//><${Eta} it=${it} />
-        <button class="ghostbtn" style="margin-left:auto" onClick=${() => archive(false, it.id)}>${d.items[rootOf(d, it.id)].archived ? G.unarchive : G.archive}${d.items[rootOf(d, it.id)].archived ? "Bring back" : "Archive"}${it.parent ? ` ${rootOf(d, it.id)}` : ""}</button><${Hot} k="e" /></div>
-    </div>
     <div class="dscroll">
+      <div class="dhead ${p && Date.now() - p.at < 1600 ? "receive" : ""}" key=${it.id}>
+        <div class="lbl"><code>${it.id}</code>${!["agent", "user"].includes(it.actor) ? html`<span class="who">${it.actor}</span>` : null}<span>created ${ago(it.created)}</span>${it.parent ? html`<span>· under ${it.parent}</span>` : null}<span style="margin-left:auto"><${Hot} k="Esc">session<//></span></div>
+        <h2>${it.title}</h2>
+        <div class="row"><button onClick=${() => set({ overlay: { kind: "status", item: it.id } })}><${Pill} s=${eff} /></button><${Hot} k="s">change<//><${Eta} it=${it} />
+          <button class="ghostbtn" style="margin-left:auto" onClick=${() => archive(false, it.id)}>${d.items[rootOf(d, it.id)].archived ? G.unarchive : G.archive}${d.items[rootOf(d, it.id)].archived ? "Bring back" : "Archive"}${it.parent ? ` ${rootOf(d, it.id)}` : ""}</button><${Hot} k="e" /></div>
+        ${it.why ? html`<div class="whyline s-${it.status}"><${SI} s=${it.status} sm /><div>${it.why}</div></div>` : null}
+      </div>
       ${it.description ? html`<section class="dsec"><${Md} text=${it.description} /></section>` : null}
       ${asks.length ? html`<section class="dsec"><h5>Needs you</h5><${Questions} list=${asks} d=${d} here=${it.id} /></section>` : null}
       <${Results} d=${d} target=${it.id} />
       ${kids.length ? html`<section class="dsec"><h5>Child sessions</h5><div class="children" style="margin-top:0">${kids.map((k) => html`<button class="chip" onClick=${() => go(k.id)}><${SI} s=${k.status} sm /><span class="ell">${k.title}</span></button>`)}</div></section>` : null}
-      <section class="dsec"><h5>History</h5><div class="timeline">${it.history.map((h) => html`<div class="ev"><${SI} s=${h.status} sm />${STATUS[h.status]}<span style="color:var(--faint)">by ${h.actor === "user" ? "you" : h.actor}</span><time>${ago(h.at)}</time></div>`)}</div></section>
       <section class="dsec"><h5>Thread</h5><${Thread} d=${d} s=${s} target=${it.id} /></section>
     </div>
     <${Composer} s=${s} target=${it.id} label=${`${it.id} · ${it.title}`} />
@@ -849,24 +999,51 @@ function Modal({ title, onClose, children, footer, wide }) {
   return html`<div class="scrim" onMouseDown=${(e) => e.target === e.currentTarget && onClose()}><div class="modal" style=${wide ? "width:min(760px,94vw)" : ""}><header><span class="grow">${title}</span><${Hot} k="Esc">close<//></header>${children}${footer ? html`<footer>${footer}</footer>` : null}</div></div>`;
 }
 
-function Seg({ options, value, onChange, label }) {
+// ←/→ step through every option, also those only the menu shows
+function Seg({ options, value, onChange, label, names = {}, shown = options }) {
   return html`<div class="seg" tabIndex="0" aria-label=${label} onKeyDown=${(e) => { const i = options.indexOf(value); if (e.key === "ArrowRight" || e.key === "l") { e.preventDefault(); onChange(options[(i + 1) % options.length]); } if (e.key === "ArrowLeft" || e.key === "h") { e.preventDefault(); onChange(options[(i - 1 + options.length) % options.length]); } }}>
-    ${options.map((o) => html`<button type="button" tabIndex="-1" class=${o === value ? "on" : ""} onClick=${() => onChange(o)}>${o}</button>`)}
+    ${shown.map((o) => html`<button type="button" tabIndex="-1" class=${o === value ? "on" : ""} onClick=${() => onChange(o)}>${names[o] || o}</button>`)}
+    <${More} rest=${options.filter((o) => !shown.includes(o))} pick=${onChange} />
   </div>`;
 }
+// a long model list (Antigravity offers a dozen) shows four as buttons: the one chosen, the agent's default, the ones last used
+// with that agent, then the agent's next in its own order; the rest wait in one menu, grouped by family (gemini, claude, gpt)
+const pinned = (provider, ids, value) => {
+  if (ids.length <= 5) return ids;
+  const used = S.sessions.filter((s) => s.provider === provider && s.model).sort((a, b) => b.updated.localeCompare(a.updated)).map((s) => s.model);
+  const keep = [...new Set([value, ids[0], ...used, ...ids])].filter((id) => ids.includes(id)).slice(0, 4);
+  return ids.filter((id) => keep.includes(id));
+};
+function More({ rest, pick }) {
+  if (!rest.length) return null;
+  const fams = rest.reduce((g, id) => ({ ...g, [id.split(/[-.]/)[0]]: [...(g[id.split(/[-.]/)[0]] || []), id] }), {});
+  const opts = (ids) => ids.map((id) => html`<option value=${id}>${id}</option>`);
+  // the menu lies unseen over its label, which keeps it as narrow as "+7 more" instead of its longest model
+  return html`<label class="more" title="More models">+${rest.length} more ▾<select tabIndex="-1" value="" onChange=${(e) => { const id = e.currentTarget.value; e.currentTarget.value = ""; e.currentTarget.blur(); if (id) pick(id); }}>
+    <option value="" disabled hidden>+${rest.length} more</option>
+    ${Object.keys(fams).length > 1 ? Object.entries(fams).map(([f, ids]) => html`<optgroup label=${f}>${opts(ids)}</optgroup>`) : opts(rest)}
+  </select></label>`;
+}
 
-function NewSession({ parent }) {
-  const prov = S.meta.providers["claude-code"], ps = parent && S.sessions.find((s) => s.id === parent.split(":")[0]);
-  const [f, setF] = useState({ cwd: home(ps?.cwd || cur()?.cwd || S.meta.recent[0] || S.meta.home), title: "", model: prov.models[0], effort: "high", permission: "default", skills: ["orchestrate"], prompt: "" });
+// each provider brings its current models (the newest of each class), the efforts each model takes, and its permission modes
+const effortFor = (m, want) => !m?.efforts.length ? null : m.efforts.includes(want) ? want : m.efforts.includes("high") ? "high" : m.effort || m.efforts[0];
+function NewSession({ nest }) {
+  const [parent, setParent] = useState("");
+  const provs = S.meta.providers;
+  const choose = (provider, effort) => { const p = provs[provider], m = p.models[0]; return { provider, model: m?.id, effort: effortFor(m, effort), permission: p.permissions[0] }; };
+  const last = (() => { try { return localStorage.getItem("orch.provider"); } catch { return null; } })();
+  const [f, setF] = useState({ cwd: home(cur()?.cwd || S.meta.recent[0] || S.meta.home), title: "", ...choose(provs[last] ? last : Object.keys(provs)[0], "high"), skills: ["orchestrate"], prompt: "" });
+  const prov = provs[f.provider], model = prov.models.find((m) => m.id === f.model);
   const [sugg, setSugg] = useState([]), [si, setSi] = useState(-1), [skills, setSkills] = useState([]), [ki, setKi] = useState(0), [busy, setBusy] = useState(false);
   const up = (patch) => setF((x) => ({ ...x, ...patch }));
   const abs = (p) => p.startsWith("~") ? S.meta.home + p.slice(1) : p;
-  useEffect(() => { const t = setTimeout(() => api.get(`/api/skills?cwd=${encodeURIComponent(abs(f.cwd))}`).then(setSkills).catch(() => {}), 150); return () => clearTimeout(t); }, [f.cwd]);
+  useEffect(() => { const t = setTimeout(() => api.get(`/api/skills?cwd=${encodeURIComponent(abs(f.cwd))}&provider=${f.provider}`).then(setSkills).catch(() => {}), 150); return () => clearTimeout(t); }, [f.cwd, f.provider]);
   const complete = (v) => api.get(`/api/dirs?prefix=${encodeURIComponent(abs(v))}`).then((r) => { setSugg(r.map(home)); setSi(-1); }).catch(() => {});
   const submit = async () => {
     if (!f.prompt.trim()) return toast("Write a starting prompt", true);
+    if (!f.model) return toast(`${prov.label} has no model to run`, true);
     setBusy(true);
-    try { const r = await api.post("/api/spawn", { ...f, cwd: abs(f.cwd), parent }); set({ overlay: null }); await loadSessions(); go(r.session); toast("Session started"); }
+    try { const r = await api.post("/api/spawn", { ...f, cwd: abs(f.cwd), parent: parent || null }); try { localStorage.setItem("orch.provider", f.provider); } catch {} set({ overlay: null }); await loadSessions(); go(r.session); toast("Session started"); }
     catch (e) { fail(e); setBusy(false); }
   };
   useKeys((e) => {
@@ -875,8 +1052,8 @@ function NewSession({ parent }) {
     return false;
   });
   const toggle = (name) => name !== "orchestrate" && up({ skills: f.skills.includes(name) ? f.skills.filter((x) => x !== name) : [...f.skills, name] });
-  return html`<${Modal} title=${parent ? html`New child session <span style="color:var(--faint);font-weight:400">of ${ps?.title || parent}${parent.includes(":") ? ` › ${parent.split(":")[1]}` : ""}</span>` : "New session"} onClose=${() => set({ overlay: null })}
-    footer=${html`<span class="grow">Runs headless; you steer it from this board. ${K("Tab")} next field</span><button class="abtn" onClick=${() => set({ overlay: null })}>Cancel</button><button class="abtn primary" disabled=${busy} onClick=${submit}>${busy ? "Starting…" : "Start"} ${K("⌘", "↵")}</button>`}>
+  return html`<${Modal} title="New session" onClose=${() => set({ overlay: null })}
+    footer=${html`<span class="grow">${["claude-code", "antigravity"].includes(f.provider) ? "Runs headless" : "Runs headless, one turn per message"}; you steer it from this board. ${K("Tab")} next field</span><button class="abtn" onClick=${() => set({ overlay: null })}>Cancel</button><button class="abtn primary" disabled=${busy} onClick=${submit}>${busy ? "Starting…" : "Start"} ${K("⌘", "↵")}</button>`}>
     <div class="mbody">
       <div class="field"><label>Path<span class="hint">${K("Tab")} complete · ${K("↑", "↓")} pick</span></label>
         <input type="text" class="mono" autoFocus value=${f.cwd} onInput=${(e) => { up({ cwd: e.target.value }); complete(e.target.value); }}
@@ -888,9 +1065,10 @@ function NewSession({ parent }) {
           }} onBlur=${() => setTimeout(() => setSugg([]), 120)} />
         ${sugg.length ? html`<div class="sugg">${sugg.map((p, i) => html`<div class=${i === si ? "on" : ""} onMouseDown=${() => { up({ cwd: p }); setSugg([]); }}>${p}</div>`)}</div>` : null}
       </div>
-      <div class="field"><label>Model<span class="hint">${K("←", "→")}</span></label><${Seg} label="Model" options=${prov.models} value=${f.model} onChange=${(model) => up({ model })} /></div>
+      ${Object.keys(provs).length > 1 ? html`<div class="field"><label>Agent<span class="hint">${K("←", "→")}</span></label><${Seg} label="Agent" options=${Object.keys(provs)} names=${Object.fromEntries(Object.entries(provs).map(([k, v]) => [k, v.label]))} value=${f.provider} onChange=${(provider) => up({ ...choose(provider, f.effort), skills: ["orchestrate"] })} /></div>` : null}
+      <div class="field"><label>Model<span class="hint">${K("←", "→")}</span></label>${prov.models.length ? html`<${Seg} label="Model" options=${prov.models.map((m) => m.id)} shown=${pinned(f.provider, prov.models.map((m) => m.id), f.model)} value=${f.model} onChange=${(id) => up({ model: id, effort: effortFor(prov.models.find((m) => m.id === id), f.effort) })} />` : html`<div class="empty" style="padding:4px 0">${prov.label} lists no models yet; run it once to fetch them.</div>`}</div>
       <div style="display:flex;gap:18px;flex-wrap:wrap">
-        <div class="field"><label>Effort<span class="hint">${K("←", "→")}</span></label><${Seg} label="Effort" options=${prov.efforts} value=${f.effort} onChange=${(effort) => up({ effort })} /></div>
+        ${model?.efforts.length ? html`<div class="field"><label>Effort<span class="hint">${K("←", "→")}</span></label><${Seg} label="Effort" options=${model.efforts} value=${f.effort} onChange=${(effort) => up({ effort })} /></div>` : null}
         <div class="field"><label>Permissions<span class="hint">${K("←", "→")}</span></label><${Seg} label="Permissions" options=${prov.permissions} value=${f.permission} onChange=${(permission) => up({ permission })} /></div>
       </div>
       <div class="field"><label>Skills<span class="hint">${K("↑", "↓")} move · ${K("Space")} toggle · orchestrate is always on</span></label>
@@ -903,6 +1081,7 @@ function NewSession({ parent }) {
             <span class="box" /><div style="min-width:0"><div class="nm">${sk.name}${sk.scope === "project" ? html`<span class="tag">project</span>` : null}</div><div class="ds">${sk.description}</div></div></div>`)}
         </div>
       </div>
+      ${nest.length ? html`<div class="field"><label>Part of<span class="hint">${K("←", "→")} · a parent's agent hears when this session finishes or needs you</span></label><${Seg} label="Part of" options=${["", ...nest.map(([k]) => k)]} names=${{ "": "Nothing, its own session", ...Object.fromEntries(nest.map(([k, v]) => [k, clip(v)])) }} value=${parent} onChange=${setParent} /></div>` : null}
       <div class="field"><label>Title<span class="hint">optional · defaults to the prompt's first line</span></label><input type="text" value=${f.title} onInput=${(e) => up({ title: e.target.value })} /></div>
       <div class="field"><label>Starting prompt<span class="hint">${K("⌘", "↵")} start</span></label><textarea value=${f.prompt} placeholder="What should this session do?" onInput=${(e) => up({ prompt: e.target.value })} /></div>
     </div>
@@ -963,13 +1142,16 @@ function ImageView({ a, api }) {
   const box = useRef(), cv = useRef(), drag = useRef(null), dragged = useRef(false), [pic, setPic] = useState(null), [size, setSize] = useState(null), [v, setV] = useState({ z: 1, x: 0, y: 0 }), [grab, setGrab] = useState(false);
   useLayoutEffect(() => { const el = box.current, ro = new ResizeObserver(() => setSize({ w: el.clientWidth, h: el.clientHeight })); ro.observe(el); return () => ro.disconnect(); }, []);
   useEffect(() => { let live = true; const im = new Image(); im.src = blobUrl(a); im.decode().then(() => live && setPic(im.naturalWidth ? im : false), () => live && setPic(false)); return () => { live = false; }; }, [a.hash]);
-  const nat = pic && { w: pic.naturalWidth, h: pic.naturalHeight }, ready = nat && size, fit = ready ? Math.min(size.w / nat.w, size.h / nat.h, 1) : 1, s = fit * v.z, w = ready ? nat.w * s : 0, h = ready ? nat.h * s : 0;
+  // a very tall image (a whole-page capture) would shrink to a sliver if fitted whole, so it fits the width instead, opens at its top
+  // and scrolls; − still zooms out to the whole image
+  const nat = pic && { w: pic.naturalWidth, h: pic.naturalHeight }, ready = nat && size, whole = ready ? Math.min(size.w / nat.w, size.h / nat.h, 1) : 1, across = ready ? Math.min(size.w / nat.w, 1) : 1;
+  const tall = ready && nat.h > 2.4 * nat.w && whole < across, fit = tall ? across : whole, low = whole / fit, s = fit * v.z, w = ready ? nat.w * s : 0, h = ready ? nat.h * s : 0;
   const cx = (x, w) => w <= size.w ? (size.w - w) / 2 : Math.min(0, Math.max(size.w - w, x)), cy = (y, h) => h <= size.h ? (size.h - h) / 2 : Math.min(0, Math.max(size.h - h, y));
   const x = ready ? cx(v.x, w) : 0, y = ready ? cy(v.y, h) : 0, zoomed = ready && (w > size.w + 1 || h > size.h + 1), top = Math.max(1, 6 / fit);
   // the visible part of the image, in view pixels relative to the image's top-left corner (the canvas covers exactly this)
   const vis = ready ? { l: Math.max(0, -x), t: Math.max(0, -y), r: Math.min(w, size.w - x), b: Math.min(h, size.h - y) } : null;
   const zoomAt = (factor, px = size.w / 2, py = size.h / 2) => ready && setV((o) => {
-    const z = Math.min(top, Math.max(1, o.z * factor)), s0 = fit * o.z, s1 = fit * z, x0 = cx(o.x, nat.w * s0), y0 = cy(o.y, nat.h * s0);
+    const z = Math.min(top, Math.max(low, o.z * factor)), s0 = fit * o.z, s1 = fit * z, x0 = cx(o.x, nat.w * s0), y0 = cy(o.y, nat.h * s0);
     return { z, x: px - (px - x0) * s1 / s0, y: py - (py - y0) * s1 / s0 };
   });
   const fitView = () => setV({ z: 1, x: 0, y: 0 });
@@ -998,7 +1180,7 @@ function ImageView({ a, api }) {
   return html`<div class="viewer ${zoomed ? "zoomed" : inward ? "" : "out"} ${grab ? "grabbing" : ""}" ref=${box} onWheel=${wheel} onPointerDown=${down} onPointerMove=${dragTo} onPointerUp=${up} onPointerCancel=${up} onClick=${click}>
     ${vis ? html`<canvas ref=${cv} class=${zoomed ? "" : "framed"} role="img" aria-label=${a.name} style=${{ left: `${x + vis.l}px`, top: `${y + vis.t}px`, width: `${vis.r - vis.l}px`, height: `${vis.b - vis.t}px` }} />`
       : html`<div class="vload">${pic === false ? "This image could not be decoded" : "Loading full resolution…"}</div>`}
-    ${ready ? html`<div class="zoomlbl">${Math.round(s * 100)}%${v.z > 1 ? "" : " · fit"}<span>${K("+", "−")} zoom · ${K("0")} fit · click ${inward ? (s < 0.995 ? "100%" : "200%") : "fit"}${zoomed ? " · drag to pan" : ""}</span></div>` : null}
+    ${ready ? html`<div class="zoomlbl">${Math.round(s * 100)}%${v.z === 1 ? (tall ? " · fit width" : " · fit") : v.z <= low ? " · whole" : ""}<span>${K("+", "−")} zoom · ${K("0")} ${tall ? "top" : "fit"} · click ${inward ? (s < 0.995 ? "100%" : "200%") : tall ? "fit width" : "fit"}${zoomed ? (tall ? " · scroll or drag" : " · drag to pan") : ""}</span></div>` : null}
     ${zoomed ? html`<div class="mini" style=${{ width: `${nat.w * m}px`, height: `${nat.h * m}px` }} onClick=${(e) => e.stopPropagation()} onPointerDown=${(e) => { e.stopPropagation(); centre(e); e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove=${(e) => e.buttons && centre(e)}>
       <img src=${blobUrl(a)} alt="" draggable="false" /><span class="vp" style=${{ left: `${vis.l / s * m}px`, top: `${vis.t / s * m}px`, width: `${(vis.r - vis.l) / s * m}px`, height: `${(vis.b - vis.t) / s * m}px` }} /></div>` : null}
   </div>`;
@@ -1023,12 +1205,15 @@ function Look() {
   const [text, setText] = useState(null), zoom = useRef(null);
   useEffect(() => { if (it && !own) markSeen([it.id]); }, [it?.id]);
   useEffect(() => { setText(null); if (a && (a.kind === "markdown" || a.kind === "text")) fetch(blobUrl(a)).then((r) => r.text()).then(setText).catch(() => setText("(unavailable)")); }, [a?.id]);
+  const copyable = text !== null && (a?.kind === "markdown" || a?.kind === "text"), copy = () => copyText(readable(a, text));
   useKeys((e) => {
     const k = e.key, z = zoom.current;
+    // c copies the whole result; with text selected, ⌘C copies just that as usual, and without, all of it
+    if (copyable && k === "c" && (!(e.metaKey || e.ctrlKey) || window.getSelection().isCollapsed)) { e.preventDefault(); copy(); return true; }
     if (z?.seek && e.shiftKey && (k === "ArrowLeft" || k === "ArrowRight")) { e.preventDefault(); z.seek(k === "ArrowLeft" ? -5 : 5); return true; }
     if (z?.pan && e.shiftKey && k.startsWith("Arrow")) { e.preventDefault(); z.pan(...{ ArrowLeft: [120, 0], ArrowRight: [-120, 0], ArrowUp: [0, 120], ArrowDown: [0, -120] }[k]); return true; }
     const run = { "+": () => z?.zoom?.(1.25), "=": () => z?.zoom?.(1.25), "-": () => z?.zoom?.(0.8), "0": () => z?.fit?.(), p: () => z?.toggle?.(), m: () => z?.mute?.(), " ": () => set({ overlay: null }), Escape: () => set({ overlay: null }), ArrowRight: () => step(1), l: () => step(1), ArrowLeft: () => step(-1), h: () => step(-1),
-      ArrowDown: () => row(1), j: () => row(1), ArrowUp: () => row(-1), k: () => row(-1), Enter: () => a && (a.kind === "link" ? window.open(a.url, "_blank", "noopener,noreferrer") : window.open(blobUrl(a), "_blank", "noopener")) }[k];
+      ArrowDown: () => row(1), j: () => row(1), ArrowUp: () => row(-1), k: () => row(-1), Enter: () => a && (outside(a) ? openOutside(a) : window.open(blobUrl(a), "_blank", "noopener")) }[k];
     if (run) { e.preventDefault(); run(); }
     return true;
   });
@@ -1037,7 +1222,7 @@ function Look() {
   const close = (e) => e.target === e.currentTarget && set({ overlay: null }), title = (r) => r.caption || (r.kind === "link" ? linkLabel(r.url) : r.name);
   return html`<div class="lightbox" onMouseDown=${close}>
     <header><div class="grow ttl"><div class="t1">${a ? title(a) : it.title}</div><div class="t2">${own && o.label ? `${a.id} · ${o.label}` : own ? `${o.from.id === "…" ? "your comment" : `${o.from.id} · ${o.from.actor === "user" ? "your" : o.from.actor + "'s"} comment`} on ${o.from.target ? `${o.from.target} · ${d?.items[o.from.target]?.title}` : "the session"}` : it ? `${it.id} · ${it.title}` : `Session · ${s.title}`}${a && a.caption && a.kind !== "link" ? ` · ${a.name}` : ""}</div></div>
-      ${list.length ? html`<span>${i + 1} / ${list.length}</span><${Hot} k=${["←", "→"]}>${own && !o.label ? "image" : "result"}<//>` : null}${own ? null : html`<${Hot} k=${["↑", "↓"]}>row<//>`}${a ? html`<${Hot} k="↵">open<//>` : null}<${Hot} k="Space">close<//></header>
+      ${list.length ? html`<span>${i + 1} / ${list.length}</span><${Hot} k=${["←", "→"]}>${own && !o.label ? "image" : "result"}<//>` : null}${own ? null : html`<${Hot} k=${["↑", "↓"]}>row<//>`}${copyable ? html`<button class="copy" onClick=${copy}>Copy</button><${Hot} k="c">copy<//>` : null}${a ? html`<${Hot} k="↵">open<//>` : null}<${Hot} k="Space">close<//></header>
     <div class="stage" onMouseDown=${close} key=${a?.id || a?.hash || a?.src || it?.id}>
       ${!a ? html`<div class="doc"><div style="display:flex;gap:10px;align-items:center;margin-bottom:12px"><${Pill} s=${d.effective[it.id]} /><span style="color:var(--faint)">${it.id} · updated ${ago(it.updated)}</span></div><h2 style="margin:0 0 10px">${it.title}</h2>${it.description ? html`<${Md} text=${it.description} />` : html`<p style="color:var(--faint)">No description and no results on this row.</p>`}</div>`
         : a.kind === "image" ? html`<${ImageView} key=${a.id || a.hash || a.src} a=${a} api=${zoom} />`
@@ -1045,8 +1230,9 @@ function Look() {
         : a.kind === "pdf" ? html`<iframe src=${blobUrl(a)} title=${a.name} />`
         : a.kind === "html" ? html`<iframe class="page" src=${blobUrl(a)} title=${a.name} sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" />`
         : a.kind === "link" ? html`<div class="doc" style="height:auto"><div style="color:var(--faint);margin-bottom:6px">${linkLabel(a.url)}</div><h2 style="margin:0 0 10px">${a.caption || a.name}</h2><a href=${a.url} target="_blank" rel="noopener noreferrer" style="word-break:break-all">${a.url}</a><p style="color:var(--faint);margin-top:14px">${K("↵")} opens it in your browser.</p></div>`
+        : a.kind === "app" ? html`<div class="doc" style="height:auto"><h2 style="margin:0 0 10px">${a.caption || a.name}</h2><pre style="white-space:pre-wrap;font:12px var(--mono)">${appTitle(a)}</pre><button class="abtn primary" onClick=${() => launchApp(a)}>${a.run ? "Run" : "Open"}</button><p style="color:var(--faint);margin-top:14px">${K("↵")} ${a.run ? "runs it in a new Terminal window" : "opens it on this Mac"}.</p></div>`
         : a.kind === "markdown" ? html`<div class="doc">${text === null ? "…" : html`<${Md} text=${text} />`}</div>`
-        : a.kind === "text" ? html`<div class="doc"><pre style="white-space:pre-wrap;font:12px var(--mono)">${text}</pre></div>`
+        : a.kind === "text" ? html`<div class="doc"><pre style="white-space:pre-wrap;font:12px var(--mono)">${readable(a, text)}</pre></div>`
         : html`<div class="doc" style="height:auto"><h2 style="margin:0 0 10px">${a.name}</h2><a href=${blobUrl(a)} download=${a.name}>Download</a></div>`}
     </div>
     ${list.length ? html`<div class="strip" onMouseDown=${close}>${list.map((r, n) => html`<button class="card ${n === i ? "on" : ""}" key=${r.id || n} onClick=${() => pick(n)}><div class="th">${thumbOf(r)}</div><div class="tl">${title(r)}</div></button>`)}</div>` : null}
@@ -1056,7 +1242,7 @@ function Look() {
 function Overlay() {
   const o = S.overlay;
   if (!o) return null;
-  if (o.kind === "new") return html`<${NewSession} parent=${o.parent} />`;
+  if (o.kind === "new") return html`<${NewSession} nest=${o.nest || []} />`;
   if (o.kind === "palette") return html`<${Palette} />`;
   if (o.kind === "help") return html`<${Help} />`;
   if (o.kind === "status") return html`<${StatusPicker} item=${o.item} />`;
@@ -1160,7 +1346,7 @@ function App() {
     [S.meta] = await Promise.all([api.get("/api/meta"), loadSessions()]);
     S.sessions.forEach((s) => { S.prev[s.id] = s.status; });
     const r = restored();
-    if (r) Object.assign(S, { sel: r.sel || {}, res: r.res || {}, closed: r.closed, drafts: r.drafts || {}, restore: r });
+    if (r) Object.assign(S, { sel: r.sel || {}, res: r.res || {}, closed: r.closed, drafts: r.drafts || {}, shown: r.shown || {}, restore: r });
     const want = r?.cur || location.hash.slice(1), o = ordered();
     go(S.sessions.find((s) => s.id === want)?.id || S.sessions.find((s) => s.status === "input" && !s.closed)?.id || [...o].sort((a, b) => b.s.updated.localeCompare(a.s.updated))[0]?.s.id);
     connect();

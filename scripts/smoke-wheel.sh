@@ -8,7 +8,8 @@ sandbox="$(mktemp -d)"
 trap 'rm -rf "$sandbox"' EXIT
 
 uv venv --python 3.12 "$sandbox/venv"
-uv pip install --python "$sandbox/venv/bin/python" --only-binary :all: "$wheel"
+# convos brings orchestrate, whose wheel is built beside it
+uv pip install --python "$sandbox/venv/bin/python" --only-binary :all: --find-links "$(dirname "$wheel")" "$wheel"
 export CONVOS_PROJECT_ROOT="$sandbox/root" CODEX_HOME="$sandbox/codex" CLAUDE_CONFIG_DIR="$sandbox/claude"
 export EXPECTED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
 "$sandbox/venv/bin/convos" init

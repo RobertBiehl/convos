@@ -14,12 +14,17 @@ V = 1
 # serialize threads, so the server's threads take turns here (always before a session lock).
 ARCHIVE = threading.RLock()
 STATUSES = ("planned", "working", "blocked", "done", "failed", "skipped")
+# statuses a row can carry a reason for (--why); blocked rows set by an agent must
+EXPLAINED = ("blocked", "failed", "skipped")
+# what the agent waits on the user for: a question or permission to answer, or an action only the user can take (need)
+LEAD, NEEDED = {"question": "Q:", "permission": "Q:", "action": "Action:"}, ["Done", "Can't"]
 # Session status precedence: anything that needs the user wins, then live work, then trouble.
 PRECEDENCE = ("input", "working", "blocked", "failed", "planned")
 STATUS_LABEL = {"input": "waiting for the user", "done": "done", "failed": "failed", "closed": "closed"}
 ALLOC = {"item": ("item", "i", "items"), "comment": ("comment", "c", "comments"), "ask": ("ask", "q", "asks"), "attach": ("attachment", "a", "attachments")}
 AGENT_KINDS = {"item", "update", "activity", "attach", "ask", "cancel", "comment", "deliver", "meta", "runtime"}
-PROVIDER_ENV = (("claude-code", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"), ("codex", "CODEX_SESSION_ID"))
+# Antigravity and Muse come first because either started from a Claude Code shell inherits that one's id
+PROVIDER_ENV = (("antigravity", "ANTIGRAVITY_CONVERSATION_ID"), ("muse", "MUSE_SESSION_ID"), ("claude-code", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"), ("codex", "CODEX_SESSION_ID"))
 
 def now(): return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 def root(): return core.PROJECT_ROOT/"orchestrate"
@@ -42,13 +47,17 @@ def apply(s, e, body):
     if kind == "open": s.update(session={**e["session"], "created": at}, prompt=body)
     elif kind == "meta": s["session"].update(e["changes"])
     elif kind == "activity": s["activity"] = dict(text=body, actor=actor, at=at) if body else None
-    elif kind == "item": s["items"][e["item"]] = dict(id=e["item"], parent=e["parent"], title=e["title"], status=e["status"], eta=e.get("eta"), description=body, actor=actor, created=at, updated=at, history=[dict(status=e["status"], actor=actor, at=at)])
+    elif kind == "item": s["items"][e["item"]] = dict(id=e["item"], parent=e["parent"], title=e["title"], status=e["status"], eta=e.get("eta"), why=e.get("why"), description=body, actor=actor, created=at, updated=at, history=[dict(status=e["status"], actor=actor, at=at, why=e.get("why"))])
     elif kind == "update":
         item = s["items"][e["item"]]
-        item.update({**e["changes"], **({"description": body} if e["description"] else {}), "updated": at})
-        if "status" in e["changes"]: item["history"].append(dict(status=e["changes"]["status"], actor=actor, at=at))
-    elif kind == "comment": s["comments"][e["comment"]] = dict(id=e["comment"], target=e["target"], reply_to=e["reply_to"], actor=actor, text=body, files=e.get("files", []), at=at, delivered=None if actor in ("user", "orchestrate") else at)
-    elif kind == "attach": s["attachments"][e["attachment"]] = dict(id=e["attachment"], target=e["target"], actor=actor, caption=body, at=at, **e["file"])
+        # a reason belongs to the status it explains, so a new status without one drops the old reason
+        item.update({**({"why": None} if "status" in e["changes"] else {}), **e["changes"], **({"description": body} if e["description"] else {}), "updated": at})
+        if "status" in e["changes"]: item["history"].append(dict(status=e["changes"]["status"], actor=actor, at=at, why=e["changes"].get("why")))
+    elif kind == "comment": s["comments"][e["comment"]] = dict(id=e["comment"], target=e["target"], reply_to=e["reply_to"], actor=actor, text=body, files=e.get("files", []), at=at, delivered=None if actor in ("user", "orchestrate") else at, notice=e.get("notice"))
+    elif kind == "attach":
+        s["attachments"][e["attachment"]] = dict(id=e["attachment"], target=e["target"], actor=actor, caption=body, at=at, replaces=e.get("replaces"), replaced_by=None, **e["file"])
+        # a newer version of a result takes its place on the row; the old one stays reachable by its id
+        if e.get("replaces"): s["attachments"][e["replaces"]]["replaced_by"] = e["attachment"]
     elif kind == "ask": s["asks"][e["ask"]] = dict(id=e["ask"], target=e["target"], options=e["options"], multi=e["multi"], kind=e["ask_kind"], detail=e["detail"], text=body, actor=actor, at=at, answer=None, delivered=None, cancelled=None)
     elif kind == "answer": s["asks"][e["ask"]]["answer"] = dict(choices=e["choices"], text=body, actor=actor, at=at)
     elif kind == "cancel": s["asks"][e["ask"]].update(cancelled=at, cancelled_by=actor)
@@ -81,6 +90,12 @@ def check(s, e):
     if kind == "item": item(e["parent"] if e["parent"] is not None or scope is None else scope, "Parent")
     if kind in ("update", "attach", "comment", "ask"): item(e.get("item", e.get("target")))
     if kind in ("item", "update") and e.get("status", e.get("changes", {}).get("status", "planned")) not in STATUSES: raise ValueError(f"Status must be one of {', '.join(STATUSES)}")
+    if kind in ("item", "update"):
+        changes = e if kind == "item" else e["changes"]
+        after = changes["status"] if "status" in changes else s["items"][e["item"]]["status"]
+        if changes.get("why") and after not in EXPLAINED: raise ValueError(f"--why explains a {', '.join(EXPLAINED[:-1])} or {EXPLAINED[-1]} row, not a {after} one")
+        # the user knows why they blocked a row; an agent's blocked row must tell the user what it waits for
+        if changes.get("status") == "blocked" and not changes.get("why") and e["actor"] != "user": raise ValueError("Say why it is blocked: --why 'what it waits for'. If it waits on the user to do something, use need instead: convos orchestrate need 'WHAT THEY DO' --on ITEM")
     if kind == "comment" and e["reply_to"] is not None and e["reply_to"] not in s["comments"]: raise ValueError(f"Comment {e['reply_to']} does not exist")
     if kind == "comment" and not all(body_path(f["hash"]).is_file() for f in e.get("files", [])): raise ValueError("A comment image is missing from the archive")
     if kind in ("answer", "cancel"):
@@ -95,6 +110,10 @@ def check(s, e):
         for i in e["items"]:
             if item(i) is None or s["items"][i]["parent"] is not None: raise ValueError(f"Only top-level rows are archived; {i} is not one")
             if marks is not None and (why := blocked(s, i, marks)): raise ValueError(why)
+    if kind == "attach" and (old := e.get("replaces")):
+        if old not in s["attachments"]: raise ValueError(f"Result {old} does not exist")
+        if (a := s["attachments"][old])["target"] != e["target"]: raise ValueError(f"{old} is on {a['target'] or 'the session'}; a result replaces one on the same row")
+        if a.get("replaced_by"): raise ValueError(f"{old} was already replaced by {a['replaced_by']}; replace that one")
     if kind == "deliver" and not all(i in (s["comments"] if i[0] == "c" else s["asks"]) for i in e["ids"]): raise ValueError("Unknown delivery id")
 
 def _conv(s, sid, at):
@@ -243,6 +262,10 @@ def open_asks(s): return [a for a in s["asks"].values() if a["answer"] is None a
 # an agent's estimate for an open row; rows created before ETAs existed carry none
 OPEN = ("planned", "working", "blocked")
 def overdue(s): return [i for i, x in s["items"].items() if x.get("eta") and x["status"] in OPEN and x["eta"] < now()]
+def lapsed(s):
+    """Rows whose ETA passed within the hour and whose agent has not been told: one notice per ETA, none for long-lapsed ones."""
+    told = {c.get("notice") for c in s["comments"].values()}
+    return [i for i in overdue(s) if not s["items"][i].get("archived") and secs(s["items"][i]["eta"]) < 3600 and f"eta:{i}:{s['items'][i]['eta']}" not in told]
 def secs(at): return (datetime.now(timezone.utc)-datetime.fromisoformat(at)).total_seconds()
 def span(x): return f"{round(x/60)}m" if x < 3600 else f"{round(x/3600)}h" if x < 86400 else f"{round(x/86400)}d"
 def clock(at): return (t := datetime.fromisoformat(at).astimezone()).strftime("%H:%M" if t.date() == datetime.now().date() else "%a %H:%M")
@@ -255,9 +278,12 @@ def reminders(s, scope=None):
     idle = [i for i in mine if s["items"][i]["status"] == "working" and not s["items"][i].get("eta") and secs(changed(s, i)) >= 1800]
     settled = [a for a in open_asks(s) if a["kind"] != "permission" and within(s, a["target"], scope) and any(c["actor"] == "user" and c["target"] == a["target"] and c["at"] > a["at"] for c in s["comments"].values())]
     waiting = pending(s, scope)
+    # rows an agent blocked before reasons existed: the user cannot tell what they wait for
+    unexplained = [i for i in mine if (x := s["items"][i])["status"] == "blocked" and not x.get("why") and not x.get("archived") and x["history"][-1]["actor"] != "user"]
     # finished an hour ago or more and read by the user since: the agent may take them off Current
     tidy = [i for i in mine if not s["items"][i]["parent"] and not s["items"][i].get("archived") and secs(changed(s, i)) >= 3600 and not blocked(s, i, marks)]
     return [*(f"{x['id']} is {span(secs(x['eta']))} past its ETA ({clock(x['eta'])}): finish it, or give it a new one: convos orchestrate set {x['id']} --eta 30m" for x in late),
+            *(f"{i} is blocked without a reason the user can see. If it waits on the user to do something: convos orchestrate need 'WHAT THEY DO' --on {i}. Otherwise: convos orchestrate set {i} --why 'what it waits for'" for i in unexplained),
             *([f"Working with no news for 30+ min: {', '.join(f'{i} ({span(secs(changed(s, i)))})' for i in idle)}. Set the real status of any that finished, stalled, or stopped; give the rest an --eta"] if idle else []),
             *(f"{a['id']} on {a['target'] or 'the session'}: the user commented there after you asked. If that settled it: convos orchestrate withdraw {a['id']}" for a in settled),
             *([f"{len(waiting)} user message(s) have not reached you yet: convos orchestrate inbox"] if waiting else []),
@@ -272,11 +298,12 @@ def status(s):
     values = set(effective(s).values()) | ({"input"} if open_asks(s) else set()) | ({"working"} if (s["runtime"] or {}).get("state") == "working" else set())
     return next((x for x in PRECEDENCE if x in values), "done" if s["items"] else "idle")
 
-def pending(s, scope=None):
-    """User words the agent has not received yet: comments, answers, and questions the user dismissed, oldest first."""
-    comments = [dict(type="comment", **c) for c in s["comments"].values() if c["delivered"] is None and within(s, c["target"], scope)]
+def pending(s, scope=None, again=()):
+    """User words the agent has not received yet (and those in again, given once more): comments, answers, and questions the
+    user dismissed, oldest first."""
+    comments = [dict(type="comment", **c) for c in s["comments"].values() if (c["delivered"] is None or c["id"] in again) and within(s, c["target"], scope)]
     # cancelled_by exists only on questions cancelled since it was recorded; older ones were all cancelled by orchestrate
-    answers = [dict(type="answer" if a["answer"] else "dismissed", **a) for a in s["asks"].values() if (a["answer"] or a.get("cancelled_by") == "user") and a["delivered"] is None and a["kind"] != "permission" and within(s, a["target"], scope)]
+    answers = [dict(type="answer" if a["answer"] else "dismissed", **a) for a in s["asks"].values() if (a["answer"] or a.get("cancelled_by") == "user") and (a["delivered"] is None or a["id"] in again) and a["kind"] != "permission" and within(s, a["target"], scope)]
     return sorted(comments+answers, key=lambda x: x["answer"]["at"] if x["type"] == "answer" else x["cancelled"] if x["type"] == "dismissed" else x["at"])
 
 def describe(s, entry):
@@ -285,8 +312,8 @@ def describe(s, entry):
     if entry["type"] == "answer":
         a = entry["answer"]
         note = f" | note: {a['text']!r}" if a["text"] else ""
-        return f"- {entry['id']} answered on {where}: Q: {entry['text']!r} -> {', '.join(a['choices']) or '(no choice)'}{note}"
-    if entry["type"] == "dismissed": return f"- {entry['id']} dismissed by the user on {where} without an answer: Q: {entry['text']!r}. Do not wait for it; ask again only if you still need it"
+        return f"- {entry['id']} answered on {where}: {LEAD[entry['kind']]} {entry['text']!r} -> {', '.join(a['choices']) or '(no choice)'}{note}"
+    if entry["type"] == "dismissed": return f"- {entry['id']} dismissed by the user on {where} without an answer: {LEAD[entry['kind']]} {entry['text']!r}. Do not wait for it; ask again only if you still need it"
     if entry["actor"] == "orchestrate": return f"- {entry['id']} orchestrate notice on {where}: {entry['text']}"
     reply = f"convos orchestrate say{f' --on {t}' if t else ''} --reply {entry['id']} 'TEXT'"
     cid, sid = entry["id"], s["session"]["id"]
@@ -308,18 +335,20 @@ MAGIC = ((b"\x89PNG\r\n\x1a\n", "image", "image/png", ".png"), (b"\xff\xd8\xff",
          (b"%PDF-", "pdf", "application/pdf", ".pdf"))
 def typed(a):
     """A result attached under a name without an extension was stored as an untyped file; its bytes still say what it is.
-    Only how the board shows it changes: the archived event keeps what the agent sent. HTML attached before it had a kind was text."""
+    Only how the board shows it changes: the archived event keeps what the agent sent. HTML attached before it had a kind was text.
+    Text under a type browsers only download (JSON, a patch, a script) is shown as text, so the user reads and copies it in place."""
     if a["kind"] == "text" and a["mime"] == "text/html": return {**a, "kind": "html"}
-    if a["kind"] != "file" or a["mime"] != "application/octet-stream": return a
+    if a["kind"] != "file": return a
     with body_path(a["hash"]).open("rb") as f: head = f.read(4096)
-    found = next(((k, m, x) for magic, k, m, x in MAGIC if head.startswith(magic)), None)
-    if not found and head[:4] == b"RIFF" and head[8:12] == b"WEBP": found = ("image", "image/webp", ".webp")
-    if not found and head[4:8] == b"ftyp": found = ("video", "video/mp4", ".mp4")
-    # agents' notes are markdown; anything that reads as text without NUL bytes is shown as one
+    bare = a["mime"] == "application/octet-stream"
+    found = next(((k, m, x) for magic, k, m, x in MAGIC if head.startswith(magic)), None) if bare else None
+    if bare and not found and head[:4] == b"RIFF" and head[8:12] == b"WEBP": found = ("image", "image/webp", ".webp")
+    if bare and not found and head[4:8] == b"ftyp": found = ("video", "video/mp4", ".mp4")
+    # agents' notes are markdown; anything else that reads as text without NUL bytes is shown as text
     if not found and b"\0" not in head:
         try: codecs.getincrementaldecoder("utf-8")().decode(head)
         except UnicodeDecodeError: pass
-        else: found = ("html", "text/html", ".html") if head.lstrip()[:15].lower().startswith((b"<!doctype html", b"<html")) else ("markdown", "text/markdown", ".md")
+        else: found = ("text", a["mime"] if not bare else "text/plain", "") if Path(a["name"]).suffix or not bare else ("html", "text/html", ".html") if head.lstrip()[:15].lower().startswith((b"<!doctype html", b"<html")) else ("markdown", "text/markdown", ".md")
     return {**a, "kind": found[0], "mime": found[1], "name": a["name"]+found[2]} if found else a
 
 def wait_for(sid, predicate, seconds):

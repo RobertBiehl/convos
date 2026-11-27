@@ -1,11 +1,12 @@
-"""Explicit, reversible skill setup so any Claude Code or Codex session can join with /orchestrate or $orchestrate."""
+"""Explicit, reversible skill setup so any Claude Code, Codex, or Antigravity session can join with /orchestrate or $orchestrate."""
 import os
 from pathlib import Path
 from ai_convos import cli as core
 
 def destinations():
     return [("claude-code", Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"skills"/"orchestrate"/"SKILL.md"),
-            ("codex", Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"skills"/"orchestrate"/"SKILL.md")]
+            ("codex", Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"skills"/"orchestrate"/"SKILL.md"),
+            ("antigravity", Path(os.environ.get("ANTIGRAVITY_CONFIG_DIR", Path.home()/".gemini"/"config"))/"skills"/"orchestrate"/"SKILL.md")]
 
 def install(remove=False):
     skill = Path(__file__).with_name("SKILL.md").read_text()

@@ -138,6 +138,28 @@ def test_muse_stop_hook_rejects_symlink_escape(hooks,monkeypatch,tmp_path):
     assert CliRunner().invoke(cli.app,["capture","muse"],input=json.dumps({"hook_event_name":"Stop","session_id":"aaaaaaaa-1111-2222-3333-444444444444"})).exit_code==0
     assert not list(cli.HOOK_DIR.glob("*.json"))
 
+def test_antigravity_stop_hook_captures_upgrades_to_full_and_emits_json(hooks,monkeypatch,tmp_path):
+    app=tmp_path/"antigravity"; sid="11111111-2222-3333-4444-555555555555"; logs=app/"brain"/sid/".system_generated"/"logs"; logs.mkdir(parents=True)
+    compact,full=logs/"transcript.jsonl",logs/"transcript_full.jsonl"
+    compact.write_text(json.dumps({"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"2026-11-27T10:00:00Z","content":"truncated"}))
+    full.write_text(json.dumps({"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"2026-11-27T10:00:00Z","content":"remember antigravity full"}))
+    monkeypatch.setenv("ANTIGRAVITY_APP_DATA_DIR",str(app))
+    r=CliRunner().invoke(cli.app,["capture","antigravity"],input=json.dumps({"hookEventName":"Stop","conversationId":sid,"transcriptPath":str(compact)}))
+    assert r.exit_code==0 and r.stdout.strip()=="{}"
+    assert [json.loads(q.read_text())["path"] for q in cli.HOOK_DIR.glob("*.json")]==[str(full.resolve())]
+    assert cli.drain_hooks()==1
+    with cli._core(read_only=True,purpose="test.read") as conn: assert conn.execute("SELECT c.source,m.content FROM conversations c JOIN messages m ON m.conversation_id=c.id").fetchall()==[("antigravity","remember antigravity full")]
+
+def test_antigravity_stop_hook_rejects_outside_and_symlink_escape(hooks,monkeypatch,tmp_path):
+    app=tmp_path/"antigravity"; sid="aaaaaaaa-1111-2222-3333-444444444444"; logs=app/"brain"/sid/".system_generated"/"logs"; logs.mkdir(parents=True)
+    outside=tmp_path/"outside.jsonl"; outside.write_text(json.dumps({"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"2026-11-27T10:00:00Z","content":"secret"}))
+    (logs/"transcript_full.jsonl").symlink_to(outside)
+    monkeypatch.setenv("ANTIGRAVITY_APP_DATA_DIR",str(app))
+    for p in (outside,logs/"transcript_full.jsonl"):
+        r=CliRunner().invoke(cli.app,["capture","antigravity"],input=json.dumps({"hookEventName":"Stop","conversationId":sid,"transcriptPath":str(p)}))
+        assert r.exit_code==0 and r.stdout.strip()=="{}"
+    assert not list(cli.HOOK_DIR.glob("*.json"))
+
 def test_unchanged_capture_and_queued_duplicate_do_not_open_archive(hooks,monkeypatch):
     sessions,data=hooks; transcript(path:=sessions/"duplicate.jsonl"); enqueue(path); assert cli.drain_hooks()==1
     launched=[]; monkeypatch.setattr(cli.subprocess,"Popen",lambda *a,**k:launched.append(a)); monkeypatch.setattr(cli,"_core",lambda **k:pytest.fail("unchanged hook opened archive"))
@@ -596,25 +618,26 @@ def test_init_sets_up_core_and_installed_products(hooks, monkeypatch):
     first, second = (CliRunner().invoke(cli.app, ["init"]) for _ in range(2))
     assert first.exit_code == second.exit_code == 0 and "Product ready" in first.output and called == [("sync",(False,300,True,True,False,False,True)),"skills",("hooks",False,False),"product"]*2
 
-@pytest.mark.parametrize("unsafe_name,unsafe_kind", [(name,kind) for name in ("codex","claude") for kind in ("file","directory","non-directory")])
+@pytest.mark.parametrize("unsafe_name,unsafe_kind", [(name,kind) for name in ("codex","claude","antigravity") for kind in ("file","directory","non-directory")])
 def test_managed_files_are_atomic_private_and_reject_skill_symlinks(tmp_path, monkeypatch, unsafe_name, unsafe_kind):
     managed, fresh = tmp_path/"managed.json", tmp_path/"fresh.json"; managed.write_text("{}"); os.chmod(managed, 0o640); cli.atomic_json(managed, {"ready":True}); cli.atomic_json(fresh, {})
     assert json.loads(managed.read_text()) == {"ready":True} and os.stat(managed).st_mode&0o777 == 0o640 and os.stat(fresh).st_mode&0o777 == 0o600
-    codex, claude, outside = tmp_path/"codex", tmp_path/"claude", tmp_path/"outside"; targets = {"codex":codex/"skills"/"convos"/"SKILL.md","claude":claude/"skills"/"convos"/"SKILL.md"}; unsafe, safe = targets[unsafe_name], targets[{"codex":"claude","claude":"codex"}[unsafe_name]]; safe.parent.mkdir(parents=True); safe.write_text("unchanged")
+    codex, claude, ag, outside = tmp_path/"codex", tmp_path/"claude", tmp_path/"ag", tmp_path/"outside"; targets = {"codex":codex/"skills"/"convos"/"SKILL.md","claude":claude/"skills"/"convos"/"SKILL.md","antigravity":ag/"skills"/"convos"/"SKILL.md"}; unsafe = targets[unsafe_name]; safes = [v for k,v in targets.items() if k != unsafe_name]
+    for safe in safes: safe.parent.mkdir(parents=True); safe.write_text("unchanged")
     if unsafe_kind == "file": unsafe.parent.mkdir(parents=True); outside.write_text("sentinel"); unsafe.symlink_to(outside)
     else: unsafe.parent.parent.mkdir(parents=True); outside.mkdir(); unsafe.parent.symlink_to(outside) if unsafe_kind == "directory" else unsafe.parent.write_text("blocker")
-    monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); result = CliRunner().invoke(cli.app, ["install-skills"])
-    assert result.exit_code == 1 and "Refusing unsafe managed file" in result.output and "Traceback" not in result.output and safe.read_text() == "unchanged" and (outside.read_text() == "sentinel" if outside.is_file() else not (outside/"SKILL.md").exists())
+    monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setenv("ANTIGRAVITY_CONFIG_DIR", str(ag)); result = CliRunner().invoke(cli.app, ["install-skills"])
+    assert result.exit_code == 1 and "Refusing unsafe managed file" in result.output and "Traceback" not in result.output and all(s.read_text() == "unchanged" for s in safes) and (outside.read_text() == "sentinel" if outside.is_file() else not (outside/"SKILL.md").exists())
 
 def test_install_skills_allows_one_shared_declared_destination(tmp_path, monkeypatch):
-    codex, claude = tmp_path/"codex", tmp_path/"claude"; (codex/"skills").mkdir(parents=True); claude.mkdir(); (claude/"skills").symlink_to(codex/"skills", target_is_directory=True); monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
-    result = CliRunner().invoke(cli.app, ["install-skills"]); a, b = codex/"skills"/"convos"/"SKILL.md", claude/"skills"/"convos"/"SKILL.md"
-    assert result.exit_code == 0 and result.output.count("Installed ") == 2 and a.samefile(b) and a.read_text() == b.read_text()
+    codex, claude, ag = tmp_path/"codex", tmp_path/"claude", tmp_path/"ag"; (codex/"skills").mkdir(parents=True); claude.mkdir(); (claude/"skills").symlink_to(codex/"skills", target_is_directory=True); monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setenv("ANTIGRAVITY_CONFIG_DIR", str(ag))
+    result = CliRunner().invoke(cli.app, ["install-skills"]); a, b, c = codex/"skills"/"convos"/"SKILL.md", claude/"skills"/"convos"/"SKILL.md", ag/"skills"/"convos"/"SKILL.md"
+    assert result.exit_code == 0 and result.output.count("Installed ") == 3 and a.samefile(b) and a.read_text() == b.read_text() == c.read_text()
 
 def test_install_skills_replaces_only_exact_legacy_skill(tmp_path, monkeypatch):
-    codex,claude=tmp_path/"codex",tmp_path/"claude"; monkeypatch.setenv("CODEX_HOME",str(codex)); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(claude)); source=(Path(__file__).resolve().parents[1]/"skills/convos/SKILL.md").read_text(); legacy=source.replace("name: convos","name: agent-convos",1).replace("# Convos","# Agent Convos",1); exact,modified=codex/"skills/agent-convos/SKILL.md",claude/"skills/agent-convos/SKILL.md"
+    codex,claude,ag=tmp_path/"codex",tmp_path/"claude",tmp_path/"ag"; monkeypatch.setenv("CODEX_HOME",str(codex)); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(claude)); monkeypatch.setenv("ANTIGRAVITY_CONFIG_DIR",str(ag)); source=(Path(__file__).resolve().parents[1]/"skills/convos/SKILL.md").read_text(); legacy=source.replace("name: convos","name: agent-convos",1).replace("# Convos","# Agent Convos",1); exact,modified=codex/"skills/agent-convos/SKILL.md",claude/"skills/agent-convos/SKILL.md"
     exact.parent.mkdir(parents=True); exact.write_text(legacy); modified.parent.mkdir(parents=True); modified.write_text(legacy+"\ncustom\n"); result=CliRunner().invoke(cli.app,["install-skills"])
-    assert result.exit_code==0 and not exact.exists() and modified.read_text().endswith("custom\n") and (codex/"skills/convos/SKILL.md").read_text()==source and (claude/"skills/convos/SKILL.md").read_text()==source
+    assert result.exit_code==0 and not exact.exists() and modified.read_text().endswith("custom\n") and (codex/"skills/convos/SKILL.md").read_text()==source and (claude/"skills/convos/SKILL.md").read_text()==source and (ag/"skills/convos/SKILL.md").read_text()==source
 
 def test_doctor_reports_archive_ingest_and_hook_health(hooks, monkeypatch):
     _, data = hooks; claude = data/"claude"; claude.mkdir(parents=True); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setattr(cli, "safari_cookie_domains", lambda: []); monkeypatch.setattr(cli, "chrome_cookie_domains", lambda: [])
@@ -622,14 +645,14 @@ def test_doctor_reports_archive_ingest_and_hook_health(hooks, monkeypatch):
     cli.atomic_json(data/"hook_state.json", {"x":[1767225600000000000,1]}); cli.atomic_json(data/"hook_embeddings_dirty", ["m"]); cli.atomic_json(data/"hook_inbox/q.json", {"source":"codex"})
     r = CliRunner().invoke(cli.app, ["doctor"]); assert r.exit_code == 0
     assert "convos:" in r.output and "archive: 1 convs, 2 msgs, 1 unembedded" in r.output and "schema=ready, fts=current" in r.output and "repair: convos embed" in r.output
-    assert "ingest: pending=1, last=2026-01-01" in r.output and "skills: 0/2 current" in r.output and "repair: convos install-skills" in r.output and "codex: 0 hooks" in r.output and "repair: convos install-hooks" in r.output
+    assert "ingest: pending=1, last=2026-01-01" in r.output and "skills: 0/3 current" in r.output and "repair: convos install-skills" in r.output and "codex: 0 hooks" in r.output and "antigravity: 0 hooks" in r.output and "repair: convos install-hooks" in r.output
 
 def test_doctor_detects_current_stale_and_symlinked_skills(hooks, tmp_path, monkeypatch):
     _, data = hooks; codex,claude=Path(os.environ["CODEX_HOME"]),tmp_path/"claude"; claude.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(claude)); monkeypatch.setattr(cli,"entry_points",lambda **_:[]); monkeypatch.setattr(cli,"safari_cookie_domains",lambda:[]); monkeypatch.setattr(cli,"chrome_cookie_domains",lambda:[]); runner=CliRunner()
-    missing=runner.invoke(cli.app,["doctor"]).output; assert "skills: 0/2 current" in missing and "repair: convos install-skills" in missing
-    assert runner.invoke(cli.app,["install-skills"]).exit_code==0; current=runner.invoke(cli.app,["doctor"]).output; assert "skills: 2/2 current" in current and "repair: convos install-skills" not in current
-    target=claude/"skills/convos/SKILL.md"; target.write_text("stale"); assert "skills: 1/2 current" in runner.invoke(cli.app,["doctor"]).output
-    target.unlink(); target.symlink_to(codex/"skills/convos/SKILL.md"); linked=runner.invoke(cli.app,["doctor"]).output; assert "skills: 1/2 current" in linked and "repair: convos install-skills" in linked
+    missing=runner.invoke(cli.app,["doctor"]).output; assert "skills: 0/3 current" in missing and "repair: convos install-skills" in missing
+    assert runner.invoke(cli.app,["install-skills"]).exit_code==0; current=runner.invoke(cli.app,["doctor"]).output; assert "skills: 3/3 current" in current and "repair: convos install-skills" not in current
+    target=claude/"skills/convos/SKILL.md"; target.write_text("stale"); assert "skills: 2/3 current" in runner.invoke(cli.app,["doctor"]).output
+    target.unlink(); target.symlink_to(codex/"skills/convos/SKILL.md"); linked=runner.invoke(cli.app,["doctor"]).output; assert "skills: 2/3 current" in linked and "repair: convos install-skills" in linked
 
 def test_doctor_surfaces_schema_skew(hooks, monkeypatch):
     _, data = hooks; data.mkdir(); monkeypatch.setattr(cli, "safari_cookie_domains", lambda: []); monkeypatch.setattr(cli, "chrome_cookie_domains", lambda: [])
@@ -642,30 +665,34 @@ def test_hook_rejects_paths_outside_provider_root(hooks):
     with pytest.raises(ValueError, match="Invalid codex transcript path"): cli.enqueue_hook("codex", {"transcript_path":str(path)})
 
 def test_install_status_reinstall_and_remove_hooks(tmp_path, monkeypatch):
-    claude, codex, archive = tmp_path/"claude", tmp_path/"codex", tmp_path/"archive root"; claude.mkdir(); codex.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(archive))
-    (claude/"settings.json").write_text(json.dumps({"x":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep me"},{"type":"command","command":"other hook claude-code"},{"type":"command","command":"/old/convos hook claude-code","statusMessage":"Updating conversation archive"},{"type":"command","command":"touch /tmp/wake # ai-convos remote hook"}]}]}})); runner = CliRunner()
+    claude, codex, ag, archive = tmp_path/"claude", tmp_path/"codex", tmp_path/"ag", tmp_path/"archive root"; claude.mkdir(); codex.mkdir(); ag.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setenv("ANTIGRAVITY_CONFIG_DIR", str(ag)); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(archive))
+    (claude/"settings.json").write_text(json.dumps({"x":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep me"},{"type":"command","command":"other hook claude-code"},{"type":"command","command":"/old/convos hook claude-code","statusMessage":"Updating conversation archive"},{"type":"command","command":"touch /tmp/wake # ai-convos remote hook"}]}]}}))
+    (ag/"hooks.json").write_text(json.dumps({"user-hook":{"PostToolUse":[{"type":"command","command":"echo ok"}]}})); runner = CliRunner()
     first = runner.invoke(cli.app, ["install-hooks"]); second = runner.invoke(cli.app, ["install-hooks"]); assert first.exit_code == second.exit_code == 0 and "`/hooks`" in first.output
-    c, x = json.loads((claude/"settings.json").read_text()), json.loads((codex/"hooks.json").read_text())
+    c, x, a = json.loads((claude/"settings.json").read_text()), json.loads((codex/"hooks.json").read_text()), json.loads((ag/"hooks.json").read_text())
     handler=x["hooks"]["Stop"][0]["hooks"][0]; assert c["x"] == 1 and sum(len(g["hooks"]) for g in c["hooks"]["Stop"]) == 3 and len(c["hooks"]["SessionEnd"]) == 1 and len(x["hooks"]["Stop"]) == 1 and handler["command"]==cli._capture_command("codex") and handler["timeout"]==5 and handler["statusMessage"]=="Saving conversation to Convos"
-    status = runner.invoke(cli.app, ["install-hooks", "--status"]).output; assert "claude-code: 2 hooks" in status and "codex: 1 hook" in status and "repair:" not in status and "`/hooks`" not in status
+    assert a["user-hook"] == {"PostToolUse":[{"type":"command","command":"echo ok"}]} and a["convos-capture"] == {"Stop":[{"type":"command","command":cli._capture_command("antigravity"),"timeout":5}]}
+    status = runner.invoke(cli.app, ["install-hooks", "--status"]).output; assert "claude-code: 2 hooks" in status and "codex: 1 hook" in status and "antigravity: 1 hook" in status and "repair:" not in status and "`/hooks`" not in status
     x["hooks"]["Stop"][0]["hooks"].append({"type":"command","command":"/old/convos capture codex","statusMessage":"Saving conversation to Convos"}); (codex/"hooks.json").write_text(json.dumps(x)); duplicate=runner.invoke(cli.app,["install-hooks","--status"]).output; assert "codex: 0 hooks" in duplicate and "repair: convos install-hooks" in duplicate
     assert runner.invoke(cli.app,["install-hooks"]).exit_code==0; x=json.loads((codex/"hooks.json").read_text())
     c["hooks"]["Stop"]+=c["hooks"].pop("SessionEnd"); (claude/"settings.json").write_text(json.dumps(c)); misplaced=runner.invoke(cli.app,["install-hooks","--status"]).output; assert "claude-code: 0 hooks" in misplaced and "repair: convos install-hooks" in misplaced
     assert runner.invoke(cli.app,["install-hooks"]).exit_code==0
     x["hooks"]["Stop"][0]["hooks"][0]["command"]="/old/convos capture codex"; (codex/"hooks.json").write_text(json.dumps(x)); stale=runner.invoke(cli.app,["install-hooks","--status"]).output; assert "codex: 0 hooks" in stale and "repair: convos install-hooks" in stale
-    assert runner.invoke(cli.app,["install-hooks"]).exit_code==0 and json.loads((codex/"hooks.json").read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]==cli._capture_command("codex")
+    a["convos-capture"]["Stop"][0]["command"]="/old/convos capture antigravity"; (ag/"hooks.json").write_text(json.dumps(a)); ag_stale=runner.invoke(cli.app,["install-hooks","--status"]).output; assert "antigravity: 0 hooks" in ag_stale and "repair: convos install-hooks" in ag_stale
+    assert runner.invoke(cli.app,["install-hooks"]).exit_code==0 and json.loads((codex/"hooks.json").read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]==cli._capture_command("codex") and json.loads((ag/"hooks.json").read_text())["convos-capture"]["Stop"][0]["command"]==cli._capture_command("antigravity")
     assert runner.invoke(cli.app, ["install-hooks", "--remove"]).exit_code == 0
-    c, x = json.loads((claude/"settings.json").read_text()), json.loads((codex/"hooks.json").read_text())
-    assert c["hooks"] == {"Stop":[{"hooks":[{"type":"command","command":"keep me"},{"type":"command","command":"other hook claude-code"}]}]} and x["hooks"] == {}
+    c, x, a = json.loads((claude/"settings.json").read_text()), json.loads((codex/"hooks.json").read_text()), json.loads((ag/"hooks.json").read_text())
+    assert c["hooks"] == {"Stop":[{"hooks":[{"type":"command","command":"keep me"},{"type":"command","command":"other hook claude-code"}]}]} and x["hooks"] == {} and a == {"user-hook":{"PostToolUse":[{"type":"command","command":"echo ok"}]}}
 
-@pytest.mark.parametrize("unsafe_name,unsafe_kind", [(name,kind) for name in ("claude","codex") for kind in ("symlink","malformed","shape","parent")])
+@pytest.mark.parametrize("unsafe_name,unsafe_kind", [(name,kind) for name in ("claude","codex","antigravity") for kind in ("symlink","malformed","shape","parent")])
 @pytest.mark.parametrize("remove", [False,True])
 def test_install_hooks_preflights_every_config_before_writing(tmp_path, monkeypatch, unsafe_name, unsafe_kind, remove):
-    homes = {"claude":tmp_path/"claude","codex":tmp_path/"codex"}; paths = {"claude":homes["claude"]/"settings.json","codex":homes["codex"]/"hooks.json"}; unsafe, safe = paths[unsafe_name], paths[{"claude":"codex","codex":"claude"}[unsafe_name]]; safe.parent.mkdir(); safe.write_text('{"keep":1}'); outside = tmp_path/"outside"
+    homes = {"claude":tmp_path/"claude","codex":tmp_path/"codex","antigravity":tmp_path/"ag"}; paths = {"claude":homes["claude"]/"settings.json","codex":homes["codex"]/"hooks.json","antigravity":homes["antigravity"]/"hooks.json"}; unsafe = paths[unsafe_name]; safes = [v for k,v in paths.items() if k != unsafe_name]; outside = tmp_path/"outside"
+    for safe in safes: safe.parent.mkdir(); safe.write_text('{"keep":{"Stop":[]}}' if safe == paths["antigravity"] else '{"keep":1}')
     if unsafe_kind == "parent": unsafe.parent.write_text("blocker")
     else: unsafe.parent.mkdir(); outside.write_text("sentinel"); unsafe.symlink_to(outside) if unsafe_kind == "symlink" else unsafe.write_text("{" if unsafe_kind == "malformed" else '{"hooks":[]}')
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(homes["claude"])); monkeypatch.setenv("CODEX_HOME", str(homes["codex"])); result = CliRunner().invoke(cli.app, ["install-hooks",*(["--remove"] if remove else [])])
-    assert result.exit_code == 1 and safe.read_text() == '{"keep":1}' and "installed" not in result.output.lower() and (outside.read_text() == "sentinel" if outside.exists() else True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(homes["claude"])); monkeypatch.setenv("CODEX_HOME", str(homes["codex"])); monkeypatch.setenv("ANTIGRAVITY_CONFIG_DIR", str(homes["antigravity"])); result = CliRunner().invoke(cli.app, ["install-hooks",*(["--remove"] if remove else [])])
+    assert result.exit_code == 1 and all(s.read_text() == ('{"keep":{"Stop":[]}}' if s == paths["antigravity"] else '{"keep":1}') for s in safes) and "installed" not in result.output.lower() and (outside.read_text() == "sentinel" if outside.exists() else True)
 
 
 def test_dispatch_releases_worker_lease_before_child_can_start(hooks,monkeypatch):
