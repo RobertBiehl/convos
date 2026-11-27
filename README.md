@@ -107,7 +107,7 @@ convos install-skills
 - Deterministic project resume packets and exact session replay
 - Optional code-change provenance: blame, timeline, time travel, and graph browsing
 - Optional end-to-end encrypted personal multi-device and team synchronization
-- Orchestrate (beta): a keyboard-first browser IDE where your Claude Code, Codex, Muse, and Antigravity sessions report work, results, and questions, and you steer them
+- Orchestrate: a keyboard-first browser IDE where your Claude Code, Codex, Muse, and Antigravity sessions report work, results, and questions, and you steer them
 - Local secret scanning with mandatory pre-encryption team redaction
 - Export to JSON or CSV
 
@@ -131,7 +131,7 @@ uv tool install convos-remote-server
 See [self-hosting, recovery, team policy, and installation](docs/remote.md) and
 the runnable synthetic [personal and team scenarios](examples/remote/README.md).
 
-## Orchestrate (beta)
+## Orchestrate
 
 Orchestrate is a local, keyboard-first IDE in your browser for your agent
 sessions. Each Claude Code, Codex, Muse, or Antigravity session publishes a board: items with
@@ -141,7 +141,7 @@ reaches the running session; start, stop, and resume headless sessions from the
 board.
 
 ```bash
-uv tool install convos --with convos-orchestrate --prerelease allow   # beta: only pre-releases exist
+uv tool install convos        # orchestrate comes with convos
 convos orchestrate install   # /orchestrate for Claude Code & Antigravity, $orchestrate for Codex
 convos orchestrate open      # the IDE, served on 127.0.0.1 only
 ```

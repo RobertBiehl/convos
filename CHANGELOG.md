@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.0
+
+The first stable release: no package is a beta anymore, and Orchestrate now comes with Convos.
+
+- Convos now installs Orchestrate: `uv tool install convos` brings `convos orchestrate`, with no `--with` and no `--prerelease allow`.
+- Antigravity: Convos imports and syncs Antigravity CLI (`agy`) conversations, captures its turns with a Stop hook, installs its skills, and checks it in `doctor`. Orchestrate starts, joins and moves Antigravity agents.
+- Orchestrate starts Codex and Muse agents as well as Claude Code ones. Each agent comes with the models it reads from the tool itself, and a long list shows four models and a menu.
+- Orchestrate: change a started session's model, effort and permission, restart it on its conversation, or move a joined terminal session into orchestrate. Children inherit their parent's permission, and switching into `bypassPermissions` asks first.
+- Orchestrate shows usage-limit interruptions and holds your words until the reset. It also uses a Codex reset from the session's limit box, continues the sessions a limit stopped, and lets you say a Claude limit is lifted.
+- Orchestrate: you see when an agent has taken your words, and comments to a Codex thread show as queued until the thread takes them. Deliveries keep flowing when one agent or the archive stalls, and a restart no longer rescans gigabytes of transcripts.
+- Orchestrate boards:
+  - blocked rows say why;
+  - `need` asks the user to do something;
+  - results sit on one line, newest first, and `attach --replaces` puts a newer version in place;
+  - `attach --open` and `--run` start an app or command with one click;
+  - JSON, patches and scripts show as text with Copy;
+  - an agent hears once when its ETA lapses.
+- Orchestrate permissions: a `bypassPermissions` session's calls that stay inside a worktree of its repo, including where its shell already is, no longer ask you. Worktrees live in `.claude/worktrees`.
+- Claude Code: the subagent transcript is captured on SubagentStop.
+
 ## 0.11.6b38
 
 - Orchestrate: headless agents survive a server restart, and a session never runs two agents: an agent's stdin is a named pipe it also holds open and its output goes to a file, so a restarted server picks it up again, even mid-turn. The IDE keeps serving while another process holds the archive; a refused write says which process holds it. (#191)
