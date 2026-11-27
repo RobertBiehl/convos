@@ -100,6 +100,12 @@ def test_enqueue_during_drainer_exit_cannot_lose_wakeup(hooks,monkeypatch):
     assert cli.drain_hooks()==1
     assert len(launched)==1 and len(list(cli.HOOK_DIR.glob('*.json')))==1
 
+def test_subagent_stop_queues_the_subagent_transcript(tmp_path,hooks,monkeypatch):
+    projects=tmp_path/".claude"/"projects"; monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(tmp_path/".claude")); parent=projects/"-repo"/"root.jsonl"; agent=projects/"-repo"/"root"/"subagents"/"agent-a1.jsonl"
+    for p in (parent,agent): p.parent.mkdir(parents=True,exist_ok=True); p.write_text("{}\n")
+    cli.enqueue_hook("claude-code",dict(hook_event_name="SubagentStop",session_id="root",transcript_path=str(parent),agent_id="a1",agent_transcript_path=str(agent)))  # Claude Code 2.1 payload shape
+    assert [json.loads(q.read_text())["path"] for q in cli.HOOK_DIR.glob("*.json")]==[str(agent.resolve())]
+
 def test_intermediate_capture_minute_limit_and_completion_bypass(hooks,monkeypatch):
     sessions,_=hooks; transcript(path:=sessions/"rate.jsonl"); launched=[]; now=[1000.0]
     monkeypatch.setattr(cli.time,"time",lambda:now[0]); monkeypatch.setattr(cli.subprocess,"Popen",lambda *a,**k:launched.append(a))
