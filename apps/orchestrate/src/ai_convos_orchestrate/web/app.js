@@ -32,6 +32,8 @@ const ITEM_STATUSES = ["planned", "working", "blocked", "done", "failed", "skipp
 const BAR = ["done", "working", "input", "blocked", "failed", "planned", "skipped"];
 const num = (id) => parseInt(id.slice(1), 10);
 const base = (p) => (p || "").split("/").filter(Boolean).pop() || p;
+const PROV_NAME = { "claude-code": "Claude Code", codex: "Codex", muse: "Muse", antigravity: "Antigravity" };
+const provName = (p) => PROV_NAME[p] || p;
 const home = (p) => S.meta && p?.startsWith(S.meta.home) ? "~" + p.slice(S.meta.home.length) : p;
 const span = (s) => s < 45 ? "now" : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`;
 const ago = (ts) => ts ? span((Date.now() - new Date(ts)) / 1000) : "";
@@ -495,7 +497,7 @@ function commands() {
     { group: "Sessions", keys: ["n"], label: "New session", run: newSession },
     { group: "Sessions", keys: ["r"], label: "Resume session", run: () => act({ kind: "resume" }, "Resuming…"), when: s && s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" },
     { group: "Sessions", keys: ["x"], label: "Stop session", run: () => act({ kind: "stop" }, "Stopping…"), when: s && s.origin === "gui" && s.live },
-    { group: "Sessions", keys: ["⇧", "R"], label: "Restart session on its conversation (applies a Claude Code update)", run: restartSession, when: s && s.agent },
+    { group: "Sessions", keys: ["⇧", "R"], label: "Restart session on its conversation (applies an agent update)", run: restartSession, when: s && s.agent },
     { group: "Sessions", keys: ["⇧", "X"], label: s?.closed ? "Reopen session" : "Close session (keeps its board)", run: () => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed"), when: s },
     { group: "Sessions", keys: ["."], label: S.closed ? "Hide closed sessions" : "Show closed sessions", run: () => set({ closed: !S.closed }) },
     { group: "View", keys: ["i"], label: "Convos on this computer: is the archive current, sync, relay, disk", run: () => set({ overlay: { kind: "convos" } }) },
@@ -586,7 +588,7 @@ function Sidebar() {
           <div class="right">${i < 9 ? html`<kbd>${i + 1}</kbd>` : null}${s.asks ? html`<button class="badge" title="Go to what needs you" onClick=${(e) => { e.stopPropagation(); needYou(s.id); }}>${s.asks}</button>` : unread ? html`<span class="unread" />` : null}${s.live ? html`<span class="dot live" title="live" />` : null}</div>
         </div>`;
       })}
-      ${!rows.length ? html`<div class="empty">No sessions yet.<br />Press ${K("n")} to start one, or type <code>/orchestrate</code> in any Claude Code or Codex session.</div>` : null}
+      ${!rows.length ? html`<div class="empty">No sessions yet.<br />Press ${K("n")} to start one, or type <code>/orchestrate</code> in any agent session.</div>` : null}
     </div>
     ${closedCount ? html`<h6 style="margin-bottom:12px"><span class="grow">${closedCount} closed</span><${Hot} k=".">${S.closed ? "hide" : "show"}<//></h6>` : null}
   </aside>`;
@@ -612,7 +614,7 @@ function SessionBar({ s }) {
 function AgentChip({ s }) {
   if (s.origin !== "gui" || !s.model) return null;
   const show = () => { select(null); requestAnimationFrame(() => { const b = document.querySelector(".dscroll"); if (b) b.scrollTop = 0; }); };
-  return html`<button class="agentchip ${s.unheard?.length ? "deaf" : newer(s) ? "upd" : ""}" title=${s.unheard?.length ? DEAF(s) : newer(s) ? `Claude Code ${s.agent.installed} is installed: restart to update` : "Model, effort, permissions, restart"} onClick=${show}><code>${s.model}</code>${s.effort ? ` · ${s.effort}` : ""}${s.unheard?.length ? " · not taking messages" : newer(s) ? " · update" : ""}</button>`;
+  return html`<button class="agentchip ${s.unheard?.length ? "deaf" : newer(s) ? "upd" : ""}" title=${s.unheard?.length ? DEAF(s) : newer(s) ? `${provName(s.provider)} ${s.agent.installed} is installed: restart to update` : "Model, effort, permissions, restart"} onClick=${show}><code>${s.model}</code>${s.effort ? ` · ${s.effort}` : ""}${s.unheard?.length ? " · not taking messages" : newer(s) ? " · update" : ""}</button>`;
 }
 // a live Claude Code agent that has not logged taking words written to its stdin minutes ago (it does within a second, even mid
 // tool call): it stopped acting on its input, as Claude Code 2.1.327 did after a skill reload; a restart gives them to it again
@@ -632,7 +634,7 @@ function WorksWith({ s }) {
 }
 // a started session's permission changes in place: Claude Code switches at once, Codex and Muse with their next turn
 // an agent started before it could be switched into bypassPermissions restarts on its conversation for it, once the user confirms
-const APPLIES = { now: "now", "next turn": "from its next turn", "next start": "when it next starts", restart: "after a restart" };
+const APPLIES = { now: "now", "after turn": "after its current turn", "next turn": "from its next turn", "next start": "when it next starts", restart: "after a restart" };
 function Permissions({ s }) {
   const modes = S.meta.providers[s.provider].permissions, on = s.permission || modes[0], [asking, setAsking] = useState(null);
   const send = async (permission, confirm = false) => {
@@ -671,13 +673,13 @@ const restartSession = async () => { const r = await act({ kind: "restart" }); i
 const newer = (s) => s.agent?.running && s.agent.installed && s.agent.installed !== s.agent.running;
 // a joined session moves into orchestrate: its terminal agent ends and the same conversation continues headless here, after the
 // user has seen what ends and what it continues with
-const movable = (s) => s.origin !== "gui" && !s.closed && ["claude-code", "codex"].includes(s.provider);
+const movable = (s) => s.origin !== "gui" && !s.closed && ["claude-code", "codex", "antigravity"].includes(s.provider);
 const planMove = async (s) => { try { set({ moving: { id: s.id, plan: await api.get(`/api/session/${s.id}/move`) } }); } catch (e) { fail(e); } };
 function MoveBox({ plan }) {
   const [busy, setBusy] = useState(false), close = () => set({ moving: null });
   const go = async () => { setBusy(true); const r = await act({ kind: "move" }); setBusy(false); close(); if (r) { toast("Moved into orchestrate"); await loadSessions(); } };
   if (plan.blocked) return html`<div class="permask"><div>${plan.blocked}.</div><div class="btns"><button class="abtn" onClick=${close}>OK</button></div></div>`;
-  const agent = plan.provider === "codex" ? "Codex" : "Claude Code";
+  const agent = provName(plan.provider);
   const how = html`<code>${plan.model}</code>${plan.effort ? ` · ${plan.effort}` : ""} · ${plan.permission}`;
   return html`<div class="permask"><div>Move this session into orchestrate? ${plan.pid ? html`This ends the ${agent} agent in its terminal (pid ${plan.pid}${plan.version ? `, ${agent} ${plan.version}` : ""}) and continues the same conversation headless here with ${how}.${plan.busy ? " It is in the middle of a turn: that turn stops, and the agent is told to continue here." : ""}` : html`No terminal runs it now; the same conversation continues headless here with ${how}.`} Don't resume it in a terminal while it runs here.</div>
     <div class="btns"><button class="abtn primary" disabled=${busy} onClick=${go}>${busy ? "Moving…" : "Move it here"}</button><button class="abtn" disabled=${busy} onClick=${close}>Cancel</button></div></div>`;
@@ -689,7 +691,7 @@ function SessionInfo({ s, d }) {
   return html`<div class="sinfo">
     <div class="actions">
       ${s.origin === "gui" && s.live ? html`<button class="abtn" onClick=${() => act({ kind: "stop" }, "Stopping…")}>${K("x")} Stop</button>` : null}
-      ${s.agent ? html`<button class="abtn ${newer(s) ? "primary" : ""}" title=${newer(s) ? `Restart on its conversation into Claude Code ${s.agent.installed}` : "Start the agent again on its conversation"} onClick=${restartSession}>${K("⇧", "R")} ${newer(s) ? `Restart into ${s.agent.installed}` : "Restart"}</button>` : null}
+      ${s.agent ? html`<button class="abtn ${newer(s) ? "primary" : ""}" title=${newer(s) ? `Restart on its conversation into ${provName(s.provider)} ${s.agent.installed}` : "Start the agent again on its conversation"} onClick=${restartSession}>${K("⇧", "R")} ${newer(s) ? `Restart into ${s.agent.installed}` : "Restart"}</button>` : null}
       ${s.origin === "gui" && !s.live && !s.closed && s.runtime?.state !== "idle" ? html`<button class="abtn" onClick=${() => act({ kind: "resume" }, "Resuming…")}>${K("r")} Resume</button>` : null}
       <button class="abtn" onClick=${() => act({ kind: s.closed ? "reopen" : "close" }, s.closed ? "Reopened" : "Closed")}>${K("⇧", "X")} ${s.closed ? "Reopen" : "Close"}</button>
       ${movable(s) ? html`<button class="abtn" title="End its terminal agent and continue the same conversation here, so restart, model and effort work on it" onClick=${() => planMove(s)}>Move into orchestrate</button>` : null}
@@ -698,7 +700,7 @@ function SessionInfo({ s, d }) {
     <div class="metaline">
       <span class="m"><span class="dot ${s.live ? "live" : ""}" />${runtime}</span>
       <span class="m">${s.provider}${s.agent?.running ? ` ${s.agent.running}` : ""}${s.model ? html` · <code>${s.model}</code>` : null}${s.effort ? ` · ${s.effort}` : ""}</span>
-      ${newer(s) ? html`<span class="m upd">Claude Code ${s.agent.installed} is installed: restart to update</span>` : null}
+      ${newer(s) ? html`<span class="m upd">${provName(s.provider)} ${s.agent.installed} is installed: restart to update</span>` : null}
       <span class="m"><code>${home(s.cwd)}</code></span>
       <span class="m"><code>${s.id}</code></span>
       ${d.runtime?.cost ? html`<span class="m">$${d.runtime.cost.toFixed(2)}</span>` : null}
@@ -707,7 +709,7 @@ function SessionInfo({ s, d }) {
     ${s.unheard?.length ? html`<div class="limitline">${G.clock}<div>${DEAF(s)} A turn it may still run stops.<div class="btns resetbtn"><button class="abtn primary" onClick=${restartSession}>Restart and resend</button></div></div></div>`
       : s.switching?.startsWith("restarting") ? html`<div class="permask"><div>Restarts on its conversation once its current turn ends${s.switching === "restarting at prompt" ? ", or at its next permission prompt" : ""}.</div></div>` : null}
     ${lim?.released ? html`<div class="limitline">${G.clock}<div>Usage reset at ${lim.released}. ${s.origin === "gui" ? "The turn the limit stopped can carry on." : "Send a message to continue."}${s.origin === "gui" && !s.busy ? html`<div class="btns resetbtn"><button class="abtn primary" onClick=${() => act({ kind: "resume" }, "Continuing…")}>Continue</button></div>` : null}</div></div>`
-      : lim ? html`<div class="limitline">${G.clock}<div>Stopped by the usage limit at ${lim.hit}. ${lim.wait ? (s.pending ? `${s.pending} message${s.pending === 1 ? " waits" : "s wait"} and go${s.pending === 1 ? "es" : ""} out at ${lim.go}, after it resets.` : `Messages you send wait and go out at ${lim.go}, after it resets.`) : lim.released ? `Your usage was reset at ${lim.released}; send a message to continue.` : lim.at ? `The limit reset at ${lim.at}; send a message to continue.` : "The notice names no reset time, so messages go out right away."}<div class="notice">${lim.title}</div>${lim.wait && s.provider === "codex" ? html`<${CodexReset} key=${s.id} />` : lim.wait ? html`<div class="btns resetbtn"><button class="abtn" title=${`For when your ${s.provider === "muse" ? "Muse" : "Claude"} usage is back before this reset (you reset it, or bought more): every session this limit stopped carries on, and held messages go out`} onClick=${() => act({ kind: "lifted" }, "Usage marked as reset; stopped sessions carry on")}>Usage is back · continue</button></div>` : null}</div></div>` : null}
+      : lim ? html`<div class="limitline">${G.clock}<div>Stopped by the usage limit at ${lim.hit}. ${lim.wait ? (s.pending ? `${s.pending} message${s.pending === 1 ? " waits" : "s wait"} and go${s.pending === 1 ? "es" : ""} out at ${lim.go}, after it resets.` : `Messages you send wait and go out at ${lim.go}, after it resets.`) : lim.released ? `Your usage was reset at ${lim.released}; send a message to continue.` : lim.at ? `The limit reset at ${lim.at}; send a message to continue.` : "The notice names no reset time, so messages go out right away."}<div class="notice">${lim.title}</div>${lim.wait && s.provider === "codex" ? html`<${CodexReset} key=${s.id} />` : lim.wait ? html`<div class="btns resetbtn"><button class="abtn" title=${`For when your ${provName(s.provider)} usage is back before this reset (you reset it, or bought more): every session this limit stopped carries on, and held messages go out`} onClick=${() => act({ kind: "lifted" }, "Usage marked as reset; stopped sessions carry on")}>Usage is back · continue</button></div>` : null}</div></div>` : null}
     <div class="activity">${s.status === "working" || s.busy ? html`<${SI} s="working" sm />` : null}${s.activity && !["done", "closed"].includes(s.status) ? html`<span class="txt" key=${s.activity.at}>${s.activity.text}</span><span style="color:var(--faint)">· ${ago(s.activity.at)}</span>` : html`<span style="color:var(--faint)">${s.items ? `${counts.done || 0} of ${s.items} done` : "No items yet"}</span>`}</div>
     ${s.items ? html`<div style="margin-top:10px"><${Progress} counts=${counts} big /></div>` : null}
     ${kids.length ? html`<div class="children">${kids.map((k) => html`<button class="chip" onClick=${() => go(k.id)}><${SI} s=${k.status} sm /><span class="ell">${k.title}</span></button>`)}</div>` : null}
@@ -1031,7 +1033,7 @@ function NewSession({ nest }) {
   });
   const toggle = (name) => name !== "orchestrate" && up({ skills: f.skills.includes(name) ? f.skills.filter((x) => x !== name) : [...f.skills, name] });
   return html`<${Modal} title="New session" onClose=${() => set({ overlay: null })}
-    footer=${html`<span class="grow">${f.provider === "claude-code" ? "Runs headless" : "Runs headless, one turn per message"}; you steer it from this board. ${K("Tab")} next field</span><button class="abtn" onClick=${() => set({ overlay: null })}>Cancel</button><button class="abtn primary" disabled=${busy} onClick=${submit}>${busy ? "Starting…" : "Start"} ${K("⌘", "↵")}</button>`}>
+    footer=${html`<span class="grow">${["claude-code", "antigravity"].includes(f.provider) ? "Runs headless" : "Runs headless, one turn per message"}; you steer it from this board. ${K("Tab")} next field</span><button class="abtn" onClick=${() => set({ overlay: null })}>Cancel</button><button class="abtn primary" disabled=${busy} onClick=${submit}>${busy ? "Starting…" : "Start"} ${K("⌘", "↵")}</button>`}>
     <div class="mbody">
       <div class="field"><label>Path<span class="hint">${K("Tab")} complete · ${K("↑", "↓")} pick</span></label>
         <input type="text" class="mono" autoFocus value=${f.cwd} onInput=${(e) => { up({ cwd: e.target.value }); complete(e.target.value); }}

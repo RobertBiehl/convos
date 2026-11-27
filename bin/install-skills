@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-target="${1:-both}"
-case "$target" in codex|claude|both) ;; *) echo "usage: $0 [codex|claude|both]" >&2; exit 1 ;; esac
+target="${1:-all}"
+case "$target" in codex|claude|antigravity|both|all) ;; *) echo "usage: $0 [codex|claude|antigravity|both|all]" >&2; exit 1 ;; esac
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 skill="$root/skills/convos/SKILL.md"
@@ -18,7 +18,9 @@ install() {
 }
 
 codex_base="${CODEX_HOME:-$HOME/.codex}/skills"
-claude_base="$HOME/.claude/skills"
+claude_base="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
+antigravity_base="${ANTIGRAVITY_CONFIG_DIR:-$HOME/.gemini/config}/skills"
 
-if [ "$target" = "codex" ] || [ "$target" = "both" ]; then install "$codex_base"; fi
-if [ "$target" = "claude" ] || [ "$target" = "both" ]; then install "$claude_base"; fi
+if [ "$target" = "codex" ] || [ "$target" = "both" ] || [ "$target" = "all" ]; then install "$codex_base"; fi
+if [ "$target" = "claude" ] || [ "$target" = "both" ] || [ "$target" = "all" ]; then install "$claude_base"; fi
+if [ "$target" = "antigravity" ] || [ "$target" = "all" ]; then install "$antigravity_base"; fi

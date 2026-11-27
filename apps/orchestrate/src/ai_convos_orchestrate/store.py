@@ -23,8 +23,8 @@ PRECEDENCE = ("input", "working", "blocked", "failed", "planned")
 STATUS_LABEL = {"input": "waiting for the user", "done": "done", "failed": "failed", "closed": "closed"}
 ALLOC = {"item": ("item", "i", "items"), "comment": ("comment", "c", "comments"), "ask": ("ask", "q", "asks"), "attach": ("attachment", "a", "attachments")}
 AGENT_KINDS = {"item", "update", "activity", "attach", "ask", "cancel", "comment", "deliver", "meta", "runtime"}
-# Muse gives its commands MUSE_SESSION_ID; it comes first because a Muse started from a Claude Code shell inherits that one's id
-PROVIDER_ENV = (("muse", "MUSE_SESSION_ID"), ("claude-code", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"), ("codex", "CODEX_SESSION_ID"))
+# Antigravity and Muse come first because either started from a Claude Code shell inherits that one's id
+PROVIDER_ENV = (("antigravity", "ANTIGRAVITY_CONVERSATION_ID"), ("muse", "MUSE_SESSION_ID"), ("claude-code", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"), ("codex", "CODEX_SESSION_ID"))
 
 def now(): return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 def root(): return core.PROJECT_ROOT/"orchestrate"

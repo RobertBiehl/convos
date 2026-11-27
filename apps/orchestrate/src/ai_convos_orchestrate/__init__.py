@@ -90,7 +90,8 @@ def join(ctx: typer.Context, title: str = typer.Option(..., "--title", "-t", hel
         if s["closed"]: s = store.emit(sid, "reopen", ctx.obj["actor"])[0]
         if s["session"]["title"] != title: s = store.emit(sid, "meta", ctx.obj["actor"], changes=dict(title=title))[0]
         return out(ctx, dict(session=sid, joined=False), f"Already joined as {sid}.\n{board(s)}")
-    meta = dict(id=(sid := store.new_id()), title=title, provider=provider, provider_session=provider_session, model=model or os.environ.get("ANTHROPIC_MODEL"), effort=os.environ.get("CLAUDE_EFFORT"), cwd=str(Path(cwd).resolve()), origin="joined", parent=parent, skills=[])
+    inferred = transcripts.latest_model(dict(provider=provider, provider_session=provider_session)) if not model and provider == "antigravity" and provider_session else None
+    meta = dict(id=(sid := store.new_id()), title=title, provider=provider, provider_session=provider_session, model=model or inferred or os.environ.get("ANTHROPIC_MODEL"), effort=os.environ.get("CLAUDE_EFFORT"), cwd=str(Path(cwd).resolve()), origin="joined", parent=parent, skills=[])
     s = store.emit(sid, "open", ctx.obj["actor"], "", session=meta)[0]
     channels.record(sid)
     hint = "" if provider_session else f"\nNo provider session id was detected: pass -s {sid} on every command, or export CONVOS_ORCHESTRATE_SESSION={sid}."
@@ -260,7 +261,7 @@ def ls(ctx: typer.Context, all_: bool = typer.Option(False, "--all", "-a", help=
 @cmd
 def spawn(ctx: typer.Context, prompt: str = typer.Argument(..., help="Starting prompt; '-' reads stdin"), title: str = typer.Option("", "--title", "-t"),
           on: str = typer.Option(None, "--on", help="Your item the child session works for"), cwd: str = typer.Option(".", "--cwd"),
-          provider: str = typer.Option("claude-code", "--provider", help="claude-code, codex or muse"), model: str = typer.Option(None, "--model", help="Default: the provider's first current model"),
+          provider: str = typer.Option("claude-code", "--provider", help="claude-code, codex, muse or antigravity"), model: str = typer.Option(None, "--model", help="Default: the provider's first current model"),
           effort: str = typer.Option(None, "--effort"), skill: list[str] = typer.Option([], "--skill", help="Repeat; orchestrate is always on"),
           permission: str = typer.Option(None, "--permission", help="Default: this session's own, when it runs on the same agent; otherwise the provider's first mode")):
     """Start a child session (headless, managed by the IDE) working for this session. Needs the IDE server running."""
@@ -285,7 +286,7 @@ def serve(port: int = typer.Option(7311, "--port"), browser: bool = typer.Option
 
 @cmd
 def install(ctx: typer.Context, remove: bool = typer.Option(False, "--remove")):
-    """Install (or remove) the orchestrate skill for Claude Code (/orchestrate) and Codex ($orchestrate)."""
+    """Install (or remove) the orchestrate skill for Claude Code (/orchestrate), Codex ($orchestrate), and Antigravity (/orchestrate)."""
     from .setup import install as run
     results = run(remove)
     out(ctx, results, "\n".join(f"{r['provider']}: {'installed' if r['installed'] else 'removed'} {r['skill']}" for r in results))
@@ -293,4 +294,4 @@ def install(ctx: typer.Context, remove: bool = typer.Option(False, "--remove")):
 def register(parent): parent.add_typer(app, name="orchestrate")
 
 # Core loads product entry points during import; registration must already exist.
-from . import store, channels
+from . import store, channels, transcripts

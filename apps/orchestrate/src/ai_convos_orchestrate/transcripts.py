@@ -78,7 +78,21 @@ def codex(path):
             return dict(text=p["error"]["message"], at=e["timestamp"], resets=codex_reset(p["error"]["message"], stamp(e["timestamp"])))
     return None
 
-READ = {"claude-code": claude, "codex": codex}
+def antigravity(path):
+    """Antigravity logs an ERROR step when a quota or rate limit stops a turn; any later model reply clears it."""
+    for line in reversed(tail(path)):
+        if not (e := entry(line)): continue
+        if e.get("type") == "PLANNER_RESPONSE" and e.get("status") == "DONE": return None
+        if e.get("status") == "ERROR" and (text := (e.get("error") or e.get("content") or "").strip()) and re.search(r"rate.?limit|quota|resource.?exhausted|too many requests", text, re.I):
+            return dict(text=text, at=e["created_at"], resets=None)
+    return None
+
+def latest_model(meta):
+    """Latest exact model recorded in the session's Antigravity transcript, if available."""
+    if meta.get("provider") != "antigravity" or not (path := transcript(meta)): return None
+    return next((e["model"] for line in reversed(tail(path)) if b'"model"' in line and (e := entry(line)) and e.get("type") == "PLANNER_RESPONSE" and e.get("model")), None)
+
+READ = {"claude-code": claude, "codex": codex, "antigravity": antigravity}
 
 def transcript(meta):
     """The provider's own file for this session: found once, and looked for again a minute after a miss."""
@@ -86,6 +100,9 @@ def transcript(meta):
     if meta["provider"] not in READ or not ps or not re.fullmatch(r"[0-9a-f-]{8,64}", ps): return None
     if (hit := FOUND.get(key)) and (hit[0] and hit[0].is_file() or not hit[0] and time.monotonic() < hit[1]): return hit[0]
     if meta["provider"] == "claude-code": found = sorted((Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()/"projects").glob(f"*/{ps}.jsonl"))
+    elif meta["provider"] == "antigravity":
+        logs = Path(os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "~/.gemini/antigravity-cli")).expanduser()/"brain"/ps/".system_generated"/"logs"
+        found = [p for name in ("transcript.jsonl", "transcript_full.jsonl") if (p := logs/name).is_file()]
     else: found = sorted((Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()/"sessions").glob(f"*/*/*/rollout-*-{ps}.jsonl"))
     FOUND[key] = (found[-1] if found else None, time.monotonic()+60)
     return FOUND[key][0]

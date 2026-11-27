@@ -8,7 +8,7 @@ import importlib.util, json, os, re, shutil, subprocess, sys, threading, time
 from pathlib import Path
 from ai_convos import cli as core
 
-SOURCES = (("claude-code", "Claude Code"), ("codex", "Codex"), ("muse", "Muse"))
+SOURCES = (("claude-code", "Claude Code"), ("codex", "Codex"), ("muse", "Muse"), ("antigravity", "Antigravity"))
 WEB = {"chatgpt": "ChatGPT", "claude": "Claude", "perplexity": "Perplexity"}
 CACHE = dict(at=0, value=None)
 LOCK = threading.Lock()
@@ -21,6 +21,7 @@ def label(source, root, p):
     """A short name for a session file: its project and session for Claude Code, the session id otherwise."""
     rel = p.relative_to(root).parts
     if source == "claude-code": return f"{rel[0].removeprefix(str(Path.home()).replace('/', '-')+'-')} · {(rel[1] if len(rel) > 2 else p.stem)[:8]}" + (" · subagent" if "subagents" in rel else "")
+    if source == "antigravity": return (p.parents[2].name if len(p.parts) >= 4 and p.parts[-3:-1] == (".system_generated", "logs") else p.stem)[:8]
     return (p.parent.name if source == "muse" else re.sub(r"^rollout-[\dT:-]+-", "", p.stem))[:8]
 
 def freshness(source, name, hooks, synced, at):
@@ -28,7 +29,7 @@ def freshness(source, name, hooks, synced, at):
     root = core.hook_root(source).expanduser()
     if not root.is_dir(): return None
     behind, total = [], 0
-    for p in root.rglob("*.jsonl"):
+    for p in root.rglob("transcript_full.jsonl" if source == "antigravity" else "*.jsonl"):
         try: st = p.stat()
         except OSError: continue
         total += 1

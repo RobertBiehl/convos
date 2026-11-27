@@ -14,13 +14,17 @@ def fixture(path, source):
                   dict(type="response_item", timestamp=stamp, payload=dict(type="message", role="user", content=[dict(type="input_text", text="inspect")])),
                   dict(type="response_item", timestamp=stamp, payload=dict(type="function_call", name="Read", call_id="call-1", arguments='{"path":"x.txt"}')),
                   dict(type="response_item", timestamp=stamp, payload=dict(type="function_call_output", call_id="call-1", output="contents"))]
+    elif source == "antigravity":
+        events = [dict(step_index=0, type="USER_INPUT", status="DONE", created_at=stamp, content="inspect"),
+                  dict(step_index=1, type="PLANNER_RESPONSE", status="DONE", created_at=stamp, content="", model="gemini-4-neon-xhigh", tool_calls=[dict(id="call-1", name="Read", args=dict(path="x.txt"))]),
+                  dict(step_index=2, type="GENERIC", source="MODEL", status="DONE", created_at=stamp, content="contents")]
     else:
         events = [dict(type="system", sessionId="session"),
                   dict(type="user", timestamp=stamp, message=dict(content="inspect")),
                   dict(type="assistant", timestamp=stamp, message=dict(content=[dict(type="tool_use", id="call-1", name="Read", input=dict(path="x.txt"))])),
                   dict(type="user", timestamp=stamp, message=dict(content=[dict(type="tool_result", tool_use_id="call-1", content="contents")]))]
     path.write_text("\n".join(map(json.dumps, events)))
-    return (core.parse_codex_session if source == "codex" else core.parse_claude_code_session)(path)
+    return (core.parse_codex_session if source == "codex" else core.parse_antigravity_session if source == "antigravity" else core.parse_claude_code_session)(path)
 
 
 def result(session):
@@ -32,7 +36,7 @@ def snapshot(db):
     return {t: db.execute(f"SELECT * FROM {t} ORDER BY 1").fetchall() for t in TABLES}
 
 
-@pytest.mark.parametrize("source", ["codex", "claude-code"])
+@pytest.mark.parametrize("source", ["codex", "claude-code", "antigravity"])
 def test_reimport_is_stable_and_idempotent(tmp_path, source):
     session = fixture(tmp_path / "session.jsonl", source)
     assert [(t["tool_name"], t["status"]) for t in session["tools"]] == [("Read", "complete")]
@@ -46,7 +50,7 @@ def test_reimport_is_stable_and_idempotent(tmp_path, source):
         assert core.archive_relationships(db) == {}
 
 
-@pytest.mark.parametrize("source", ["codex", "claude-code"])
+@pytest.mark.parametrize("source", ["codex", "claude-code", "antigravity"])
 def test_changed_message_reimport_preserves_history(tmp_path, source):
     path = tmp_path / "session.jsonl"
     session = fixture(path, source)

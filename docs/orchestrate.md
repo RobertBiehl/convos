@@ -20,35 +20,42 @@ convos orchestrate install     # the /orchestrate and $orchestrate skills
 convos orchestrate open        # open the IDE (starts its local server)
 ```
 
-Any Claude Code or Muse session joins with `/orchestrate`, any Codex session with
+Any Antigravity, Claude Code, or Muse session joins with `/orchestrate`, any Codex session with
 `$orchestrate`; the skill tells the agent to join before anything else. Join binds the board to the
-agent's own session id (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, or `MUSE_SESSION_ID`, which
-wins when a Muse runs inside a Claude Code shell). A joined Muse session has no message channel
-yet: your words wait for its `inbox`, which every command's board check points it to. Sessions started from the IDE (`n`) run headless and are
-owned by it. The dialog offers every agent installed on this Mac: Claude Code, Codex and Muse. Each
-comes with its current models, the newest of each class, read from the tool itself: the model ids
-the installed Claude Code binary knows, Codex's `models_cache.json`, and Muse's model catalog.
+agent's own session id (`ANTIGRAVITY_CONVERSATION_ID`, `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`,
+or `MUSE_SESSION_ID`, which wins when a Muse runs inside a Claude Code shell). A joined Antigravity
+or Muse session has no push channel yet: your words wait for its `inbox`, which every command's board
+check points it to. Sessions started from the IDE (`n`) run headless and are
+owned by it. The dialog offers every agent installed on this Mac: Claude Code, Codex, Muse, and
+Antigravity. Each comes with its current models, the newest of each class, read from the tool itself:
+the model ids the installed Claude Code binary knows, Codex's `models_cache.json`, Muse's model
+catalog, and Antigravity's `agy models` (grouped by base model and effort, cached per binary version).
 Efforts follow the chosen model, and permissions the agent (Claude Code's permission modes, Codex's
-sandbox, Muse sandboxed or `--yolo`). The session pane changes a started session's permission in
-place: a live Claude Code agent switches at once (it is launched with
-`--allow-dangerously-skip-permissions`, so even into `bypassPermissions`), Codex and Muse with their
-next turn. An agent launched before that needs a restart on its conversation for `bypassPermissions`;
+sandbox, Muse sandboxed or `--yolo`, Antigravity `accept-edits`, `plan`, or `always-proceed`). The
+session pane changes a started session's permission in place: a live Claude Code agent switches at
+once (it is launched with `--allow-dangerously-skip-permissions`, so even into `bypassPermissions`),
+a live Antigravity agent restarts on its conversation once its current turn ends (or immediately when
+idle), and Codex and Muse take it with their next turn. An agent launched before that needs a restart
+on its conversation for `bypassPermissions`;
 the pane asks you to confirm it, and the agent then restarts at once if it waits on a permission
 prompt (the prompt goes away and the agent is told to go on), otherwise once its turn ends.
 
 The pane also switches a started session's model and effort. Codex and Muse take them with their next
-turn; a live Claude Code agent restarts on its conversation for them (`--resume`), at once when idle,
-otherwise once its current turn ends. The model a session runs stays selectable after a newer one of
-its class replaces it in the list. **Restart** (`⇧R`) starts a live Claude Code agent again on its
-conversation the same way, with the Claude Code installed now: the pane shows the version the agent
-runs, and once an update installs a newer one, the button reads *Restart into VERSION*. Codex and Muse
-start a fresh process every turn, so an update reaches them by itself.
+turn; a live Claude Code or Antigravity agent restarts on its conversation for them (`--resume` /
+`--conversation`), at once when idle, otherwise once its current turn ends. The model a session runs
+stays selectable after a newer one of its class replaces it in the list. **Restart** (`⇧R`) starts a
+live Claude Code or Antigravity agent again on its conversation the same way, with the CLI installed
+now: the pane shows the version the agent runs, and once an update installs a newer one, the button
+reads *Restart into VERSION*. Codex and Muse start a fresh process every turn, so an update reaches
+them by itself.
 
-A joined Claude Code or Codex session can **Move into orchestrate**. The pane first shows what that
-does: the terminal agent it ends (Claude Code names each running session in its `sessions` folder; the
-agent's own orchestrate calls also record its pid), and the model, effort and permission the
-conversation continues with (Claude Code: the transcript's model, the session's effort, the terminal's
-permission flags; Codex: the thread's last turn context). Once confirmed, the terminal agent gets
+A joined Claude Code, Codex, or Antigravity session can **Move into orchestrate**. The pane first
+shows what that does: the terminal agent it ends (Claude Code names each running session in its
+`sessions` folder, and the agent's own orchestrate calls also record its pid; Antigravity holds its
+`conversations/<id>.db` open), and the model, effort and permission the conversation continues with
+(Claude Code: the transcript's model, the session's effort, the terminal's permission flags; Codex:
+the thread's last turn context; Antigravity: the latest `PLANNER_RESPONSE` model/effort and CLI
+flags). Once confirmed, the terminal agent gets
 SIGTERM and the same conversation resumes headless here, in the folder it was started in; one stopped
 mid-turn is told to continue. From then on it is a session started here. A session another program runs
 headless, a Codex thread collab manages, or one Codex still holds open is refused with what to do.
@@ -84,7 +91,7 @@ install`) documents the tools; how an agent uses them is left to the agent.
 | `need ACTION [--on ITEM] [--detail MD] [--wait S]` | Ask the user to do something only they can (run a test on their hardware, sign in). The card reads **Your action** and offers Done and Can't with an optional note; the reply reaches the agent like an answer (`Action: ... -> Done`). |
 | `withdraw Q...` | Take back open questions or needs that no longer apply. |
 | `inbox [--wait S]` | Pull undelivered comments, answers, and notices. |
-| `spawn PROMPT --on ITEM [--provider claude-code\|codex\|muse] [--model M] [--permission P]` | Start a child session working for this item. On the same agent, it runs with this session's permission unless `--permission` says otherwise. |
+| `spawn PROMPT --on ITEM [--provider claude-code\|codex\|muse\|antigravity] [--model M] [--permission P]` | Start a child session working for this item. On the same agent, it runs with this session's permission unless `--permission` says otherwise. |
 | `archive ITEM...` | Archive finished top-level rows the user has read (see below). |
 | `show`, `ls`, `close`, `reopen` | Inspect and close. `show` marks rows `· unseen by the user`, `· archivable`, `(archived)`. |
 
@@ -130,6 +137,7 @@ available channel. Whatever cannot be pushed stays pending for `inbox`.
 | Session | Channel |
 |---|---|
 | Started in the IDE, Claude Code | `stream-json` on the process's stdin; resumed with `--resume` after a restart |
+| Started in the IDE, Antigravity | persistent `agy --input-format stream-json --output-format stream-json` on stdin; resumed with `--conversation` after a restart. Sandboxed sessions allow writing to the Convos root and running `convos orchestrate` |
 | Started in the IDE, Codex or Muse | one process per turn (`codex exec`, then `codex exec resume THREAD`; `muse exec --session-id`), the prompt from a file. Words that arrive during a turn wait and start the next one, so the session shows *ready* between turns. A Codex agent's sandbox may write to the Convos root, where its board lives |
 | Joined Claude Code | the session's inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`), recorded by the agent's own CLI calls |
 | Joined Codex | `codex queue --thread ID --message TEXT`; the thread takes it at its next turn, and the comment shows *queued in Codex* until then. Orchestrate also gets the thread that turn: a thread collab runs as a managed worker gets a collab wake (one turn with collab's own model and sandbox), and an interactive thread (started by the Codex TUI) is resumed by Codex's local daemon (`codex queue --resume`, after `codex app-server daemon start`). A thread another program drives with `codex exec` is not resumed, because the daemon keeps a resumed thread's write lock and would lock that program out; its messages wait for its next turn |

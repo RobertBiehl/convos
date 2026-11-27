@@ -35,13 +35,19 @@ def summary(s):
 def detail(s): return dict(s, attachments={k: store.typed(a) for k, a in s["attachments"].items() if not a["hash"] or store.body_path(a["hash"]).is_file()}, summary=summary(s), effective=store.effective(s), pending_ids=[p["id"] for p in store.pending(s)], received=None if (heard := transcripts.arrived(s["session"])) is None else sorted(heard), unread=sorted(store.unread(s, store.seen(s["session"]["id"]))))
 
 def skills(cwd, provider="claude-code"):
-    # Codex reads its own skills; Claude Code's are also what Muse loads as personal skills
-    home, project = (Path(os.environ.get("CODEX_HOME", Path.home()/".codex")), ".codex") if provider == "codex" else (Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude")), ".claude")
-    roots = [home/"skills", *([Path(cwd)/project/"skills"] if cwd else [])]
+    # Codex reads its own skills; Antigravity reads ~/.gemini/config/skills + .agents/skills; Claude Code's are also what Muse loads
+    if provider == "antigravity":
+        home = Path(os.environ.get("ANTIGRAVITY_CONFIG_DIR", Path.home()/".gemini"/"config"))
+        cli_home = Path(os.environ.get("ANTIGRAVITY_APP_DATA_DIR", Path.home()/".gemini"/"antigravity-cli"))
+        roots = [home/"skills", cli_home/"skills", *([Path(cwd)/".agents"/"skills", Path(cwd)/".agent"/"skills"] if cwd else [])]
+        user_roots = (home/"skills", cli_home/"skills")
+    else:
+        home, project = (Path(os.environ.get("CODEX_HOME", Path.home()/".codex")), ".codex") if provider == "codex" else (Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude")), ".claude")
+        roots, user_roots = [home/"skills", *([Path(cwd)/project/"skills"] if cwd else [])], (home/"skills",)
     def meta(path):
         head = path.read_text(errors="replace")[:2000].split("---")
         fields = dict(re.findall(r"^(name|description):\s*(.+)$", head[1], re.M)) if len(head) > 2 else {}
-        return dict(name=fields.get("name", path.parent.name).strip(), description=fields.get("description", "").strip()[:240], scope="user" if home/"skills" in path.parents else "project")
+        return dict(name=fields.get("name", path.parent.name).strip(), description=fields.get("description", "").strip()[:240], scope="user" if any(u in path.parents for u in user_roots) else "project")
     found = {m["name"]: m for r in roots if r.is_dir() for p in sorted(r.glob("*/SKILL.md")) for m in [meta(p)]}
     return sorted(found.values(), key=lambda m: (m["name"] != "orchestrate", m["name"]))
 

@@ -19,8 +19,8 @@ already joined, and its instructions say so: skip this.)
 convos orchestrate join --title "SHORT GOAL OF THIS SESSION"
 ```
 
-Joining is idempotent and binds to your provider session automatically (Claude Code, Codex
-and Muse expose their session id to your shell). If join says no provider session was
+Joining is idempotent and binds to your provider session automatically (Antigravity, Claude Code,
+Codex and Muse expose their session id to your shell). If join says no provider session was
 detected, pass `-s SESSION` on every later command. Then put your work on the board.
 
 ## Tools

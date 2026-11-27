@@ -1,6 +1,6 @@
 ---
 name: convos
-description: Give agents queryable memory from prior AI conversations, keep the local archive current, and synchronize Codex/Claude memories through the optional canonical overlay. Use whenever the user asks to recall, find, continue, summarize, compare, or verify information from past ChatGPT, Claude, Claude Code, or Codex conversations, including earlier plans, decisions, commands, evidence, work sessions, or provider memories.
+description: Give agents queryable memory from prior AI conversations, keep the local archive current, and synchronize Codex/Claude memories through the optional canonical overlay. Use whenever the user asks to recall, find, continue, summarize, compare, or verify information from past ChatGPT, Claude, Claude Code, Codex, Muse, or Antigravity conversations, including earlier plans, decisions, commands, evidence, work sessions, or provider memories.
 ---
 
 # Convos
@@ -58,7 +58,7 @@ Behavior:
 - Use `replay` after an exact conversation is known and the question depends on what the agent actually did, including captured tool inputs/outputs, statuses, durations, or file edits. It is deterministic, local, and read-only; keep `-n`, `-c`, and `--activity` bounded, honor `activity_truncated`, and treat absence as missing capture rather than proof an action never occurred. Replay may expose secrets present in tool payloads or edit contents, so do not persist or transmit its output without explicit authorization.
 - Optimize discovery relevance and tokens: keep search/query `-n` <= 8 and `-c` <= 200 unless the user wants more.
 - `sql` runs on a read-only connection, so writes fail by construction; it is safe for arbitrary `SELECT`s.
-- Installed coding-agent hooks make local Claude Code and Codex turns available just in time; read commands flush pending hook work automatically.
+- Installed coding-agent hooks make local Claude Code, Codex, and Antigravity turns available just in time; read commands flush pending hook work automatically.
 - If retrieval is stale, empty, or unavailable, run `convos doctor` before syncing; it reports archive/schema/FTS health, ingestion and embedding backlog, exact installed-skill freshness, exact current-executable hook readiness, and web access. Repair a missing or stale skill with `convos install-skills`, and a stale, duplicated, or misplaced capture hook with `convos install-hooks`.
 - Sync when the request needs fresh web conversations, imports, missed-hook reconciliation, or the user explicitly asks for an update.
 - Use `sync` as the only fetch/import update command; use `embed` only to backfill hybrid embeddings.
@@ -74,7 +74,7 @@ convos init                 # archive, existing local agent history, hooks, and 
 convos sync                 # fetch/import new or changed source data
 convos sync --local-only    # local agent history and configured exports without web probes
 convos embed                # backfill hybrid embeddings without a web sync
-convos install-hooks        # repair or refresh user-level Claude Code + Codex JIT ingestion
+convos install-hooks        # repair or refresh user-level Claude Code + Codex + Antigravity JIT ingestion
 ```
 
 Storage:

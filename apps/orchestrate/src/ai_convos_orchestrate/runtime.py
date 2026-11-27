@@ -1,18 +1,19 @@
 """Session runtime: start, stop, and resume headless agents, and deliver the user's words to any session.
 
-Headless sessions started from the IDE are owned here. Claude Code runs as one process that takes each message on stdin.
-Codex and Muse take one prompt per process, so each of their turns is a run of `codex exec` / `codex exec resume` or
-`muse exec`, and words that arrive during a turn start the next one. Joined sessions receive messages through their
-provider's own channel (Claude Code messaging socket, codex queue); whatever cannot be delivered stays pending for the
-agent's `inbox`.
+Headless sessions started from the IDE are owned here. Claude Code and Antigravity run as one process that takes each
+message on stdin. Codex and Muse take one prompt per process, so each of their turns is a run of `codex exec` /
+`codex exec resume` or `muse exec`, and words that arrive during a turn start the next one. Joined sessions receive
+messages through their provider's own channel (Claude Code messaging socket, codex queue); whatever cannot be delivered
+stays pending for the agent's `inbox`.
 """
 import collections, contextlib, faulthandler, json, mmap, os, queue, re, shutil, signal, subprocess, sys, threading, time, uuid
 from pathlib import Path
 from . import store, channels, transcripts
 
 TURNS = ("codex", "muse")  # providers that run one process per turn
-PERMISSIONS = {"claude-code": ["default", "acceptEdits", "plan", "bypassPermissions"], "codex": ["workspace-write", "danger-full-access"], "muse": ["sandboxed", "yolo"]}
+PERMISSIONS = {"claude-code": ["default", "acceptEdits", "plan", "bypassPermissions"], "codex": ["workspace-write", "danger-full-access"], "muse": ["sandboxed", "yolo"], "antigravity": ["accept-edits", "plan", "always-proceed"]}
 CLAUDE_CLASSES, CLAUDE_EFFORTS, SCANNED = ("opus", "sonnet", "haiku", "fable"), ["low", "medium", "high", "xhigh", "max"], {}
+AGY_EFFORTS, AGY_EFFORT_RE, AGY_ANSI = ("low", "medium", "high", "xhigh", "max"), re.compile(r"-(low|medium|high|xhigh|max)$"), re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 def claude_models():
     """The newest model of each class the installed Claude Code can run: its binary names every model id it knows."""
@@ -25,16 +26,56 @@ def claude_models():
         SCANNED.update(claude=key, claude_models=[f"claude-{c}-{a}" + (f"-{b}" if b else "") for c, (a, b) in newest.items()])
     return [dict(id=m, efforts=CLAUDE_EFFORTS) for m in SCANNED["claude_models"]]
 
-def claude_version():
-    """The installed Claude Code's version, asked again only when its binary changes (an update replaces it); None when it cannot
+def cli_version(name):
+    """An installed CLI's version, asked again only when its binary changes (an update replaces it); None when it cannot
     tell, which only hides the version: it never stops an agent from starting."""
     try:
-        key = (str(path := Path(os.path.realpath(shutil.which("claude")))), path.stat().st_mtime_ns)
-        if (hit := SCANNED.get("claude_version")) and hit[0] == key: return hit[1]
+        key = (str(path := Path(os.path.realpath(shutil.which(name)))), path.stat().st_mtime_ns)
+        if (hit := SCANNED.get(f"{name}_version")) and hit[0] == key: return hit[1]
         out = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=15).stdout
     except (OSError, TypeError, subprocess.SubprocessError): return None
-    SCANNED["claude_version"] = (key, version := m[1] if (m := re.match(r"\s*(\d[\w.+-]*)", out)) else None)
+    SCANNED[f"{name}_version"] = (key, version := m[1] if (m := re.match(r"\s*(\d[\w.+-]*)", out)) else None)
     return version
+
+def claude_version(): return cli_version("claude")
+def antigravity_version(): return cli_version("agy")
+
+def antigravity_split(model):
+    """Split an Antigravity model slug like gemini-4-neon-xhigh into (base_model, effort)."""
+    return (model[:m.start()], m[1]) if model and (m := AGY_EFFORT_RE.search(model)) else (model, None)
+
+def parse_antigravity_models(out):
+    """Parse `agy models` output into base models with ordered efforts (first seen effort as default)."""
+    grouped = {}
+    for line in out.splitlines():
+        clean = AGY_ANSI.sub("", line).rsplit("\r", 1)[-1].strip()
+        if not (m := re.match(r"^([a-z0-9][a-z0-9._-]+)\s{2,}(.+)$", clean)): continue
+        base, eff = antigravity_split(m[1])
+        seen = grouped.setdefault(base, [])
+        if eff and eff not in seen: seen.append(eff)
+    return [dict(id=base, efforts=[e for e in AGY_EFFORTS if e in seen], effort=seen[0] if seen else None) for base, seen in grouped.items()]
+
+def antigravity_models():
+    """Models the installed Antigravity CLI lists (`agy models`), cached on disk per binary version and refreshed every 6 h."""
+    try: key = [str(path := Path(os.path.realpath(shutil.which("agy")))), path.stat().st_mtime_ns]
+    except (OSError, TypeError): return []
+    now = time.time()
+    if (hit := SCANNED.get("antigravity")) and hit[0] == key and now < hit[1]: return hit[2]
+    cache = store.root()/"agy-models.json"
+    try: saved = json.loads(cache.read_text())
+    except (OSError, ValueError): saved = {}
+    if saved.get("key") == key and saved.get("models") and now - saved.get("at", 0) < 21600:
+        SCANNED["antigravity"] = (key, saved["at"] + 21600, saved["models"])
+        return saved["models"]
+    try: models = parse_antigravity_models(subprocess.run([str(path), "models"], capture_output=True, text=True, timeout=30).stdout)
+    except (OSError, subprocess.SubprocessError): models = []
+    if models:
+        SCANNED["antigravity"] = (key, now + 21600, models)
+        with contextlib.suppress(OSError):
+            store.core.secure_dir(cache.parent)
+            store.core.atomic_json(cache, dict(key=key, at=now, models=models))
+        return models
+    return saved.get("models") or []
 
 def codex_models():
     """The models Codex lists (its models_cache.json, which Codex refreshes), the newest of each class: gpt-6.1-sol over gpt-6-sol."""
@@ -95,14 +136,14 @@ def muse_models():
 
 def providers():
     """What a new session can run: each installed agent CLI with its current models, their efforts, and its permission modes."""
-    found = dict(claude=("claude-code", "Claude Code", claude_models), codex=("codex", "Codex", codex_models), muse=("muse", "Muse", muse_models))
+    found = dict(claude=("claude-code", "Claude Code", claude_models), codex=("codex", "Codex", codex_models), muse=("muse", "Muse", muse_models), agy=("antigravity", "Antigravity", antigravity_models))
     return {key: dict(label=label, models=models(), permissions=PERMISSIONS[key]) for cli, (key, label, models) in found.items() if shutil.which(cli)}
 INHERITED = ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_PID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_EFFORT", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CONVOS_ORCHESTRATE_SCOPE", "CONVOS_ORCHESTRATE_AS")
 SYSTEM = ("You were started from Convos Orchestrate, the user's agentic IDE (orchestrate session {sid}). The user watches and steers "
           "you there, not in a terminal. Report your work by updating the board with the orchestrate skill's tools (`convos orchestrate ...`; "
           "this session is preselected, do not run join); every changed row shows as unread to the user, so do not post status recaps in chat. Messages beginning with [orchestrate] are the user's comments and answers from the board, "
           "addressed to the session or a named item. {load}")
-LOAD = {"claude-code": "Before starting, load these skills with the Skill tool: {}.", "codex": "Use these skills: {}.", "muse": "Before starting, read these skills: {}."}
+LOAD = {"claude-code": "Before starting, load these skills with the Skill tool: {}.", "codex": "Use these skills: {}.", "muse": "Before starting, read these skills: {}.", "antigravity": "Before starting, read these skills: {}."}
 TURN = " Each of your turns ends when you finish it; the user's next words start your next turn, so never wait for them."
 
 def preamble(sid, meta):
@@ -149,8 +190,8 @@ def stuck(secs=120):
 def alive(sid): return (p := PROCS.get(sid)) is not None and running(p)
 def busy(sid): return alive(sid) and PROCS[sid]["busy"]
 
-# an agent's command line names its session: Claude Code's MCP config, Codex's shell environment setting, Muse's prompt file
-MARK = re.compile(r'^\s*\d+ (?:\S*/)?(?:claude|codex|muse) .*?(?:"CONVOS_ORCHESTRATE_SESSION": "|CONVOS_ORCHESTRATE_SESSION="|/sessions/)(o[0-9a-f]{11})')
+# an agent's command line names its session: Claude Code's MCP config, Codex's shell environment setting, Muse's prompt file, Antigravity's log file
+MARK = re.compile(r'^\s*\d+ (?:\S*/)?(?:claude|codex|muse|agy|antigravity) .*?(?:"CONVOS_ORCHESTRATE_SESSION": "|CONVOS_ORCHESTRATE_SESSION="|/sessions/)(o[0-9a-f]{11})')
 
 def live_agents():
     """Every running agent process by session, ours or not, found by the session id on its command line."""
@@ -169,7 +210,7 @@ def set_runtime(sid, state, **extra):
     if (s["runtime"] or {}).get("state") != state or extra: store.emit(sid, "runtime", "orchestrate", runtime=dict(state=state, **extra))
 
 def child_env(sid):
-    env = {k: v for k, v in os.environ.items() if k not in INHERITED}
+    env = {k: v for k, v in os.environ.items() if k not in INHERITED and not k.startswith("ANTIGRAVITY_")}
     return {**env, "CONVOS_ORCHESTRATE_SESSION": sid}
 
 def command(sid, meta, resume):
@@ -181,6 +222,15 @@ def command(sid, meta, resume):
     if meta["provider"] == "muse":
         return ["muse", "exec", "--json", "--session-id", meta["provider_session"], "--model", meta["model"], *(["--reasoning-effort", meta["effort"]] if meta.get("effort") else []),
                 "--approval-mode", "never", "--trust-workspace", *(["--yolo"] if meta.get("permission") == "yolo" else []), "--prompt-file", str(store.sdir(sid)/"prompt.md")]
+    if meta["provider"] == "antigravity":
+        base, inferred = antigravity_split(meta["model"])
+        effort, perm = meta.get("effort") or inferred, meta.get("permission") or "accept-edits"
+        settings = dict(toolPermission="proceed-in-sandbox", permissions=dict(allow=[f"write_file({store.core.PROJECT_ROOT})", "command(convos orchestrate)", "command(convos)"]))
+        perm_args = ["--dangerously-skip-permissions"] if perm == "always-proceed" else ["--mode", perm, "--sandbox", "--settings", json.dumps(settings, separators=(",", ":"))]
+        return ["agy", "--input-format", "stream-json", "--output-format", "stream-json",
+                "--model", base, *(["--effort", effort] if effort else []),
+                *(["--conversation", ps] if resume and (ps := meta.get("provider_session")) else []),
+                *perm_args, "--log-file", str(store.sdir(sid)/"agy.log")]
     # a permission prompt waits up to 6 h for the user (mcp.decide); Claude Code would give up on the tool after 30 min
     mcp = dict(mcpServers=dict(orchestrate=dict(command=sys.executable, args=["-m", "ai_convos_orchestrate.mcp"], env={k: v for k, v in child_env(sid).items() if k.startswith(("CONVOS_", "PATH", "HOME"))}, timeout=6*3600*1000)))
     return ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
@@ -194,6 +244,7 @@ def start(sid, text=None):
     """Start (or resume) a managed session's agent; optionally give it the user's words. A turn-based agent in the middle of
     a turn raises Busy: the words wait and start its next turn."""
     with lock(sid):
+        first, meta = False, None
         if not alive(sid):
             s = store.load(sid)
             meta, resume = s["session"], s["runtime"] is not None and s["runtime"].get("started")
@@ -206,10 +257,11 @@ def start(sid, text=None):
             if not alive(sid):
                 if meta["provider"] in TURNS: return turn(sid, s, text) if text else None
                 launch(sid, meta, resume)
+                first = meta["provider"] == "antigravity" and (not resume or not meta.get("provider_session"))
         if PROCS[sid]["stdin"] is None:
             if text: raise Busy("A turn is running; your words start the next one")
             return
-        if text: send(sid, text)
+        if text: send(sid, f"{preamble(sid, meta)}\n\n{text}" if first else text)
 
 def turn(sid, s, text):
     """One turn of a Codex or Muse agent: its own process, the prompt from a file, its output followed like Claude Code's."""
@@ -238,7 +290,7 @@ def launch(sid, meta, resume):
             proc = subprocess.Popen(cmd := command(sid, meta, resume), cwd=meta["cwd"], stdin=own, stdout=out, stderr=log, env=child_env(sid), start_new_session=True)
     finally: os.close(own)
     hold(sid, proc.pid, proc, 0, False)
-    PROCS[sid].update(bypassable="--allow-dangerously-skip-permissions" in cmd, version=claude_version())
+    PROCS[sid].update(provider=meta["provider"], bypassable="--allow-dangerously-skip-permissions" in cmd, version=antigravity_version() if meta["provider"] == "antigravity" else claude_version())
     set_runtime(sid, "idle", started=True, pid=proc.pid)
 
 def hold(sid, pid, proc, offset, busy):
@@ -278,25 +330,31 @@ def adopt(sid, s, pids):
     whole = tail[:tail.rfind(b"\n")+1]
     last = next((e for line in reversed(whole.splitlines()) if (e := event(line))), {})
     # still in the turn the last server gave it, unless a turn has ended since
-    busy = rt.get("state") == "working" and last.get("type") != "result"
+    busy = rt.get("state") == "working" and last.get("type") != "result" and last.get("event") != "result"
     try: hold(sid, pids[0], None, size-len(tail)+len(whole), busy)
     except OSError: return False
     # agents launched before they could be switched into bypassPermissions need a restart for it
     cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pids[0])], capture_output=True, text=True).stdout
-    # the Claude Code it runs is named in the first turn it reported; one that has not had a turn yet stays unknown
-    with out.open("rb") as f: head = f.read(1 << 20)
-    PROCS[sid].update(bypassable="--allow-dangerously-skip-permissions" in cmd or "bypassPermissions" in cmd, version=m[1].decode() if (m := re.search(rb'"claude_code_version":"([^"]+)"', head)) else None)
+    prov = s["session"]["provider"]
+    if prov == "antigravity":
+        PROCS[sid].update(provider=prov, version=antigravity_version())
+    else:
+        # the Claude Code it runs is named in the first turn it reported; one that has not had a turn yet stays unknown
+        with out.open("rb") as f: head = f.read(1 << 20)
+        PROCS[sid].update(provider=prov, bypassable="--allow-dangerously-skip-permissions" in cmd or "bypassPermissions" in cmd, version=m[1].decode() if (m := re.search(rb'"claude_code_version":"([^"]+)"', head)) else None)
     set_runtime(sid, "working" if busy else "idle", started=True, pid=pids[0])
     return True
 
 def send(sid, text):
     with lock(sid):
-        tell(p := PROCS[sid], dict(type="user", message=dict(role="user", content=[dict(type="text", text=text)])))
+        p = PROCS[sid]
+        payload = dict(event="user", message=dict(content=text)) if p.get("provider") == "antigravity" else dict(type="user", message=dict(role="user", content=[dict(type="text", text=text)]))
+        tell(p, payload)
         p["busy"] = True
     set_runtime(sid, "working", started=True, pid=p["pid"])
 
 def read(sid, p, offset):
-    """The board is what the agent reports; its output only tells us when a turn ends, and which thread a Codex agent runs."""
+    """The board is what the agent reports; its output only tells us when a turn ends, and which thread/conversation a Codex or Antigravity agent runs."""
     with (store.sdir(sid)/"stdout.jsonl").open("rb") as f:
         f.seek(offset)
         while True:
@@ -305,6 +363,12 @@ def read(sid, p, offset):
                 if (e := event(line)) and e.get("type") == "result":
                     p["busy"] = False
                     set_runtime(sid, "idle", started=True, pid=p["pid"], cost=e.get("total_cost_usd"), turns=e.get("num_turns"))
+                if e and e.get("event") == "init" and (cid := e.get("conversation_id") or (e.get("init") or {}).get("conversation_id")) and store.load(sid)["session"].get("provider_session") != cid:
+                    store.emit(sid, "meta", "orchestrate", changes=dict(provider_session=cid))
+                if e and e.get("event") == "result":
+                    p["busy"] = False
+                    res = e.get("result") or {}
+                    set_runtime(sid, "idle", started=True, pid=p["pid"], turns=res.get("num_turns"))
                 # an agent launched before agents could be switched into bypassPermissions takes it only by starting again
                 if e and e.get("type") == "control_response" and e["response"].get("error_code") == "bypass_not_launched": p["bypassable"] = False
                 # Codex names its thread when the first turn starts; later turns resume it
@@ -344,6 +408,9 @@ def permit(sid, mode, confirmed=False):
     if mode != meta.get("permission"): store.emit(sid, "meta", "user", changes=dict(permission=mode))
     with lock(sid):
         if not live: return "next turn" if meta["provider"] in TURNS else "next start"
+        if meta["provider"] == "antigravity":
+            p["relaunch"] = p.get("relaunch") or "switched this session's permission"
+            return "after turn" if p["busy"] else "restart"
         # a restart pending only for bypassPermissions is not needed once the user picks another mode
         if restart or p.get("relaunch") == BYPASS: p["relaunch"] = restart and BYPASS
         if restart: return "restart"
@@ -384,10 +451,10 @@ def switching(sid, meta):
     return "needs restart" if meta.get("permission") == "bypassPermissions" and not p.get("bypassable") else None
 
 def agent(sid, meta):
-    """The Claude Code a live agent runs and the one installed now; they differ after an update, which a restart applies."""
+    """The CLI a live persistent agent runs and the one installed now; they differ after an update, which a restart applies."""
     p = PROCS.get(sid)
-    if meta["provider"] != "claude-code" or not p or not running(p) or p["stdin"] is None: return None
-    return dict(running=p.get("version"), installed=claude_version())
+    if meta["provider"] not in ("claude-code", "antigravity") or not p or not running(p) or p["stdin"] is None: return None
+    return dict(running=p.get("version"), installed=antigravity_version() if meta["provider"] == "antigravity" else claude_version())
 
 def listen(sid, meta):
     """Mark a live Claude Code agent deaf when its transcript logs neither taking words written to its stdin LATE seconds ago
@@ -460,7 +527,7 @@ def spawn(title, cwd, prompt, model=None, effort=None, skills=(), permission=Non
     # a child on the same agent as its parent runs with the parent's permission unless told otherwise
     inherited = above["session"].get("permission") if above and above["session"]["provider"] == provider else None
     if (permission := permission or inherited or offer["permissions"][0]) not in offer["permissions"]: raise ValueError(f"{offer['label']} permissions: {', '.join(offer['permissions'])}")
-    meta = dict(id=(sid := store.new_id()), title=title.strip() or prompt.strip().splitlines()[0][:80], provider=provider, provider_session=None if provider == "codex" else str(uuid.uuid4()), model=model, effort=effort or None, cwd=str(Path(cwd).expanduser().resolve()), origin="gui", parent=parent or None, skills=sorted(set(skills) | {"orchestrate"}), permission=permission)
+    meta = dict(id=(sid := store.new_id()), title=title.strip() or prompt.strip().splitlines()[0][:80], provider=provider, provider_session=None if provider in ("codex", "antigravity") else str(uuid.uuid4()), model=model, effort=effort or None, cwd=str(Path(cwd).expanduser().resolve()), origin="gui", parent=parent or None, skills=sorted(set(skills) | {"orchestrate"}), permission=permission)
     store.emit(sid, "open", "user", prompt, session=meta)
     start(sid, prompt)
     return sid
@@ -476,8 +543,21 @@ def plan_move(s):
     meta, path = s["session"], transcripts.transcript(s["session"])
     plan = dict(provider=meta["provider"], pid=None, version=None, busy=False, blocked=None)
     if meta["origin"] == "gui": return dict(plan, blocked="This session already runs in orchestrate")
-    if meta["provider"] not in ("claude-code", "codex") or not path: return dict(plan, blocked=f"orchestrate cannot find this {meta['provider']} session's conversation to continue it")
+    if meta["provider"] not in ("claude-code", "codex", "antigravity") or not path: return dict(plan, blocked=f"orchestrate cannot find this {meta['provider']} session's conversation to continue it")
     lines = [e for line in transcripts.tail(path) if (e := transcripts.entry(line))]
+    if meta["provider"] == "antigravity":
+        db = Path(os.environ.get("ANTIGRAVITY_APP_DATA_DIR", Path.home()/".gemini"/"antigravity-cli"))/"conversations"/f"{meta['provider_session']}.db"
+        held = subprocess.run(["lsof", "-t", str(db)], capture_output=True, text=True).stdout.split() if db.is_file() else []
+        running = {p: c for p, c in commands([int(p) for p in held]).items() if re.match(r"(?:\S*/)?(?:agy|antigravity)(?:\s|$)", c)}
+        if headless := [p for p, c in running.items() if re.search(r"(?:^|\s)(?:-p|--print|--input-format)(?:\s|$)", c)]:
+            return dict(plan, blocked=f"Another program runs this session headless (pid {headless[0]}); stop it there first")
+        pid = max(running, default=None)
+        cmd = running.get(pid, "")
+        mode = m[1] if (m := re.search(r"--mode[ =](\S+)", cmd)) else None
+        permission = "always-proceed" if "--dangerously-skip-permissions" in cmd else mode if mode in PERMISSIONS["antigravity"] else "accept-edits"
+        raw_model = next((e["model"] for e in reversed(lines) if e.get("type") == "PLANNER_RESPONSE" and e.get("model")), None) or meta.get("model") or (antigravity_models() or [dict(id=None)])[0]["id"]
+        model, effort = antigravity_split(raw_model)
+        return dict(plan, pid=pid, version=antigravity_version() if pid else None, model=model, effort=effort or (meta.get("effort") if meta.get("effort") in AGY_EFFORTS else None), permission=permission, cwd=meta["cwd"])
     if meta["provider"] == "claude-code":
         root = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))
         listed = {}
