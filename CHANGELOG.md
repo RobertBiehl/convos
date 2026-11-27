@@ -4,21 +4,21 @@
 
 The first stable release: no package is a beta anymore, and Orchestrate now comes with Convos.
 
-- Convos now installs Orchestrate: `uv tool install convos` brings `convos orchestrate`, with no `--with` and no `--prerelease allow`.
-- Antigravity: Convos imports and syncs Antigravity CLI (`agy`) conversations, captures its turns with a Stop hook, installs its skills, and checks it in `doctor`. Orchestrate starts, joins and moves Antigravity agents.
-- Orchestrate starts Codex and Muse agents as well as Claude Code ones. Each agent comes with the models it reads from the tool itself, and a long list shows four models and a menu.
-- Orchestrate: change a started session's model, effort and permission, restart it on its conversation, or move a joined terminal session into orchestrate. Children inherit their parent's permission, and switching into `bypassPermissions` asks first.
-- Orchestrate shows usage-limit interruptions and holds your words until the reset. It also uses a Codex reset from the session's limit box, continues the sessions a limit stopped, and lets you say a Claude limit is lifted.
-- Orchestrate: you see when an agent has taken your words, and comments to a Codex thread show as queued until the thread takes them. Deliveries keep flowing when one agent or the archive stalls, and a restart no longer rescans gigabytes of transcripts.
-- Orchestrate boards:
+- Convos now installs Orchestrate: `uv tool install convos` brings `convos orchestrate`, with no `--with` and no `--prerelease allow`. (#194)
+- Antigravity: Convos imports and syncs Antigravity CLI (`agy`) conversations, captures its turns with a Stop hook, installs its skills, and checks it in `doctor`. Orchestrate starts, joins and moves Antigravity agents. (#194)
+- Orchestrate starts Codex and Muse agents as well as Claude Code ones. Each agent comes with the models it reads from the tool itself, and a long list shows four models and a menu. (#194)
+- Orchestrate: change a started session's model, effort and permission, restart it on its conversation, or move a joined terminal session into orchestrate. Children inherit their parent's permission, and switching into `bypassPermissions` asks first. (#194)
+- Orchestrate shows usage-limit interruptions and holds your words until the reset. It also uses a Codex reset from the session's limit box, continues the sessions a limit stopped, and lets you say a Claude limit is lifted. (#194)
+- Orchestrate: you see when an agent has taken your words, and comments to a Codex thread show as queued until the thread takes them. Deliveries keep flowing when one agent or the archive stalls, and a restart no longer rescans gigabytes of transcripts. (#194)
+- Orchestrate boards (#194):
   - blocked rows say why;
   - `need` asks the user to do something;
   - results sit on one line, newest first, and `attach --replaces` puts a newer version in place;
   - `attach --open` and `--run` start an app or command with one click;
   - JSON, patches and scripts show as text with Copy;
   - an agent hears once when its ETA lapses.
-- Orchestrate permissions: a `bypassPermissions` session's calls that stay inside a worktree of its repo, including where its shell already is, no longer ask you. Worktrees live in `.claude/worktrees`.
-- Claude Code: the subagent transcript is captured on SubagentStop.
+- Orchestrate permissions: a `bypassPermissions` session's calls that stay inside a worktree of its repo, including where its shell already is, no longer ask you. Worktrees live in `.claude/worktrees`. (#194)
+- Claude Code: the subagent transcript is captured on SubagentStop. (#194)
 
 ## 0.11.6b38
 
