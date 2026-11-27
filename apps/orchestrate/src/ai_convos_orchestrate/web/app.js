@@ -664,8 +664,8 @@ function Tuning({ s }) {
     if (r.applies !== "unchanged") toast(`${id}${effort ? ` · ${effort}` : ""}: ${RESTARTS[r.applies]}`);
     await loadSessions();
   };
-  const row = (label, options, on, pick) => html`<div class="permline"><span>${label}</span><div class="seg" aria-label=${`Session ${label.toLowerCase()}`}>${options.map((o) => html`<button type="button" tabIndex="-1" class=${o === on ? "on" : ""} onClick=${(e) => { e.currentTarget.blur(); if (o !== on) pick(o); }}>${o}</button>`)}</div></div>`;
-  return html`${row("Model", ids, s.model, (id) => send(id, s.effort && effortFor(models.find((m) => m.id === id), s.effort)))}
+  const row = (label, options, on, pick, shown = options) => html`<div class="permline"><span>${label}</span><div class="seg" aria-label=${`Session ${label.toLowerCase()}`}>${shown.map((o) => html`<button type="button" tabIndex="-1" class=${o === on ? "on" : ""} onClick=${(e) => { e.currentTarget.blur(); if (o !== on) pick(o); }}>${o}</button>`)}<${More} rest=${options.filter((o) => !shown.includes(o))} pick=${pick} /></div></div>`;
+  return html`${row("Model", ids, s.model, (id) => send(id, s.effort && effortFor(models.find((m) => m.id === id), s.effort)), pinned(s.provider, ids, s.model))}
     ${model?.efforts.length ? row("Effort", model.efforts, s.effort, (effort) => send(s.model, effort)) : null}`;
 }
 // a live Claude Code agent restarts on its conversation: how a Claude Code update reaches it (Codex and Muse start afresh each turn)
@@ -999,10 +999,30 @@ function Modal({ title, onClose, children, footer, wide }) {
   return html`<div class="scrim" onMouseDown=${(e) => e.target === e.currentTarget && onClose()}><div class="modal" style=${wide ? "width:min(760px,94vw)" : ""}><header><span class="grow">${title}</span><${Hot} k="Esc">close<//></header>${children}${footer ? html`<footer>${footer}</footer>` : null}</div></div>`;
 }
 
-function Seg({ options, value, onChange, label, names = {} }) {
+// ←/→ step through every option, also those only the menu shows
+function Seg({ options, value, onChange, label, names = {}, shown = options }) {
   return html`<div class="seg" tabIndex="0" aria-label=${label} onKeyDown=${(e) => { const i = options.indexOf(value); if (e.key === "ArrowRight" || e.key === "l") { e.preventDefault(); onChange(options[(i + 1) % options.length]); } if (e.key === "ArrowLeft" || e.key === "h") { e.preventDefault(); onChange(options[(i - 1 + options.length) % options.length]); } }}>
-    ${options.map((o) => html`<button type="button" tabIndex="-1" class=${o === value ? "on" : ""} onClick=${() => onChange(o)}>${names[o] || o}</button>`)}
+    ${shown.map((o) => html`<button type="button" tabIndex="-1" class=${o === value ? "on" : ""} onClick=${() => onChange(o)}>${names[o] || o}</button>`)}
+    <${More} rest=${options.filter((o) => !shown.includes(o))} pick=${onChange} />
   </div>`;
+}
+// a long model list (Antigravity offers a dozen) shows four as buttons: the one chosen, the agent's default, the ones last used
+// with that agent, then the agent's next in its own order; the rest wait in one menu, grouped by family (gemini, claude, gpt)
+const pinned = (provider, ids, value) => {
+  if (ids.length <= 5) return ids;
+  const used = S.sessions.filter((s) => s.provider === provider && s.model).sort((a, b) => b.updated.localeCompare(a.updated)).map((s) => s.model);
+  const keep = [...new Set([value, ids[0], ...used, ...ids])].filter((id) => ids.includes(id)).slice(0, 4);
+  return ids.filter((id) => keep.includes(id));
+};
+function More({ rest, pick }) {
+  if (!rest.length) return null;
+  const fams = rest.reduce((g, id) => ({ ...g, [id.split(/[-.]/)[0]]: [...(g[id.split(/[-.]/)[0]] || []), id] }), {});
+  const opts = (ids) => ids.map((id) => html`<option value=${id}>${id}</option>`);
+  // the menu lies unseen over its label, which keeps it as narrow as "+7 more" instead of its longest model
+  return html`<label class="more" title="More models">+${rest.length} more ▾<select tabIndex="-1" value="" onChange=${(e) => { const id = e.currentTarget.value; e.currentTarget.value = ""; e.currentTarget.blur(); if (id) pick(id); }}>
+    <option value="" disabled hidden>+${rest.length} more</option>
+    ${Object.keys(fams).length > 1 ? Object.entries(fams).map(([f, ids]) => html`<optgroup label=${f}>${opts(ids)}</optgroup>`) : opts(rest)}
+  </select></label>`;
 }
 
 // each provider brings its current models (the newest of each class), the efforts each model takes, and its permission modes
@@ -1046,7 +1066,7 @@ function NewSession({ nest }) {
         ${sugg.length ? html`<div class="sugg">${sugg.map((p, i) => html`<div class=${i === si ? "on" : ""} onMouseDown=${() => { up({ cwd: p }); setSugg([]); }}>${p}</div>`)}</div>` : null}
       </div>
       ${Object.keys(provs).length > 1 ? html`<div class="field"><label>Agent<span class="hint">${K("←", "→")}</span></label><${Seg} label="Agent" options=${Object.keys(provs)} names=${Object.fromEntries(Object.entries(provs).map(([k, v]) => [k, v.label]))} value=${f.provider} onChange=${(provider) => up({ ...choose(provider, f.effort), skills: ["orchestrate"] })} /></div>` : null}
-      <div class="field"><label>Model<span class="hint">${K("←", "→")}</span></label>${prov.models.length ? html`<${Seg} label="Model" options=${prov.models.map((m) => m.id)} value=${f.model} onChange=${(id) => up({ model: id, effort: effortFor(prov.models.find((m) => m.id === id), f.effort) })} />` : html`<div class="empty" style="padding:4px 0">${prov.label} lists no models yet; run it once to fetch them.</div>`}</div>
+      <div class="field"><label>Model<span class="hint">${K("←", "→")}</span></label>${prov.models.length ? html`<${Seg} label="Model" options=${prov.models.map((m) => m.id)} shown=${pinned(f.provider, prov.models.map((m) => m.id), f.model)} value=${f.model} onChange=${(id) => up({ model: id, effort: effortFor(prov.models.find((m) => m.id === id), f.effort) })} />` : html`<div class="empty" style="padding:4px 0">${prov.label} lists no models yet; run it once to fetch them.</div>`}</div>
       <div style="display:flex;gap:18px;flex-wrap:wrap">
         ${model?.efforts.length ? html`<div class="field"><label>Effort<span class="hint">${K("←", "→")}</span></label><${Seg} label="Effort" options=${model.efforts} value=${f.effort} onChange=${(effort) => up({ effort })} /></div>` : null}
         <div class="field"><label>Permissions<span class="hint">${K("←", "→")}</span></label><${Seg} label="Permissions" options=${prov.permissions} value=${f.permission} onChange=${(permission) => up({ permission })} /></div>

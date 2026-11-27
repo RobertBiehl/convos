@@ -30,6 +30,10 @@ owned by it. The dialog offers every agent installed on this Mac: Claude Code, C
 Antigravity. Each comes with its current models, the newest of each class, read from the tool itself:
 the model ids the installed Claude Code binary knows, Codex's `models_cache.json`, Muse's model
 catalog, and Antigravity's `agy models` (grouped by base model and effort, cached per binary version).
+A list longer than five (Antigravity offers a dozen) shows four as buttons: the model chosen, the agent's
+default, the ones you last ran with that agent, then the agent's next in its own order. The rest wait
+behind *+N more*, a menu grouped by family (gemini, claude, gpt); `←`/`→` still step through all of them.
+The session pane's model row works the same way.
 Efforts follow the chosen model, and permissions the agent (Claude Code's permission modes, Codex's
 sandbox, Muse sandboxed or `--yolo`, Antigravity `accept-edits`, `plan`, or `always-proceed`). The
 session pane changes a started session's permission in place: a live Claude Code agent switches at
