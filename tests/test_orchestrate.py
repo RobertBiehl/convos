@@ -14,10 +14,10 @@ def _ag_transcript(app_dir, sid, events):
 
 def test_antigravity_models_cache_and_command_invariants(tmp_path, monkeypatch):
     raw = (
-        "\r\x1b[32mgemini-4-neon-high             Gemini 4 Neon (High)\x1b[0m\n"
+        "\r\x1b[32mgemini-4-neon-high\tGemini 4 Neon (High)\x1b[0m\n"
         "gemini-4-neon-xhigh            Gemini 4 Neon (XHigh)\n"
-        "gemini-4-neon-low              Gemini 4 Neon (Low)\n"
-        "gemini-pro-orchestrator        Orchestrator (Carbon)\n"
+        "gemini-4-neon-low\tGemini 4 Neon (Low)\n"
+        "gemini-pro-orchestrator\tOrchestrator (Carbon)\n"
     )
     fake_agy = tmp_path / "agy"
     fake_agy.write_text("#!/bin/sh\n")

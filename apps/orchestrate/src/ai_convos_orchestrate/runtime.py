@@ -49,7 +49,7 @@ def parse_antigravity_models(out):
     grouped = {}
     for line in out.splitlines():
         clean = AGY_ANSI.sub("", line).rsplit("\r", 1)[-1].strip()
-        if not (m := re.match(r"^([a-z0-9][a-z0-9._-]+)\s{2,}(.+)$", clean)): continue
+        if not (m := re.match(r"^([a-z0-9][a-z0-9._-]+)(?:\t|\s{2,})(.+)$", clean)): continue
         base, eff = antigravity_split(m[1])
         seen = grouped.setdefault(base, [])
         if eff and eff not in seen: seen.append(eff)
